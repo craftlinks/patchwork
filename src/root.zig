@@ -1,9 +1,5 @@
-const std = @import("std");
+pub const frame = @import("frame.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expectEqual(@as(i32, 10), add(3, 7));
+test {
+    _ = frame;
 }
