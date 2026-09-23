@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "Patchwork",
+			"path": "."
+		},
+		{
+			"name": "Zig 0.16.0 Stdlib",
+			"path": "../zig/lib/std"
+		}
+	],
+	"settings": {}
+}
