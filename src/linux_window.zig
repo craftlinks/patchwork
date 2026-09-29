@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const xdg = @import("xdg_shell.zig");
@@ -25,6 +26,8 @@ pub const State = struct {
     xdg_surface: ?*xdg.XdgSurface,
     toplevel: ?*xdg.XdgToplevel,
     gpu: gpu.Gpu,
+    list: draw.DrawList,
+    cursor: draw.UploadCursor,
     configure_serial: u32,
     ack_pending: bool,
     pending_width: u32,
@@ -119,6 +122,7 @@ pub fn run(state: *State) !void {
     try bind_globals(state);
     try create_toplevel(state);
     try create_device(state);
+    draw.demo(&state.list);
     try loop(state);
 }
 
@@ -206,12 +210,21 @@ fn present_if_dirty(state: *State) !void {
         return;
     }
     set_buffer_scale(state);
-    try gpu.present_clear(
-        &state.gpu,
-        state.frame.width_px,
-        state.frame.height_px,
-        gpu.clear_color,
-    );
+    var header: draw.PresentHeader = undefined;
+    draw.fill_header(&header, .{
+        .list = &state.list,
+        .cursor = state.cursor,
+        .width_logical = state.frame.width_logical,
+        .height_logical = state.frame.height_logical,
+        .width_px = state.frame.width_px,
+        .height_px = state.frame.height_px,
+        .clear_r = gpu.clear_color.r,
+        .clear_g = gpu.clear_color.g,
+        .clear_b = gpu.clear_color.b,
+        .clear_a = gpu.clear_color.a,
+    });
+    try gpu.present(&state.gpu, &header, &state.list.items);
+    state.cursor.mark(&state.list, state.frame.width_logical, state.frame.height_logical);
     state.frame.mark_presented();
     assert(!state.frame.redraw);
 }

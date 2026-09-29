@@ -1,6 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const gpu = @import("gpu.zig");
+const draw = @import("draw.zig");
 
 pub const Gpu = struct {
     instance: Instance,
@@ -11,6 +11,11 @@ pub const Gpu = struct {
     format: TextureFormat,
     configured_width: u32,
     configured_height: u32,
+    pipeline: RenderPipeline,
+    quad_buffer: Buffer,
+    instance_buffer: Buffer,
+    uniform_buffer: Buffer,
+    bind_group: BindGroup,
 };
 
 const Instance = *opaque {};
@@ -23,6 +28,12 @@ const TextureView = *opaque {};
 const CommandEncoder = *opaque {};
 const CommandBuffer = *opaque {};
 const RenderPassEncoder = *opaque {};
+const Buffer = *opaque {};
+const ShaderModule = *opaque {};
+const BindGroupLayout = *opaque {};
+const PipelineLayout = *opaque {};
+const BindGroup = *opaque {};
+const RenderPipeline = *opaque {};
 
 const Bool = u32;
 const Flags = u64;
@@ -38,10 +49,23 @@ const StoreOp = u32;
 const RequestAdapterStatus = u32;
 const RequestDeviceStatus = u32;
 const SurfaceGetCurrentTextureStatus = u32;
+const VertexFormat = u32;
+const VertexStepMode = u32;
+const PrimitiveTopology = u32;
+const IndexFormat = u32;
+const FrontFace = u32;
+const CullMode = u32;
+const BlendOperation = u32;
+const BlendFactor = u32;
+const BufferBindingType = u32;
 const s_type_wayland_surface: SType = 0x00000007;
+const s_type_shader_source_wgsl: SType = 0x00000002;
 const callback_process_events: CallbackMode = 0x00000002;
 const format_bgra8_unorm: TextureFormat = 0x0000001B;
 const usage_render_attachment: TextureUsage = 0x0000000000000010;
+const usage_copy_dst: Flags = 0x0000000000000008;
+const usage_vertex: Flags = 0x0000000000000020;
+const usage_uniform: Flags = 0x0000000000000040;
 const present_fifo: PresentMode = 0x00000001;
 const alpha_auto: CompositeAlphaMode = 0x00000000;
 const load_clear: LoadOp = 0x00000002;
@@ -54,6 +78,21 @@ const texture_success_suboptimal: SurfaceGetCurrentTextureStatus = 0x00000002;
 const depth_slice_undefined: u32 = 0xFFFFFFFF;
 const wait_max: u32 = 8000;
 const format_cap: u32 = 32;
+const vertex_float32x2: VertexFormat = 0x0000001D;
+const vertex_float32x4: VertexFormat = 0x0000001F;
+const step_vertex: VertexStepMode = 0x00000001;
+const step_instance: VertexStepMode = 0x00000002;
+const topology_triangle_list: PrimitiveTopology = 0x00000004;
+const index_undefined: IndexFormat = 0x00000000;
+const front_ccw: FrontFace = 0x00000001;
+const cull_none: CullMode = 0x00000001;
+const blend_add: BlendOperation = 0x00000001;
+const blend_src_alpha: BlendFactor = 0x00000005;
+const blend_one_minus_src_alpha: BlendFactor = 0x00000006;
+const buffer_uniform: BufferBindingType = 0x00000002;
+const shader_vertex: Flags = 0x0000000000000001;
+const color_write_all: Flags = 0x000000000000000F;
+const whole_size: u64 = 0xFFFFFFFFFFFFFFFF;
 
 const ChainedStruct = extern struct {
     next: ?*ChainedStruct,
@@ -174,6 +213,174 @@ const RenderPassDescriptor = extern struct {
     timestamp_writes: ?*anyopaque,
 };
 
+const ShaderSourceWgsl = extern struct {
+    chain: ChainedStruct,
+    code: StringView,
+};
+
+const ShaderModuleDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+};
+
+const BufferDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    usage: Flags,
+    size: u64,
+    mapped_at_creation: Bool,
+};
+
+const BufferBindingLayout = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    type: BufferBindingType,
+    has_dynamic_offset: Bool,
+    min_binding_size: u64,
+};
+
+const SamplerBindingLayout = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    type: u32,
+};
+
+const TextureBindingLayout = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    sample_type: u32,
+    view_dimension: u32,
+    multisampled: Bool,
+};
+
+const StorageTextureBindingLayout = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    access: u32,
+    format: TextureFormat,
+    view_dimension: u32,
+};
+
+const BindGroupLayoutEntry = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    binding: u32,
+    visibility: Flags,
+    binding_array_size: u32,
+    buffer: BufferBindingLayout,
+    sampler: SamplerBindingLayout,
+    texture: TextureBindingLayout,
+    storage_texture: StorageTextureBindingLayout,
+};
+
+const BindGroupLayoutDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    entry_count: usize,
+    entries: ?[*]const BindGroupLayoutEntry,
+};
+
+const PipelineLayoutDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    bind_group_layout_count: usize,
+    bind_group_layouts: ?[*]const BindGroupLayout,
+    immediate_size: u32,
+};
+
+const BindGroupEntry = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    binding: u32,
+    buffer: ?Buffer,
+    offset: u64,
+    size: u64,
+    sampler: ?*anyopaque,
+    texture_view: ?*anyopaque,
+};
+
+const BindGroupDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    layout: BindGroupLayout,
+    entry_count: usize,
+    entries: ?[*]const BindGroupEntry,
+};
+
+const VertexAttribute = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    format: VertexFormat,
+    offset: u64,
+    shader_location: u32,
+};
+
+const VertexBufferLayout = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    step_mode: VertexStepMode,
+    array_stride: u64,
+    attribute_count: usize,
+    attributes: ?[*]const VertexAttribute,
+};
+
+const BlendComponent = extern struct {
+    operation: BlendOperation,
+    src_factor: BlendFactor,
+    dst_factor: BlendFactor,
+};
+
+const BlendState = extern struct {
+    color: BlendComponent,
+    alpha: BlendComponent,
+};
+
+const ColorTargetState = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    format: TextureFormat,
+    blend: ?*const BlendState,
+    write_mask: Flags,
+};
+
+const VertexState = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    module: ShaderModule,
+    entry_point: StringView,
+    constant_count: usize,
+    constants: ?*anyopaque,
+    buffer_count: usize,
+    buffers: ?[*]const VertexBufferLayout,
+};
+
+const PrimitiveState = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    topology: PrimitiveTopology,
+    strip_index_format: IndexFormat,
+    front_face: FrontFace,
+    cull_mode: CullMode,
+    unclipped_depth: Bool,
+};
+
+const MultisampleState = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    count: u32,
+    mask: u32,
+    alpha_to_coverage_enabled: Bool,
+};
+
+const FragmentState = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    module: ShaderModule,
+    entry_point: StringView,
+    constant_count: usize,
+    constants: ?*anyopaque,
+    target_count: usize,
+    targets: ?[*]const ColorTargetState,
+};
+
+const RenderPipelineDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    layout: ?PipelineLayout,
+    vertex: VertexState,
+    primitive: PrimitiveState,
+    depth_stencil: ?*anyopaque,
+    multisample: MultisampleState,
+    fragment: ?*const FragmentState,
+};
+
 const AdapterSlot = struct {
     adapter: ?Adapter,
     ok: bool,
@@ -182,6 +389,12 @@ const AdapterSlot = struct {
 const DeviceSlot = struct {
     device: ?Device,
     ok: bool,
+};
+
+const Buffers = struct {
+    quad: Buffer,
+    instances: Buffer,
+    uniform: Buffer,
 };
 
 extern fn wgpuCreateInstance(descriptor: ?*const anyopaque) ?Instance;
@@ -199,6 +412,28 @@ extern fn wgpuAdapterRequestDevice(
 ) Future;
 extern fn wgpuDeviceGetQueue(device: Device) Queue;
 extern fn wgpuDeviceCreateCommandEncoder(device: Device, descriptor: ?*const anyopaque) CommandEncoder;
+extern fn wgpuDeviceCreateShaderModule(device: Device, descriptor: *const ShaderModuleDescriptor) ShaderModule;
+extern fn wgpuDeviceCreateBuffer(device: Device, descriptor: *const BufferDescriptor) ?Buffer;
+extern fn wgpuDeviceCreateBindGroupLayout(
+    device: Device,
+    descriptor: *const BindGroupLayoutDescriptor,
+) BindGroupLayout;
+extern fn wgpuDeviceCreatePipelineLayout(
+    device: Device,
+    descriptor: *const PipelineLayoutDescriptor,
+) PipelineLayout;
+extern fn wgpuDeviceCreateBindGroup(device: Device, descriptor: *const BindGroupDescriptor) BindGroup;
+extern fn wgpuDeviceCreateRenderPipeline(
+    device: Device,
+    descriptor: *const RenderPipelineDescriptor,
+) RenderPipeline;
+extern fn wgpuQueueWriteBuffer(
+    queue: Queue,
+    buffer: Buffer,
+    offset: u64,
+    data: *const anyopaque,
+    size: usize,
+) void;
 extern fn wgpuSurfaceGetCapabilities(
     surface: Surface,
     adapter: Adapter,
@@ -215,6 +450,28 @@ extern fn wgpuCommandEncoderBeginRenderPass(
 ) RenderPassEncoder;
 extern fn wgpuCommandEncoderFinish(encoder: CommandEncoder, descriptor: ?*const anyopaque) CommandBuffer;
 extern fn wgpuRenderPassEncoderEnd(pass: RenderPassEncoder) void;
+extern fn wgpuRenderPassEncoderSetPipeline(pass: RenderPassEncoder, pipeline: RenderPipeline) void;
+extern fn wgpuRenderPassEncoderSetBindGroup(
+    pass: RenderPassEncoder,
+    group_index: u32,
+    group: BindGroup,
+    dynamic_offset_count: usize,
+    dynamic_offsets: ?[*]const u32,
+) void;
+extern fn wgpuRenderPassEncoderSetVertexBuffer(
+    pass: RenderPassEncoder,
+    slot: u32,
+    buffer: Buffer,
+    offset: u64,
+    size: u64,
+) void;
+extern fn wgpuRenderPassEncoderDraw(
+    pass: RenderPassEncoder,
+    vertex_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_instance: u32,
+) void;
 extern fn wgpuQueueSubmit(queue: Queue, command_count: usize, commands: [*]const CommandBuffer) void;
 extern fn wgpuTextureViewRelease(view: TextureView) void;
 extern fn wgpuTextureRelease(texture: Texture) void;
@@ -227,9 +484,47 @@ comptime {
     assert(@sizeOf(ChainedStruct) == 16);
     assert(@sizeOf(Future) == 8);
     assert(@sizeOf(SurfaceSourceWayland) == 32);
+    assert(@sizeOf(ShaderSourceWgsl) == 32);
 }
 
 const empty_label: StringView = .{ .data = null, .length = 0 };
+const vs_main_name: []const u8 = "vs_main";
+const fs_main_name: []const u8 = "fs_main";
+
+const alpha_blend: BlendState = .{
+    .color = .{
+        .operation = blend_add,
+        .src_factor = blend_src_alpha,
+        .dst_factor = blend_one_minus_src_alpha,
+    },
+    .alpha = .{
+        .operation = blend_add,
+        .src_factor = blend_src_alpha,
+        .dst_factor = blend_one_minus_src_alpha,
+    },
+};
+
+const unit_attr: VertexAttribute = .{
+    .next_in_chain = null,
+    .format = vertex_float32x2,
+    .offset = 0,
+    .shader_location = 0,
+};
+
+const instance_attrs = [_]VertexAttribute{
+    .{
+        .next_in_chain = null,
+        .format = vertex_float32x4,
+        .offset = 0,
+        .shader_location = 1,
+    },
+    .{
+        .next_in_chain = null,
+        .format = vertex_float32x4,
+        .offset = 16,
+        .shader_location = 2,
+    },
+};
 
 pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     assert(@intFromPtr(display) != 0);
@@ -240,6 +535,7 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     const device = try request_device(instance, adapter);
     const queue = wgpuDeviceGetQueue(device);
     const format = try pick_format(surface, adapter);
+    const resources = try create_resources(device, queue, format);
     return .{
         .instance = instance,
         .adapter = adapter,
@@ -249,15 +545,57 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
         .format = format,
         .configured_width = 0,
         .configured_height = 0,
+        .pipeline = resources.pipeline,
+        .quad_buffer = resources.quad,
+        .instance_buffer = resources.instances,
+        .uniform_buffer = resources.uniform,
+        .bind_group = resources.bind_group,
     };
 }
 
-pub fn present_clear(self: *Gpu, width_px: u32, height_px: u32, color: gpu.Color) !void {
-    assert(width_px != 0);
-    assert(height_px != 0);
-    configure_surface(self, width_px, height_px);
+const PipelineResources = struct {
+    pipeline: RenderPipeline,
+    quad: Buffer,
+    instances: Buffer,
+    uniform: Buffer,
+    bind_group: BindGroup,
+};
+
+fn create_resources(
+    device: Device,
+    queue: Queue,
+    format: TextureFormat,
+) !PipelineResources {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(queue) != 0);
+    const shader = create_shader(device);
+    const buffers = try create_buffers(device);
+    write_quad(queue, buffers.quad);
+    const layout = create_bind_group_layout(device);
+    const pipeline_layout = create_pipeline_layout(device, layout);
+    const bind_group = create_bind_group(device, layout, buffers.uniform);
+    const pipeline = create_pipeline(device, shader, pipeline_layout, format);
+    return .{
+        .pipeline = pipeline,
+        .quad = buffers.quad,
+        .instances = buffers.instances,
+        .uniform = buffers.uniform,
+        .bind_group = bind_group,
+    };
+}
+
+pub fn present(
+    self: *Gpu,
+    header: *const draw.PresentHeader,
+    instances: [*]const draw.Instance,
+) !void {
+    assert(header.width_px != 0);
+    assert(header.height_px != 0);
+    assert(header.instance_count <= draw.instance_cap);
+    configure_surface(self, header.width_px, header.height_px);
+    write_uploads(self, header, instances);
     const texture = try acquire_texture(self.surface);
-    encode_submit_present(self, texture, color);
+    encode_submit_present(self, texture, header);
 }
 
 fn create_instance() !Instance {
@@ -384,6 +722,250 @@ fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     return null;
 }
 
+fn create_shader(device: Device) ShaderModule {
+    assert(@intFromPtr(device) != 0);
+    assert(draw.shader_file.len >= 1);
+    var source: ShaderSourceWgsl = .{
+        .chain = .{ .next = null, .s_type = s_type_shader_source_wgsl },
+        .code = .{
+            .data = draw.shader_file.ptr,
+            .length = draw.shader_file.len,
+        },
+    };
+    const descriptor: ShaderModuleDescriptor = .{
+        .next_in_chain = @ptrCast(&source.chain),
+        .label = empty_label,
+    };
+    const shader = wgpuDeviceCreateShaderModule(device, &descriptor);
+    assert(@intFromPtr(shader) != 0);
+    return shader;
+}
+
+fn create_buffers(device: Device) !Buffers {
+    assert(@intFromPtr(device) != 0);
+    const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
+    const vertex_usage: Flags = usage_vertex | usage_copy_dst;
+    const uniform_usage: Flags = usage_uniform | usage_copy_dst;
+    const quad = try create_buffer(device, draw.quad_bytes, vertex_usage);
+    const instances = try create_buffer(device, instance_bytes, vertex_usage);
+    const uniform = try create_buffer(device, draw.uniform_bytes, uniform_usage);
+    assert(@intFromPtr(instances) != 0);
+    assert(@intFromPtr(uniform) != 0);
+    return .{ .quad = quad, .instances = instances, .uniform = uniform };
+}
+
+fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
+    assert(size != 0);
+    assert(usage != 0);
+    const descriptor: BufferDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = usage,
+        .size = size,
+        .mapped_at_creation = 0,
+    };
+    const buffer = wgpuDeviceCreateBuffer(device, &descriptor) orelse return error.BufferFailed;
+    assert(@intFromPtr(buffer) != 0);
+    return buffer;
+}
+
+fn write_quad(queue: Queue, buffer: Buffer) void {
+    assert(@intFromPtr(queue) != 0);
+    assert(@intFromPtr(buffer) != 0);
+    wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
+}
+
+fn create_bind_group_layout(device: Device) BindGroupLayout {
+    assert(@intFromPtr(device) != 0);
+    const entry: BindGroupLayoutEntry = .{
+        .next_in_chain = null,
+        .binding = 0,
+        .visibility = shader_vertex,
+        .binding_array_size = 0,
+        .buffer = .{
+            .next_in_chain = null,
+            .type = buffer_uniform,
+            .has_dynamic_offset = 0,
+            .min_binding_size = draw.matrix_bytes,
+        },
+        .sampler = std.mem.zeroes(SamplerBindingLayout),
+        .texture = std.mem.zeroes(TextureBindingLayout),
+        .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
+    };
+    const descriptor: BindGroupLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .entry_count = 1,
+        .entries = @ptrCast(&entry),
+    };
+    const layout = wgpuDeviceCreateBindGroupLayout(device, &descriptor);
+    assert(@intFromPtr(layout) != 0);
+    return layout;
+}
+
+fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) PipelineLayout {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(bind_layout) != 0);
+    const descriptor: PipelineLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&bind_layout),
+        .immediate_size = 0,
+    };
+    const layout = wgpuDeviceCreatePipelineLayout(device, &descriptor);
+    assert(@intFromPtr(layout) != 0);
+    return layout;
+}
+
+fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) BindGroup {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(uniform) != 0);
+    const entry: BindGroupEntry = .{
+        .next_in_chain = null,
+        .binding = 0,
+        .buffer = uniform,
+        .offset = 0,
+        .size = draw.uniform_bytes,
+        .sampler = null,
+        .texture_view = null,
+    };
+    const descriptor: BindGroupDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .entry_count = 1,
+        .entries = @ptrCast(&entry),
+    };
+    const group = wgpuDeviceCreateBindGroup(device, &descriptor);
+    assert(@intFromPtr(group) != 0);
+    return group;
+}
+
+fn create_pipeline(
+    device: Device,
+    shader: ShaderModule,
+    layout: PipelineLayout,
+    format: TextureFormat,
+) RenderPipeline {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(shader) != 0);
+    var buffers: [2]VertexBufferLayout = undefined;
+    fill_vertex_layouts(&buffers);
+    const vertex = vertex_state(shader, &buffers);
+    const target: ColorTargetState = .{
+        .next_in_chain = null,
+        .format = format,
+        .blend = &alpha_blend,
+        .write_mask = color_write_all,
+    };
+    const fragment = fragment_state(shader, &target);
+    const descriptor: RenderPipelineDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .vertex = vertex,
+        .primitive = .{
+            .next_in_chain = null,
+            .topology = topology_triangle_list,
+            .strip_index_format = index_undefined,
+            .front_face = front_ccw,
+            .cull_mode = cull_none,
+            .unclipped_depth = 0,
+        },
+        .depth_stencil = null,
+        .multisample = .{
+            .next_in_chain = null,
+            .count = 1,
+            .mask = 0xFFFFFFFF,
+            .alpha_to_coverage_enabled = 0,
+        },
+        .fragment = &fragment,
+    };
+    const pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+    // wgpu-native v29.0.1.1 panics on GetCompilationInfo. A non-null pipeline
+    // is the compile barrier for this pin.
+    assert(@intFromPtr(pipeline) != 0);
+    return pipeline;
+}
+
+fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
+    buffers[0] = .{
+        .next_in_chain = null,
+        .step_mode = step_vertex,
+        .array_stride = 8,
+        .attribute_count = 1,
+        .attributes = @ptrCast(&unit_attr),
+    };
+    buffers[1] = .{
+        .next_in_chain = null,
+        .step_mode = step_instance,
+        .array_stride = draw.instance_stride,
+        .attribute_count = 2,
+        .attributes = &instance_attrs,
+    };
+    assert(buffers[0].attribute_count == 1);
+    assert(buffers[1].attribute_count == 2);
+}
+
+fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) VertexState {
+    assert(@intFromPtr(shader) != 0);
+    assert(vs_main_name.len == 7);
+    return .{
+        .next_in_chain = null,
+        .module = shader,
+        .entry_point = .{ .data = vs_main_name.ptr, .length = vs_main_name.len },
+        .constant_count = 0,
+        .constants = null,
+        .buffer_count = 2,
+        .buffers = buffers,
+    };
+}
+
+fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) FragmentState {
+    assert(@intFromPtr(shader) != 0);
+    assert(target.format == format_bgra8_unorm);
+    return .{
+        .next_in_chain = null,
+        .module = shader,
+        .entry_point = .{ .data = fs_main_name.ptr, .length = fs_main_name.len },
+        .constant_count = 0,
+        .constants = null,
+        .target_count = 1,
+        .targets = @ptrCast(target),
+    };
+}
+
+fn write_uploads(
+    self: *Gpu,
+    header: *const draw.PresentHeader,
+    instances: [*]const draw.Instance,
+) void {
+    assert(header.instance_count <= draw.instance_cap);
+    if ((header.flags & draw.flag_uniform) != 0) {
+        wgpuQueueWriteBuffer(
+            self.queue,
+            self.uniform_buffer,
+            0,
+            @ptrCast(&header.ortho),
+            @intCast(draw.matrix_bytes),
+        );
+    }
+    if ((header.flags & draw.flag_instances) != 0) {
+        if (header.instance_count != 0) {
+            const byte_count: u32 = header.instance_count * draw.instance_stride;
+            wgpuQueueWriteBuffer(
+                self.queue,
+                self.instance_buffer,
+                0,
+                @ptrCast(instances),
+                @intCast(byte_count),
+            );
+        }
+    }
+    assert(@intFromPtr(self.queue) != 0);
+}
+
 fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     assert(width_px != 0);
     assert(height_px != 0);
@@ -429,12 +1011,36 @@ fn acquire_texture(surface: Surface) !Texture {
     return error.TextureAcquireFailed;
 }
 
-fn encode_submit_present(self: *Gpu, texture: Texture, color: gpu.Color) void {
+fn encode_submit_present(
+    self: *Gpu,
+    texture: Texture,
+    header: *const draw.PresentHeader,
+) void {
     assert(@intFromPtr(texture) != 0);
     const view = wgpuTextureCreateView(texture, null);
     const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
     assert(@intFromPtr(view) != 0);
     assert(@intFromPtr(encoder) != 0);
+    const pass = begin_clear_pass(encoder, view, header);
+    draw_quads(self, pass, header.instance_count);
+    wgpuRenderPassEncoderEnd(pass);
+    const commands = wgpuCommandEncoderFinish(encoder, null);
+    wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands));
+    _ = wgpuSurfacePresent(self.surface);
+    wgpuRenderPassEncoderRelease(pass);
+    wgpuCommandEncoderRelease(encoder);
+    wgpuCommandBufferRelease(commands);
+    wgpuTextureViewRelease(view);
+    wgpuTextureRelease(texture);
+}
+
+fn begin_clear_pass(
+    encoder: CommandEncoder,
+    view: TextureView,
+    header: *const draw.PresentHeader,
+) RenderPassEncoder {
+    assert(@intFromPtr(encoder) != 0);
+    assert(@intFromPtr(view) != 0);
     const attachment: RenderPassColorAttachment = .{
         .next_in_chain = null,
         .view = view,
@@ -443,10 +1049,10 @@ fn encode_submit_present(self: *Gpu, texture: Texture, color: gpu.Color) void {
         .load_op = load_clear,
         .store_op = store_store,
         .clear_value = .{
-            .r = color.r,
-            .g = color.g,
-            .b = color.b,
-            .a = color.a,
+            .r = header.clear_r,
+            .g = header.clear_g,
+            .b = header.clear_b,
+            .a = header.clear_a,
         },
     };
     const pass_desc: RenderPassDescriptor = .{
@@ -458,16 +1064,17 @@ fn encode_submit_present(self: *Gpu, texture: Texture, color: gpu.Color) void {
         .occlusion_query_set = null,
         .timestamp_writes = null,
     };
-    const pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-    wgpuRenderPassEncoderEnd(pass);
-    const commands = wgpuCommandEncoderFinish(encoder, null);
-    wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands));
-    _ = wgpuSurfacePresent(self.surface);
-    wgpuRenderPassEncoderRelease(pass);
-    wgpuCommandEncoderRelease(encoder);
-    wgpuCommandBufferRelease(commands);
-    wgpuTextureViewRelease(view);
-    wgpuTextureRelease(texture);
+    return wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+}
+
+fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
+    assert(@intFromPtr(pass) != 0);
+    assert(instance_count <= draw.instance_cap);
+    wgpuRenderPassEncoderSetPipeline(pass, self.pipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.quad_buffer, 0, whole_size);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.instance_buffer, 0, whole_size);
+    wgpuRenderPassEncoderDraw(pass, draw.vertex_count, instance_count, 0, 0);
 }
 
 fn adapter_ready(

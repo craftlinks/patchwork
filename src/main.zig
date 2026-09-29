@@ -10,6 +10,8 @@ pub fn main() !void {
         .xdg_surface = null,
         .toplevel = null,
         .gpu = undefined,
+        .list = .init(),
+        .cursor = .init(),
         .configure_serial = 0,
         .ack_pending = false,
         .pending_width = 0,
