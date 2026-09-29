@@ -100,6 +100,8 @@ fn add_wasm(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.Step.C
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    // shell.js reads the shader and instance bytes out of the wasm linear memory.
+    wasm.export_memory = true;
     const wasm_step = b.step("wasm", "Build the browser module");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
     return wasm;

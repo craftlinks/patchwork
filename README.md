@@ -2,9 +2,8 @@
 
 A Zig 0.16.0 library that copies Makepad's drawing model: a retained widget
 tree that lays itself out with a turtle and paints with instanced signed-distance
-shaders. Step 1 opens one Wayland window and one full-page browser canvas,
-clears each through a single WebGPU device and swapchain with FIFO present, and
-blocks while the picture is clean.
+shaders. Step 2 draws a 16x16 grid of 256 rectangles in one instanced call on a
+Wayland window and a full-page browser canvas, then blocks while the picture is clean.
 
 ## Native (Linux / Wayland)
 
@@ -21,9 +20,13 @@ zig build -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```
 
+Use the distro `zig` (`/usr/bin/zig` on this machine). The official 0.16.0
+tarball's LLD rejects GCC 16's `.sframe` relocations in `crt1.o`.
+
 `zig build` and `zig build run` require that flag. After the window shows the
-clear color, the process should sit in a sleeping poll (`ps -o state,wchan -p
-<pid>`). Resize paints again. Closing the window exits.
+slate plus the 16x16 grid of 256 color- and alpha-blended rectangles, the process
+should sit in a sleeping poll (`ps -o state,wchan -p <pid>`). Resize paints again.
+Closing the window exits.
 
 ## Tests, wasm, and the browser host
 
@@ -36,4 +39,6 @@ zig build serve
 ```
 
 `zig build serve` starts a localhost static server for `index.html`, `shell.js`,
-and the wasm module. WebGPU is unavailable on `file://`.
+and the wasm module. WebGPU is unavailable on `file://`. The page shows the same
+16x16 grid of 256 rectangles. The frame scheduler is idle after the first paint
+and wakes once on resize.

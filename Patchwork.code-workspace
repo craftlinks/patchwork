@@ -9,5 +9,7 @@
 			"path": "../zig/lib/std"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"zig.path": "/usr/bin/zig"
+	}
 }
