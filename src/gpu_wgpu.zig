@@ -1,7 +1,51 @@
+//! Native Linux WebGPU Implementation using wgpu-native (v29.0.1.1 C ABI).
+//!
+//! # Concepts for Novices:
+//!
+//! ## 1. What is wgpu-native?
+//! `wgpu-native` is a high-performance WebGPU implementation written in Rust (the core of
+//! Firefox's WebGPU engine) that exports a standard C ABI defined by the W3C `webgpu.h` spec.
+//! Instead of using third-party package managers or complex C++ wrappers, we interface directly
+//! with `libwgpu_native.so` using Zig's native C ABI calling conventions (`callconv(.c)`).
+//!
+//! ## 2. Type-Safe Opaque Handles in Zig
+//! In C, graphics handles are often declared as untyped `void*` or incomplete pointer types.
+//! In Zig, we declare handles as distinct opaque types: `const Instance = *opaque {};`.
+//! In Zig, each `*opaque {}` declaration is a unique type. If you accidentally pass an `Adapter`
+//! to a function expecting a `Device`, the Zig compiler catches the bug at compile time.
+//!
+//! ## 3. The Chained Struct Pattern (`ChainedStruct` and `s_type`)
+//! Modern graphics APIs (Vulkan and WebGPU) need a way to pass platform-specific
+//! configuration structures without breaking C ABI binary compatibility.
+//! They use a tagged, singly-linked list of structs:
+//! - Every extensibility struct begins with `ChainedStruct` (16 bytes: `next: ?*ChainedStruct`,
+//!   `s_type: SType`, plus 4 bytes padding).
+//! - When creating a Wayland surface, `SurfaceSourceWayland` has `chain: ChainedStruct` as its
+//!   first field and sets `s_type = s_type_wayland_surface` (0x00000007).
+//! - `SurfaceDescriptor` has `next_in_chain: ?*ChainedStruct`. We point `next_in_chain` directly to
+//!   `&source.chain`. The underlying C library walks this linked list, checks the `s_type` tag,
+//!   casts the pointer to `SurfaceSourceWayland`, and reads the display and surface handles.
+//!
+//! ## 4. The WebGPU Resource Hierarchy
+//! - `Instance`: Entry point to the WebGPU runtime.
+//! - `Adapter`: Physical GPU hardware (e.g. Intel UHD, AMD Radeon, NVIDIA).
+//! - `Device`: Logical GPU context used to allocate buffers, shaders, and pipelines.
+//! - `Queue`: Command queue where recorded command buffers are submitted for execution.
+//! - `Surface`: Window attachment connecting WebGPU to the Linux Wayland display server.
+//! - `Texture` / `TextureView`: The actual pixel image buffers in GPU VRAM (swapchain images).
+//!
+//! ## 5. Recording and Submitting GPU Commands
+//! Unlike old APIs (like OpenGL) where draw calls happen immediately, modern GPUs are asynchronous:
+//! 1. `CommandEncoder`: Records drawing commands into a `CommandBuffer` in CPU memory.
+//! 2. `RenderPassEncoder`: Configures render targets, clear colors, pipelines, and draw calls.
+//! 3. `wgpuQueueSubmit`: Hands the finished command buffer over to the GPU hardware driver.
+//! 4. `wgpuSurfacePresent`: Flips the completed swapchain image onto the display monitor.
+
 const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("draw.zig");
 
+/// Hardware GPU state context encapsulating all native WebGPU resources.
 pub const Gpu = struct {
     instance: Instance,
     adapter: Adapter,
@@ -398,7 +442,10 @@ const Buffers = struct {
 };
 
 extern fn wgpuCreateInstance(descriptor: ?*const anyopaque) ?Instance;
-extern fn wgpuInstanceCreateSurface(instance: Instance, descriptor: *const SurfaceDescriptor) ?Surface;
+extern fn wgpuInstanceCreateSurface(
+    instance: Instance,
+    descriptor: *const SurfaceDescriptor,
+) ?Surface;
 extern fn wgpuInstanceRequestAdapter(
     instance: Instance,
     options: ?*const RequestAdapterOptions,
@@ -411,8 +458,14 @@ extern fn wgpuAdapterRequestDevice(
     callback_info: RequestDeviceCallbackInfo,
 ) Future;
 extern fn wgpuDeviceGetQueue(device: Device) Queue;
-extern fn wgpuDeviceCreateCommandEncoder(device: Device, descriptor: ?*const anyopaque) CommandEncoder;
-extern fn wgpuDeviceCreateShaderModule(device: Device, descriptor: *const ShaderModuleDescriptor) ShaderModule;
+extern fn wgpuDeviceCreateCommandEncoder(
+    device: Device,
+    descriptor: ?*const anyopaque,
+) CommandEncoder;
+extern fn wgpuDeviceCreateShaderModule(
+    device: Device,
+    descriptor: *const ShaderModuleDescriptor,
+) ShaderModule;
 extern fn wgpuDeviceCreateBuffer(device: Device, descriptor: *const BufferDescriptor) ?Buffer;
 extern fn wgpuDeviceCreateBindGroupLayout(
     device: Device,
@@ -422,7 +475,10 @@ extern fn wgpuDeviceCreatePipelineLayout(
     device: Device,
     descriptor: *const PipelineLayoutDescriptor,
 ) PipelineLayout;
-extern fn wgpuDeviceCreateBindGroup(device: Device, descriptor: *const BindGroupDescriptor) BindGroup;
+extern fn wgpuDeviceCreateBindGroup(
+    device: Device,
+    descriptor: *const BindGroupDescriptor,
+) BindGroup;
 extern fn wgpuDeviceCreateRenderPipeline(
     device: Device,
     descriptor: *const RenderPipelineDescriptor,
@@ -448,7 +504,10 @@ extern fn wgpuCommandEncoderBeginRenderPass(
     encoder: CommandEncoder,
     descriptor: *const RenderPassDescriptor,
 ) RenderPassEncoder;
-extern fn wgpuCommandEncoderFinish(encoder: CommandEncoder, descriptor: ?*const anyopaque) CommandBuffer;
+extern fn wgpuCommandEncoderFinish(
+    encoder: CommandEncoder,
+    descriptor: ?*const anyopaque,
+) CommandBuffer;
 extern fn wgpuRenderPassEncoderEnd(pass: RenderPassEncoder) void;
 extern fn wgpuRenderPassEncoderSetPipeline(pass: RenderPassEncoder, pipeline: RenderPipeline) void;
 extern fn wgpuRenderPassEncoderSetBindGroup(
@@ -472,7 +531,11 @@ extern fn wgpuRenderPassEncoderDraw(
     first_vertex: u32,
     first_instance: u32,
 ) void;
-extern fn wgpuQueueSubmit(queue: Queue, command_count: usize, commands: [*]const CommandBuffer) void;
+extern fn wgpuQueueSubmit(
+    queue: Queue,
+    command_count: usize,
+    commands: [*]const CommandBuffer,
+) void;
 extern fn wgpuTextureViewRelease(view: TextureView) void;
 extern fn wgpuTextureRelease(texture: Texture) void;
 extern fn wgpuCommandEncoderRelease(encoder: CommandEncoder) void;
@@ -526,6 +589,13 @@ const instance_attrs = [_]VertexAttribute{
     },
 };
 
+/// Initializes the full WebGPU graphics pipeline for Linux Wayland.
+/// 1. Connects to WebGPU runtime (Instance).
+/// 2. Binds the Wayland window to WebGPU (Surface).
+/// 3. Queries the physical graphics card (Adapter).
+/// 4. Opens a logical GPU device and execution queue (Device, Queue).
+/// 5. Validates surface pixel format (BGRA8Unorm).
+/// 6. Compiles the WGSL shader and constructs the render pipeline and buffers.
 pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(wl_surface) != 0);
@@ -561,6 +631,7 @@ const PipelineResources = struct {
     bind_group: BindGroup,
 };
 
+/// Compiles the shader, creates VRAM buffers, writes the static unit quad, and builds the pipeline.
 fn create_resources(
     device: Device,
     queue: Queue,
@@ -584,6 +655,8 @@ fn create_resources(
     };
 }
 
+/// Presents a frame by updating GPU buffers as needed, acquiring a swapchain texture,
+/// and executing the clear and instanced draw render pass.
 pub fn present(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -598,6 +671,7 @@ pub fn present(
     encode_submit_present(self, texture, header);
 }
 
+/// Creates the top-level WebGPU instance handle.
 fn create_instance() !Instance {
     // wgpu-native v29.0.1.1 panics if TimedWaitAny is required. Startup waits
     // with WaitAny(0) plus ProcessEvents instead.
@@ -607,6 +681,8 @@ fn create_instance() !Instance {
     return instance;
 }
 
+/// Creates a WebGPU Surface backed by a Linux Wayland `wl_display` and `wl_surface`.
+/// Uses the ChainedStruct mechanism (`s_type_wayland_surface`).
 fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaque) !Surface {
     assert(@intFromPtr(instance) != 0);
     var source: SurfaceSourceWayland = .{
@@ -625,6 +701,7 @@ fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaqu
     return surface;
 }
 
+/// Asynchronously requests a physical GPU adapter compatible with the window surface.
 fn request_adapter(instance: Instance, surface: Surface) !Adapter {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(surface) != 0);
@@ -651,6 +728,7 @@ fn request_adapter(instance: Instance, surface: Surface) !Adapter {
     return adapter;
 }
 
+/// Asynchronously requests a logical WebGPU Device and execution queue from the Adapter.
 fn request_device(instance: Instance, adapter: Adapter) !Device {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(adapter) != 0);
@@ -669,6 +747,7 @@ fn request_device(instance: Instance, adapter: Adapter) !Device {
     return device;
 }
 
+/// Pumps the wgpu event loop synchronously until an asynchronous future resolves.
 fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
     // wgpu-native v29.0.1.1 ships WaitAny in the header and panics if it is called.
     _ = future;
@@ -684,6 +763,7 @@ fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
     return error.WaitTimeout;
 }
 
+/// Queries surface capabilities and confirms support for BGRA8Unorm texture format.
 fn pick_format(surface: Surface, adapter: Adapter) !TextureFormat {
     assert(@intFromPtr(surface) != 0);
     assert(@intFromPtr(adapter) != 0);
@@ -701,6 +781,7 @@ fn pick_format(surface: Surface, adapter: Adapter) !TextureFormat {
     return format;
 }
 
+/// Helper that searches the list of supported surface formats for BGRA8Unorm.
 fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     const formats = capabilities.formats orelse return null;
     const count_usize = capabilities.format_count;
@@ -722,6 +803,7 @@ fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     return null;
 }
 
+/// Compiles the embedded WGSL shader text into a WebGPU ShaderModule handle.
 fn create_shader(device: Device) ShaderModule {
     assert(@intFromPtr(device) != 0);
     assert(draw.shader_file.len >= 1);
@@ -741,6 +823,7 @@ fn create_shader(device: Device) ShaderModule {
     return shader;
 }
 
+/// Allocates the static unit quad buffer, instance buffer, and uniform buffer in GPU VRAM.
 fn create_buffers(device: Device) !Buffers {
     assert(@intFromPtr(device) != 0);
     const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
@@ -754,6 +837,7 @@ fn create_buffers(device: Device) !Buffers {
     return .{ .quad = quad, .instances = instances, .uniform = uniform };
 }
 
+/// Helper that creates a single WebGPU Buffer descriptor and allocates GPU memory.
 fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
     assert(size != 0);
     assert(usage != 0);
@@ -769,12 +853,15 @@ fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
     return buffer;
 }
 
+/// Writes the static unit quad vertex coordinates (48 bytes) into GPU buffer 0 once at startup.
 fn write_quad(queue: Queue, buffer: Buffer) void {
     assert(@intFromPtr(queue) != 0);
     assert(@intFromPtr(buffer) != 0);
     wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
 }
 
+/// Defines the bind group layout for binding slot 0 (the orthographic projection matrix uniform).
+/// Defines the bind group layout for binding slot 0 (the orthographic projection matrix uniform).
 fn create_bind_group_layout(device: Device) BindGroupLayout {
     assert(@intFromPtr(device) != 0);
     const entry: BindGroupLayoutEntry = .{
@@ -803,6 +890,7 @@ fn create_bind_group_layout(device: Device) BindGroupLayout {
     return layout;
 }
 
+/// Bundles the bind group layouts into a top-level pipeline layout.
 fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) PipelineLayout {
     assert(@intFromPtr(device) != 0);
     assert(@intFromPtr(bind_layout) != 0);
@@ -818,6 +906,7 @@ fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) Pipeline
     return layout;
 }
 
+/// Instantiates the bind group connecting the uniform buffer (at offset 0) to binding 0.
 fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) BindGroup {
     assert(@intFromPtr(device) != 0);
     assert(@intFromPtr(uniform) != 0);
@@ -842,6 +931,7 @@ fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) B
     return group;
 }
 
+/// Creates the complete render pipeline: vertex layouts, shaders, topology, and alpha blend.
 fn create_pipeline(
     device: Device,
     shader: ShaderModule,
@@ -889,6 +979,9 @@ fn create_pipeline(
     return pipeline;
 }
 
+/// Configures the dual vertex buffer layout:
+/// Buffer 0: step_vertex, 8-byte stride (unit quad points).
+/// Buffer 1: step_instance, 32-byte stride (instance rect and color).
 fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     buffers[0] = .{
         .next_in_chain = null,
@@ -908,6 +1001,7 @@ fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     assert(buffers[1].attribute_count == 2);
 }
 
+/// Configures the vertex stage descriptor referencing the `vs_main` entry point.
 fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) VertexState {
     assert(@intFromPtr(shader) != 0);
     assert(vs_main_name.len == 7);
@@ -922,6 +1016,7 @@ fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) Vert
     };
 }
 
+/// Configures the fragment stage descriptor referencing the `fs_main` entry point.
 fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) FragmentState {
     assert(@intFromPtr(shader) != 0);
     assert(target.format == format_bgra8_unorm);
@@ -936,6 +1031,7 @@ fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) Fragmen
     };
 }
 
+/// Conditionally uploads uniform matrix and instance buffer data based on header flags.
 fn write_uploads(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -966,6 +1062,7 @@ fn write_uploads(
     assert(@intFromPtr(self.queue) != 0);
 }
 
+/// Configures or reconfigures the swapchain when window pixel dimensions change.
 fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     assert(width_px != 0);
     assert(height_px != 0);
@@ -993,6 +1090,7 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     self.configured_height = height_px;
 }
 
+/// Acquires the current swapchain texture for rendering.
 fn acquire_texture(surface: Surface) !Texture {
     assert(@intFromPtr(surface) != 0);
     var surface_texture: SurfaceTexture = .{
@@ -1011,6 +1109,7 @@ fn acquire_texture(surface: Surface) !Texture {
     return error.TextureAcquireFailed;
 }
 
+/// Encodes the clear and draw render pass, submits commands, and presents to the surface.
 fn encode_submit_present(
     self: *Gpu,
     texture: Texture,
@@ -1034,6 +1133,7 @@ fn encode_submit_present(
     wgpuTextureRelease(texture);
 }
 
+/// Begins a render pass configured with `load_op = load_clear` and the background slate color.
 fn begin_clear_pass(
     encoder: CommandEncoder,
     view: TextureView,
@@ -1067,6 +1167,7 @@ fn begin_clear_pass(
     return wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
 }
 
+/// Binds pipeline, bind group 0, vertex buffers 0 and 1, and draws 6 vertices instanced.
 fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
     assert(@intFromPtr(pass) != 0);
     assert(instance_count <= draw.instance_cap);
@@ -1077,6 +1178,7 @@ fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
     wgpuRenderPassEncoderDraw(pass, draw.vertex_count, instance_count, 0, 0);
 }
 
+/// C ABI callback for adapter request completion.
 fn adapter_ready(
     status: RequestAdapterStatus,
     adapter: ?Adapter,
@@ -1095,6 +1197,7 @@ fn adapter_ready(
     }
 }
 
+/// C ABI callback for device request completion.
 fn device_ready(
     status: RequestDeviceStatus,
     device: ?Device,

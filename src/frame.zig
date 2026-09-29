@@ -1,16 +1,54 @@
+//! Pure Window Sizing, HiDPI Scaling, and Redraw Policy.
+//!
+//! # Concepts for Novices:
+//!
+//! ## 1. Separation of Policy and Mechanism (Pure Logic)
+//! In traditional GUI programming, window event handling is often tangled with GPU drawing
+//! and platform-specific window handles. This makes automated testing difficult.
+//!
+//! `frame.zig` represents pure **Policy**:
+//! - It contains NO Wayland dependencies, NO WebGPU dependencies, and NO I/O syscalls.
+//! - It can be thoroughly verified under `zig build test` without needing a display server,
+//!   GPU driver, or graphics hardware.
+//!
+//! ## 2. Logical Coordinates vs. Physical Pixels (HiDPI Scaling)
+//! Modern computer displays have vastly different pixel densities:
+//! - A standard 24" 1080p monitor has ~92 pixels per inch (PPI).
+//! - A 13" 4K laptop or Retina screen has ~220–300 PPI.
+//!
+//! If a UI rendered a 100-pixel wide button on a 4K screen without scaling, it would appear
+//! physically microscopic. To solve this, desktop environments use a **scale factor**:
+//! - **Logical Pixels (`width_logical`, `height_logical`):** The coordinate system used by UI
+//!   layout, fonts, and application logic (e.g. 1280 x 720).
+//! - **Scale Factor (`scale`):** An integer multiplier (e.g. 1 on standard displays, 2 on 4K).
+//! - **Physical Pixels (`width_px`, `height_px`):** The actual pixel resolution of the GPU
+//!   framebuffer texture:
+//!   $$\text{Physical Pixels} = \text{Logical Pixels} \times \text{Scale}$$
+//!
+//! ## 3. Damage and Redraw Pacing
+//! Every GPU draw call and buffer presentation consumes energy. To maintain 0% CPU and low
+//! GPU power while idle, `Frame` tracks a single `redraw` flag:
+//! - Setting a new size or scale sets `redraw = true`.
+//! - If the compositor sends a duplicate configure event with identical dimensions, `redraw`
+//!   remains `false`, preventing redundant rendering.
+//! - Once presented, `mark_presented()` resets `redraw = false`.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Logical pixels the compositor treats as "client chooses the size".
+/// Default logical window width when the display compositor does not request a specific size.
 pub const width_default: u32 = 1280;
+
+/// Default logical window height when the display compositor does not request a specific size.
 pub const height_default: u32 = 720;
 
-/// Hard cap on a surface edge. Larger compositor sizes are clamped.
+/// Hard upper bound on a window dimension in pixels. Clamps excessively large compositor requests.
 pub const edge_max: u32 = 16384;
 
-/// Integer buffer scale never exceeds this. Hyprland stays well below it.
+/// Upper bound on display scaling factor. Clamps abnormal scale factor events.
 pub const scale_max: u32 = 16;
 
+/// State container tracking window dimensions, scaling, and frame dirtiness.
 pub const Frame = struct {
     running: bool,
     redraw: bool,
@@ -22,7 +60,8 @@ pub const Frame = struct {
 
     pub const ScaleError = error{ScaleZero};
 
-    /// The first present is owed before any configure arrives.
+    /// Initializes a newly created frame.
+    /// `running` and `redraw` start as `true` because the initial frame must be drawn.
     pub fn init() Frame {
         const frame: Frame = .{
             .running = true,
@@ -38,7 +77,9 @@ pub const Frame = struct {
         return frame;
     }
 
-    /// A zero edge means the compositor left the size to us.
+    /// Applies a configure event from the window system (e.g. Wayland configure or browser resize).
+    /// If the compositor provides (0, 0), substitutes `width_default` and `height_default`.
+    /// If the dimensions are identical to the current configuration, returns without dirtying.
     pub fn apply_configure(self: *Frame, width_logical: u32, height_logical: u32) void {
         assert(self.running);
         const resolved = resolve_logical(width_logical, height_logical);
@@ -58,6 +99,8 @@ pub const Frame = struct {
         assert(self.height_px != 0);
     }
 
+    /// Updates the integer display scale factor (e.g. 1 -> 2 when moved to a HiDPI screen).
+    /// Recomputes physical pixel dimensions and sets `redraw = true`.
     pub fn apply_scale(self: *Frame, scale: u32) ScaleError!void {
         assert(self.running);
         if (scale == 0) {
@@ -79,6 +122,7 @@ pub const Frame = struct {
         assert(self.width_px != 0);
     }
 
+    /// Marks the current frame as presented to the display, clearing the dirty flag.
     pub fn mark_presented(self: *Frame) void {
         assert(self.running);
         assert(self.redraw);
@@ -87,6 +131,7 @@ pub const Frame = struct {
         assert(self.running);
     }
 
+    /// Signals the window loop to terminate.
     pub fn close(self: *Frame) void {
         assert(self.running);
         self.running = false;
@@ -94,6 +139,7 @@ pub const Frame = struct {
         assert(self.redraw or !self.redraw);
     }
 
+    /// Recomputes physical pixel dimensions from logical dimensions and buffer scale.
     fn refresh_pixels(self: *Frame) void {
         assert(self.scale >= 1);
         assert(self.width_logical != 0);
@@ -109,6 +155,7 @@ const LogicalSize = struct {
     height: u32,
 };
 
+/// Resolves compositor-suggested logical dimensions, applying defaults and bounds.
 fn resolve_logical(width: u32, height: u32) LogicalSize {
     if (width == 0) {
         return .{ .width = width_default, .height = height_default };
@@ -122,6 +169,7 @@ fn resolve_logical(width: u32, height: u32) LogicalSize {
     };
 }
 
+/// Clamps dimension values to prevent integer overflows or graphics driver crashes.
 fn clamp_edge(edge: u32) u32 {
     assert(edge != 0);
     if (edge > edge_max) {
@@ -131,6 +179,7 @@ fn clamp_edge(edge: u32) u32 {
     return edge;
 }
 
+/// Multiplies logical size by scale factor, safely clamping to `edge_max`.
 fn pixel_size(logical: u32, scale: u32) u32 {
     assert(logical != 0);
     assert(scale >= 1);
