@@ -1,45 +1,92 @@
 //! Native Linux WebGPU Implementation using wgpu-native (v29.0.1.1 C ABI).
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. What is wgpu-native?
 //! `wgpu-native` is a high-performance WebGPU implementation written in Rust (the core of
-//! Firefox's WebGPU engine) that exports a standard C ABI defined by the W3C `webgpu.h` spec.
-//! Instead of using third-party package managers or complex C++ wrappers, we interface directly
-//! with `libwgpu_native.so` using Zig's native C ABI calling conventions (`callconv(.c)`).
+//! Mozilla Firefox's WebGPU engine) that exports a standard C ABI defined by the W3C `webgpu.h`
+//! specification.
+//! Instead of using third-party package managers, C++ wrappers, or heavyweight abstraction layers,
+//! Patchwork interfaces directly with `libwgpu_native.so` using Zig's native C ABI calling
+//! conventions (`callconv(.c)`).
 //!
 //! ## 2. Type-Safe Opaque Handles in Zig
-//! In C, graphics handles are often declared as untyped `void*` or incomplete pointer types.
-//! In Zig, we declare handles as distinct opaque types: `const Instance = *opaque {};`.
-//! In Zig, each `*opaque {}` declaration is a unique type. If you accidentally pass an `Adapter`
-//! to a function expecting a `Device`, the Zig compiler catches the bug at compile time.
+//! In traditional C graphics programming, handles are often declared as untyped `void*` or
+//! incomplete pointer types (`typedef struct WGPUDeviceImpl* WGPUDevice;`). This allows dangerous
+//! bugs where an `Adapter` handle is accidentally passed to a function expecting a `Device`.
 //!
-//! ## 3. The Chained Struct Pattern (`ChainedStruct` and `s_type`)
-//! Modern graphics APIs (Vulkan and WebGPU) need a way to pass platform-specific
-//! configuration structures without breaking C ABI binary compatibility.
-//! They use a tagged, singly-linked list of structs:
-//! - Every extensibility struct begins with `ChainedStruct` (16 bytes: `next: ?*ChainedStruct`,
-//!   `s_type: SType`, plus 4 bytes padding).
-//! - When creating a Wayland surface, `SurfaceSourceWayland` has `chain: ChainedStruct` as its
-//!   first field and sets `s_type = s_type_wayland_surface` (0x00000007).
-//! - `SurfaceDescriptor` has `next_in_chain: ?*ChainedStruct`. We point `next_in_chain` directly to
-//!   `&source.chain`. The underlying C library walks this linked list, checks the `s_type` tag,
-//!   casts the pointer to `SurfaceSourceWayland`, and reads the display and surface handles.
+//! In Zig, we declare handles as distinct opaque types:
+//! ```zig
+//! const Instance = *opaque {};
+//! const Device = *opaque {};
+//! ```
+//! In Zig's type system, each `*opaque {}` is a strictly unique type. If a function argument is
+//! mismatched, the Zig compiler rejects the code at compile time with zero runtime overhead.
 //!
-//! ## 4. The WebGPU Resource Hierarchy
-//! - `Instance`: Entry point to the WebGPU runtime.
-//! - `Adapter`: Physical GPU hardware (e.g. Intel UHD, AMD Radeon, NVIDIA).
-//! - `Device`: Logical GPU context used to allocate buffers, shaders, and pipelines.
-//! - `Queue`: Command queue where recorded command buffers are submitted for execution.
-//! - `Surface`: Window attachment connecting WebGPU to the Linux Wayland display server.
-//! - `Texture` / `TextureView`: The actual pixel image buffers in GPU VRAM (swapchain images).
+//! ## 3. The Chained Struct Extensibility Pattern (`ChainedStruct` and `s_type`)
+//! Modern graphics specifications (Vulkan and WebGPU) require extensible configuration structs
+//! that allow platform-specific extensions without breaking C ABI binary compatibility.
+//! They implement a singly-linked list of tagged structs:
+//! ```text
+//! [ SurfaceDescriptor ]
+//!   next_in_chain ───────► [ SurfaceSourceWayland ]
+//!                            chain.next ──► null
+//!                            chain.s_type ═ s_type_wayland_surface (0x7)
+//!                            display ═════► *wl_display
+//!                            surface ═════► *wl_surface
+//! ```
+//! Every extensible struct begins with `chain: ChainedStruct` (16 bytes: `next: ?*ChainedStruct`,
+//! `s_type: SType`, plus 4 bytes padding).
+//! When creating a Wayland surface:
+//! - `SurfaceSourceWayland` begins with `chain: ChainedStruct` and sets `s_type = 0x00000007`.
+//! - `SurfaceDescriptor` has `next_in_chain: ?*ChainedStruct`.
+//! - We assign `next_in_chain = &source.chain`. The underlying C library inspects `s_type`,
+//!   casts the pointer to `SurfaceSourceWayland`, and extracts the Wayland handles.
+//! - A similar pattern is used for WGSL shader compilation via `ShaderSourceWgsl` (`s_type = 0x2`).
 //!
-//! ## 5. Recording and Submitting GPU Commands
-//! Unlike old APIs (like OpenGL) where draw calls happen immediately, modern GPUs are asynchronous:
-//! 1. `CommandEncoder`: Records drawing commands into a `CommandBuffer` in CPU memory.
-//! 2. `RenderPassEncoder`: Configures render targets, clear colors, pipelines, and draw calls.
-//! 3. `wgpuQueueSubmit`: Hands the finished command buffer over to the GPU hardware driver.
-//! 4. `wgpuSurfacePresent`: Flips the completed swapchain image onto the display monitor.
+//! ## 4. The Complete WebGPU Resource Hierarchy
+//! - **Instance:** The top-level entry point to the WebGPU runtime.
+//! - **Adapter:** The physical graphics processor (Intel, AMD, NVIDIA).
+//! - **Device:** The logical GPU context used to allocate VRAM buffers, textures, and pipelines.
+//! - **Queue:** The hardware execution queue where command buffers are scheduled.
+//! - **Surface:** The display presentation target bound to the Linux Wayland `wl_surface`.
+//! - **Texture / TextureView:** The swapchain framebuffers rendered into and presented.
+//! - **Buffer:** GPU VRAM memory allocations (unit quad, instances, uniform matrix).
+//! - **BindGroupLayout & BindGroup:** Describes and binds uniform resources to shader slots.
+//! - **PipelineLayout & RenderPipeline:** Monolithic compiled graphics state (shaders, blending).
+//! - **CommandEncoder & RenderPassEncoder:** Records drawing commands into a `CommandBuffer`.
+//!
+//! ## 5. The Hardware-Instanced Render Pipeline
+//! Patchwork configures a dual vertex buffer layout:
+//! - **Vertex Buffer 0 (Unit Quad):**
+//!   `stepMode = step_vertex`, `array_stride = 8`, `format = vertex_float32x2`.
+//!   Contains 6 static 2D coordinates representing two triangles in the range [0, 0] to [1, 1].
+//! - **Vertex Buffer 1 (Instances):**
+//!   `stepMode = step_instance`, `array_stride = 32`.
+//!   Contains two vertex attributes per instance:
+//!   - Slot 1: `rect` (`vertex_float32x4` at offset 0) -> `[x, y, w, h]`.
+//!   - Slot 2: `fill` (`vertex_float32x4` at offset 16) -> `[r, g, b, a]`.
+//! - **Bind Group 0 (Uniform Buffer):**
+//!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix.
+//!
+//! ## 6. Swapchain Lifecycle and Command Submission
+//! For every presented frame in `present()`:
+//! 1. `configure_surface()`: Configures the swapchain when physical dimensions change.
+//! 2. `write_uploads()`: Selectively transfers modified uniform or instance data via `writeBuffer`.
+//! 3. `acquire_texture()`: Requests the next swapchain `Texture` from the display surface.
+//! 4. `encode_submit_present()`:
+//!    - Creates a `TextureView` and `CommandEncoder`.
+//!    - Begins a render pass with `load_op = load_clear` and background slate color.
+//!    - Binds the pipeline, bind group 0, vertex buffers 0 and 1.
+//!    - Executes `wgpuRenderPassEncoderDraw(pass, 6, count, 0, 0)`.
+//!    - Finishes encoding, submits the command buffer to `Queue`, and presents the surface.
+//!    - Releases all temporary C ABI handles (`Texture`, `TextureView`, encoders, command buffer).
+//!
+//! ## 7. Future Polling Workaround in v29.0.1.1
+//! `wgpu-native` v29.0.1.1 ships a header definition for `wgpuInstanceWaitAny`, but calling it
+//! causes an internal panic in Rust.
+//! To work around this upstream bug, `wait_future()` pumps `wgpuInstanceProcessEvents()` with a
+//! bounded sleep loop, ensuring deterministic completion without hangs.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -589,13 +636,15 @@ const instance_attrs = [_]VertexAttribute{
     },
 };
 
-/// Initializes the full WebGPU graphics pipeline for Linux Wayland.
-/// 1. Connects to WebGPU runtime (Instance).
-/// 2. Binds the Wayland window to WebGPU (Surface).
-/// 3. Queries the physical graphics card (Adapter).
-/// 4. Opens a logical GPU device and execution queue (Device, Queue).
-/// 5. Validates surface pixel format (BGRA8Unorm).
-/// 6. Compiles the WGSL shader and constructs the render pipeline and buffers.
+/// Initializes the complete WebGPU graphics pipeline for Linux Wayland.
+///
+/// Execution Steps:
+/// 1. Connects to the WebGPU runtime (`Instance`).
+/// 2. Binds the Wayland window to WebGPU (`Surface`) via `SurfaceSourceWayland`.
+/// 3. Queries a physical GPU adapter compatible with the surface (`Adapter`).
+/// 4. Opens a logical GPU device and execution queue (`Device`, `Queue`).
+/// 5. Verifies and selects the `BGRA8Unorm` swapchain texture format.
+/// 6. Compiles the WGSL shader and constructs the render pipeline, bind group, and VRAM buffers.
 pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(wl_surface) != 0);
@@ -631,7 +680,8 @@ const PipelineResources = struct {
     bind_group: BindGroup,
 };
 
-/// Compiles the shader, creates VRAM buffers, writes the static unit quad, and builds the pipeline.
+/// Compiles the WGSL shader, allocates VRAM buffers, uploads the static unit quad,
+/// and builds the pipeline layout, bind group, and render pipeline.
 fn create_resources(
     device: Device,
     queue: Queue,
@@ -655,8 +705,11 @@ fn create_resources(
     };
 }
 
-/// Presents a frame by updating GPU buffers as needed, acquiring a swapchain texture,
-/// and executing the clear and instanced draw render pass.
+/// Presents a frame onto the Wayland surface:
+/// 1. Reconfigures the swapchain if the physical pixel size changed.
+/// 2. Selectively transfers modified uniform or instance data into GPU VRAM.
+/// 3. Acquires the current swapchain framebuffer texture from the compositor.
+/// 4. Records the clear and instanced draw commands and submits them to the GPU queue.
 pub fn present(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -672,17 +725,17 @@ pub fn present(
 }
 
 /// Creates the top-level WebGPU instance handle.
+/// wgpu-native v29.0.1.1 panics if `TimedWaitAny` is invoked, so startup waiting
+/// uses `ProcessEvents` instead.
 fn create_instance() !Instance {
-    // wgpu-native v29.0.1.1 panics if TimedWaitAny is required. Startup waits
-    // with WaitAny(0) plus ProcessEvents instead.
     const instance = wgpuCreateInstance(null) orelse return error.InstanceFailed;
     assert(@intFromPtr(instance) != 0);
     assert(wait_max >= 1);
     return instance;
 }
 
-/// Creates a WebGPU Surface backed by a Linux Wayland `wl_display` and `wl_surface`.
-/// Uses the ChainedStruct mechanism (`s_type_wayland_surface`).
+/// Creates a WebGPU Surface bound to a Linux Wayland `wl_display` and `wl_surface`.
+/// Utilizes the tagged `ChainedStruct` mechanism with `s_type_wayland_surface`.
 fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaque) !Surface {
     assert(@intFromPtr(instance) != 0);
     var source: SurfaceSourceWayland = .{
@@ -748,6 +801,7 @@ fn request_device(instance: Instance, adapter: Adapter) !Device {
 }
 
 /// Pumps the wgpu event loop synchronously until an asynchronous future resolves.
+/// Loops with bounded timeout, calling `wgpuInstanceProcessEvents` and nanosleep.
 fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
     // wgpu-native v29.0.1.1 ships WaitAny in the header and panics if it is called.
     _ = future;
@@ -860,7 +914,6 @@ fn write_quad(queue: Queue, buffer: Buffer) void {
     wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
 }
 
-/// Defines the bind group layout for binding slot 0 (the orthographic projection matrix uniform).
 /// Defines the bind group layout for binding slot 0 (the orthographic projection matrix uniform).
 fn create_bind_group_layout(device: Device) BindGroupLayout {
     assert(@intFromPtr(device) != 0);

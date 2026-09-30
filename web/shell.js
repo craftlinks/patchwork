@@ -1,26 +1,52 @@
-// Browser-side WebGPU and WebAssembly host harness.
+// Browser-Side WebGPU and WebAssembly Host Harness.
 //
-// Concepts for Novices:
-// 1. WebGPU in the Browser:
-//    WebGPU is the modern W3C graphics standard for the web (replacing WebGL).
-//    Unlike WebGL (which was stateful and based on OpenGL ES), WebGPU is stateless and mirrors
-//    explicit modern APIs like Vulkan, Metal, and DirectX 12.
-//    - `GPUAdapter`: Represents the physical GPU hardware installed in the computer.
-//    - `GPUDevice`: The logical connection to the adapter used to allocate GPU resources.
-//    - `GPUCanvasContext`: Attached to an HTML5 <canvas> element to display rendered frames.
+// # Deep Architectural Guide for Reviewers:
 //
-// 2. Zero-Copy WebAssembly Interop:
-//    When Zig exports memory (`export_memory = true`), `wasm.memory.buffer` exposes the
-//    entire linear memory of the WebAssembly module as an `ArrayBuffer`.
-//    JavaScript can create typed array views (`Uint8Array`, `DataView`) directly over this buffer
-//    using memory addresses passed from Zig. This allows copying binary graphics data directly
-//    into WebGPU VRAM buffers without JSON serialization or intermediate string conversions.
+// ## 1. WebGPU Architecture and Modern Web Graphics
+// WebGPU is the modern W3C standard for hardware-accelerated 3D and 2D computing on the web,
+// designed to replace legacy WebGL (OpenGL ES 2.0/3.0).
 //
-// 3. Power-Efficient Frame Pacing (0% Idle CPU):
-//    Traditional web games run a continuous `requestAnimationFrame` loop that paints 60-144 times
-//    a second. For a UI toolkit, this drains battery while reading a document or typing.
-//    Here, `requestAnimationFrame` is ONLY scheduled when Zig indicates the frame is dirty
-//    (e.g. during an initial draw or a resize event). When clean, the browser is idle.
+// Key Architectural Principles of WebGPU:
+// - **Explicit Resource Management:** Unlike WebGL (which maintained global state machines and
+//   hidden driver validation), WebGPU uses explicit, stateless, immutable objects:
+//   - `GPUAdapter`: The physical graphics card installed in the host machine.
+//   - `GPUDevice`: The logical connection to the GPU used to allocate VRAM buffers and textures.
+//   - `GPUQueue`: The hardware command queue where recorded command buffers are submitted.
+//   - `GPURenderPipeline`: A monolithic, ahead-of-time compiled graphics state object
+//     encapsulating shader modules, vertex layouts, blending equations, and rasterization modes.
+// - **Asynchronous Validation:** Shader compilation and pipeline creation occur asynchronously
+//   during bootstrap, ensuring zero compilation stutter during the interactive render loop.
+//
+// ## 2. Zero-Copy WebAssembly Interoperability Bridge
+// When compiling Zig to WebAssembly with `export_memory = true`, the entire linear memory of
+// the Wasm instance is exposed to JavaScript as `wasm.memory.buffer` (an `ArrayBuffer`).
+//
+// Instead of copying data across boundaries or serializing to JSON:
+// - Pointers passed from Zig (e.g. `headerPtr`, `instancePtr`, `shader_ptr()`) are raw 32-bit
+//   unsigned integer byte offsets into `wasm.memory.buffer`.
+// - JavaScript constructs typed views (`Uint8Array`, `DataView`) over these memory offsets.
+// - Binary graphics data is copied directly from Wasm linear memory into WebGPU VRAM buffers via
+//   `device.queue.writeBuffer()`.
+// - Zero heap allocations, zero string parsing, zero GC pauses.
+//
+// ## 3. Synchronous Call-Stack Longevity
+// In `web_exports.zig:tick()`, `PresentHeader` is allocated directly on Zig's call stack.
+// Zig calls the host import `present_js(headerPtr, instancePtr)` synchronously.
+// Because WebAssembly and JavaScript run synchronously on the main UI thread:
+// - The Zig stack frame remains active and frozen while `present_js()` executes.
+// - JavaScript safely reads `PresentHeader` and instance records directly from Wasm stack memory.
+// - When `present_js()` returns, Zig resumes and unwinds the stack.
+//
+// ## 4. Power-Optimal Frame Pacing (0% Idle CPU / GPU)
+// Traditional web games run an unconditional `requestAnimationFrame` loop that paints 60-144 times
+// a second. For an application UI toolkit, this wastes battery and heats the device while reading
+// or idling.
+//
+// In Patchwork:
+// - `requestAnimationFrame` is scheduled **only** when Zig signals that a frame is dirty.
+// - Once `wasm.tick()` presents the frame, the dirty flag is cleared.
+// - No further animation frames are requested until a resize or user interaction event occurs.
+// - The browser tab consumes 0.0% CPU and 0.0% GPU cycles when idle.
 
 const canvas = document.getElementById("surface");
 
@@ -37,7 +63,7 @@ let bindGroup = null;
 let configuredWidth = 0;
 let configuredHeight = 0;
 
-// Constants matching the binary layout defined in `src/draw.zig`.
+// Binary layout constants matching `src/draw.zig`.
 const FLAG_INSTANCES = 1;
 const FLAG_UNIFORM = 2;
 const HEADER_BYTES = 96;
@@ -46,17 +72,18 @@ const INSTANCE_CAP = 256;
 
 /**
  * Host import invoked synchronously from Zig's `web_exports.zig:tick()`.
- * Reads the `PresentHeader` from Wasm stack memory and issues the WebGPU draw pass.
+ * Reads the `PresentHeader` from Wasm stack memory, conditionally uploads modified
+ * buffers to GPU VRAM, and executes the instanced draw render pass.
  *
- * @param {number} headerPtr Memory address of the `PresentHeader` in Wasm linear memory.
- * @param {number} instancePtr Memory address of the `Instance` array in Wasm linear memory.
+ * @param {number} headerPtr Byte offset of `PresentHeader` in Wasm linear memory.
+ * @param {number} instancePtr Byte offset of `Instance` array in Wasm linear memory.
  */
 function present_js(headerPtr, instancePtr) {
     if (context === null || device === null || pipeline === null) {
-        throw new Error("present before the pipeline exists");
+        throw new Error("present called before the graphics pipeline is initialized");
     }
 
-    // Direct binary access to WebAssembly linear memory without copying.
+    // Direct binary access to WebAssembly linear memory without intermediate copying.
     const memory = wasm.memory.buffer;
     const view = new DataView(memory, headerPtr, HEADER_BYTES);
 
@@ -91,7 +118,7 @@ function present_js(headerPtr, instancePtr) {
         }
     }
 
-    // Reconfigure the canvas swapchain texture if the physical dimensions changed.
+    // Reconfigure the canvas swapchain texture if physical pixel dimensions changed.
     if (width !== configuredWidth || height !== configuredHeight) {
         context.configure({
             device,
@@ -109,7 +136,7 @@ function present_js(headerPtr, instancePtr) {
     // Record GPU drawing commands into a command buffer.
     const encoder = device.createCommandEncoder();
 
-    // Begin the render pass: clears the screen with the background slate color.
+    // Begin render pass: clears the screen with the background slate color.
     const pass = encoder.beginRenderPass({
         colorAttachments: [{
             view: context.getCurrentTexture().createView(),
@@ -132,7 +159,9 @@ function present_js(headerPtr, instancePtr) {
 }
 
 /**
- * Compiles the WGSL shader and builds the WebGPU render pipeline.
+ * Compiles the WGSL shader and constructs the WebGPU render pipeline.
+ * Queries buffer sizes and layout strides dynamically from Zig exports to ensure
+ * Zig remains the single authoritative source of truth.
  */
 async function create_pipeline() {
     const stride = wasm.instance_stride();
@@ -140,10 +169,10 @@ async function create_pipeline() {
     const shaderLen = wasm.shader_len();
 
     if (stride !== 32) {
-        throw new Error("instance stride must be 32");
+        throw new Error("instance stride mismatch: expected 32 bytes");
     }
     if (quadByteCount !== 48) {
-        throw new Error("unit quad must be 48 bytes");
+        throw new Error("unit quad size mismatch: expected 48 bytes");
     }
     if (shaderLen === 0) {
         throw new Error("shader source is empty");
@@ -159,7 +188,7 @@ async function create_pipeline() {
     const info = await module.getCompilationInfo();
     for (const message of info.messages) {
         if (message.type === "error") {
-            throw new Error(message.message);
+            throw new Error(`WGSL Compilation Error: ${message.message}`);
         }
     }
 
@@ -182,7 +211,7 @@ async function create_pipeline() {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Upload the static unit quad coordinates once at startup.
+    // Upload static unit quad coordinates once at startup.
     device.queue.writeBuffer(
         quadBuffer,
         0,
@@ -260,7 +289,8 @@ function schedule() {
 }
 
 /**
- * Synchronizes the canvas resolution to physical device pixels (HiDPI / Retina scaling).
+ * Synchronizes canvas resolution to physical device pixels (HiDPI / Retina scaling).
+ * If the physical resolution changes, notifies Zig and schedules a redraw.
  */
 function fit_canvas() {
     const dpr = window.devicePixelRatio || 1;
@@ -277,6 +307,7 @@ function fit_canvas() {
 
 /**
  * Main application bootstrap.
+ * Connects to WebGPU, instantiates Wasm, compiles the pipeline, and begins presentation.
  */
 async function main() {
     if (navigator.gpu === undefined) {

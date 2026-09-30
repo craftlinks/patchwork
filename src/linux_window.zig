@@ -1,46 +1,59 @@
-//! Linux Wayland Window and Event Loop Implementation.
+//! Linux Wayland Windowing, Event Loop, and Graphics Integration.
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. What is Wayland?
-//! On Linux desktops, the window system is typically **Wayland** (or historically X11).
-//! In Wayland:
-//! - The **Compositor** (e.g. Hyprland, Sway, GNOME Mutter, KDE KWin) is the display server.
-//!   It owns the screen monitors, compositor pipeline, and input devices.
-//! - The **Client** (our program) connects to the compositor via a Unix domain socket
-//!   located at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` (usually `/run/user/1000/wayland-0`).
-//! - Unlike X11, Wayland has no server-side drawing primitives. The client renders complete
-//!   pixel buffers (e.g. via WebGPU or shared memory) and attaches them to a `wl_surface`.
+//! On modern Linux desktops, the window management system is **Wayland** (replacing legacy X11).
+//! In the Wayland architecture:
+//! - The **Compositor** (e.g. Hyprland, Sway, GNOME Mutter, KDE KWin) acts as the display server.
+//!   It directly controls physical monitors, graphics scanout, and input devices (keyboard, mouse).
+//! - The **Client** (our application) connects to the compositor via a Unix domain socket
+//!   located at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` (typically `/run/user/1000/wayland-0`).
+//! - Unlike X11, Wayland provides no server-side 2D drawing primitives. The client is solely
+//!   responsible for allocating and rendering complete pixel buffers (via WebGPU or shared memory)
+//!   and attaching them to a `wl_surface`.
 //!
 //! ## 2. Wayland Discovery and the Registry (`wl_registry`)
-//! When a client first connects, it only has a handle to `wl_display`. To find out what
-//! capabilities the compositor supports, it creates a `wl_registry`. The compositor announces
-//! available "globals" (e.g. `wl_compositor` version 6, `xdg_wm_base` version 1).
-//! The client binds to the globals it requires.
+//! When a client first connects, it receives only a raw handle to `wl_display`. To determine what
+//! features and protocols the compositor supports, the client instantiates a `wl_registry`.
+//! The compositor broadcasts available "globals" (e.g. `wl_compositor` version 6, `xdg_wm_base`
+//! version 1). The client inspects interface names and dynamically binds to the required globals.
 //!
-//! ## 3. Desktop Windows and `xdg_shell`
-//! A raw `wl_surface` is just a rectangular canvas with no window frame or behavior.
-//! To turn it into a standard desktop application window, Wayland uses the `xdg_shell` protocol:
-//! - `xdg_wm_base`: The global factory for window management objects.
-//! - `xdg_surface`: Assigns desktop semantics to a `wl_surface`.
-//! - `xdg_toplevel`: Defines a top-level desktop window with title, app_id, minimize,
-//!   maximize, resize, and close operations.
+//! ## 3. Desktop Windows and the `xdg_shell` Protocol
+//! A raw `wl_surface` is an unpositioned rectangular pixel canvas with no window borders or
+//! desktop behavior. To turn it into a standard application window, Wayland uses `xdg_shell`:
+//! - `xdg_wm_base`: The global factory interface for creating desktop surfaces.
+//! - `xdg_surface`: Assigns desktop window roles to a `wl_surface`.
+//! - `xdg_toplevel`: Implements desktop application window semantics (window title, app ID,
+//!   minimize, maximize, interactive resize, and close operations).
 //!
-//! The compositor controls window sizing by sending `configure` events with a `serial` number.
-//! The client MUST acknowledge this configure event (`xdg_surface.ack_configure(serial)`)
-//! before presenting a newly sized frame.
+//! ### The Configure-Acknowledge State Machine:
+//! In Wayland, the compositor—not the client—dictates window sizing:
+//! 1. When the window is mapped or resized, the compositor sends
+//!    `toplevel.configure(width, height)`.
+//! 2. It then sends `xdg_surface.configure(serial)` with a unique 32-bit transaction ID.
+//! 3. The client MUST acknowledge this transaction (`xdg_surface.ack_configure(serial)`) before
+//!    presenting a newly sized framebuffer texture.
 //!
-//! ## 4. The Power-Optimal Blocking Event Loop
-//! Many GUI loops use a continuous poll or sleep timer (e.g. `sleep(16ms)`), which burns CPU
-//! cycles and battery even when the screen is static.
+//! ## 4. The Power-Optimal Blocking Event Loop (0% Idle CPU)
+//! Many GUI frameworks use an unconditional polling loop or timer tick (e.g. `sleep(16ms)`),
+//! which consumes CPU cycles, wakes CPU cores from low-power C-states, and drains laptop batteries.
 //!
-//! Here, the event loop adheres strictly to the libwayland reader concurrency protocol:
-//! 1. `wl_display_prepare_read()` checks if events are already buffered in memory.
-//! 2. `wl_display_flush()` flushes any pending outgoing requests to the socket.
-//! 3. `std.posix.poll(&fds, -1)` puts the thread into an **uninterruptible kernel sleep**
-//!    with timeout `-1` (infinite). The thread consumes 0.0% CPU until the compositor writes bytes.
-//! 4. `wl_display_read_events()` reads the incoming bytes into libwayland.
-//! 5. `wl_display_dispatch_pending()` runs the registered event callbacks.
+//! Patchwork's event loop implements the libwayland multi-thread reader protocol:
+//! 1. `wl_display_prepare_read()`: Atomically registers intent to read socket events.
+//! 2. `wl_display_flush()`: Flushes any pending client requests over the Unix socket.
+//! 3. `std.posix.poll(&fds, -1)`: Puts the calling OS thread into an **uninterruptible sleep**
+//!    with timeout `-1` (infinite). The thread consumes 0.0% CPU until compositor writes bytes.
+//! 4. `wl_display_read_events()`: Reads incoming bytes from socket into libwayland buffers.
+//! 5. `wl_display_dispatch_pending()`: Invokes registered C ABI event callbacks.
+//!
+//! ## 5. Graphics Pipeline Integration
+//! In `run()`:
+//! - Allocates `DrawList` and `UploadCursor` on the thread's stack.
+//! - Initializes `Gpu` via `gpu.create(display, wl_surface)`.
+//! - Populates the demo scene (`draw.demo(&state.list)`).
+//! - In `present_if_dirty()`: fills `PresentHeader`, transfers modified buffers, draws instanced
+//!   quads, and marks the frame clean before returning to the kernel sleep in `poll`.
 
 const std = @import("std");
 const assert = std.debug.assert;

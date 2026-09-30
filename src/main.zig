@@ -1,3 +1,12 @@
+//! Native Linux Application Entry Point.
+//!
+//! # Architecture:
+//! Allocates the entire native window and graphics state (`linux_window.State`) directly on
+//! the operating system thread's call stack.
+//! In accordance with TigerStyle:
+//! - Zero dynamic heap allocation.
+//! - Runs the blocking Wayland event loop to completion until the window is closed.
+
 const linux_window = @import("linux_window.zig");
 
 pub fn main() !void {
