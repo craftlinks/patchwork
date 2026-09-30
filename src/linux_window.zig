@@ -95,18 +95,62 @@ pub const State = struct {
     global_count: u32,
 };
 
+// libwayland-client symbols. A request is not its own C function:
+// `wl_proxy_marshal_flags` encodes every one, and the interface tables name the
+// object a creating request returns. The `wl_display_*` functions own the socket,
+// from the first connect through the sleep in `wait_for_events`.
+
+/// Vtable for `wl_registry`. `get_registry` passes it so the proxy from
+/// `wl_display.get_registry` can receive `global` events.
 extern const wl_registry_interface: WlInterface;
+
+/// Vtable for `wl_compositor`. `registry_global` passes it when binding the global
+/// that creates surfaces.
 extern const wl_compositor_interface: WlInterface;
+
+/// Vtable for `wl_surface`. `create_surface` passes it so the new proxy is the
+/// canvas `gpu.create` presents into.
 extern const wl_surface_interface: WlInterface;
 
+/// Opens the compositor socket. A null `name` selects `$WAYLAND_DISPLAY`, usually
+/// `wayland-0`. Returns the connection used by every later call, or null if the
+/// socket cannot be opened. `connect` stores the handle on `State`.
 extern fn wl_display_connect(name: ?[*:0]const u8) ?*Display;
+
+/// Socket descriptor for this connection. `wait_for_events` passes it to `poll`
+/// and sleeps there until the compositor writes.
 extern fn wl_display_get_fd(display: *Display) i32;
+
+/// Claims this thread as the reader of the display socket. Returns 0 when the
+/// claim is held. A non-zero return means events are already queued, so
+/// `wait_for_events` dispatches them and does not sleep.
 extern fn wl_display_prepare_read(display: *Display) i32;
+
+/// Drops a claim from `prepare_read` when `flush` or `poll` fails. Required
+/// whenever a successful prepare will not be followed by `read_events`.
 extern fn wl_display_cancel_read(display: *Display) void;
+
+/// Reads socket bytes into libwayland's queue after `poll` reports the descriptor
+/// readable. Consumes the `prepare_read` claim. Returns 0, or -1 on error.
 extern fn wl_display_read_events(display: *Display) i32;
+
+/// Invokes listeners installed with `wl_proxy_add_listener` for events already in
+/// the queue. Configure, close, ping, and scale run here. Returns the number of
+/// events dispatched, or -1 on error.
 extern fn wl_display_dispatch_pending(display: *Display) i32;
+
+/// Pushes queued requests (bind, commit, ack, buffer scale) out the socket before
+/// `poll`. Returns the number of bytes written, or -1 on error.
 extern fn wl_display_flush(display: *Display) i32;
+
+/// Sends queued requests and blocks until the compositor's replies have been
+/// dispatched. `bind_globals` calls this once so `wl_compositor` and `xdg_wm_base`
+/// are bound before the window exists. Returns the event count, or -1 on error.
 extern fn wl_display_roundtrip(display: *Display) i32;
+
+/// Encodes one Wayland request on `proxy`. `opcode` selects the method. When
+/// `interface` is non-null, libwayland allocates the new object and returns it.
+/// Null means the request has no new id. The variadic arguments are the payload.
 extern fn wl_proxy_marshal_flags(
     proxy: ?*WlProxy,
     opcode: u32,
@@ -115,7 +159,13 @@ extern fn wl_proxy_marshal_flags(
     flags: u32,
     ...,
 ) ?*WlProxy;
+
+/// Version agreed when `proxy` was bound. `set_buffer_scale` skips the request on
+/// a `wl_surface` older than version 3, where that request does not exist.
 extern fn wl_proxy_get_version(proxy: *WlProxy) u32;
+
+/// Installs the C callback table for events on `proxy`. `data` is the `*State`
+/// those callbacks recover. Returns 0, or -1 if a listener is already set.
 extern fn wl_proxy_add_listener(
     proxy: *WlProxy,
     implementation: *const anyopaque,
