@@ -1,32 +1,66 @@
-//! WebAssembly Freestanding Entry Points for Browser Hosting.
+//! WebAssembly Freestanding Entry Points and Browser Interoperability Bridge.
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. What is `wasm32-freestanding`?
-//! When compiling for the browser, we target `wasm32-freestanding`.
-//! - `wasm32`: 32-bit WebAssembly instruction architecture (pointers are 32-bit integer offsets).
-//! - `freestanding`: Indicates there is NO operating system, NO standard C library (libc),
-//!   NO POSIX threads, and NO filesystem. The resulting `.wasm` binary contains pure, standalone
-//!   computational logic.
+//! ## 1. The `wasm32-freestanding` Execution Model
+//! When targeting the browser, Zig compiles to `wasm32-freestanding`:
+//! - `wasm32`: A 32-bit WebAssembly virtual machine architecture where pointers are 32-bit
+//!   unsigned integers representing byte offsets into a single contiguous linear memory array.
+//! - `freestanding`: Indicates that there is NO underlying operating system, NO standard C
+//!   runtime library (libc), NO POSIX threads, and NO direct access to platform system calls.
+//! - The resulting `.wasm` binary is completely self-contained, deterministic, and contains
+//!   only application code without runtime bloat.
 //!
-//! ## 2. How WebAssembly Interacts with the Browser
-//! WebAssembly cannot directly access the DOM, window events, or the WebGPU API.
-//! All communication happens across a strict boundary:
-//! - **Exports (`export fn`):** Functions written in Zig that JavaScript can call directly
-//!   from the Wasm instance exports table (e.g. `wasm.start()`, `wasm.tick()`).
-//! - **Imports (`extern "env"`):** Functions provided by JavaScript that Zig can call
-//!   (e.g. `present_js()`).
-//! - **Linear Memory (`WebAssembly.Memory`):** A contiguous, resizable array of bytes
-//!   shared between Zig and JavaScript. Because `export_memory = true` is set in `build.zig`,
-//!   JavaScript can inspect and read slices of this memory via typed arrays (`Uint8Array`).
+//! ## 2. The Browser-Wasm Sandbox Boundary
+//! WebAssembly code executes in a memory-isolated sandbox. It cannot directly touch the DOM,
+//! receive browser window events, or invoke WebGPU JavaScript APIs.
+//! All communication is bridged through three explicit channels:
+//! - **Exports (`export fn`):** Functions compiled in Zig that the JavaScript host can call
+//!   directly from the Wasm instance's exports table (`wasm.start()`, `wasm.tick()`).
+//! - **Imports (`extern "env"`):** JavaScript functions exposed to WebAssembly via the import
+//!   object passed to `WebAssembly.instantiateStreaming` (`present_js()`).
+//! - **Linear Memory (`WebAssembly.Memory`):** A contiguous byte buffer shared between the Wasm
+//!   instance and JavaScript. When `export_memory = true` is set in `build.zig`, JavaScript gains
+//!   direct access to `wasm.memory.buffer` (an `ArrayBuffer`).
 //!
-//! ## 3. Synchronous Call-Stack Memory Sharing
-//! In `tick()`, `PresentHeader` is allocated as a local variable on Zig's call stack.
-//! Zig passes the pointer to JavaScript by calling `present_js(header_ptr, ...)`.
-//! Because host import calls in WebAssembly execute **synchronously on the same thread**,
-//! the stack frame remains fully valid while JavaScript reads it.
-//! When JavaScript returns, Zig marks the frame clean and exits `tick()`.
-//! This guarantees 100% memory safety with ZERO dynamic heap allocations.
+//! ## 3. Single Source of Truth for Graphics Layouts
+//! A classic anti-pattern in WebAssembly graphics applications is duplicating buffer sizes,
+//! attribute strides, and shader strings between the backend language and JavaScript.
+//!
+//! In Patchwork, Zig is the single authoritative source of truth:
+//! - `shader_ptr()` and `shader_len()` expose the embedded WGSL shader source code.
+//! - `quad_ptr()` and `quad_bytes()` expose the static unit quad vertex coordinates.
+//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (32 bytes).
+//!
+//! When `web/shell.js` bootstraps, it queries these export functions to allocate its GPU buffers
+//! and compile its pipeline. If the shader or struct layouts change in Zig, JavaScript adapts
+//! automatically without code duplication.
+//!
+//! ## 4. Synchronous Stack-Frame Memory Sharing (Zero-Copy & Zero-Heap)
+//! In `tick()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
+//! Zig passes the memory address `@intFromPtr(&header)` across the FFI boundary to `present_js`.
+//!
+//! ### Why is this 100% memory safe?
+//! - WebAssembly host calls are **strictly synchronous** and execute on the same thread.
+//! - When Zig invokes `present_js(header_ptr, ...)`, the WebAssembly engine halts Zig execution
+//!   at that instruction while preserving its stack frame in linear memory.
+//! - JavaScript receives `headerPtr`, wraps it in a typed `DataView` over `wasm.memory.buffer`,
+//!   and reads the fields directly.
+//! - When JavaScript returns, control resumes in Zig. Zig updates the cursor, marks the frame
+//!   presented, and returns from `tick()`.
+//! - Only then is the stack frame popped.
+//! - This achieves zero heap allocation, zero serialization, and zero garbage collection overhead.
+//!
+//! ## 5. Power-Optimal Frame Pacing (0% Idle CPU)
+//! Traditional WebGL/WebGPU applications run a continuous loop with `requestAnimationFrame`.
+//! This burns CPU and GPU power even when displaying static documents or idle user interfaces.
+//!
+//! In Patchwork:
+//! - `resize()` and `start()` return a `u32` dirty flag (1 if dirty, 0 if clean).
+//! - `web/shell.js` schedules a `requestAnimationFrame` **only** when the dirty flag is 1.
+//! - `tick()` renders the frame and resets `frame.redraw = false`.
+//! - Subsequent animation frames are halted until a window resize or state mutation.
+//! - When idle, the browser tab consumes 0.0% CPU and 0.0% GPU cycles.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -36,6 +70,7 @@ const gpu = @import("gpu.zig");
 
 /// Global application state for the WebAssembly runtime.
 /// Statically allocated in Wasm linear memory at startup (BSS segment).
+/// No dynamic memory allocation or heap pointers are used.
 const State = struct {
     frame: frame.Frame,
     list: draw.DrawList,

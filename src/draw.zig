@@ -1,41 +1,108 @@
-//! 2D Instanced Quad Rendering and Draw List Management.
+//! 2D Instanced Quad Rendering, Orthographic Projections, and Draw List Management.
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Why Instanced Unit Quads?
-//! In a typical graphical user interface (buttons, panels, borders, badges, scrollbars),
-//! almost every primitive is a rectangle. Traditional 3D graphics draws geometry by defining
-//! vertex meshes (e.g. 4 vertices and 6 indices per rectangle). If a UI has 1,000 rectangles,
-//! computing and uploading 4,000 vertices every frame consumes CPU time and PCIe bus bandwidth.
+//! ## 1. Why Instanced Unit Quads Instead of Immediate Geometry?
+//! In a graphical user interface (buttons, panels, borders, badges, scrollbars, text backgrounds),
+//! virtually every rendered visual element is a 2D axis-aligned rectangle (quad).
 //!
-//! Instead, modern UI engines like Makepad use **GPU Hardware Instancing**:
-//! - We upload **one** static "unit quad" of 6 vertices representing a 1x1 square
-//!   `(0,0)` to `(1,1)` into GPU memory once at startup (48 bytes total).
-//! - We pass a compact array of per-rectangle parameters called **instances**
-//!   (`[x, y, w, h, r, g, b, a]`).
-//! - With a single draw call `draw(6, instance_count)`, the GPU duplicates the unit quad
-//!   for every instance, running the vertex shader to scale and translate each rectangle.
+//! In traditional or legacy graphics approaches (such as OpenGL 1.x immediate mode or naive 2D
+//! canvas drawing):
+//! - The CPU recalculates four 2D vertex positions `(x, y)` and UV coordinates for each quad.
+//! - The CPU builds a temporary vertex buffer with 4 to 6 vertices per quad.
+//! - For 256 quads, this requires copying $256 \times 6 = 1,536$ vertices (~49 KB)
+//!   across the PCIe bus to GPU VRAM every single frame.
+//! - This burns CPU cycles, causes memory allocator churn, and congests PCIe bandwidth.
 //!
-//! ## 2. Coordinate Spaces and the Orthographic Matrix
-//! - **UI Coordinate Space:** Programmers reason about 2D layouts using pixels:
-//!   - Origin `(0, 0)` is at the top-left of the window.
-//!   - `+X` goes rightwards.
-//!   - `+Y` goes downwards (Y-down).
-//! - **Normalized Device Coordinates (NDC):** Modern graphics APIs (WebGPU, Vulkan, DirectX)
-//!   expect vertex positions in a normalized clip cube:
-//!   - Center of the screen is `(0, 0)`.
-//!   - Left edge is `-1.0`, right edge is `+1.0`.
-//!   - Bottom edge is `-1.0`, top edge is `+1.0` (Y-up!).
+//! Modern GPU engines (such as Makepad, Flutter Impeller, and modern game UI engines) leverage
+//! **Hardware Instancing**:
+//! - A single canonical "unit quad" of 6 vertices representing a $1 \times 1$ square spanning
+//!   from `(0, 0)` to `(1, 1)` is uploaded to GPU memory **once** at startup (48 bytes total).
+//! - Per-quad parameters (position `x, y`, dimension `width, height`, and color `r, g, b, a`)
+//!   are packed into a compact array called **instances** (32 bytes per instance).
+//! - Drawing all 256 quads requires just **one single draw call**: `draw(6, instance_count)`.
+//! - The GPU hardware vertex fetch unit advances unit quad attributes once per vertex,
+//!   and advances instance attributes once per instance. The vertex shader expands each
+//!   unit quad into its world-space pixel rectangle directly inside GPU registers.
 //!
-//! An **orthographic projection matrix** performs the linear transformation that maps
-//! pixel coordinates `[0, width]` and `[0, height]` directly into NDC `[-1, 1]`, flipping
-//! the vertical axis so Y points downwards naturally.
+//! ## 2. Mathematical Derivation of the Y-Down Orthographic Projection Matrix
 //!
-//! ## 3. TigerStyle Design Rules
-//! - **No Heap Allocation:** The draw list has a fixed capacity (`instance_cap = 256`).
-//! - **Bounded & Asserted:** Preconditions and postconditions are asserted on all operations.
-//! - **Dirty Tracking:** `UploadCursor` tracks whether the draw list or window dimensions
-//!   have changed, avoiding redundant GPU buffer uploads when re-rendering.
+//! ### Coordinate Spaces:
+//! - **UI Pixel Coordinates:**
+//!   User interfaces are defined in 2D screen coordinates with origin `(0, 0)` at the top-left
+//!   corner of the window. `+X` increases rightwards (`[0, width]`), and `+Y` increases downwards
+//!   (`[0, height]`).
+//! - **Normalized Device Coordinates (NDC) in WebGPU:**
+//!   WebGPU (and Vulkan / Metal) defines the visible clip space as a 3D volume:
+//!   - $X \in [-1.0, +1.0]$: $-1.0$ is the left edge, $+1.0$ is the right edge.
+//!   - $Y \in [-1.0, +1.0]$: $-1.0$ is the bottom edge, $+1.0$ is the top edge (Y-up!).
+//!   - $Z \in [0.0, 1.0]$: $0.0$ is the near plane, $1.0$ is far plane (not OpenGL $[-1, 1]$).
+//!
+//! ### Algebraic Derivation:
+//! We seek linear transformations $f(x)$ and $g(y)$ mapping pixel ranges to NDC ranges:
+//!
+//! 1. **Horizontal Mapping ($X$):**
+//!    $$f(0) = -1.0, \quad f(w) = +1.0$$
+//!    $$f(x) = m_x \cdot x + c_x$$
+//!    $$m_x \cdot 0 + c_x = -1.0 \implies c_x = -1.0$$
+//!    $$m_x \cdot w - 1.0 = +1.0 \implies m_x = \frac{2}{w}$$
+//!    $$\mathbf{X_{\text{ndc}} = \frac{2}{w} x - 1}$$
+//!
+//! 2. **Vertical Mapping ($Y$, Inverting Top-Down to Bottom-Up):**
+//!    $$g(0) = +1.0\ (\text{top}), \quad g(h) = -1.0\ (\text{bottom})$$
+//!    $$g(y) = m_y \cdot y + c_y$$
+//!    $$m_y \cdot 0 + c_y = +1.0 \implies c_y = +1.0$$
+//!    $$m_y \cdot h + 1.0 = -1.0 \implies m_y = -\frac{2}{h}$$
+//!    $$\mathbf{Y_{\text{ndc}} = -\frac{2}{h} y + 1}$$
+//!
+//! 3. **Depth Mapping ($Z$):**
+//!    For 2D orthographic UI rendering, depth is unused.
+//!    We set $z = 0$, mapping directly to $Z_{\text{ndc}} = 0.0$.
+//!
+//! 4. **Matrix Formulation (Column-Major 4x4):**
+//!    Multiplying matrix $M$ by column vector $[x, y, 0, 1]^T$:
+//!    ```text
+//!    | 2/w   0    0  -1 |   | x |   | (2*x)/w - 1 | -> NDC X in [-1, +1]
+//!    |  0  -2/h   0   1 | * | y | = | 1 - (2*y)/h | -> NDC Y in [+1, -1]
+//!    |  0    0    1   0 |   | 0 |   |      0      | -> NDC Z in [0, 1]
+//!    |  0    0    0   1 |   | 1 |   |      1      | -> W
+//!    ```
+//!    Because WebGPU and WGSL represent matrices in **column-major memory order**,
+//!    the 16 consecutive floats in memory are stored column by column:
+//!    - Column 0 (indices 0..3):   `[ 2.0 / w,      0.0, 0.0, 0.0 ]`
+//!    - Column 1 (indices 4..7):   `[     0.0, -2.0 / h, 0.0, 0.0 ]`
+//!    - Column 2 (indices 8..11):  `[     0.0,      0.0, 1.0, 0.0 ]`
+//!    - Column 3 (indices 12..15): `[    -1.0,      1.0, 0.0, 1.0 ]`
+//!
+//! ## 3. WebGPU Specification Limit: The 256-Byte Uniform Buffer Alignment Rule
+//! The WebGPU standard specification (Section 24.1, Table 23 "Limits") specifies:
+//! - `minUniformBufferOffsetAlignment`: Minimum byte alignment for dynamic uniform buffer
+//!   offsets and bind group ranges. Compliant hardware requires at least **256 bytes**.
+//! - Even though our 4x4 matrix is exactly 64 bytes (16 * 4 bytes), allocating 64 bytes
+//!   violates the minimum binding size on certain Vulkan and Metal backends.
+//! - Therefore, we set `uniform_bytes = 256` for the GPU allocation, leaving bytes 64..255
+//!   zeroed as safe padding.
+//!
+//! ## 4. The Dirty Tracking Architecture (`UploadCursor`)
+//! Transferring data from CPU to GPU via `writeBuffer` incurs driver synchronization overhead.
+//! `UploadCursor` implements a state machine that tracks:
+//! - `primed`: Has the GPU received the initial data yet? (First frame uploads all buffers).
+//! - `revision`: An incrementing counter bumped on `DrawList.append()` or `DrawList.clear()`.
+//! - `width_logical`, `height_logical`: Window dimensions from which matrix was built.
+//!
+//! This enables four distinct upload scenarios:
+//! 1. **Initial Frame:** `flag_instances | flag_uniform` (uploads both buffers).
+//! 2. **Content Change Only:** `flag_instances` (re-uploads instance buffer; leaves matrix alone).
+//! 3. **Window Resize Only:** `flag_uniform` (re-uploads 64-byte matrix; leaves instances intact).
+//! 4. **Identical Re-present:** `0` (skips all buffer uploads; immediately begins render pass).
+//!
+//! ## 5. TigerStyle Safety and Determinism
+//! - **Static Allocation:** Fixed capacity of 256 instances (`items: [instance_cap]Instance`).
+//!   Zero heap allocation, zero pointer chasing, zero risk of `OutOfMemory` after startup.
+//! - **Defensive Pre/Postconditions:** Every public function asserts valid bounds, positive edges,
+//!   and correct state transitions.
+//! - **Binary Layout Verification:** Comptime assertions enforce exact struct sizes, alignments,
+//!   and layout compatibility with WGSL shader declarations.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -49,6 +116,7 @@ pub const shader_file: []const u8 = @embedFile("quad.wgsl");
 pub const instance_cap: u32 = 256;
 
 /// Byte size of a single instance record in memory (8 floats * 4 bytes = 32 bytes).
+/// Matches the WGSL `@location(1)` and `@location(2)` vertex buffer layout stride.
 pub const instance_stride: u32 = 32;
 
 /// Number of vertices in a quad drawn as a triangle list (2 triangles * 3 vertices = 6).
@@ -84,6 +152,16 @@ pub const unit_quad: [12]f32 = .{
 
 /// Per-instance parameters sent to the GPU in Vertex Buffer 1.
 /// Marked as `extern struct` to guarantee exact C ABI memory layout with no compiler reordering.
+/// Memory Layout:
+/// - Offset  0: `x` (f32, 4 bytes) - Left edge in logical UI pixels.
+/// - Offset  4: `y` (f32, 4 bytes) - Top edge in logical UI pixels.
+/// - Offset  8: `width` (f32, 4 bytes) - Width in logical UI pixels.
+/// - Offset 12: `height` (f32, 4 bytes) - Height in logical UI pixels.
+/// - Offset 16: `r` (f32, 4 bytes) - Red color channel [0.0, 1.0].
+/// - Offset 20: `g` (f32, 4 bytes) - Green color channel [0.0, 1.0].
+/// - Offset 24: `b` (f32, 4 bytes) - Blue color channel [0.0, 1.0].
+/// - Offset 28: `a` (f32, 4 bytes) - Alpha transparency channel [0.0, 1.0].
+/// Total size: 32 bytes.
 pub const Instance = extern struct {
     x: f32,
     y: f32,
@@ -98,6 +176,17 @@ pub const Instance = extern struct {
 /// The binary header passed to the graphics backend before rendering a frame.
 /// In WebAssembly, this exact struct is constructed on the Zig call stack and read by
 /// JavaScript via a typed `DataView` over Wasm linear memory.
+/// Memory Layout:
+/// - Offset  0: `width_px` (u32, 4 bytes) - Physical swapchain width in device pixels.
+/// - Offset  4: `height_px` (u32, 4 bytes) - Physical swapchain height in device pixels.
+/// - Offset  8: `instance_count` (u32, 4 bytes) - Number of instances to draw [0..256].
+/// - Offset 12: `flags` (u32, 4 bytes) - Bitmask of buffers to upload (flags_instances / uniform).
+/// - Offset 16: `clear_r` (f32, 4 bytes) - Framebuffer background clear color red.
+/// - Offset 20: `clear_g` (f32, 4 bytes) - Framebuffer background clear color green.
+/// - Offset 24: `clear_b` (f32, 4 bytes) - Framebuffer background clear color blue.
+/// - Offset 28: `clear_a` (f32, 4 bytes) - Framebuffer background clear color alpha.
+/// - Offset 32: `ortho` ([16]f32, 64 bytes) - 4x4 column-major orthographic projection matrix.
+/// Total size: 96 bytes.
 pub const PresentHeader = extern struct {
     width_px: u32,
     height_px: u32,

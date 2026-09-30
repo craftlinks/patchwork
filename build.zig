@@ -28,9 +28,9 @@ fn add_native(
     wgpu_lib_dir: ?[]const u8,
 ) void {
     const dir = wgpu_lib_dir orelse {
-        const missing = b.addFail(
-            "native build requires -Dwgpu-lib-dir= pointing at the directory that contains libwgpu_native.so",
-        );
+        const msg =
+            "native build requires -Dwgpu-lib-dir= pointing at directory with libwgpu_native.so";
+        const missing = b.addFail(msg);
         b.getInstallStep().dependOn(&missing.step);
         const run_step = b.step("run", "Run the app");
         run_step.dependOn(&missing.step);
@@ -86,6 +86,13 @@ fn add_tests(b: *std.Build, patchwork: *std.Build.Module) void {
     test_step.dependOn(&run_tests.step);
 }
 
+/// Configures compilation of the freestanding WebAssembly browser module.
+/// - Targets `wasm32-freestanding`: No OS, no libc, no runtime overhead.
+/// - `entry = .disabled`: Freestanding library without a `main()` function.
+/// - `rdynamic = true`: Preserves exported symbols (`start`, `resize`, `tick`, etc.).
+/// - `export_memory = true`: Exposes `WebAssembly.Memory` as `wasm.memory.buffer`
+///   so `web/shell.js` can read WGSL shader code, vertex layouts, and instance arrays
+///   directly without data copies.
 fn add_wasm(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const wasm = b.addExecutable(.{
         .name = "patchwork",
@@ -100,7 +107,6 @@ fn add_wasm(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.Step.C
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
-    // shell.js reads the shader and instance bytes out of the wasm linear memory.
     wasm.export_memory = true;
     const wasm_step = b.step("wasm", "Build the browser module");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);

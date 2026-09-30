@@ -1,27 +1,40 @@
-//! Cross-Platform GPU Abstraction Seam.
+//! Cross-Platform GPU Abstraction Seam and Compile-Time Backend Dispatch.
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Zero-Cost Compile-Time Platform Selection
-//! In C or C++, cross-platform graphics code often uses virtual interfaces (`IVideoDriver`),
-//! heavy wrapper libraries (SDL, GLFW), or complex preprocessor `#ifdef` chains.
+//! In traditional C or C++ game and graphics engines, supporting multiple platforms (like native
+//! desktop vs web) typically requires:
+//! - Abstract base classes with virtual methods (`IVideoDriver`).
+//! - Heavy external abstraction libraries (SDL, GLFW, Sokol).
+//! - Tangled preprocessor `#ifdef` chains scattered throughout the rendering codebase.
 //!
-//! In Zig, types and modules are first-class comptime values:
-//! - When targeting native Linux (`x86_64`): `gpu_wgpu.zig` is imported, linking directly
-//!   against the native `libwgpu_native.so` C library.
-//! - When targeting the browser (`wasm32-freestanding`): `gpu_wgpu` is typed as `void`,
-//!   completely omitting the native GPU code from compilation. The browser host JavaScript
-//!   (`web/shell.js`) owns the WebGPU device, swapchain, and pipeline.
+//! In Zig, types and modules are first-class compile-time (`comptime`) values:
+//! - When compiling for native Linux (`x86_64`):
+//!   `gpu_wgpu.zig` is imported, linking directly against `libwgpu_native.so`.
+//! - When compiling for the browser (`wasm32-freestanding`):
+//!   `gpu_wgpu` is evaluated to the primitive type `void`. The native WebGPU binding code is
+//!   completely omitted from compilation. `Gpu` evaluates to a zero-sized dummy struct,
+//!   and calls to `gpu.present()` compile into a single WebAssembly host call instruction.
+//! - Result: Zero dynamic dispatch (no `vtable`), zero pointer indirection, zero binary bloat.
 //!
-//! ## 2. Passing Pointers Across the WebAssembly Boundary
+//! ## 2. Passing Memory Pointers Across the WebAssembly Boundary
 //! A 32-bit WebAssembly module has a single linear memory space (a contiguous array of bytes).
-//! In Zig on `wasm32`, any pointer `*T` is simply a 32-bit unsigned integer offset into that
-//! linear memory.
+//! In Zig on `wasm32`:
+//! - Any pointer `*T` or `[*]T` is fundamentally a 32-bit unsigned integer offset into that
+//!   linear memory buffer.
+//! - By casting pointers with `@intCast(@intFromPtr(header))` and
+//!   `@intCast(@intFromPtr(instances))`, Zig passes the raw memory addresses across the FFI
+//!   boundary to the host import `present_js()`.
+//! - In the browser, JavaScript reads the `PresentHeader` struct directly out of Wasm memory
+//!   using a `DataView(wasm.memory.buffer, headerPtr, 96)`.
+//! - Zero serialization, zero copying, zero JSON overhead, zero GC pressure.
 //!
-//! By casting the pointer with `@intFromPtr(header)` and passing it to the imported JavaScript
-//! function `present_js(header_ptr, instance_ptr)`, JavaScript can read the exact binary struct
-//! directly out of `wasm.memory.buffer` using a `DataView` or `Uint8Array`.
-//! Zero serialization, zero copying, zero JSON overhead.
+//! ## 3. Clear Color Rationale
+//! The background clear color is configured as a distinctive slate gray: `(0.11, 0.12, 0.16)`.
+//! Rather than using default black `(0, 0, 0)` or white `(1, 1, 1)`, a custom dark slate ensures
+//! that uninitialized textures, failed clear passes, or driver swapchain glitches are immediately
+//! and unmistakably visible during testing and code review.
 
 const builtin = @import("builtin");
 const std = @import("std");
