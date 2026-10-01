@@ -1,4 +1,4 @@
-//! 2D Instanced Quad Rendering, Orthographic Projections, and Draw List Management.
+//! 2D Instanced Quad Rendering, Orthographic Projections, Draw Lists, and SDF Boxes.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -18,8 +18,10 @@
 //! **Hardware Instancing**:
 //! - A single canonical "unit quad" of 6 vertices representing a $1 \times 1$ square spanning
 //!   from `(0, 0)` to `(1, 1)` is uploaded to GPU memory **once** at startup (48 bytes total).
-//! - Per-quad parameters (position `x, y`, dimension `width, height`, and color `r, g, b, a`)
-//!   are packed into a compact array called **instances** (32 bytes per instance).
+//! - Per-quad parameters (position `x, y`, dimension `width, height`, color `r, g, b, a`,
+//!   corner `radius`, and a baked `hover` lighten) are packed into a compact array called
+//!   **instances** (48 bytes per instance, three `vec4` groups). Section 6 derives the
+//!   rounded-box field those extra floats drive.
 //! - Drawing all 256 quads requires just **one single draw call**: `draw(6, instance_count)`.
 //! - The GPU hardware vertex fetch unit advances unit quad attributes once per vertex,
 //!   and advances instance attributes once per instance. The vertex shader expands each
@@ -103,6 +105,71 @@
 //!   and correct state transitions.
 //! - **Binary Layout Verification:** Comptime assertions enforce exact struct sizes, alignments,
 //!   and layout compatibility with WGSL shader declarations.
+//!
+//! ## 6. Rounded-Box Distance Field
+//! Step 2 filled each instance with a flat color. Step 3 keeps the same unit quad, the same
+//! draw call, and the same straight-alpha blend, and evaluates a signed distance in the
+//! fragment shader. A panel, a pill, and a button face are one instance type.
+//!
+//! ### Why a distance instead of more triangles
+//! A rounded corner can be a fan of extra vertices. That would rebuild the mesh whenever the
+//! radius changed, and it would alias on a scaled surface unless the fan was finer than a
+//! pixel. A signed distance is a scalar at every local point: negative inside the shape, zero
+//! on the boundary, positive outside. The unit quad stays the rectangle's bounding box. The
+//! fragment shader asks the field whether that pixel is inside the rounded outline, then turns
+//! the distance into coverage. Radius 0 reproduces the sharp rectangle from step 2.
+//!
+//! ### The 48-byte instance
+//! `Instance` is twelve `f32`s in three groups the GPU fetches as `float32x4`:
+//! - Offset  0: rectangle `(x, y, width, height)` in logical pixels, origin top-left.
+//! - Offset 16: straight-alpha fill `(r, g, b, a)`.
+//! - Offset 32: `(radius, hover, 0, 0)`.
+//!
+//! WebGPU requires a vertex `arrayStride` that is a multiple of 4. It does not require a
+//! multiple of 16. The third attribute is still a `float32x4`, the same format as the
+//! rectangle and the fill, so the record occupies bytes 32..48 and the stride is 48.
+//! `radius` and `hover` are the live values. The last two floats are pads so that one
+//! attribute format is shared by `quad.wgsl`, the native pipeline, and `web/shell.js`.
+//! `append` writes the pads as 0. A later reader of `.z` or `.w` then sees a defined value,
+//! and two uploads of the same face compare equal.
+//!
+//! The instance buffer stays fixed at `instance_cap * instance_stride` bytes (256 * 48).
+//! Only `count` instances are uploaded.
+//!
+//! ### Radius
+//! `radius` is the geometric corner radius in logical pixels. `append` rejects a negative
+//! radius, because `min(radius, half_edge)` would keep the negative value and the field
+//! would invert. A radius larger than the box is stored as given. `sdf_box` and the shader
+//! both clamp it to half the shorter edge, so the two implementations cannot drift. A wide
+//! box becomes a capsule. A square becomes a disc whose diameter is the side. Makepad's
+//! older button shader multiplied the radius by 2 as a compatibility clamp. This field uses
+//! the geometric radius, so a value of 16 is a 16-pixel corner.
+//!
+//! ### Hover
+//! `hover` is a weight in `[0, 1]`. The shader computes `mix(fill.rgb, white, hover)` and
+//! leaves the fill alpha unchanged. Weight 0 is the stored fill. Weight 1 is white. A weight
+//! outside that range would extrapolate past the fill or past white, so `append` rejects it.
+//! The stored color stays the un-hovered fill even when `hover` is 1. The lighten happens in
+//! the shader, which is why the hover-1 demo face is still blue in the instance buffer and
+//! near white on screen.
+//!
+//! The float is baked. Nothing animates it. Step 5 writes it from hit-testing. A second
+//! hover color, a stroke, and a theme struct belong to later steps. This step only stores
+//! the weight.
+//!
+//! ### CPU twin and shader paint
+//! `sdf_box` is the CPU twin of the WGSL function. The point is in the same local logical
+//! pixels the vertex shader interpolates (`unit * size`, origin at the top-left). Tests lock
+//! the field without a GPU: center, sharp edge, outside corner, a corner that falls outside
+//! once the radius grows, and disc saturation. The shader owns the paint: analytic coverage
+//! from `fwidth`, then the hover mix. See the guide at the top of `src/quad.wgsl`.
+//!
+//! ### The seven-face scene
+//! `demo` appends seven faces inside the default 1280 by 720 logical surface: a sharp panel,
+//! a rounded panel, a pill, three button faces at hover 0, 0.5, and 1, and one translucent
+//! rounded rect. The cap stays 256. The previous 16 by 16 grid filled the cap and showed
+//! blending; its cells were too small to judge a corner. `start` on both backends asserts
+//! `demo_count`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -115,9 +182,15 @@ pub const shader_file: []const u8 = @embedFile("quad.wgsl");
 /// In TigerStyle, all buffer sizes are statically bounded at compile time.
 pub const instance_cap: u32 = 256;
 
-/// Byte size of a single instance record in memory (8 floats * 4 bytes = 32 bytes).
-/// Matches the WGSL `@location(1)` and `@location(2)` vertex buffer layout stride.
-pub const instance_stride: u32 = 32;
+/// Byte size of one instance (12 floats * 4 bytes = 48 bytes).
+/// Three `float32x4` attributes at offsets 0, 16, and 32. WebGPU only requires the
+/// buffer stride to be a multiple of 4. The third attribute is a full `vec4`, so the
+/// record is 48 bytes and the two unused floats are pads. See the module guide.
+pub const instance_stride: u32 = 48;
+
+/// Faces written by `demo`. The list cap stays 256; this scene is short so the
+/// corner radius and hover mix are readable on a 1280 by 720 surface.
+pub const demo_count: u32 = 7;
 
 /// Number of vertices in a quad drawn as a triangle list (2 triangles * 3 vertices = 6).
 pub const vertex_count: u32 = 6;
@@ -153,15 +226,17 @@ pub const unit_quad: [12]f32 = .{
 /// Per-instance parameters sent to the GPU in Vertex Buffer 1.
 /// Marked as `extern struct` to guarantee exact C ABI memory layout with no compiler reordering.
 /// Memory Layout:
-/// - Offset  0: `x` (f32, 4 bytes) - Left edge in logical UI pixels.
-/// - Offset  4: `y` (f32, 4 bytes) - Top edge in logical UI pixels.
-/// - Offset  8: `width` (f32, 4 bytes) - Width in logical UI pixels.
-/// - Offset 12: `height` (f32, 4 bytes) - Height in logical UI pixels.
-/// - Offset 16: `r` (f32, 4 bytes) - Red color channel [0.0, 1.0].
-/// - Offset 20: `g` (f32, 4 bytes) - Green color channel [0.0, 1.0].
-/// - Offset 24: `b` (f32, 4 bytes) - Blue color channel [0.0, 1.0].
-/// - Offset 28: `a` (f32, 4 bytes) - Alpha transparency channel [0.0, 1.0].
-/// Total size: 32 bytes.
+/// - Offset  0: `x` (f32) - Left edge in logical UI pixels.
+/// - Offset  4: `y` (f32) - Top edge in logical UI pixels.
+/// - Offset  8: `width` (f32) - Width in logical UI pixels.
+/// - Offset 12: `height` (f32) - Height in logical UI pixels.
+/// - Offset 16: `r`, `g`, `b`, `a` (4 f32) - Fill color.
+/// - Offset 32: `radius` (f32) - Geometric corner radius in logical pixels.
+///   Oversized values are stored here and clamped inside `sdf_box`.
+/// - Offset 36: `hover` (f32) - Baked mix weight toward white, range [0, 1].
+///   The shader applies it. Hit-testing writes it in a later step.
+/// - Offset 40: `pad0`, `pad1` - Written as 0. They complete the third `vec4`.
+/// Total size: 48 bytes.
 pub const Instance = extern struct {
     x: f32,
     y: f32,
@@ -171,6 +246,10 @@ pub const Instance = extern struct {
     g: f32,
     b: f32,
     a: f32,
+    radius: f32,
+    hover: f32,
+    pad0: f32,
+    pad1: f32,
 };
 
 /// The binary header passed to the graphics backend before rendering a frame.
@@ -218,11 +297,15 @@ pub const DrawList = struct {
         return list;
     }
 
-    pub const AppendError = error{ ZeroEdge, ListFull };
+    pub const AppendError = error{ ZeroEdge, ListFull, NegativeRadius, HoverOutOfRange };
 
-    /// Appends a new rectangle instance to the draw list.
-    /// Rejects zero-width or zero-height rectangles, and enforces the compile-time capacity.
-    /// Increments the revision counter so the GPU upload cursor detects the change.
+    /// Appends one rectangle.
+    ///
+    /// A zero edge, a negative radius, a hover outside [0, 1], and a full list are
+    /// rejected. An oversized radius is stored unchanged; `sdf_box` clamps it, and the
+    /// shader applies that same clamp. A negative radius would survive `min(radius, half)`
+    /// and invert the field. A hover outside [0, 1] would push `mix` past the fill or past
+    /// white. Pads are forced to 0 so the unused half of the shape `vec4` is defined.
     pub fn append(self: *DrawList, instance: Instance) AppendError!void {
         assert(self.count <= instance_cap);
         if (instance.width == 0) {
@@ -231,14 +314,29 @@ pub const DrawList = struct {
         if (instance.height == 0) {
             return error.ZeroEdge;
         }
+        if (instance.radius < 0) {
+            return error.NegativeRadius;
+        }
+        if (instance.hover < 0) {
+            return error.HoverOutOfRange;
+        }
+        if (instance.hover > 1) {
+            return error.HoverOutOfRange;
+        }
         if (self.count == instance_cap) {
             return error.ListFull;
         }
-        self.items[self.count] = instance;
+        assert(instance.radius >= 0);
+        assert(instance.hover >= 0);
+        var stored: Instance = instance;
+        stored.pad0 = 0;
+        stored.pad1 = 0;
+        self.items[self.count] = stored;
         self.count += 1;
         self.revision += 1;
-        assert(self.count >= 1);
-        assert(self.revision >= 1);
+        assert(self.items[self.count - 1].hover <= 1);
+        assert(self.items[self.count - 1].pad0 == 0);
+        assert(self.items[self.count - 1].pad1 == 0);
     }
 
     /// Clears the draw list for the next frame, bumping the revision counter.
@@ -377,57 +475,222 @@ pub fn ortho_y_down(out: *[16]f32, width: u32, height: u32) void {
     assert(out[5] < 0);
 }
 
-/// Populates the draw list with a 16x16 grid demo (256 instances, 100% buffer capacity).
-/// Illustrates coordinate placement, color gradients, and alpha transparency blending.
+/// Signed distance of a rounded rectangle. This is the CPU twin of `sdf_box` in `quad.wgsl`.
+///
+/// `(px, py)` is in local logical pixels. The origin is the rectangle's top-left, the same
+/// space the vertex shader interpolates as `unit * size`. The return is negative inside, zero
+/// on the boundary, and positive outside. Tests lock this field without a GPU. The shader
+/// turns the same field into coverage and applies hover. This function does not.
+///
+/// `radius` is the geometric corner radius in logical pixels. It is clamped to half the
+/// shorter edge. A larger value becomes a capsule, and a square becomes a disc whose diameter
+/// is the side. Radius 0 is the sharp rectangle from step 2. `append` stores an oversized
+/// radius unchanged and rejects a negative one. This function and the shader both clamp, so
+/// the pictures cannot drift. Makepad's older button shader multiplied the radius by 2 as a
+/// compatibility clamp. The value here is the geometric radius.
+///
+/// The outline is an inner sharp box shrunk by the clamped radius `k`, then expanded by `k`.
+/// The expansion turns the inner corners into quarter-circles. With `half = (width/2, height/2)`
+/// and `k = min(radius, min(half.x, half.y))`:
+///
+/// ```
+/// q = abs(point - half) - (half - k)
+/// distance = min(max(q.x, q.y), 0) + length(max(q, 0)) - k
+/// ```
+///
+/// `q` is the first-quadrant offset from the inner box. `abs` folds the other three quadrants.
+/// `min(max(q.x, q.y), 0)` is the inside distance to the nearest inner face. `length(max(q, 0))`
+/// is the outside Euclidean distance. At a corner, that length is the distance to the inner
+/// corner point. Subtracting `k` moves the boundary out to the rounded outline.
+///
+/// Values locked by the tests:
+/// - Center of a 20 by 10 sharp box: -5, which is half the shorter side.
+/// - Midpoint of that box's top edge: 0.
+/// - The point (-1, -1), one pixel left and one pixel above the top-left corner: sqrt(2).
+/// - The point (0.5, 0.5) on a 20 by 20 box is inside at radius 0 and outside at radius 8.
+/// - A 20 by 20 box with radius 100 clamps to `k = 10`. The center is -10, an edge midpoint
+///   is 0, and a geometric corner is outside. That is a disc.
+pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
+    assert(width > 0);
+    assert(height > 0);
+    assert(radius >= 0);
+    // Origin is the top-left, so the center sits at (half_w, half_h). Those same
+    // numbers are the half-extents of the box. The field is measured from there.
+    const half_w: f32 = 0.5 * width;
+    const half_h: f32 = 0.5 * height;
+    // A radius past half the shorter edge would make the inner box negative and the
+    // corner circles overlap. The clamp saturates a wide box into a capsule and a
+    // square into a disc.
+    const shorter: f32 = @min(half_w, half_h);
+    const k: f32 = @min(radius, shorter);
+    assert(k >= 0);
+    assert(k <= shorter);
+    // First-quadrant offset from the inner box, whose half-extent is (half - k).
+    const qx: f32 = @abs(px - half_w) - (half_w - k);
+    const qy: f32 = @abs(py - half_h) - (half_h - k);
+    // The outside term ignores inward components. At a corner it is the distance
+    // to the inner corner point.
+    const outside_x: f32 = @max(qx, 0.0);
+    const outside_y: f32 = @max(qy, 0.0);
+    const outside: f32 = @sqrt(outside_x * outside_x + outside_y * outside_y);
+    // The inside term is the nearest face, and only while the point is inside both axes.
+    const inside: f32 = @min(@max(qx, qy), 0.0);
+    // Expand the inner box by k. The boundary lands on the quarter-circle.
+    return inside + outside - k;
+}
+
+/// Demo and test construction record. Pads are not fields here. `face` writes them as 0
+/// so every call site stores a defined shape `vec4`.
+const Face = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    radius: f32,
+    hover: f32,
+};
+
+fn face(spec: Face) Instance {
+    const instance: Instance = .{
+        .x = spec.x,
+        .y = spec.y,
+        .width = spec.width,
+        .height = spec.height,
+        .r = spec.r,
+        .g = spec.g,
+        .b = spec.b,
+        .a = spec.a,
+        .radius = spec.radius,
+        .hover = spec.hover,
+        .pad0 = 0,
+        .pad1 = 0,
+    };
+    assert(instance.pad0 == 0);
+    assert(instance.pad1 == 0);
+    return instance;
+}
+
+/// Left to right inside the default 1280 by 720 logical surface.
+/// The instance cap stays 256. This row is short so a corner and a hover step
+/// are large enough to judge. The stored fill of the hover-1 face stays blue.
+/// The shader mixes it toward white.
+const demo_faces: [demo_count]Face = .{
+    // Sharp panel. Radius 0 is the step 2 rectangle.
+    .{
+        .x = 40,
+        .y = 72,
+        .width = 160,
+        .height = 96,
+        .r = 0.22,
+        .g = 0.24,
+        .b = 0.30,
+        .a = 1.0,
+        .radius = 0,
+        .hover = 0,
+    },
+    // Rounded panel. Radius 16 is a geometric 16-pixel corner.
+    .{
+        .x = 224,
+        .y = 72,
+        .width = 160,
+        .height = 96,
+        .r = 0.20,
+        .g = 0.28,
+        .b = 0.36,
+        .a = 1.0,
+        .radius = 16,
+        .hover = 0,
+    },
+    // Pill. Height 48 and radius 24 saturate the clamp, so the ends are semicircles.
+    .{
+        .x = 408,
+        .y = 96,
+        .width = 160,
+        .height = 48,
+        .r = 0.28,
+        .g = 0.22,
+        .b = 0.36,
+        .a = 1.0,
+        .radius = 24,
+        .hover = 0,
+    },
+    // Button faces. Same fill and radius. Hover 0, 0.5, and 1 lighten toward white.
+    .{
+        .x = 592,
+        .y = 100,
+        .width = 112,
+        .height = 40,
+        .r = 0.30,
+        .g = 0.46,
+        .b = 0.70,
+        .a = 1.0,
+        .radius = 8,
+        .hover = 0,
+    },
+    .{
+        .x = 728,
+        .y = 100,
+        .width = 112,
+        .height = 40,
+        .r = 0.30,
+        .g = 0.46,
+        .b = 0.70,
+        .a = 1.0,
+        .radius = 8,
+        .hover = 0.5,
+    },
+    .{
+        .x = 864,
+        .y = 100,
+        .width = 112,
+        .height = 40,
+        .r = 0.30,
+        .g = 0.46,
+        .b = 0.70,
+        .a = 1.0,
+        .radius = 8,
+        .hover = 1,
+    },
+    // Translucent rounded rect. Alpha below 1, then coverage scales it again on the edge.
+    .{
+        .x = 1000,
+        .y = 72,
+        .width = 160,
+        .height = 96,
+        .r = 0.90,
+        .g = 0.45,
+        .b = 0.25,
+        .a = 0.45,
+        .radius = 16,
+        .hover = 0,
+    },
+};
+
+/// Writes the seven-face row. The list must be empty. Each face fits in 1280 by 720.
+/// See `demo_faces` for which index is the sharp panel, the pill, and the hover steps.
 pub fn demo(list: *DrawList) void {
     assert(list.count == 0);
-    const cols: u32 = 16;
-    const rows: u32 = 16;
-    assert(cols * rows == instance_cap);
-    assert(instance_cap <= 256);
-
-    const x_start: f32 = 132.0;
-    const y_start: f32 = 44.0;
-    const tile_w: f32 = 56.0;
-    const tile_h: f32 = 32.0;
-    const gap_x: f32 = 8.0;
-    const gap_y: f32 = 8.0;
-
-    var row: u32 = 0;
-    while (row < rows) : (row += 1) {
-        var col: u32 = 0;
-        while (col < cols) : (col += 1) {
-            const col_f: f32 = @floatFromInt(col);
-            const row_f: f32 = @floatFromInt(row);
-            const x: f32 = x_start + col_f * (tile_w + gap_x);
-            const y: f32 = y_start + row_f * (tile_h + gap_y);
-            const r: f32 = 0.15 + 0.80 * (col_f / 15.0);
-            const g: f32 = 0.20 + 0.75 * (row_f / 15.0);
-            const b: f32 = 0.20 + 0.75 * ((15.0 - col_f) / 15.0);
-            const a: f32 = 0.35 + 0.65 * ((col_f + row_f) / 30.0);
-
-            list.append(.{
-                .x = x,
-                .y = y,
-                .width = tile_w,
-                .height = tile_h,
-                .r = r,
-                .g = g,
-                .b = b,
-                .a = a,
-            }) catch unreachable;
-        }
+    assert(demo_count <= instance_cap);
+    var index: u32 = 0;
+    while (index < demo_count) : (index += 1) {
+        list.append(face(demo_faces[index])) catch unreachable;
     }
-    assert(list.count == instance_cap);
-    assert(list.revision == instance_cap);
+    assert(list.count == demo_count);
+    assert(list.revision == demo_count);
 }
 
 comptime {
     // Assert struct sizes and alignments to prevent C ABI mismatches across compilers.
-    assert(@sizeOf(Instance) == 32);
+    assert(@sizeOf(Instance) == 48);
     assert(@alignOf(Instance) >= 4);
-    assert(instance_stride == 32);
+    assert(instance_stride == 48);
+    // 48 is three vec4 groups, not a WebGPU minimum. The spec only requires a multiple of 4.
     assert(instance_stride % 16 == 0);
+    assert(demo_count == 7);
     assert(@sizeOf(PresentHeader) == 96);
     assert(quad_bytes == 48);
     assert(unit_quad.len == 12);
@@ -441,6 +704,24 @@ fn project(matrix: [16]f32, x: f32, y: f32) [2]f32 {
     const nx = matrix[0] * x + matrix[4] * y + matrix[12];
     const ny = matrix[1] * x + matrix[5] * y + matrix[13];
     return .{ nx, ny };
+}
+
+fn rect(width: f32, height: f32) Instance {
+    const instance = face(.{
+        .x = 0,
+        .y = 0,
+        .width = width,
+        .height = height,
+        .r = 1,
+        .g = 1,
+        .b = 1,
+        .a = 1,
+        .radius = 0,
+        .hover = 0,
+    });
+    assert(instance.pad0 == 0);
+    assert(instance.pad1 == 0);
+    return instance;
 }
 
 test "ortho maps the four corners and the center" {
@@ -465,8 +746,30 @@ test "ortho maps the four corners and the center" {
 
 test "append keeps order" {
     var list = DrawList.init();
-    try list.append(.{ .x = 1, .y = 2, .width = 3, .height = 4, .r = 1, .g = 0, .b = 0, .a = 1 });
-    try list.append(.{ .x = 5, .y = 6, .width = 7, .height = 8, .r = 0, .g = 1, .b = 0, .a = 1 });
+    try list.append(face(.{
+        .x = 1,
+        .y = 2,
+        .width = 3,
+        .height = 4,
+        .r = 1,
+        .g = 0,
+        .b = 0,
+        .a = 1,
+        .radius = 0,
+        .hover = 0,
+    }));
+    try list.append(face(.{
+        .x = 5,
+        .y = 6,
+        .width = 7,
+        .height = 8,
+        .r = 0,
+        .g = 1,
+        .b = 0,
+        .a = 1,
+        .radius = 0,
+        .hover = 0,
+    }));
     try std.testing.expectEqual(@as(u32, 2), list.count);
     try std.testing.expectEqual(@as(f32, 1), list.items[0].x);
     try std.testing.expectEqual(@as(f32, 5), list.items[1].x);
@@ -474,72 +777,107 @@ test "append keeps order" {
 
 test "zero edge is rejected" {
     var list = DrawList.init();
-    try std.testing.expectError(error.ZeroEdge, list.append(.{
-        .x = 0,
-        .y = 0,
-        .width = 0,
-        .height = 10,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-    }));
-    try std.testing.expectError(error.ZeroEdge, list.append(.{
-        .x = 0,
-        .y = 0,
-        .width = 10,
-        .height = 0,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-    }));
+    try std.testing.expectError(error.ZeroEdge, list.append(rect(0, 10)));
+    try std.testing.expectError(error.ZeroEdge, list.append(rect(10, 0)));
     try std.testing.expectEqual(@as(u32, 0), list.count);
+}
+
+test "negative radius is rejected" {
+    var list = DrawList.init();
+    var instance = rect(10, 10);
+    instance.radius = -1;
+    try std.testing.expectError(error.NegativeRadius, list.append(instance));
+    try std.testing.expectEqual(@as(u32, 0), list.count);
+}
+
+test "hover outside 0 to 1 is rejected" {
+    var list = DrawList.init();
+    var low = rect(10, 10);
+    low.hover = -0.1;
+    try std.testing.expectError(error.HoverOutOfRange, list.append(low));
+    var high = rect(10, 10);
+    high.hover = 1.1;
+    try std.testing.expectError(error.HoverOutOfRange, list.append(high));
+    try std.testing.expectEqual(@as(u32, 0), list.count);
+}
+
+test "append zeros the instance pads" {
+    var list = DrawList.init();
+    var instance = rect(10, 10);
+    instance.pad0 = 9;
+    instance.pad1 = 8;
+    try list.append(instance);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad0);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad1);
 }
 
 test "a full list rejects the next append" {
     var list = DrawList.init();
     var index: u32 = 0;
     while (index < instance_cap) : (index += 1) {
-        try list.append(.{
-            .x = 0,
-            .y = 0,
-            .width = 1,
-            .height = 1,
-            .r = 1,
-            .g = 1,
-            .b = 1,
-            .a = 1,
-        });
+        try list.append(rect(1, 1));
     }
-    try std.testing.expectError(error.ListFull, list.append(.{
-        .x = 0,
-        .y = 0,
-        .width = 1,
-        .height = 1,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-    }));
+    try std.testing.expectError(error.ListFull, list.append(rect(1, 1)));
     try std.testing.expectEqual(instance_cap, list.count);
 }
 
 test "clear zeros the count and bumps the revision" {
     var list = DrawList.init();
-    try list.append(.{ .x = 0, .y = 0, .width = 1, .height = 1, .r = 1, .g = 1, .b = 1, .a = 1 });
+    try list.append(rect(1, 1));
     const revision = list.revision;
     list.clear();
     try std.testing.expectEqual(@as(u32, 0), list.count);
     try std.testing.expectEqual(revision + 1, list.revision);
 }
 
-test "demo writes 16x16 grid of instances" {
+test "demo writes seven faces" {
     var list = DrawList.init();
     demo(&list);
-    try std.testing.expectEqual(instance_cap, list.count);
-    try std.testing.expect(list.items[0].a < 1);
-    try std.testing.expectEqual(@as(f32, 1.0), list.items[instance_cap - 1].a);
+    try std.testing.expectEqual(demo_count, list.count);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].radius);
+    try std.testing.expectEqual(@as(f32, 16), list.items[1].radius);
+    try std.testing.expect(list.items[2].radius >= list.items[2].height * 0.5);
+    try std.testing.expectEqual(@as(f32, 0), list.items[3].hover);
+    try std.testing.expectEqual(@as(f32, 0.5), list.items[4].hover);
+    try std.testing.expectEqual(@as(f32, 1), list.items[5].hover);
+    try std.testing.expect(list.items[6].a < 1);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad0);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad1);
+}
+
+// The five distance tests mirror the worked values on `sdf_box`: interior, boundary,
+// exterior corner, a corner sample pushed outside by a grown radius, and disc saturation.
+test "sdf center is inside" {
+    const dist = sdf_box(10, 5, 20, 10, 0);
+    try std.testing.expect(dist < 0);
+    try std.testing.expectApproxEqAbs(@as(f32, -5), dist, 0.0001);
+}
+
+test "sdf sharp edge midpoint is on the boundary" {
+    const dist = sdf_box(10, 0, 20, 10, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), dist, 0.0001);
+}
+
+test "sdf point outside a sharp corner is positive" {
+    const dist = sdf_box(-1, -1, 20, 10, 0);
+    try std.testing.expect(dist > 0);
+    try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 2)), dist, 0.0001);
+}
+
+test "sdf grown radius puts a former inner corner outside" {
+    const sharp = sdf_box(0.5, 0.5, 20, 20, 0);
+    const rounded = sdf_box(0.5, 0.5, 20, 20, 8);
+    try std.testing.expect(sharp < 0);
+    try std.testing.expect(rounded > 0);
+}
+
+test "sdf oversized radius saturates into a disc" {
+    const center = sdf_box(10, 10, 20, 20, 100);
+    const edge = sdf_box(10, 0, 20, 20, 100);
+    const corner = sdf_box(0, 0, 20, 20, 100);
+    try std.testing.expectApproxEqAbs(@as(f32, -10), center, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), edge, 0.0001);
+    try std.testing.expect(corner > 0);
 }
 
 test "the first present uploads instances and the uniform" {
@@ -556,7 +894,18 @@ test "a revision change uploads instances" {
     var cursor = UploadCursor.init();
     cursor.mark(&list, 1280, 720);
     list.clear();
-    try list.append(.{ .x = 8, .y = 8, .width = 16, .height = 16, .r = 1, .g = 1, .b = 1, .a = 1 });
+    try list.append(face(.{
+        .x = 8,
+        .y = 8,
+        .width = 16,
+        .height = 16,
+        .r = 1,
+        .g = 1,
+        .b = 1,
+        .a = 1,
+        .radius = 0,
+        .hover = 0,
+    }));
     const flags = cursor.flags(&list, 1280, 720);
     try std.testing.expectEqual(flag_instances, flags);
 }

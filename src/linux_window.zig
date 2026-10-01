@@ -51,7 +51,8 @@
 //! In `run()`:
 //! - Allocates `DrawList` and `UploadCursor` on the thread's stack.
 //! - Initializes `Gpu` via `gpu.create(display, wl_surface)`.
-//! - Populates the demo scene (`draw.demo(&state.list)`).
+//! - Populates the demo scene (`draw.demo(&state.list)`): seven SDF box faces
+//!   (sharp, rounded, pill, three hover steps, one translucent rect).
 //! - In `present_if_dirty()`: fills `PresentHeader`, transfers modified buffers, draws instanced
 //!   quads, and marks the frame clean before returning to the kernel sleep in `poll`.
 
@@ -242,6 +243,8 @@ pub fn run(state: *State) !void {
     try create_toplevel(state);
     try create_device(state);
     draw.demo(&state.list);
+    assert(state.list.count == draw.demo_count);
+    assert(state.list.revision == draw.demo_count);
     try loop(state);
 }
 

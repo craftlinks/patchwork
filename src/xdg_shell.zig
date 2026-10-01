@@ -1,9 +1,46 @@
+//! Hand-Written Wayland xdg-shell v1 Protocol Dispatch Tables.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. Why Hand-Written Protocol Tables Instead of `wayland-scanner`?
+//! In conventional C/C++ Wayland applications, protocol bindings are produced by running
+//! `wayland-scanner client-header` and `wayland-scanner private-code` on `xdg-shell.xml`.
+//! This introduces external toolchain dependencies and generates verbose C glue code that must
+//! either be committed to the repository or produced by complex build-system hooks.
+//!
+//! In Patchwork:
+//! - We avoid `wayland-scanner` completely by specifying the minimal subset of `xdg-shell`
+//!   v1 interfaces (`WlInterface`, `WlMessage`, opcode indices, and listener function pointer
+//!   tables) directly in Zig according to the Wayland wire protocol specification.
+//! - Only the essential desktop surface lifecycle methods are bound: `xdg_wm_base` (ping/pong,
+//!   surface creation), `xdg_surface` (configure, ack_configure), and `xdg_toplevel` (title,
+//!   app_id, close events).
+//!
+//! ## 2. Wayland Wire Protocol & Type Signatures
+//! Wayland's IPC mechanism passes binary event/request structures over a Unix domain socket.
+//! In `WlMessage`:
+//! - `signature` encodes the serialized parameter types using Wayland type specifiers:
+//!   - `u`: 32-bit unsigned integer (e.g. configure serial, ping serial).
+//!   - `i`: 32-bit signed integer (e.g. width, height).
+//!   - `s`: Null-terminated string (e.g. window title, app ID).
+//!   - `o`: Object ID / proxy handle (`*WlProxy`).
+//!   - `n`: New object ID created by the request.
+//!   - `a`: Byte array (`WlArray`).
+//!   - `?`: Indicates that an object argument is nullable.
+//! - `types` points to an array of interface pointers validating the object types in the signature.
+//!
+//! ## 3. The Proxy Marshaling Mechanism (`wl_proxy_marshal_flags`)
+//! Rather than compiling a separate C dispatch stub for every request, `libwayland-client`
+//! provides `wl_proxy_marshal_flags`.
+//! - Requests are issued by passing the proxy pointer, the 0-based opcode index in the interface's
+//!   method table, the target interface, and variable arguments.
+//! - The compositor processes these requests asynchronously. Incoming events are dispatched by
+//!   `wl_display_dispatch_pending()` through the listener callbacks registered via
+//!   `wl_proxy_add_listener()`.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Hand-written xdg-shell v1 tables. wayland-scanner output is generated C we
-/// do not want in the tree, and this step only needs bind, ping/pong, configure,
-/// ack, and close.
 pub const WlInterface = extern struct {
     name: [*:0]const u8,
     version: i32,
@@ -237,12 +274,20 @@ pub fn set_app_id(toplevel: *XdgToplevel, app_id: [*:0]const u8) void {
     assert(version >= 1);
 }
 
-pub fn add_wm_base_listener(base: *XdgWmBase, listener: *const XdgWmBaseListener, data: *anyopaque) void {
+pub fn add_wm_base_listener(
+    base: *XdgWmBase,
+    listener: *const XdgWmBaseListener,
+    data: *anyopaque,
+) void {
     const rc = wl_proxy_add_listener(@ptrCast(base), listener, data);
     assert(rc == 0);
 }
 
-pub fn add_surface_listener(surface: *XdgSurface, listener: *const XdgSurfaceListener, data: *anyopaque) void {
+pub fn add_surface_listener(
+    surface: *XdgSurface,
+    listener: *const XdgSurfaceListener,
+    data: *anyopaque,
+) void {
     const rc = wl_proxy_add_listener(@ptrCast(surface), listener, data);
     assert(rc == 0);
 }

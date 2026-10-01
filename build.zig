@@ -1,3 +1,25 @@
+//! Build Graph Configuration and Multi-Target Orchestration.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. Build Pipeline Architecture & Step Matrix
+//! Patchwork compiles to two distinct platform targets from a single Zig codebase:
+//! - `native` (`zig build` / `zig build run`):
+//!   Compiles `src/main.zig` for the host platform (Linux x86_64), linking against
+//!   `libwayland-client.so` and `libwgpu_native.so` (v29.0.1.1 C ABI).
+//!   Automatically resolves `libwgpu_native.so` via the `wgpu_native` package dependency
+//!   declared in `build.zig.zon` and cached by Zig's package manager. An optional
+//!   `-Dwgpu-lib-dir=` override allows linking against a custom directory if desired.
+//! - `wasm` (`zig build wasm`):
+//!   Compiles `src/web_exports.zig` for `wasm32-freestanding`. Zero libc, zero OS syscalls.
+//!   Sets `export_memory = true` so linear memory can be inspected zero-copy by JavaScript.
+//! - `test` (`zig build test`):
+//!   Compiles pure logic tests in `src/root.zig` (`draw.zig` and `frame.zig`).
+//!   Requires NO GPU drivers, NO Wayland display, and NO external dynamic libraries.
+//! - `serve` (`zig build serve`):
+//!   Compiles and launches the lightweight static HTTP server in `src/serve.zig` to serve
+//!   `index.html`, `shell.js`, and `patchwork.wasm` on `http://127.0.0.1:8080/`.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -6,7 +28,7 @@ pub fn build(b: *std.Build) void {
     const wgpu_lib_dir = b.option(
         []const u8,
         "wgpu-lib-dir",
-        "Directory that contains libwgpu_native.so (wgpu-native v29.0.1.1)",
+        "Override directory containing libwgpu_native.so (defaults to wgpu_native package in build.zig.zon)",
     );
 
     const patchwork = b.addModule("patchwork", .{
@@ -21,21 +43,21 @@ pub fn build(b: *std.Build) void {
     add_serve(b, target, optimize, wasm);
 }
 
+/// Configures native Wayland + WebGPU compilation for the host executable.
+/// - Resolves `libwgpu_native.so` and its dynamic runtime linker path (RPATH) from the
+///   `wgpu_native` dependency package declared in `build.zig.zon`, or from the user-provided
+///   `wgpu_lib_dir` override when specified via `-Dwgpu-lib-dir=`.
+/// - Dynamically links `libwayland-client.so` and `libwgpu_native.so`.
 fn add_native(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     wgpu_lib_dir: ?[]const u8,
 ) void {
-    const dir = wgpu_lib_dir orelse {
-        const msg =
-            "native build requires -Dwgpu-lib-dir= pointing at directory with libwgpu_native.so";
-        const missing = b.addFail(msg);
-        b.getInstallStep().dependOn(&missing.step);
-        const run_step = b.step("run", "Run the app");
-        run_step.dependOn(&missing.step);
-        return;
-    };
+    const lib_path: std.Build.LazyPath = if (wgpu_lib_dir) |dir|
+        .{ .cwd_relative = dir }
+    else
+        b.dependency("wgpu_native", .{}).path("lib");
 
     const exe = b.addExecutable(.{
         .name = "patchwork",
@@ -46,8 +68,8 @@ fn add_native(
             .link_libc = true,
         }),
     });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = dir });
-    exe.root_module.addRPath(.{ .cwd_relative = dir });
+    exe.root_module.addLibraryPath(lib_path);
+    exe.root_module.addRPath(lib_path);
     exe.root_module.linkSystemLibrary("wayland-client", .{
         .needed = true,
         .weak = false,

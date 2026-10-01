@@ -62,10 +62,16 @@
 //!   `stepMode = step_vertex`, `array_stride = 8`, `format = vertex_float32x2`.
 //!   Contains 6 static 2D coordinates representing two triangles in the range [0, 0] to [1, 1].
 //! - **Vertex Buffer 1 (Instances):**
-//!   `stepMode = step_instance`, `array_stride = 32`.
-//!   Contains two vertex attributes per instance:
+//!   `stepMode = step_instance`, `array_stride = 48`.
+//!   Contains three vertex attributes per instance:
 //!   - Slot 1: `rect` (`vertex_float32x4` at offset 0) -> `[x, y, w, h]`.
 //!   - Slot 2: `fill` (`vertex_float32x4` at offset 16) -> `[r, g, b, a]`.
+//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, pad, pad]`.
+//!     Radius is the geometric corner radius in logical pixels. Hover is the baked
+//!     mix weight toward white. The pads exist because this slot is a `vec4`, the
+//!     same format as `rect` and `fill`. WebGPU only requires the stride to be a
+//!     multiple of 4. Fetching 16 bytes at offset 32 makes the stride 48. `append`
+//!     writes the pads as 0. The fragment shader reads `.x` and `.y` only.
 //! - **Bind Group 0 (Uniform Buffer):**
 //!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix.
 //!
@@ -621,6 +627,10 @@ const unit_attr: VertexAttribute = .{
     .shader_location = 0,
 };
 
+/// Instance vertex fetch. Locations match `@location` in `quad.wgsl`.
+/// Location 1 is the rectangle, location 2 is the straight-alpha fill, and
+/// location 3 is `(radius, hover, pad, pad)`. All three are `float32x4`, so
+/// the offsets are 0, 16, and 32 and `draw.instance_stride` is 48.
 const instance_attrs = [_]VertexAttribute{
     .{
         .next_in_chain = null,
@@ -633,6 +643,12 @@ const instance_attrs = [_]VertexAttribute{
         .format = vertex_float32x4,
         .offset = 16,
         .shader_location = 2,
+    },
+    .{
+        .next_in_chain = null,
+        .format = vertex_float32x4,
+        .offset = 32,
+        .shader_location = 3,
     },
 };
 
@@ -880,6 +896,8 @@ fn create_shader(device: Device) ShaderModule {
 /// Allocates the static unit quad buffer, instance buffer, and uniform buffer in GPU VRAM.
 fn create_buffers(device: Device) !Buffers {
     assert(@intFromPtr(device) != 0);
+    // Fixed for the life of the device: 256 records times the 48-byte stride.
+    // A frame uploads only `count` records. The radius and hover live in that stride.
     const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
     const vertex_usage: Flags = usage_vertex | usage_copy_dst;
     const uniform_usage: Flags = usage_uniform | usage_copy_dst;
@@ -1034,7 +1052,8 @@ fn create_pipeline(
 
 /// Configures the dual vertex buffer layout:
 /// Buffer 0: step_vertex, 8-byte stride (unit quad points).
-/// Buffer 1: step_instance, 32-byte stride (instance rect and color).
+/// Buffer 1: step_instance, 48-byte stride. Three attributes: rect, fill, shape.
+/// `attribute_count` is 3 because location 3 carries the rounded-box radius and hover.
 fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     buffers[0] = .{
         .next_in_chain = null,
@@ -1047,11 +1066,11 @@ fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
         .next_in_chain = null,
         .step_mode = step_instance,
         .array_stride = draw.instance_stride,
-        .attribute_count = 2,
+        .attribute_count = 3,
         .attributes = &instance_attrs,
     };
     assert(buffers[0].attribute_count == 1);
-    assert(buffers[1].attribute_count == 2);
+    assert(buffers[1].attribute_count == 3);
 }
 
 /// Configures the vertex stage descriptor referencing the `vs_main` entry point.
@@ -1102,6 +1121,8 @@ fn write_uploads(
     }
     if ((header.flags & draw.flag_instances) != 0) {
         if (header.instance_count != 0) {
+            // Paired with the export and the browser. 48 is rect + fill + shape.
+            assert(draw.instance_stride == 48);
             const byte_count: u32 = header.instance_count * draw.instance_stride;
             wgpuQueueWriteBuffer(
                 self.queue,

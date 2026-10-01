@@ -30,11 +30,18 @@
 //! In Patchwork, Zig is the single authoritative source of truth:
 //! - `shader_ptr()` and `shader_len()` expose the embedded WGSL shader source code.
 //! - `quad_ptr()` and `quad_bytes()` expose the static unit quad vertex coordinates.
-//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (32 bytes).
+//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (48 bytes).
 //!
 //! When `web/shell.js` bootstraps, it queries these export functions to allocate its GPU buffers
 //! and compile its pipeline. If the shader or struct layouts change in Zig, JavaScript adapts
 //! automatically without code duplication.
+//!
+//! The 48-byte stride is the step 3 instance: rectangle, fill, and a shape `vec4` of
+//! `(radius, hover, 0, 0)`. `instance_stride` asserts 48 here, and `shell.js` asserts 48
+//! again before it builds the pipeline and before it uploads. The third vertex attribute
+//! (shader location 3, offset 32, `float32x4`) must stay in lockstep with `quad.wgsl` and
+//! with the native `instance_attrs` table. A stride mismatch would silently fetch hover
+//! from the wrong bytes.
 //!
 //! ## 4. Synchronous Stack-Frame Memory Sharing (Zero-Copy & Zero-Heap)
 //! In `tick()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
@@ -87,7 +94,7 @@ var state: State = .{
 /// JavaScript uses this pointer to decode the WGSL string and compile the pipeline.
 export fn shader_ptr() [*]const u8 {
     assert(draw.shader_file.len >= 1);
-    assert(draw.instance_stride == 32);
+    assert(draw.instance_stride == 48);
     return draw.shader_file.ptr;
 }
 
@@ -110,10 +117,13 @@ export fn quad_bytes() u32 {
     return draw.quad_bytes;
 }
 
-/// Returns the byte stride between instances in the instance buffer (32 bytes).
-/// JavaScript asserts this matches its expected vertex buffer layout.
+/// Returns the byte stride between instances (48 bytes).
+///
+/// JavaScript asserts the same 48 before creating the pipeline and again before
+/// `writeBuffer`. The stride covers three `vec4` groups. The third is radius, hover,
+/// and two zero pads. See the module guide in `draw.zig`.
 export fn instance_stride() u32 {
-    assert(draw.instance_stride == 32);
+    assert(draw.instance_stride == 48);
     return draw.instance_stride;
 }
 
@@ -126,7 +136,7 @@ export fn start() u32 {
     state.cursor = draw.UploadCursor.init();
     draw.demo(&state.list);
     assert(state.frame.running);
-    assert(state.list.count == draw.instance_cap);
+    assert(state.list.count == draw.demo_count);
     return dirty_flag();
 }
 
