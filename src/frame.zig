@@ -1,6 +1,6 @@
 //! Pure Window Sizing, HiDPI Scaling, and Redraw Policy.
 //!
-//! # Concepts for Novices:
+//! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Separation of Policy and Mechanism (Pure Logic)
 //! In traditional GUI programming, window event handling is often tangled with GPU drawing

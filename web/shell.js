@@ -47,6 +47,23 @@
 // - Once `wasm.tick()` presents the frame, the dirty flag is cleared.
 // - No further animation frames are requested until a resize or user interaction event occurs.
 // - The browser tab consumes 0.0% CPU and 0.0% GPU cycles when idle.
+//
+// ## 5. The 48-Byte Instance and the Shape Attribute
+// Zig's `Instance` is three `vec4` groups. The pipeline below fetches them as `float32x4`:
+// - Shader location 1, offset  0: rectangle `(x, y, width, height)` in logical pixels.
+// - Shader location 2, offset 16: straight-alpha fill `(r, g, b, a)`.
+// - Shader location 3, offset 32: `(radius, hover, pad, pad)`.
+//
+// Radius is the geometric corner radius. Hover is the baked mix toward white. The pads
+// complete the `vec4` the shader declares at `@location(3)`. WebGPU requires `arrayStride`
+// to be a multiple of 4. This buffer's stride is 48 because location 3 reads 16 bytes at
+// offset 32. `wasm.instance_stride()` is the authority. This file asserts 48 at pipeline
+// creation and again before `writeBuffer`, so a Zig layout change fails loudly instead of
+// sampling hover from the fill's alpha.
+//
+// The fragment shader evaluates a rounded-box distance in that local rectangle, antialiases
+// with `fwidth`, and lightens RGB by hover. Alpha is `fill.a * coverage`. The blend below
+// is source-over on straight alpha. A zero-coverage corner blends away and shows the slate.
 
 const canvas = document.getElementById("surface");
 
@@ -110,6 +127,9 @@ function present_js(headerPtr, instancePtr) {
     if ((flags & FLAG_INSTANCES) !== 0) {
         if (count !== 0) {
             const stride = wasm.instance_stride();
+            if (stride !== 48) {
+                throw new Error("instance stride mismatch: expected 48 bytes");
+            }
             device.queue.writeBuffer(
                 instanceBuffer,
                 0,
@@ -168,8 +188,8 @@ async function create_pipeline() {
     const quadByteCount = wasm.quad_bytes();
     const shaderLen = wasm.shader_len();
 
-    if (stride !== 32) {
-        throw new Error("instance stride mismatch: expected 32 bytes");
+    if (stride !== 48) {
+        throw new Error("instance stride mismatch: expected 48 bytes");
     }
     if (quadByteCount !== 48) {
         throw new Error("unit quad size mismatch: expected 48 bytes");
@@ -199,7 +219,7 @@ async function create_pipeline() {
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    // 2. Instance buffer (8,192 bytes: 256 instances * 32 bytes).
+    // 2. Instance buffer (12,288 bytes: 256 instances * 48 bytes).
     instanceBuffer = device.createBuffer({
         size: INSTANCE_CAP * stride,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -231,13 +251,15 @@ async function create_pipeline() {
                     stepMode: "vertex",
                     attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
                 },
-                // Vertex Buffer 1: Instances (stepMode: "instance")
+                // Vertex Buffer 1: Instances (stepMode: "instance").
+                // Location 3 is the shape vec4. The shader reads radius from .x and hover from .y.
                 {
                     arrayStride: stride,
                     stepMode: "instance",
                     attributes: [
-                        { shaderLocation: 1, offset: 0, format: "float32x4" }, // rect [x, y, w, h]
-                        { shaderLocation: 2, offset: 16, format: "float32x4" }, // fill [r, g, b, a]
+                        { shaderLocation: 1, offset: 0, format: "float32x4" }, // rect
+                        { shaderLocation: 2, offset: 16, format: "float32x4" }, // fill
+                        { shaderLocation: 3, offset: 32, format: "float32x4" }, // shape
                     ],
                 },
             ],

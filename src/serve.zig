@@ -1,3 +1,24 @@
+//! Zero-Dependency Development HTTP Server for Browser WebGPU/Wasm Host Testing.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. Why an Internal HTTP Server Instead of `file://` or External Tools?
+//! WebGPU is strictly disabled by all modern browsers on local `file://` URIs due to the
+//! W3C cross-origin security specification and origin-isolation rules.
+//! - Running browser builds typically requires external dependencies like Python (`python -m
+//!   http.server`), Node.js (`npx serve`), or Go.
+//! - In Patchwork, `zig build serve` provides a completely self-contained, zero-dependency
+//!   static HTTP server compiled using only Zig's standard library.
+//!
+//! ## 2. TigerStyle Memory and Concurrency Guarantees
+//! - **Bounded Buffers:** Fixed 4 KB request/response header buffers (`header_cap = 4096`)
+//!   and a 4 MB maximum file size limit (`file_cap = 4 * 1024 * 1024`).
+//! - **Zero Runtime Allocation:** Serves directly from preallocated stack/file buffers without
+//!   dynamic heap allocation.
+//! - **Deterministic MIME Handling:** Explicitly sets correct `Content-Type` headers for
+//!   `text/html`, `application/javascript`, and `application/wasm` (which is required by browsers
+//!   for streaming instantiation via `WebAssembly.instantiateStreaming`).
+
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -61,7 +82,10 @@ fn serve_one(io: std.Io, server: *std.Io.net.Server, paths: Paths) !void {
     var send_buffer: [header_cap]u8 = undefined;
     var connection_reader = stream.reader(io, recv_buffer[0..]);
     var connection_writer = stream.writer(io, send_buffer[0..]);
-    var http_server = std.http.Server.init(&connection_reader.interface, &connection_writer.interface);
+    var http_server = std.http.Server.init(
+        &connection_reader.interface,
+        &connection_writer.interface,
+    );
     const request = http_server.receiveHead() catch {
         return;
     };

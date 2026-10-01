@@ -35,6 +35,8 @@
 //! Rather than using default black `(0, 0, 0)` or white `(1, 1, 1)`, a custom dark slate ensures
 //! that uninitialized textures, failed clear passes, or driver swapchain glitches are immediately
 //! and unmistakably visible during testing and code review.
+//! Rounded-box corners rely on that clear. A quad fragment that falls outside the rounded
+//! shape writes coverage 0 and blends to nothing, so the slate shows through that corner.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -55,6 +57,8 @@ pub const Color = struct {
 /// Background clear color: a distinct dark slate `(0.11, 0.12, 0.16)`.
 /// Using a custom slate rather than pure black `(0, 0, 0)` or white `(1, 1, 1)` ensures that
 /// missing clears, driver buffer bleeding, or compositor glitches are immediately visible.
+/// A quad fragment outside the rounded shape writes coverage 0 and blends away, so this
+/// slate is what shows in the corner of the bounding quad.
 pub const clear_color: Color = .{
     .r = 0.11,
     .g = 0.12,
