@@ -127,15 +127,15 @@
 //! `Instance` is twelve `f32`s in three groups the GPU fetches as `float32x4`:
 //! - Offset  0: rectangle `(x, y, width, height)` in logical pixels, origin top-left.
 //! - Offset 16: straight-alpha fill `(r, g, b, a)`.
-//! - Offset 32: `(radius, hover, 0, 0)`.
+//! - Offset 32: `(radius, hover, down, 0)`.
 //!
 //! WebGPU requires a vertex `arrayStride` that is a multiple of 4. It does not require a
 //! multiple of 16. The third attribute is still a `float32x4`, the same format as the
 //! rectangle and the fill, so the record occupies bytes 32..48 and the stride is 48.
-//! `radius` and `hover` are the live values. The last two floats are pads so that one
+//! `radius`, `hover`, and `down` are the live values. The last float is a pad so that one
 //! attribute format is shared by `quad.wgsl`, the native pipeline, and `web/shell.js`.
-//! `append` writes the pads as 0. A later reader of `.z` or `.w` then sees a defined value,
-//! and two uploads of the same face compare equal.
+//! `append` writes the pad as 0 and stores `down`. A later reader of `.w` then sees a
+//! defined value, and two uploads of the same face compare equal.
 //!
 //! The instance buffer stays fixed at `instance_cap * instance_stride` bytes (256 * 48).
 //! Only `count` instances are uploaded.
@@ -149,17 +149,14 @@
 //! older button shader multiplied the radius by 2 as a compatibility clamp. This field uses
 //! the geometric radius, so a value of 16 is a 16-pixel corner.
 //!
-//! ### Hover
-//! `hover` is a weight in `[0, 1]`. The shader computes `mix(fill.rgb, white, hover)` and
-//! leaves the fill alpha unchanged. Weight 0 is the stored fill. Weight 1 is white. A weight
-//! outside that range would extrapolate past the fill or past white, so `append` rejects it.
-//! The stored color stays the un-hovered fill even when `hover` is 1. The lighten happens in
-//! the shader, which is why the hover-1 demo footer is still blue in the instance buffer and
-//! near white on screen.
-//!
-//! The float is baked. Nothing animates it. Step 5 writes it from hit-testing. A second
-//! hover color, a stroke, and a theme struct belong to later steps. This step only stores
-//! the weight.
+//! ### Hover and down
+//! `hover` is a weight in `[0, 1]` toward white. `down` is a weight in `[0, 1]` toward
+//! black, applied after the lighten. The shader computes
+//! `mix(mix(fill.rgb, white, hover), black, down)` and leaves the fill alpha unchanged.
+//! Weight 0 leaves that stage at the incoming color. Weight 1 replaces it with white or
+//! black. A weight outside `[0, 1]` would extrapolate, so `append` rejects it. The stored
+//! fill stays the resting color. `hit.zig` writes both weights. `set_state` bumps
+//! `revision` only when a stored weight changes, so a resting pointer uploads nothing.
 //!
 //! ### CPU twin and shader paint
 //! `sdf_box` is the CPU twin of the WGSL function. The point is in the same local logical
@@ -175,11 +172,11 @@
 //! `turtle.paint_column` clears the draw list and appends the full-window column followed
 //! by each placed child panel whose dimensions are strictly positive.
 //!
-//! The draw list capacity remains statically bounded at `instance_cap` (256). Radius and
-//! hover remain packed fields of `Instance`. In the demo scene, the column's footer panel
-//! stores `hover: 1.0` so the shader's `mix(fill.rgb, vec3(1.0), hover)` lightening remains
-//! visually verified. Hit-testing will dynamically write hover weights from pointer events
-//! in Step 5. Child capacity is `child_cap = instance_cap - 1` (255), guaranteeing that the
+//! The draw list capacity remains statically bounded at `instance_cap` (256). Radius,
+//! hover, and down remain packed fields of `Instance`. The demo column paints every panel
+//! at hover 0 and down 0. `hit.apply` writes the weights after each layout walk, so a
+//! resize does not leave a resting pointer on an unlit panel. Child capacity is
+//! `child_cap = instance_cap - 1` (255), guaranteeing that the
 //! root column rectangle (1 slot) plus all children never exceed the 256-instance limit.
 
 const std = @import("std");
@@ -196,7 +193,7 @@ pub const instance_cap: u32 = 256;
 /// Byte size of one instance (12 floats * 4 bytes = 48 bytes).
 /// Three `float32x4` attributes at offsets 0, 16, and 32. WebGPU only requires the
 /// buffer stride to be a multiple of 4. The third attribute is a full `vec4`, so the
-/// record is 48 bytes and the two unused floats are pads. See the module guide.
+/// record is 48 bytes. `down` occupies the former first pad. `pad1` stays 0.
 pub const instance_stride: u32 = 48;
 
 /// Number of vertices in a quad drawn as a triangle list (2 triangles * 3 vertices = 6).
@@ -240,9 +237,11 @@ pub const unit_quad: [12]f32 = .{
 /// - Offset 16: `r`, `g`, `b`, `a` (4 f32) - Fill color.
 /// - Offset 32: `radius` (f32) - Geometric corner radius in logical pixels.
 ///   Oversized values are stored here and clamped inside `sdf_box`.
-/// - Offset 36: `hover` (f32) - Baked mix weight toward white, range [0, 1].
-///   The shader applies it. Hit-testing writes it in a later step.
-/// - Offset 40: `pad0`, `pad1` - Written as 0. They complete the third `vec4`.
+/// - Offset 36: `hover` (f32) - Mix weight toward white, range [0, 1].
+///   `hit.apply` writes it. The shader applies it before `down`.
+/// - Offset 40: `down` (f32) - Mix weight toward black, range [0, 1].
+///   Applied after the hover lighten. `append` stores the caller's value.
+/// - Offset 44: `pad1` (f32) - Written as 0. It completes the third `vec4`.
 /// Total size: 48 bytes.
 pub const Instance = extern struct {
     x: f32,
@@ -255,7 +254,7 @@ pub const Instance = extern struct {
     a: f32,
     radius: f32,
     hover: f32,
-    pad0: f32,
+    down: f32,
     pad1: f32,
 };
 
@@ -304,7 +303,13 @@ pub const DrawList = struct {
         return list;
     }
 
-    pub const AppendError = error{ EdgeNotPositive, ListFull, NegativeRadius, HoverOutOfRange };
+    pub const AppendError = error{
+        EdgeNotPositive,
+        ListFull,
+        NegativeRadius,
+        HoverOutOfRange,
+        DownOutOfRange,
+    };
 
     /// Appends one rectangle instance to the draw list.
     ///
@@ -318,12 +323,14 @@ pub const DrawList = struct {
     ///   stored unchanged because both `sdf_box` and `quad.wgsl` clamp it to half the shorter
     ///   edge. A negative radius would survive `min(radius, half)` and invert the field.
     /// - `error.HoverOutOfRange`: Returned if `instance.hover < 0` or `instance.hover > 1`.
-    ///   Weights outside `[0.0, 1.0]` would extrapolate the shader `mix` beyond base fill or white.
+    ///   Weights outside `[0.0, 1.0]` would extrapolate the shader `mix` beyond the fill or white.
+    /// - `error.DownOutOfRange`: Returned if `instance.down < 0` or `instance.down > 1`.
+    ///   The darken mix would extrapolate past black the same way an out-of-range hover
+    ///   extrapolates past white.
     /// - `error.ListFull`: Returned if `self.count == instance_cap` (256).
     ///
     /// Attribute Padding & Revision:
-    /// - `pad0` and `pad1` are explicitly zeroed to guarantee deterministic zero bits in the
-    ///   trailing half of the third `vec4` vertex attribute (`float32x4`).
+    /// - `down` is stored. `pad1` is zeroed so the unused `.w` of the third `vec4` is defined.
     /// - Increments both `count` and `revision` on success.
     pub fn append(self: *DrawList, instance: Instance) AppendError!void {
         assert(self.count <= instance_cap);
@@ -342,20 +349,61 @@ pub const DrawList = struct {
         if (instance.hover > 1) {
             return error.HoverOutOfRange;
         }
+        if (instance.down < 0) {
+            return error.DownOutOfRange;
+        }
+        if (instance.down > 1) {
+            return error.DownOutOfRange;
+        }
         if (self.count == instance_cap) {
             return error.ListFull;
         }
         assert(instance.radius >= 0);
         assert(instance.hover >= 0);
+        assert(instance.down >= 0);
         var stored: Instance = instance;
-        stored.pad0 = 0;
         stored.pad1 = 0;
         self.items[self.count] = stored;
         self.count += 1;
         self.revision += 1;
         assert(self.items[self.count - 1].hover <= 1);
-        assert(self.items[self.count - 1].pad0 == 0);
+        assert(self.items[self.count - 1].down <= 1);
         assert(self.items[self.count - 1].pad1 == 0);
+    }
+
+    /// Writes `hover` and `down` on one live slot.
+    ///
+    /// Parameters & Invariants:
+    /// - `index`: Must be a valid live slot (`index < self.count`). Slot 0 is reserved for column
+    ///   background and should not be modified by caller.
+    /// - `hover`: Mix weight toward white, clamped to `[0.0, 1.0]`.
+    /// - `down`: Mix weight toward black, clamped to `[0.0, 1.0]`.
+    ///
+    /// Revision & Dirty Tracking Interplay:
+    /// - Returns false when both stored weights already match existing values, leaving `revision`
+    ///   unchanged. This allows resting pointers to hit-test every poll wake with 0% CPU and zero
+    ///   GPU buffer uploads (`UploadCursor.flags() == 0`).
+    /// - Returns true when either weight differs, updating `items[index]` and incrementing
+    ///   `self.revision` so `UploadCursor.flags()` emits `flag_instances`.
+    pub fn set_state(self: *DrawList, index: u32, hover: f32, down: f32) bool {
+        assert(index < self.count);
+        assert(hover >= 0);
+        assert(hover <= 1);
+        assert(down >= 0);
+        assert(down <= 1);
+        const item = &self.items[index];
+        if (item.hover == hover) {
+            if (item.down == down) {
+                assert(self.items[index].hover == hover);
+                return false;
+            }
+        }
+        item.hover = hover;
+        item.down = down;
+        self.revision += 1;
+        assert(self.items[index].hover == hover);
+        assert(self.items[index].down == down);
+        return true;
     }
 
     /// Clears the draw list for the next frame, bumping the revision counter.
@@ -558,8 +606,45 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
     return inside + outside - k;
 }
 
-/// Test construction record. Pads are not fields here. `face` writes them as 0
-/// so every call site stores a defined shape `vec4`.
+/// True when `(x, y)` lies inside the rounded face, inclusive of the boundary.
+///
+/// Coordinate Space & Units:
+/// - `(x, y)`: UI logical pixels, top-left origin, `+X` right, `+Y` down.
+/// - Matched against `(instance.x, instance.y, instance.width, instance.height)` in logical pixels.
+///
+/// Preconditions:
+/// - `instance.width > 0`, `instance.height > 0`, `instance.radius >= 0`.
+///
+/// Two-Phase Hit Detection:
+/// 1. Axis-Aligned Bounding Box (AABB) early rejection: points strictly outside `[x, x + width]`
+///    or `[y, y + height]` return false immediately without distance computation.
+/// 2. Analytic Distance Twin: evaluates `sdf_box` on local coordinates `(x - inst.x, y - inst.y)`.
+///    Boundary test is `dist <= 0.0`, matching WGSL fragment coverage `>= 0.5`.
+///    A corner pixel inside the AABB but outside the rounded boundary returns false.
+pub fn contains(instance: Instance, x: f32, y: f32) bool {
+    assert(instance.width > 0);
+    assert(instance.height > 0);
+    assert(instance.radius >= 0);
+    if (x < instance.x) {
+        return false;
+    }
+    if (x > instance.x + instance.width) {
+        return false;
+    }
+    if (y < instance.y) {
+        return false;
+    }
+    if (y > instance.y + instance.height) {
+        return false;
+    }
+    const local_x = x - instance.x;
+    const local_y = y - instance.y;
+    const dist = sdf_box(local_x, local_y, instance.width, instance.height, instance.radius);
+    return dist <= 0;
+}
+
+/// Test construction record. `face` writes `pad1` as 0 so every call site stores
+/// a defined shape `vec4`.
 const Face = struct {
     x: f32,
     y: f32,
@@ -571,6 +656,7 @@ const Face = struct {
     a: f32,
     radius: f32,
     hover: f32,
+    down: f32,
 };
 
 fn face(spec: Face) Instance {
@@ -585,10 +671,10 @@ fn face(spec: Face) Instance {
         .a = spec.a,
         .radius = spec.radius,
         .hover = spec.hover,
-        .pad0 = 0,
+        .down = spec.down,
         .pad1 = 0,
     };
-    assert(instance.pad0 == 0);
+    assert(instance.down >= 0);
     assert(instance.pad1 == 0);
     return instance;
 }
@@ -627,8 +713,9 @@ fn rect(width: f32, height: f32) Instance {
         .a = 1,
         .radius = 0,
         .hover = 0,
+        .down = 0,
     });
-    assert(instance.pad0 == 0);
+    assert(instance.down == 0);
     assert(instance.pad1 == 0);
     return instance;
 }
@@ -666,6 +753,7 @@ test "append keeps order" {
         .a = 1,
         .radius = 0,
         .hover = 0,
+        .down = 0,
     }));
     try list.append(face(.{
         .x = 5,
@@ -678,6 +766,7 @@ test "append keeps order" {
         .a = 1,
         .radius = 0,
         .hover = 0,
+        .down = 0,
     }));
     try std.testing.expectEqual(@as(u32, 2), list.count);
     try std.testing.expectEqual(@as(f32, 1), list.items[0].x);
@@ -717,14 +806,72 @@ test "hover outside 0 to 1 is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
-test "append zeros the instance pads" {
+// Locks storage of down weight at offset 40 and deterministically zeroed pad1 at offset 44.
+test "append stores down and zeros the pad" {
     var list = DrawList.init();
     var instance = rect(10, 10);
-    instance.pad0 = 9;
+    instance.down = 0.25;
     instance.pad1 = 8;
     try list.append(instance);
-    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad0);
+    try std.testing.expectEqual(@as(f32, 0.25), list.items[0].down);
     try std.testing.expectEqual(@as(f32, 0), list.items[0].pad1);
+}
+
+// Locks defensive bounds validation: down weights outside [0, 1] return DownOutOfRange.
+test "down outside 0 to 1 is rejected" {
+    var list = DrawList.init();
+    var low = rect(10, 10);
+    low.down = -0.1;
+    try std.testing.expectError(error.DownOutOfRange, list.append(low));
+    var high = rect(10, 10);
+    high.down = 1.1;
+    try std.testing.expectError(error.DownOutOfRange, list.append(high));
+    try std.testing.expectEqual(@as(u32, 0), list.count);
+}
+
+// Locks dirty tracking optimization: matching weights return false without bumping revision.
+test "set_state leaves the revision when the weights match" {
+    var list = DrawList.init();
+    try list.append(rect(10, 10));
+    const revision = list.revision;
+    try std.testing.expect(!list.set_state(0, 0, 0));
+    try std.testing.expectEqual(revision, list.revision);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].hover);
+    try std.testing.expectEqual(@as(f32, 0), list.items[0].down);
+}
+
+// Locks revision bumping: changed hover or down weights return true and increment revision.
+test "set_state bumps the revision when a weight changes" {
+    var list = DrawList.init();
+    try list.append(rect(10, 10));
+    const revision = list.revision;
+    try std.testing.expect(list.set_state(0, 0.18, 0.30));
+    try std.testing.expectEqual(revision + 1, list.revision);
+    try std.testing.expectEqual(@as(f32, 0.18), list.items[0].hover);
+    try std.testing.expectEqual(@as(f32, 0.30), list.items[0].down);
+}
+
+// Locks analytic boundary testing: sharp corners hit edges, rounded corners reject outside curve.
+test "contains accepts the sharp edge and rejects a rounded corner" {
+    const sharp = rect(20, 10);
+    try std.testing.expect(contains(sharp, 10, 0));
+    try std.testing.expect(contains(sharp, 0, 5));
+    try std.testing.expect(!contains(sharp, -1, 5));
+    const footer = face(.{
+        .x = 1024,
+        .y = 656,
+        .width = 240,
+        .height = 48,
+        .r = 1,
+        .g = 1,
+        .b = 1,
+        .a = 1,
+        .radius = 24,
+        .hover = 0,
+        .down = 0,
+    });
+    try std.testing.expect(contains(footer, 1144, 680));
+    try std.testing.expect(!contains(footer, 1025, 657));
 }
 
 test "a full list rejects the next append" {
@@ -806,6 +953,7 @@ test "a revision change uploads instances" {
         .a = 1,
         .radius = 0,
         .hover = 0,
+        .down = 0,
     }));
     const flags = cursor.flags(&list, 1280, 720);
     try std.testing.expectEqual(flag_instances, flags);

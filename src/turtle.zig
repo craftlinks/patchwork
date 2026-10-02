@@ -94,7 +94,7 @@
 //! - Root Column: bounds `(0, 0, width_logical, height_logical)`, padding 16 on all edges.
 //! - Header: width `fill`, height `fixed 64`, margin 0, radius 8, hover 0.
 //! - Body: width `fill`, height `fill`, margin top 16, radius 16, hover 0.
-//! - Footer: width `fixed 240`, height `fixed 48`, margin top 16, align_x 1.0, radius 24, hover 1.
+//! - Footer: width `fixed 240`, height `fixed 48`, margin top 16, align_x 1.0, radius 24, hover 0.
 //!
 //! ### Worked Case 1: Default 1280 x 720 Window
 //! - Column Rect: `(0, 0, 1280, 720)`. Padding: left 16, top 16, right 16, bottom 16.
@@ -321,7 +321,7 @@ const panels: [panel_count]Panel = .{
             .b = 0.70,
             .a = 1,
             .radius = 24,
-            .hover = 1,
+            .hover = 0,
         },
     },
 };
@@ -351,7 +351,7 @@ comptime {
     assert(panels[2].walk.margin.top == 16);
     assert(panels[2].walk.align_x == 1);
     assert(panels[2].paint.radius == 24);
-    assert(panels[2].paint.hover == 1);
+    assert(panels[2].paint.hover == 0);
 }
 
 /// Resolves layout for a sequence of child walks inside a parent column container,
@@ -395,6 +395,9 @@ pub fn place_column(column: Column, walks: []const Walk, out: []Rect) void {
 /// 5. Appends each child panel whose width and height are both strictly positive. Any child
 ///    with a zero or negative edge is safely skipped so degenerate windows (such as 1x1) do not
 ///    trigger errors or fail presentation.
+/// 6. All instances are emitted with resting weights (`hover = 0, down = 0`). The platform render
+///    path (`linux_window.zig:present_if_dirty` and `web_exports.zig:tick`) immediately calls
+///    `hit.apply` after `frame.mark_laid_out()` so highlights survive relayout.
 pub fn paint_column(list: *draw.DrawList, width_logical: u32, height_logical: u32) void {
     assert(width_logical != 0);
     assert(height_logical != 0);
@@ -611,7 +614,7 @@ fn append_paint(list: *draw.DrawList, rect: Rect, paint: Paint) void {
         .a = paint.a,
         .radius = paint.radius,
         .hover = paint.hover,
-        .pad0 = 0,
+        .down = 0,
         .pad1 = 0,
     }) catch unreachable;
     assert(list.count >= 1);
@@ -629,7 +632,7 @@ fn expect_box(instance: draw.Instance, x: f32, y: f32, width: f32, height: f32) 
 // - Root column: (0, 0, 1280, 720) with 16px padding on all sides.
 // - Header: (16, 16, 1248, 64) with radius 8.
 // - Body: (16, 96, 1248, 544) with radius 16, receiving the 544px leftover height.
-// - Footer: (1024, 656, 240, 48) with radius 24 and hover 1.0, right-aligned (align_x = 1.0).
+// - Footer: (1024, 656, 240, 48) with radius 24 and hover 0, right-aligned (align_x = 1.0).
 test "column at 1280 by 720" {
     var list = draw.DrawList.init();
     paint_column(&list, 1280, 720);
@@ -643,7 +646,8 @@ test "column at 1280 by 720" {
     try std.testing.expectEqual(@as(f32, 8), list.items[1].radius);
     try std.testing.expectEqual(@as(f32, 16), list.items[2].radius);
     try std.testing.expectEqual(@as(f32, 24), list.items[3].radius);
-    try std.testing.expectEqual(@as(f32, 1), list.items[3].hover);
+    try std.testing.expectEqual(@as(f32, 0), list.items[3].hover);
+    try std.testing.expectEqual(@as(f32, 0), list.items[3].down);
 }
 
 // Verifies layout adaptation on window resize to 800x600:
@@ -767,5 +771,6 @@ test "a 1 by 1 window keeps the column and the fixed footer" {
     try expect_box(list.items[0], 0, 0, 1, 1);
     try expect_box(list.items[1], 16, 112, 240, 48);
     try std.testing.expectEqual(@as(f32, 24), list.items[1].radius);
-    try std.testing.expectEqual(@as(f32, 1), list.items[1].hover);
+    try std.testing.expectEqual(@as(f32, 0), list.items[1].hover);
+    try std.testing.expectEqual(@as(f32, 0), list.items[1].down);
 }

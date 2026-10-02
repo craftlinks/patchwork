@@ -66,12 +66,13 @@
 //!   Contains three vertex attributes per instance:
 //!   - Slot 1: `rect` (`vertex_float32x4` at offset 0) -> `[x, y, w, h]`.
 //!   - Slot 2: `fill` (`vertex_float32x4` at offset 16) -> `[r, g, b, a]`.
-//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, pad, pad]`.
-//!     Radius is the geometric corner radius in logical pixels. Hover is the baked
-//!     mix weight toward white. The pads exist because this slot is a `vec4`, the
-//!     same format as `rect` and `fill`. WebGPU only requires the stride to be a
-//!     multiple of 4. Fetching 16 bytes at offset 32 makes the stride 48. `append`
-//!     writes the pads as 0. The fragment shader reads `.x` and `.y` only.
+//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, down, pad]`.
+//!     Radius is the geometric corner radius in logical pixels. Hover is the mix
+//!     weight toward white. Down is the mix weight toward black, applied after hover.
+//!     The pad exists because this slot is a `vec4`, the same format as `rect` and
+//!     `fill`. WebGPU only requires the stride to be a multiple of 4. Fetching 16
+//!     bytes at offset 32 makes the stride 48. `append` writes the pad as 0 and stores
+//!     `down`. The fragment shader reads `.x`, `.y`, and `.z`.
 //! - **Bind Group 0 (Uniform Buffer):**
 //!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix.
 //!
@@ -629,7 +630,7 @@ const unit_attr: VertexAttribute = .{
 
 /// Instance vertex fetch. Locations match `@location` in `quad.wgsl`.
 /// Location 1 is the rectangle, location 2 is the straight-alpha fill, and
-/// location 3 is `(radius, hover, pad, pad)`. All three are `float32x4`, so
+/// location 3 is `(radius, hover, down, pad)`. All three are `float32x4`, so
 /// the offsets are 0, 16, and 32 and `draw.instance_stride` is 48.
 const instance_attrs = [_]VertexAttribute{
     .{
@@ -897,7 +898,7 @@ fn create_shader(device: Device) ShaderModule {
 fn create_buffers(device: Device) !Buffers {
     assert(@intFromPtr(device) != 0);
     // Fixed for the life of the device: 256 records times the 48-byte stride.
-    // A frame uploads only `count` records. The radius and hover live in that stride.
+    // A frame uploads only `count` records. Radius, hover, and down live in that stride.
     const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
     const vertex_usage: Flags = usage_vertex | usage_copy_dst;
     const uniform_usage: Flags = usage_uniform | usage_copy_dst;
@@ -1053,7 +1054,7 @@ fn create_pipeline(
 /// Configures the dual vertex buffer layout:
 /// Buffer 0: step_vertex, 8-byte stride (unit quad points).
 /// Buffer 1: step_instance, 48-byte stride. Three attributes: rect, fill, shape.
-/// `attribute_count` is 3 because location 3 carries the rounded-box radius and hover.
+/// `attribute_count` is 3 because location 3 carries radius, hover, and down.
 fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     buffers[0] = .{
         .next_in_chain = null,

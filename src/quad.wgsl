@@ -14,7 +14,7 @@
 //      Configured with `stepMode: "vertex"`, so the hardware pointer advances by 8 bytes
 //      (vec2<f32>) for every individual vertex index in [0..5].
 //    - Vertex Buffer 1 (Instances):
-//      Contains an array of 48-byte instance records: rect, fill, radius, hover, and pads.
+//      Contains an array of 48-byte instance records: rect, fill, radius, hover, down, pad.
 //      Configured with `stepMode: "instance"`, so the hardware pointer advances by 48 bytes
 //      only once per instance index in [0..N-1].
 //
@@ -26,7 +26,7 @@
 //    - Orthographic Projection: Multiplies the 2D pixel coordinate by the 4x4 projection matrix
 //      to convert from UI logical pixel space [0..width, 0..height] into homogeneous clip space.
 //    - Attribute Passing: Forwards the fill, the local pixel, the rectangle size, and the
-//      shape vec4 (radius, hover, pads) to the rasterizer. Size and shape are identical at
+//      shape vec4 (radius, hover, down, pad) to the rasterizer. Size and shape are identical at
 //      every vertex of one instance, so interpolation leaves them unchanged. Local varies.
 //
 // 3. **Primitive Assembly and Clipping:**
@@ -41,7 +41,7 @@
 //
 // 5. **Fragment Shader (`@fragment fn fs_main`):**
 //    Invoked once per covered pixel fragment. Evaluates the rounded-box distance, turns it
-//    into analytic coverage, lightens the fill by the baked hover weight, and returns
+//    into analytic coverage, lightens by hover, darkens by down, and returns
 //    straight-alpha RGBA. Sections 7 through 9 derive that paint.
 //
 // 6. **Fixed-Function Blending & Output Merger:**
@@ -95,12 +95,23 @@
 //    Partial coverage blends the fill over that slate. The rounded corner is the clear color
 //    showing through, not a hole cut out of the pipeline.
 //
-// 9. **Hover Lighten**
-//    `shape.y` is the baked hover weight in [0, 1]. RGB is `mix(fill.rgb, white, hover)`.
-//    Alpha is `fill.a * coverage` and does not include hover. Weight 0 paints the stored fill.
-//    Weight 1 paints white. The instance buffer keeps the un-hovered fill in either case.
-//    Hit-testing writes the weight in a later step. This shader does not animate it, and it
-//    does not read a second color.
+// 9. **Hover Lighten, Then Down Darken**
+//    `shape.y` is the hover weight in [0.0, 1.0].
+//    `shape.z` is the down/press weight in [0.0, 1.0].
+//    `shape.w` is the trailing attribute pad (always 0.0).
+//
+//    Sequential two-stage color transformation:
+//
+//        lit = mix(fill.rgb, vec3<f32>(1.0, 1.0, 1.0), shape.y)
+//        rgb = mix(lit, vec3<f32>(0.0, 0.0, 0.0), shape.z)
+//
+//    - Resting state (hover=0, down=0): RGB is unchanged from `fill.rgb`.
+//    - Hovered state (hover=0.18, down=0): lightens toward white by 18%.
+//    - Pressed state (hover=0.18, down=0.30): lightens by 18%, then darkens by 30%.
+//      The down darken wins over hover, giving immediate visual feedback for clicks.
+//    - Alpha channel is strictly `fill.a * coverage`. Neither weight modifies alpha.
+//    - Straight alpha (unmultiplied RGB) is preserved into the output merger.
+//    - Stored instances retain their resting colors; lighting is evaluated entirely in shader.
 
 // Uniform Buffer Binding:
 // - `@group(0) @binding(0)`: Binds slot 0 of resource bind group 0 to this uniform variable.
@@ -119,7 +130,7 @@ struct VertexOut {
     // Local pixel inside the rectangle, origin at the instance top-left.
     @location(1) local: vec2<f32>,
     @location(2) size: vec2<f32>,
-    // shape.x is radius, shape.y is hover. The last two floats are unused pads.
+    // shape.x is radius, shape.y is hover, shape.z is down. shape.w is the pad.
     @location(3) shape: vec4<f32>,
 };
 
@@ -152,7 +163,7 @@ fn sdf_box(p: vec2<f32>, size: vec2<f32>, radius: f32) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - k;
 }
 
-// `shape.x` is radius. `shape.y` is hover. Coverage scales alpha only.
+// `shape.x` is radius. `shape.y` is hover. `shape.z` is down. Coverage scales alpha only.
 // RGB stays straight so the source-over blend does not darken the ramp.
 // Zero coverage blends away, which is why the shader does not discard.
 @fragment
@@ -162,6 +173,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let pixel = max(fwidth(dist), 1.0e-5);
     // 0.5 centers the ramp on the boundary. Dividing by fwidth makes it one device pixel.
     let coverage = clamp(0.5 - dist / pixel, 0.0, 1.0);
-    let rgb = mix(in.fill.rgb, vec3<f32>(1.0, 1.0, 1.0), in.shape.y);
+    // Lighten toward white, then darken that result toward black. Down wins on a press.
+    let lit = mix(in.fill.rgb, vec3<f32>(1.0, 1.0, 1.0), in.shape.y);
+    let rgb = mix(lit, vec3<f32>(0.0, 0.0, 0.0), in.shape.z);
     return vec4<f32>(rgb, in.fill.a * coverage);
 }

@@ -63,6 +63,7 @@
 //! apply_scale (changed scale) true     false      No (reuses instances)
 //! mark_laid_out()             -        false      (clears layout dirty)
 //! mark_presented()            false    -          (clears presentation dirty)
+//! request_redraw()            true     unchanged  No (input, not a size change)
 //! ```
 
 const std = @import("std");
@@ -181,6 +182,18 @@ pub const Frame = struct {
         assert(self.relayout);
         self.relayout = false;
         assert(!self.relayout);
+    }
+
+    /// Flags that presentation to the display is required (`redraw = true`).
+    ///
+    /// Input events (pointer hover, button press) use this entry point. Because pointer
+    /// hit-state changes modify instance weights without altering window dimensions,
+    /// `relayout` is preserved unchanged, bypassing `turtle.paint_column` layout passes.
+    pub fn request_redraw(self: *Frame) void {
+        assert(self.running);
+        self.redraw = true;
+        assert(self.redraw);
+        assert(self.running);
     }
 
     /// Marks the current frame as presented to the display, clearing `redraw = false`.
@@ -331,6 +344,18 @@ test "a same size leaves layout clear" {
     frame.apply_configure(800, 600);
     try std.testing.expect(!frame.relayout);
     try std.testing.expect(!frame.redraw);
+}
+
+// Verifies that a pointer-driven redraw does not walk layout again.
+test "request_redraw leaves relayout clear" {
+    var frame = Frame.init();
+    frame.apply_configure(800, 600);
+    frame.mark_laid_out();
+    frame.mark_presented();
+    frame.request_redraw();
+    try std.testing.expect(frame.redraw);
+    try std.testing.expect(!frame.relayout);
+    try std.testing.expect(frame.running);
 }
 
 // Verifies that close clears the running state.

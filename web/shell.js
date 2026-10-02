@@ -52,18 +52,32 @@
 // Zig's `Instance` is three `vec4` groups. The pipeline below fetches them as `float32x4`:
 // - Shader location 1, offset  0: rectangle `(x, y, width, height)` in logical pixels.
 // - Shader location 2, offset 16: straight-alpha fill `(r, g, b, a)`.
-// - Shader location 3, offset 32: `(radius, hover, pad, pad)`.
+// - Shader location 3, offset 32: `(radius, hover, down, pad)`.
 //
-// Radius is the geometric corner radius. Hover is the baked mix toward white. The pads
-// complete the `vec4` the shader declares at `@location(3)`. WebGPU requires `arrayStride`
-// to be a multiple of 4. This buffer's stride is 48 because location 3 reads 16 bytes at
-// offset 32. `wasm.instance_stride()` is the authority. This file asserts 48 at pipeline
-// creation and again before `writeBuffer`, so a Zig layout change fails loudly instead of
-// sampling hover from the fill's alpha.
+// Radius is the geometric corner radius. Hover mixes toward white. Down mixes that result
+// toward black. The pad completes the `vec4` the shader declares at `@location(3)`.
+// WebGPU requires `arrayStride` to be a multiple of 4. This buffer's stride is 48 because
+// location 3 reads 16 bytes at offset 32. `wasm.instance_stride()` is the authority. This
+// file asserts 48 at pipeline creation and again before `writeBuffer`, so a Zig layout
+// change fails loudly instead of sampling hover from the fill's alpha.
 //
 // The fragment shader evaluates a rounded-box distance in that local rectangle, antialiases
-// with `fwidth`, and lightens RGB by hover. Alpha is `fill.a * coverage`. The blend below
-// is source-over on straight alpha. A zero-coverage corner blends away and shows the slate.
+// with `fwidth`, lightens RGB by hover, then darkens by down. Alpha is `fill.a * coverage`.
+// The blend below is source-over on straight alpha. A zero-coverage corner blends away and
+// shows the slate.
+//
+// ## 6. Pointer Event Handling, DPI Scaling, and Pointer Capture
+// The browser host manages pointer interactions via standard W3C Pointer Events:
+// - **DPI Scaling:** `shell.js` receives `offsetX` and `offsetY` in CSS logical pixels.
+//   Because `resize` currently passes the physical canvas dimensions (`width * dpr`), pointer
+//   coordinates are multiplied by `window.devicePixelRatio` before calling `wasm.pointer_move()`.
+// - **Adaptive Frame Scheduling:** Every pointer export returns a `u32` dirty flag.
+//   `schedule()` is called only when the return is 1. If the pointer moves entirely within a
+//   single panel, Wasm hit testing returns 0, and `requestAnimationFrame` remains idle (0% CPU).
+// - **Pointer Capture:** On `pointerdown`, `canvas.setPointerCapture(event.pointerId)` is invoked.
+//   This ensures that dragging the mouse outside the canvas or browser window continues to route
+//   input events to the canvas until `pointerup` occurs, preventing stuck button states.
+//   `pointerleave` and `pointercancel` call `wasm.pointer_leave()` to safely clear hover and press.
 
 const canvas = document.getElementById("surface");
 
@@ -252,7 +266,7 @@ async function create_pipeline() {
                     attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
                 },
                 // Vertex Buffer 1: Instances (stepMode: "instance").
-                // Location 3 is the shape vec4. The shader reads radius from .x and hover from .y.
+                // Location 3 is the shape vec4. The shader reads radius, hover, and down.
                 {
                     arrayStride: stride,
                     stepMode: "instance",
@@ -328,6 +342,61 @@ function fit_canvas() {
 }
 
 /**
+ * Returns the device pixel ratio multiplier used to scale CSS coordinates to canvas pixels.
+ * @returns {number} Device pixel ratio (defaults to 1.0 if undefined).
+ */
+function pointer_scale() {
+    return window.devicePixelRatio || 1;
+}
+
+/**
+ * Handles DOM `pointermove` events. Scales coordinates and notifies Wasm.
+ * @param {PointerEvent} event
+ */
+function on_pointer_move(event) {
+    const scale = pointer_scale();
+    if (wasm.pointer_move(event.offsetX * scale, event.offsetY * scale) === 1) {
+        schedule();
+    }
+}
+
+/**
+ * Handles DOM `pointerdown` events for the primary button. Captures pointer and notifies Wasm.
+ * @param {PointerEvent} event
+ */
+function on_pointer_down(event) {
+    if (event.button !== 0) {
+        return;
+    }
+    canvas.setPointerCapture(event.pointerId);
+    if (wasm.pointer_button(1) === 1) {
+        schedule();
+    }
+}
+
+/**
+ * Handles DOM `pointerup` events for the primary button. Notifies Wasm of button release.
+ * @param {PointerEvent} event
+ */
+function on_pointer_up(event) {
+    if (event.button !== 0) {
+        return;
+    }
+    if (wasm.pointer_button(0) === 1) {
+        schedule();
+    }
+}
+
+/**
+ * Handles DOM `pointerleave` and `pointercancel` events. Resets hover and press states in Wasm.
+ */
+function on_pointer_leave() {
+    if (wasm.pointer_leave() === 1) {
+        schedule();
+    }
+}
+
+/**
  * Main application bootstrap.
  * Connects to WebGPU, instantiates Wasm, compiles the pipeline, and begins presentation.
  */
@@ -360,6 +429,11 @@ async function main() {
 
     // Listen for window resize events.
     window.addEventListener("resize", fit_canvas);
+    canvas.addEventListener("pointermove", on_pointer_move);
+    canvas.addEventListener("pointerdown", on_pointer_down);
+    canvas.addEventListener("pointerup", on_pointer_up);
+    canvas.addEventListener("pointerleave", on_pointer_leave);
+    canvas.addEventListener("pointercancel", on_pointer_leave);
 }
 
 main();

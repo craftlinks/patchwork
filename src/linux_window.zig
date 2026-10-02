@@ -47,6 +47,28 @@
 //! 4. `wl_display_read_events()`: Reads incoming bytes from socket into libwayland buffers.
 //! 5. `wl_display_dispatch_pending()`: Invokes registered C ABI event callbacks.
 //!
+//! ### Pointer Event Batching & Amortization:
+//! High-frequency gaming mice and trackpads can generate 1,000+ events per second.
+//! If every `motion` callback executed a CPU hit test and GPU present, the UI thread would
+//! choke and thrash VRAM.
+//!
+//! Patchwork's event loop decouples input reception from rendering:
+//! ```text
+//! Socket Event Batch:       [motion] [motion] [motion] [button]
+//!                             |        |        |        |
+//! dispatch_pending():       Leaf writes update State.pointer (4 memory writes)
+//!                             |
+//! sync_pointer():           hit.apply() runs ONCE for the entire batch
+//!                             |
+//! present_if_dirty():       Uploads modified instances and presents ONCE
+//! ```
+//! Pointer callbacks are leaf writers: they store `x`, `y`, `inside`, and `down` on
+//! `State.pointer` and return immediately. The loop applies that sample once per wake:
+//! `ack_if_needed`, then `sync_pointer`, then `present_if_dirty`, then `wait_for_events`.
+//! Twenty motion events in one dispatch therefore cost one hit test and at most one present.
+//! `wl_pointer.frame` is not bound. The seat is `wl_seat` version 1, so the listener tables
+//! in `wl_seat.zig` match the event opcodes exactly.
+//!
 //! ## 5. Graphics Pipeline Integration
 //! In `run()`:
 //! - State contains `DrawList` and `UploadCursor` on the thread's stack.
@@ -55,12 +77,14 @@
 //!   Instead, `state.list` remains completely empty (`state.list.count == 0`) and
 //!   `state.frame.relayout` is initialized to `true`.
 //! - In `loop()`, incoming configure events trigger `ack_if_needed()`, which calls
-//!   `frame.apply_configure(pending_width, pending_height)`.
+//!   `frame.apply_configure(pending_width, pending_height)`. `sync_pointer` then runs
+//!   `hit.apply` and requests a redraw only when a weight changed.
 //! - In `present_if_dirty()`:
 //!   - Evaluates `frame.redraw`. Returns early if clean or unconfigured (`width_px == 0`).
 //!   - Evaluates `frame.relayout`. Only while `relayout` is set does it invoke
 //!     `turtle.paint_column(&state.list, ...)` to lay out the column and populate instance
-//!     rectangles, followed by `state.frame.mark_laid_out()`.
+//!     rectangles, followed by `state.frame.mark_laid_out()`. `hit.apply` runs immediately
+//!     after that, so a resize keeps the highlight under the last pointer position.
 //!   - Preserves instance list across scale changes: When a scale change occurs (via
 //!     `surface_preferred_scale`), `frame.apply_scale()` sets `redraw = true` while leaving
 //!     `relayout = false`. `present_if_dirty()` skips `turtle.paint_column()`, reusing the
@@ -76,7 +100,9 @@ const assert = std.debug.assert;
 const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
+const hit = @import("hit.zig");
 const turtle = @import("turtle.zig");
+const wl_seat = @import("wl_seat.zig");
 const xdg = @import("xdg_shell.zig");
 
 /// Maximum number of advertised compositor globals to scan during registry roundtrip.
@@ -105,6 +131,12 @@ pub const State = struct {
     gpu: gpu.Gpu,
     list: draw.DrawList,
     cursor: draw.UploadCursor,
+    /// Latest pointer coordinates, surface entry state, and button state.
+    pointer: hit.Pointer,
+    /// Bound Wayland seat proxy (`wl_seat` version 1) from the compositor registry.
+    seat: ?*wl_seat.WlSeat,
+    /// Active Wayland pointer proxy (`wl_pointer` version 1) instantiated from `seat`.
+    pointer_proxy: ?*wl_seat.WlPointer,
     configure_serial: u32,
     ack_pending: bool,
     pending_width: u32,
@@ -252,6 +284,18 @@ const toplevel_listener: xdg.XdgToplevelListener = .{
     .close = toplevel_close,
 };
 
+const seat_listener: wl_seat.SeatListener = .{
+    .capabilities = seat_capabilities,
+};
+
+const pointer_listener: wl_seat.PointerListener = .{
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+};
+
 /// Orchestrates the entire Wayland application lifecycle:
 /// 1. Connects to the Wayland display socket and binds core globals
 ///    (`wl_compositor`, `xdg_wm_base`).
@@ -327,15 +371,31 @@ fn create_device(state: *State) !void {
     assert(state.gpu.configured_height == 0);
 }
 
-/// Main blocking event loop: acknowledges configure, renders dirty frames, and sleeps in poll.
+/// Main blocking event loop: acknowledges configure, applies the pointer once,
+/// renders dirty frames, and sleeps in poll.
 fn loop(state: *State) !void {
     assert(@intFromPtr(state.display) != 0);
     while (state.frame.running) {
+        // Handle any compositor resize configure.
         ack_if_needed(state);
+        // Hit-test once.
+        sync_pointer(state);
+        // Present once if dirty.
         try present_if_dirty(state);
+        // Sleep until the compositor sends new bytes.
         try wait_for_events(state.display);
     }
     assert(!state.frame.running);
+}
+
+/// Evaluates hit testing against `state.list` using the latest stored `state.pointer` sample.
+/// Runs once per event loop wake after flushing socket events, amortizing multiple motion packets.
+/// Requests a frame redraw only if any instance's hover or down weight changed.
+fn sync_pointer(state: *State) void {
+    if (hit.apply(&state.list, state.pointer)) {
+        state.frame.request_redraw();
+    }
+    assert(state.frame.running);
 }
 
 /// Acknowledges pending configure serials sent by the compositor.
@@ -374,6 +434,9 @@ fn present_if_dirty(state: *State) !void {
     if (state.frame.relayout) {
         turtle.paint_column(&state.list, state.frame.width_logical, state.frame.height_logical);
         state.frame.mark_laid_out();
+        // The walk writes every weight as 0. Apply the stored pointer again so a
+        // resize does not clear a highlight. Redraw is already owed.
+        _ = hit.apply(&state.list, state.pointer);
     }
     assert(!state.frame.relayout);
     set_buffer_scale(state);
@@ -432,13 +495,17 @@ fn wait_for_events(display: *Display) !void {
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
+    // puts the thread into an OS kernel sleep with zero CPU usage.
     _ = std.posix.poll(fds[0..], -1) catch {
         wl_display_cancel_read(display);
         return error.PollFailed;
     };
+    // Poll wakes up because data is ready.
+    // Reads all pending bytes off the socket into libwayland's ring buffer in one syscall.
     if (wl_display_read_events(display) != 0) {
         return error.ReadFailed;
     }
+    // Loops through all those messages in memory and invokes our C callbacks one by one.
     const pending = wl_display_dispatch_pending(display);
     if (pending < 0) {
         return error.DispatchFailed;
@@ -533,6 +600,25 @@ fn registry_global(
     }
     if (std.mem.eql(u8, iface, "xdg_wm_base")) {
         state.xdg_base = @ptrCast(bind_global(live_registry, name, &xdg.xdg_wm_base_interface, 1));
+        return;
+    }
+    if (std.mem.eql(u8, iface, "wl_seat")) {
+        if (state.seat != null) {
+            return;
+        }
+        if (version < wl_seat.seat_version) {
+            return;
+        }
+        const bound = bind_global(
+            live_registry,
+            name,
+            &wl_seat.wl_seat_interface,
+            wl_seat.seat_version,
+        );
+        const seat: *wl_seat.WlSeat = @ptrCast(bound);
+        wl_seat.add_seat_listener(seat, &seat_listener, state);
+        state.seat = seat;
+        assert(state.seat != null);
     }
 }
 
@@ -609,6 +695,133 @@ fn toplevel_configure(
     const state: *State = @ptrCast(@alignCast(data.?));
     state.pending_width = if (width > 0) @intCast(width) else 0;
     state.pending_height = if (height > 0) @intCast(height) else 0;
+}
+
+/// C ABI callback for `wl_seat.capabilities` (opcode 0).
+/// Dynamically creates or destroys the `wl_pointer` proxy based on `pointer_capability`.
+fn seat_capabilities(
+    data: ?*anyopaque,
+    seat: ?*wl_seat.WlSeat,
+    capabilities: u32,
+) callconv(.c) void {
+    _ = seat;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    const has_pointer = (capabilities & wl_seat.pointer_capability) != 0;
+    if (has_pointer) {
+        if (state.pointer_proxy == null) {
+            const live = state.seat orelse return;
+            const pointer = wl_seat.get_pointer(live);
+            wl_seat.add_pointer_listener(pointer, &pointer_listener, state);
+            state.pointer_proxy = pointer;
+        }
+        assert(state.pointer_proxy != null);
+        return;
+    }
+    const pointer = state.pointer_proxy orelse return;
+    wl_seat.destroy_pointer(pointer);
+    state.pointer_proxy = null;
+    state.pointer.leave();
+    assert(state.pointer_proxy == null);
+    assert(!state.pointer.down);
+}
+
+/// C ABI callback for `wl_pointer.enter` (opcode 0).
+/// Marks pointer as inside the window surface at logical position `(sx, sy)`.
+fn pointer_enter(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    serial: u32,
+    surface: ?*xdg.WlSurface,
+    sx: i32,
+    sy: i32,
+) callconv(.c) void {
+    _ = pointer;
+    _ = serial;
+    _ = surface;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    move_pointer(state, sx, sy);
+}
+
+/// C ABI callback for `wl_pointer.leave` (opcode 1).
+/// Marks pointer as outside surface and resets button state to prevent stuck drags.
+fn pointer_leave(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    serial: u32,
+    surface: ?*xdg.WlSurface,
+) callconv(.c) void {
+    _ = pointer;
+    _ = serial;
+    _ = surface;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    state.pointer.leave();
+    assert(!state.pointer.inside);
+}
+
+/// C ABI callback for `wl_pointer.motion` (opcode 2).
+/// Updates stored pointer coordinates from 24.8 fixed-point surface coordinates.
+fn pointer_motion(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    time: u32,
+    sx: i32,
+    sy: i32,
+) callconv(.c) void {
+    _ = pointer;
+    _ = time;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    move_pointer(state, sx, sy);
+}
+
+/// C ABI callback for `wl_pointer.button` (opcode 3).
+/// Tracks primary mouse button (`BTN_LEFT` = 0x110). Ignores secondary and middle clicks.
+fn pointer_button(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    serial: u32,
+    time: u32,
+    button: u32,
+    button_state: u32,
+) callconv(.c) void {
+    _ = pointer;
+    _ = serial;
+    _ = time;
+    assert(data != null);
+    if (button != wl_seat.button_code_left) {
+        return;
+    }
+    const state: *State = @ptrCast(@alignCast(data.?));
+    const pressed = button_state == wl_seat.button_state_pressed;
+    state.pointer.button(pressed);
+    assert(state.pointer.down == pressed);
+}
+
+/// C ABI callback for `wl_pointer.axis` (opcode 4).
+/// Satisfies version 1 listener vtable layout; scroll input is deferred to step 8.
+fn pointer_axis(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    time: u32,
+    axis: u32,
+    value: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = pointer;
+    _ = time;
+    _ = axis;
+    _ = value;
+}
+
+/// Converts surface-local 24.8 fixed-point coordinates into UI logical pixels and stores them.
+fn move_pointer(state: *State, sx: i32, sy: i32) void {
+    const x = hit.fixed_to_logical(sx);
+    const y = hit.fixed_to_logical(sy);
+    state.pointer.move(x, y);
+    assert(state.pointer.inside);
 }
 
 /// Callback when the user clicks the window close button.

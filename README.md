@@ -2,9 +2,10 @@
 
 A Zig 0.16.0 library that copies Makepad's drawing model: a retained widget
 tree that lays itself out with a turtle and paints with instanced signed-distance
-shaders. Step 4 walks a column of panels inside the logical window and paints
-them in one instanced call on a Wayland window and a full-page browser canvas,
-then blocks while the picture is clean.
+shaders. Step 5 hit-tests that column. A pointer move or press picks the topmost
+rounded face with the same distance field the shader paints, writes `hover` and
+`down` onto the instance, and redraws. The process still blocks while the pointer
+is resting.
 
 Flow is downward only. Sizing is either `fixed: f32` or `fill`; content-derived `fit`
 is deferred until text measurement and widgets exist. Padding lives on the `Column`
@@ -22,7 +23,7 @@ three panels:
 - Header: width `fill`, height `fixed 64`, zero margin, corner radius 8.
 - Body: width `fill`, height `fill`, margin-top 16, corner radius 16.
 - Footer: width `fixed 240`, height `fixed 48`, margin-top 16, `align_x = 1.0` (right-aligned),
-  corner radius 24, hover weight 1.0.
+  corner radius 24. Every panel starts at hover 0 and down 0.
 At the default 1280 x 720 logical resolution, the root column rect is (0, 0, 1280, 720), the
 header is (16, 16, 1248, 64), the body is (16, 96, 1248, 544), and the footer is
 (1024, 656, 240, 48).
@@ -35,11 +36,15 @@ the column or bumping instance revisions.
 
 Each panel is one instance of the same unit quad. The fragment shader evaluates a
 rounded-box distance in local logical pixels, antialiases the edge from `fwidth`,
-and lightens the fill toward white by a baked hover weight. Radius 0 is a sharp
-rectangle. A radius of at least half the shorter edge is a capsule, and a square
-with that radius is a disc. The instance record is 48 bytes: rectangle, fill, and
-`(radius, hover, 0, 0)`. The field derivation and the coverage math are in
-`src/draw.zig` and `src/quad.wgsl`. The walk math is in `src/turtle.zig`.
+lightens the fill toward white by `hover`, then darkens that result toward black
+by `down`. Radius 0 is a sharp rectangle. A radius of at least half the shorter
+edge is a capsule, and a square with that radius is a disc. The instance record
+is 48 bytes: rectangle, fill, and `(radius, hover, down, 0)`. The CPU hit test
+uses that same field, so a rounded corner that shows the slate is not a hit.
+Hover is a weight of 0.18. Down is 0.30, and it follows the pointer while the
+primary button is held. The field derivation and the coverage math are in
+`src/draw.zig` and `src/quad.wgsl`. The walk math is in `src/turtle.zig`. The
+hit test is in `src/hit.zig`.
 
 ## Native (Linux / Wayland)
 
@@ -62,9 +67,12 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 Use the distro `zig` (`/usr/bin/zig` on this machine). The official 0.16.0
 tarball's LLD rejects GCC 16's `.sframe` relocations in `crt1.o`.
 
-After the window shows the padded column (header, expanding body, and right-aligned hover-1
-footer), the process sits in a sleeping poll (`ps -o state,wchan -p <pid>`). Resize lays the
-column out again and paints. Closing the window exits.
+After the window shows the padded column, the process sits in a sleeping poll
+(`ps -o state,wchan -p <pid>`). Moving the pointer lightens the panel under it.
+Pressing darkens that panel. A resize keeps the highlight on whatever face is now
+under the last pointer position. The seat is bound at `wl_seat` version 1 and the
+client does not call `set_cursor`; the compositor keeps the previous cursor image.
+Closing the window exits.
 
 ## Tests, wasm, and the browser host
 
@@ -78,4 +86,8 @@ zig build serve
 
 `zig build serve` starts a localhost static server for `index.html`, `shell.js`,
 and the wasm module. WebGPU is unavailable on `file://`. The page shows the same
-column. The frame scheduler is idle after the first paint and wakes once on resize.
+column. Pointer coordinates are multiplied by `devicePixelRatio` so they land in
+the same space `resize` currently uses for layout. `requestAnimationFrame` runs
+for a hit change or a resize, and it stays idle while the pointer moves inside
+one panel. A press dragged off the canvas releases, because the canvas captures
+the pointer.
