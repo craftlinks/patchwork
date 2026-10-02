@@ -49,18 +49,34 @@
 //!
 //! ## 5. Graphics Pipeline Integration
 //! In `run()`:
-//! - Allocates `DrawList` and `UploadCursor` on the thread's stack.
+//! - State contains `DrawList` and `UploadCursor` on the thread's stack.
 //! - Initializes `Gpu` via `gpu.create(display, wl_surface)`.
-//! - Populates the demo scene (`draw.demo(&state.list)`): seven SDF box faces
-//!   (sharp, rounded, pill, three hover steps, one translucent rect).
-//! - In `present_if_dirty()`: fills `PresentHeader`, transfers modified buffers, draws instanced
-//!   quads, and marks the frame clean before returning to the kernel sleep in `poll`.
+//! - No hard-coded demo scene is populated on startup: `draw.demo` does not exist.
+//!   Instead, `state.list` remains completely empty (`state.list.count == 0`) and
+//!   `state.frame.relayout` is initialized to `true`.
+//! - In `loop()`, incoming configure events trigger `ack_if_needed()`, which calls
+//!   `frame.apply_configure(pending_width, pending_height)`.
+//! - In `present_if_dirty()`:
+//!   - Evaluates `frame.redraw`. Returns early if clean or unconfigured (`width_px == 0`).
+//!   - Evaluates `frame.relayout`. Only while `relayout` is set does it invoke
+//!     `turtle.paint_column(&state.list, ...)` to lay out the column and populate instance
+//!     rectangles, followed by `state.frame.mark_laid_out()`.
+//!   - Preserves instance list across scale changes: When a scale change occurs (via
+//!     `surface_preferred_scale`), `frame.apply_scale()` sets `redraw = true` while leaving
+//!     `relayout = false`. `present_if_dirty()` skips `turtle.paint_column()`, reusing the
+//!     existing draw list and avoiding an unnecessary revision bump.
+//!   - Calls `set_buffer_scale()` to inform Wayland of the framebuffer scale factor.
+//!   - Fills `PresentHeader` with upload flags computed by `UploadCursor.flags()`.
+//!   - Invokes `gpu.present()` to transfer modified buffers and draw instanced quads.
+//!   - Calls `cursor.mark()` and `state.frame.mark_presented()`, returning to kernel sleep
+//!     in `poll(-1)` where the process consumes 0.0% CPU until the compositor writes bytes.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
+const turtle = @import("turtle.zig");
 const xdg = @import("xdg_shell.zig");
 
 /// Maximum number of advertised compositor globals to scan during registry roundtrip.
@@ -236,15 +252,21 @@ const toplevel_listener: xdg.XdgToplevelListener = .{
     .close = toplevel_close,
 };
 
-/// Orchestrates the entire lifecycle: connects, initializes window and GPU, and runs loop.
+/// Orchestrates the entire Wayland application lifecycle:
+/// 1. Connects to the Wayland display socket and binds core globals
+///    (`wl_compositor`, `xdg_wm_base`).
+/// 2. Creates the surface and desktop window (`xdg_surface`, `xdg_toplevel`).
+/// 3. Initializes the native WebGPU rendering context (`gpu.Gpu`).
+/// 4. Confirms initial state: draw list is empty (`state.list.count == 0`) and
+///    `state.frame.relayout` is true.
+/// 5. Enters the blocking event loop (`loop`).
 pub fn run(state: *State) !void {
     try connect(state);
     try bind_globals(state);
     try create_toplevel(state);
     try create_device(state);
-    draw.demo(&state.list);
-    assert(state.list.count == draw.demo_count);
-    assert(state.list.revision == draw.demo_count);
+    assert(state.list.count == 0);
+    assert(state.frame.relayout);
     try loop(state);
 }
 
@@ -329,7 +351,18 @@ fn ack_if_needed(state: *State) void {
     assert(!state.ack_pending);
 }
 
-/// Renders and presents a frame if the dirty flag is set.
+/// Renders and presents a frame if the dirty flag (`redraw`) is set.
+///
+/// Execution Lifecycle:
+/// 1. Early-out if `!frame.redraw` or if window dimensions are unconfigured (`width_px == 0`).
+/// 2. Conditional layout: If `frame.relayout` is true (set on startup or after dimension
+///    changes), calls `turtle.paint_column` to walk the column and populate `state.list`, then
+///    clears the flag via `frame.mark_laid_out()`. If only scale changed, this step is bypassed.
+/// 3. Informs the compositor of buffer scaling via `wl_surface.set_buffer_scale`.
+/// 4. Constructs a `PresentHeader` on the stack with upload flags from `state.cursor.flags()`.
+/// 5. Transfers modified GPU buffers and draws instances via `gpu.present()`.
+/// 6. Updates `state.cursor.mark()` and clears presentation dirtying via
+///    `state.frame.mark_presented()`.
 fn present_if_dirty(state: *State) !void {
     if (!state.frame.redraw) {
         return;
@@ -338,6 +371,11 @@ fn present_if_dirty(state: *State) !void {
         assert(state.frame.height_px == 0);
         return;
     }
+    if (state.frame.relayout) {
+        turtle.paint_column(&state.list, state.frame.width_logical, state.frame.height_logical);
+        state.frame.mark_laid_out();
+    }
+    assert(!state.frame.relayout);
     set_buffer_scale(state);
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{

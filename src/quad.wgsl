@@ -19,7 +19,7 @@
 //      only once per instance index in [0..N-1].
 //
 // 2. **Vertex Shader (`@vertex fn vs_main`):**
-//    Invoked $6 \times N$ times by the GPU execution units (e.g. SIMD warps/wavefronts).
+//    Invoked 6 * N times by the GPU execution units (e.g. SIMD warps/wavefronts).
 //    For each vertex, it performs:
 //    - Local Quad Expansion: Scales the [0..1] unit quad corner to pixel dimensions (rect.zw)
 //      and offsets it by the instance screen position (rect.xy).
@@ -32,8 +32,8 @@
 // 3. **Primitive Assembly and Clipping:**
 //    The GPU groups triples of vertices into triangles. Triangles outside the clip frustum
 //    are discarded; triangles intersecting the clip boundary are geometrically clipped.
-//    Perspective division ($x/w, y/w, z/w$) is performed by hardware to produce Normalized
-//    Device Coordinates (NDC) in the $[-1, 1]$ cube.
+//    Perspective division (x/w, y/w, z/w) is performed by hardware to produce Normalized
+//    Device Coordinates (NDC) in the [-1, 1] cube.
 //
 // 4. **Rasterization:**
 //    The rasterizer tests which physical display pixels (fragments) fall within each triangle face.

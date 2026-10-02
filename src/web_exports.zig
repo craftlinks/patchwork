@@ -63,10 +63,22 @@
 //! This burns CPU and GPU power even when displaying static documents or idle user interfaces.
 //!
 //! In Patchwork:
+//! - `start()` initializes state (`frame`, `list`, `cursor`) and leaves the draw list empty
+//!   (`state.list.count == 0`), setting `relayout = true`.
+//! - When the canvas attaches to the DOM, `web/shell.js` calls `resize(width_px, height_px)` with
+//!   actual physical dimensions, configuring the logical coordinate space and setting `redraw`.
 //! - `resize()` and `start()` return a `u32` dirty flag (1 if dirty, 0 if clean).
 //! - `web/shell.js` schedules a `requestAnimationFrame` **only** when the dirty flag is 1.
-//! - `tick()` renders the frame and resets `frame.redraw = false`.
-//! - Subsequent animation frames are halted until a window resize or state mutation.
+//! - In `tick()`:
+//!   - Evaluates `frame.redraw`. If clean or dimensions are zero, returns 0 immediately.
+//!   - Evaluates `frame.relayout`. When `relayout` is set, invokes `turtle.paint_column` before
+//!     `fill_header`, walking the column hierarchy and populating instance rectangles, then
+//!     clears `relayout` via `frame.mark_laid_out()`. If only scale changed, this layout walk
+//!     is completely bypassed, keeping the instance list and its revision intact.
+//!   - Constructs `PresentHeader` on the stack and populates it via `draw.fill_header`.
+//!   - Invokes `present_js` across the FFI boundary, updates `cursor.mark()`, and clears
+//!     `frame.redraw` via `state.frame.mark_presented()`.
+//! - Subsequent animation frames are halted until a window resize or state mutation occurs.
 //! - When idle, the browser tab consumes 0.0% CPU and 0.0% GPU cycles.
 
 const std = @import("std");
@@ -74,6 +86,7 @@ const assert = std.debug.assert;
 const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
+const turtle = @import("turtle.zig");
 
 /// Global application state for the WebAssembly runtime.
 /// Statically allocated in Wasm linear memory at startup (BSS segment).
@@ -127,16 +140,22 @@ export fn instance_stride() u32 {
     return draw.instance_stride;
 }
 
-/// Initializes the application state and populates the demo draw list.
+/// Initializes the application state and leaves the draw list empty.
+///
 /// Called once by JavaScript after the WebGPU pipeline is compiled.
-/// Returns 1 if the first frame needs rendering, or 0 if clean.
+/// Unlike static scenes, this does not populate instances during startup; `state.list.count`
+/// remains 0 and `state.frame.relayout` is initialized to true.
+/// The initial layout walk is deferred to `tick`, after `resize` has configured the true
+/// canvas dimensions.
+///
+/// Returns 1 if a frame should be scheduled via `requestAnimationFrame`, or 0 if clean.
 export fn start() u32 {
     state.frame = frame.Frame.init();
     state.list = draw.DrawList.init();
     state.cursor = draw.UploadCursor.init();
-    draw.demo(&state.list);
     assert(state.frame.running);
-    assert(state.list.count == draw.demo_count);
+    assert(state.frame.relayout);
+    assert(state.list.count == 0);
     return dirty_flag();
 }
 
@@ -150,9 +169,21 @@ export fn resize(width_px: u32, height_px: u32) u32 {
     return dirty_flag();
 }
 
-/// Renders a frame if the dirty flag is set.
-/// Constructs the `PresentHeader` on the stack and invokes `present_js`.
-/// After presentation, clears the redraw flag so no further frames are scheduled.
+/// Renders a frame if the dirty flag (`redraw`) is set.
+///
+/// Execution Lifecycle:
+/// 1. Verifies that `frame.redraw` is true and physical dimensions are non-zero (`width_px != 0`).
+/// 2. If `frame.relayout` is set, walks the column via `turtle.paint_column` from the logical
+///    window dimensions before filling the header, then clears the flag via
+///    `frame.mark_laid_out()`. A scale-only frame leaves `relayout` false and leaves the
+///    instance list untouched.
+/// 3. Constructs `draw.PresentHeader` on the call stack and populates it via `draw.fill_header`.
+/// 4. Synchronously invokes `present_js` across the FFI boundary via `gpu.present`.
+/// 5. Records uploaded revision in `state.cursor.mark` and resets `frame.redraw` via
+///    `state.frame.mark_presented()`.
+///
+/// Returns 0 to inform JavaScript that the frame is clean and no further `requestAnimationFrame`
+/// loop should be scheduled.
 export fn tick() u32 {
     assert(state.frame.running);
     if (!state.frame.redraw) {
@@ -161,6 +192,11 @@ export fn tick() u32 {
     if (state.frame.width_px == 0) {
         return 0;
     }
+    if (state.frame.relayout) {
+        turtle.paint_column(&state.list, state.frame.width_logical, state.frame.height_logical);
+        state.frame.mark_laid_out();
+    }
+    assert(!state.frame.relayout);
     // The header lives on this stack until present_js returns, so JS can read it safely.
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{

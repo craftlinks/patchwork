@@ -23,15 +23,47 @@
 //! - **Scale Factor (`scale`):** An integer multiplier (e.g. 1 on standard displays, 2 on 4K).
 //! - **Physical Pixels (`width_px`, `height_px`):** The actual pixel resolution of the GPU
 //!   framebuffer texture:
-//!   $$\text{Physical Pixels} = \text{Logical Pixels} \times \text{Scale}$$
+//!   `Physical Pixels = Logical Pixels * Scale`
 //!
 //! ## 3. Damage and Redraw Pacing
 //! Every GPU draw call and buffer presentation consumes energy. To maintain 0% CPU and low
-//! GPU power while idle, `Frame` tracks a single `redraw` flag:
-//! - Setting a new size or scale sets `redraw = true`.
-//! - If the compositor sends a duplicate configure event with identical dimensions, `redraw`
-//!   remains `false`, preventing redundant rendering.
-//! - Once presented, `mark_presented()` resets `redraw = false`.
+//! GPU power while idle, `Frame` decouples presentation dirtying from layout dirtying using
+//! two distinct lifecycle flags: `redraw` and `relayout`.
+//!
+//! ### The `redraw` Flag (Presentation Dirty)
+//! - **Lifecycle:** `init()` sets `redraw = true`. When the display server sends a configure
+//!   event with altered dimensions, `apply_configure()` sets `redraw = true`. When the window
+//!   moves between monitors of different pixel density, `apply_scale()` sets `redraw = true`
+//!   so the framebuffer texture is resized to match the new physical resolution. A duplicate
+//!   configure with identical dimensions leaves `redraw` unchanged.
+//! - **Clearance:** `mark_presented()` resets `redraw = false` immediately after presentation.
+//!
+//! ### The `relayout` Flag (Layout Dirty)
+//! - **Lifecycle:** `init()` sets `relayout = true` because the initial frame must calculate
+//!   child geometry and populate the draw list. A changed configure event sets `relayout = true`
+//!   via `apply_configure()`, signaling that `turtle.paint_column()` must re-walk the column.
+//! - **Preservation Across Scale Changes:** Crucially, `apply_scale()` does NOT set `relayout`.
+//!   Logical UI dimensions are invariant to display scale; only the physical framebuffer size
+//!   changes. If a scale change re-ran layout, `turtle.paint_column()` would clear the
+//!   `DrawList` and bump `DrawList.revision`. This revision bump would trick `UploadCursor.flags()`
+//!   into unnecessarily re-uploading the 256-instance GPU vertex buffer (`flag_instances`).
+//!   Because `relayout` remains false, a scale-only present reuses the existing instance list
+//!   in place without rebuilding it, updating only the projection uniform (`flag_uniform`).
+//! - **Clearance:** `mark_laid_out()` resets `relayout = false` immediately after
+//!   `turtle.paint_column()` finishes populating the draw list. A same-size configure leaves
+//!   a cleared `relayout` cleared.
+//!
+//! ### Flag Transition Matrix
+//! ```text
+//! Event                       redraw   relayout   Instance list rebuilt?
+//! ----------------------------------------------------------------------
+//! Frame.init()                true     true       Yes (first frame)
+//! apply_configure (changed)   true     true       Yes (new logical bounds)
+//! apply_configure (identical) clean    clean      No
+//! apply_scale (changed scale) true     false      No (reuses instances)
+//! mark_laid_out()             -        false      (clears layout dirty)
+//! mark_presented()            false    -          (clears presentation dirty)
+//! ```
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -50,22 +82,34 @@ pub const scale_max: u32 = 16;
 
 /// State container tracking window dimensions, scaling, and frame dirtiness.
 pub const Frame = struct {
+    /// True while the window lifecycle is active; set to false by `close()`.
     running: bool,
+    /// Presentation dirty flag: true when swapchain presentation is required.
     redraw: bool,
+    /// Layout dirty flag: true when logical bounds changed and child walks must be re-run.
+    /// Crucially, scale changes do not set this flag, preserving instances without churn.
+    relayout: bool,
+    /// Current window width in UI logical pixels.
     width_logical: u32,
+    /// Current window height in UI logical pixels.
     height_logical: u32,
+    /// Display buffer scale factor (e.g. 1 for standard DPI, 2 for HiDPI/Retina).
     scale: u32,
+    /// Physical framebuffer width in device pixels (`width_logical * scale`).
     width_px: u32,
+    /// Physical framebuffer height in device pixels (`height_logical * scale`).
     height_px: u32,
 
     pub const ScaleError = error{ScaleZero};
 
-    /// Initializes a newly created frame.
-    /// `running` and `redraw` start as `true` because the initial frame must be drawn.
+    /// Initializes a newly created frame state container.
+    /// `running`, `redraw`, and `relayout` initialize to `true` because the initial frame
+    /// must compute layout and present to the display.
     pub fn init() Frame {
         const frame: Frame = .{
             .running = true,
             .redraw = true,
+            .relayout = true,
             .width_logical = 0,
             .height_logical = 0,
             .scale = 1,
@@ -74,12 +118,15 @@ pub const Frame = struct {
         };
         assert(frame.running);
         assert(frame.redraw);
+        assert(frame.relayout);
         return frame;
     }
 
     /// Applies a configure event from the window system (e.g. Wayland configure or browser resize).
     /// If the compositor provides (0, 0), substitutes `width_default` and `height_default`.
     /// If the dimensions are identical to the current configuration, returns without dirtying.
+    /// If dimensions changed, updates logical and physical sizes and sets both `redraw = true`
+    /// and `relayout = true`.
     pub fn apply_configure(self: *Frame, width_logical: u32, height_logical: u32) void {
         assert(self.running);
         const resolved = resolve_logical(width_logical, height_logical);
@@ -95,12 +142,17 @@ pub const Frame = struct {
         self.height_logical = resolved.height;
         self.refresh_pixels();
         self.redraw = true;
+        self.relayout = true;
         assert(self.width_px != 0);
         assert(self.height_px != 0);
+        assert(self.relayout);
     }
 
     /// Updates the integer display scale factor (e.g. 1 -> 2 when moved to a HiDPI screen).
-    /// Recomputes physical pixel dimensions and sets `redraw = true`.
+    /// Clamps scale to `scale_max` and recomputes physical pixel dimensions.
+    /// Sets `redraw = true` so the swapchain texture is resized and presented.
+    /// Leaves `relayout` untouched because logical coordinates and instance border boxes are
+    /// unchanged, avoiding unnecessary draw list rebuilds.
     pub fn apply_scale(self: *Frame, scale: u32) ScaleError!void {
         assert(self.running);
         if (scale == 0) {
@@ -122,7 +174,17 @@ pub const Frame = struct {
         assert(self.width_px != 0);
     }
 
-    /// Marks the current frame as presented to the display, clearing the dirty flag.
+    /// Clears `relayout = false` after the turtle has written border rects for this logical size.
+    /// Asserts that `relayout` was previously true. A scale-only present must never call this.
+    pub fn mark_laid_out(self: *Frame) void {
+        assert(self.running);
+        assert(self.relayout);
+        self.relayout = false;
+        assert(!self.relayout);
+    }
+
+    /// Marks the current frame as presented to the display, clearing `redraw = false`.
+    /// Asserts that `redraw` was previously true.
     pub fn mark_presented(self: *Frame) void {
         assert(self.running);
         assert(self.redraw);
@@ -192,12 +254,15 @@ fn pixel_size(logical: u32, scale: u32) u32 {
     return pixels;
 }
 
+// Verifies that a newly initialized frame starts in running state with redraw and relayout set.
 test "initial frame is dirty and running" {
     const frame = Frame.init();
     try std.testing.expect(frame.redraw);
+    try std.testing.expect(frame.relayout);
     try std.testing.expect(frame.running);
 }
 
+// Verifies that mark_presented clears redraw while leaving the frame running.
 test "a successful present leaves the frame clean" {
     var frame = Frame.init();
     frame.mark_presented();
@@ -205,6 +270,7 @@ test "a successful present leaves the frame clean" {
     try std.testing.expect(frame.running);
 }
 
+// Verifies that a configure event with identical dimensions does not set redraw or relayout.
 test "a same size does not dirty a clean frame" {
     var frame = Frame.init();
     frame.apply_configure(800, 600);
@@ -214,6 +280,7 @@ test "a same size does not dirty a clean frame" {
     try std.testing.expectEqual(@as(u32, 800), frame.width_px);
 }
 
+// Verifies that a configure event with changed dimensions sets redraw and updates pixel size.
 test "a new size dirties the frame" {
     var frame = Frame.init();
     frame.apply_configure(800, 600);
@@ -223,6 +290,7 @@ test "a new size dirties the frame" {
     try std.testing.expectEqual(@as(u32, 1024), frame.width_px);
 }
 
+// Verifies that apply_scale sets redraw and recalculates physical pixel dimensions.
 test "a new scale dirties the frame" {
     var frame = Frame.init();
     frame.apply_configure(800, 600);
@@ -232,12 +300,47 @@ test "a new scale dirties the frame" {
     try std.testing.expectEqual(@as(u32, 1600), frame.width_px);
 }
 
+// Verifies that apply_configure with changed dimensions sets both relayout and redraw.
+test "a new size requests layout" {
+    var frame = Frame.init();
+    frame.apply_configure(800, 600);
+    frame.mark_laid_out();
+    frame.mark_presented();
+    frame.apply_configure(1024, 768);
+    try std.testing.expect(frame.relayout);
+    try std.testing.expect(frame.redraw);
+}
+
+// Verifies the core invariant: apply_scale sets redraw but does NOT set relayout.
+test "a scale change does not request layout" {
+    var frame = Frame.init();
+    frame.apply_configure(800, 600);
+    frame.mark_laid_out();
+    frame.mark_presented();
+    try frame.apply_scale(2);
+    try std.testing.expect(frame.redraw);
+    try std.testing.expect(!frame.relayout);
+}
+
+// Verifies that an identical configure event leaves both relayout and redraw clean.
+test "a same size leaves layout clear" {
+    var frame = Frame.init();
+    frame.apply_configure(800, 600);
+    frame.mark_laid_out();
+    frame.mark_presented();
+    frame.apply_configure(800, 600);
+    try std.testing.expect(!frame.relayout);
+    try std.testing.expect(!frame.redraw);
+}
+
+// Verifies that close clears the running state.
 test "close clears running" {
     var frame = Frame.init();
     frame.close();
     try std.testing.expect(!frame.running);
 }
 
+// Verifies that compositor zero-size hints are resolved to default logical dimensions.
 test "a zero configure is replaced by the default size" {
     var frame = Frame.init();
     frame.apply_configure(0, 0);
@@ -247,6 +350,7 @@ test "a zero configure is replaced by the default size" {
     try std.testing.expect(frame.redraw);
 }
 
+// Verifies that a scale factor of 0 is rejected with ScaleError.ScaleZero.
 test "scale zero is rejected" {
     var frame = Frame.init();
     try std.testing.expectError(error.ScaleZero, frame.apply_scale(0));
