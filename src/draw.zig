@@ -149,35 +149,54 @@
 //! older button shader multiplied the radius by 2 as a compatibility clamp. This field uses
 //! the geometric radius, so a value of 16 is a 16-pixel corner.
 //!
-//! ### Hover and down
-//! `hover` is a weight in `[0, 1]` toward white. `down` is a weight in `[0, 1]` toward
-//! black, applied after the lighten. The shader computes
-//! `mix(mix(fill.rgb, white, hover), black, down)` and leaves the fill alpha unchanged.
-//! Weight 0 leaves that stage at the incoming color. Weight 1 replaces it with white or
-//! black. A weight outside `[0, 1]` would extrapolate, so `append` rejects it. The stored
-//! fill stays the resting color. `hit.zig` writes both weights. `set_state` bumps
-//! `revision` only when a stored weight changes, so a resting pointer uploads nothing.
+//! ### Hover and Down Shader Blend Weights
+//! `hover` is a mix weight in `[0.0, 1.0]` toward white (`vec3<f32>(1.0)`).
+//! `down` is a mix weight in `[0.0, 1.0]` toward black (`vec3<f32>(0.0)`), applied after hover.
+//! In `quad.wgsl`, the fragment shader computes:
+//! ```text
+//! let lightened = mix(fill.rgb, vec3<f32>(1.0), in.shape.y); // shape.y is hover
+//! let final_rgb = mix(lightened, vec3<f32>(0.0), in.shape.z); // shape.z is down
+//! ```
+//! The shader alpha remains strictly `fill.a * coverage`.
 //!
-//! ### CPU twin and shader paint
-//! `sdf_box` is the CPU twin of the WGSL function. The point is in the same local logical
-//! pixels the vertex shader interpolates (`unit * size`, origin at the top-left). Tests lock
-//! the field without a GPU: center, sharp edge, outside corner, a corner that falls outside
-//! once the radius grows, and disc saturation. The shader owns the paint: analytic coverage
-//! from `fwidth`, then the hover mix. See the guide at the top of `src/quad.wgsl`.
+//! #### Widget Ownership and Weight Scaling:
+//! Widgets own continuous `Animator` instances in `[0.0, 1.0]`. When writing instance records:
+//! - Hover weight: `instance.hover = animator.value * hover_lighten` (`0.18`).
+//! - Down weight: `instance.down = animator.value * down_darken` (`0.30`).
+//! The shader is completely unchanged and unaware of widgets; it receives raw 48-byte instances.
+//! Direct writing of unscaled `1.0` weights would wash the fill completely out to pure white or black.
+//! Weights outside `[0.0, 1.0]` would extrapolate beyond the color boundaries, so `append` rejects them.
+//! `set_state` updates stored weights in place and bumps `revision` only when values differ, so resting
+//! pointers upload zero bytes to the GPU.
 //!
-//! ### Who writes the rectangles
-//! This file does not place the scene. Scene construction and layout are handled by
-//! `turtle.paint_column` in `src/turtle.zig`, which replaces the hardcoded seven-face demo
-//! from Step 3. Whenever logical window dimensions change (indicated by `Frame.relayout`),
-//! `turtle.paint_column` clears the draw list and appends the full-window column followed
-//! by each placed child panel whose dimensions are strictly positive.
+//! ### CPU Twin and Shader Paint
+//! `sdf_box` is the exact CPU mathematical twin of the WGSL function. Coordinates are in the same
+//! local logical pixels that the vertex shader interpolates (`unit * size`, origin at top-left).
+//! Automated tests verify the CPU field without requiring a GPU: center, sharp edge midpoint,
+//! exterior corner, corner sample pushed outside by a grown radius, and disc saturation.
+//! The WGSL fragment shader handles screen-space antialiasing via `fwidth` coverage calculation.
 //!
-//! The draw list capacity remains statically bounded at `instance_cap` (256). Radius,
-//! hover, and down remain packed fields of `Instance`. The demo column paints every panel
-//! at hover 0 and down 0. `hit.apply` writes the weights after each layout walk, so a
-//! resize does not leave a resting pointer on an unlit panel. Child capacity is
-//! `child_cap = instance_cap - 1` (255), guaranteeing that the
-//! root column rectangle (1 slot) plus all children never exceed the 256-instance limit.
+//! ### Who Writes the Rectangles
+//! This module (`draw.zig`) provides graphics primitives, buffer layouts, and distance fields; it
+//! does NOT place scene geometry or widgets.
+//! `scene.Scene.draw` clears the `DrawList`, appends the root column background instance, and iterates
+//! through its retained widgets so each widget appends its own visual faces (`Panel` and `Button` append
+//! 1 instance; `Slider` appends up to 3 instances: track, fill, and knob).
+//!
+//! That rebuild executes ONLY when `scene.dirty` is set:
+//! 1. Window layout changes (`Frame.relayout` is true),
+//! 2. User input updates widget state (mouse enter/leave, button press/release, slider drag), or
+//! 3. An in-flight animator steps by `dt_ms` and alters an animated weight.
+//!
+//! A scale-only present (e.g. moving between monitors) leaves `scene.dirty` false. As a result,
+//! `UploadCursor.flags` returns `flag_uniform` only, and the 256-instance GPU vertex buffer is NOT
+//! re-uploaded.
+//!
+//! Capacity invariant: `1 + widget_cap * 3 <= instance_cap` (1 + 32 * 3 = 97 <= 256), guaranteeing
+//! that the full scene never exceeds the static instance capacity.
+//!
+//! `contains_box` is the low-level analytic rounded-box point test used across the codebase;
+//! `contains` delegates directly to it so instance hit testing and widget bounds checking can never drift.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -238,7 +257,7 @@ pub const unit_quad: [12]f32 = .{
 /// - Offset 32: `radius` (f32) - Geometric corner radius in logical pixels.
 ///   Oversized values are stored here and clamped inside `sdf_box`.
 /// - Offset 36: `hover` (f32) - Mix weight toward white, range [0, 1].
-///   `hit.apply` writes it. The shader applies it before `down`.
+///   Widgets write `animator.value * hover_lighten`. The shader applies it before `down`.
 /// - Offset 40: `down` (f32) - Mix weight toward black, range [0, 1].
 ///   Applied after the hover lighten. `append` stores the caller's value.
 /// - Offset 44: `pad1` (f32) - Written as 0. It completes the third `vec4`.
@@ -606,41 +625,58 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
     return inside + outside - k;
 }
 
-/// True when `(x, y)` lies inside the rounded face, inclusive of the boundary.
+/// True when `(px, py)` lies inside the rounded rectangle, inclusive of the boundary.
 ///
-/// Coordinate Space & Units:
-/// - `(x, y)`: UI logical pixels, top-left origin, `+X` right, `+Y` down.
-/// - Matched against `(instance.x, instance.y, instance.width, instance.height)` in logical pixels.
-///
-/// Preconditions:
-/// - `instance.width > 0`, `instance.height > 0`, `instance.radius >= 0`.
-///
-/// Two-Phase Hit Detection:
-/// 1. Axis-Aligned Bounding Box (AABB) early rejection: points strictly outside `[x, x + width]`
-///    or `[y, y + height]` return false immediately without distance computation.
-/// 2. Analytic Distance Twin: evaluates `sdf_box` on local coordinates `(x - inst.x, y - inst.y)`.
-///    Boundary test is `dist <= 0.0`, matching WGSL fragment coverage `>= 0.5`.
-///    A corner pixel inside the AABB but outside the rounded boundary returns false.
+/// Coordinate space: UI logical pixels, top-left origin, Y down. `(x, y)` is the
+/// rectangle's top-left. The test rejects the axis-aligned box first, then requires
+/// `sdf_box <= 0`, which matches fragment coverage of at least 0.5 on the boundary.
+/// A corner inside the box but outside the quarter-circle returns false.
+pub fn contains_box(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+    px: f32,
+    py: f32,
+) bool {
+    assert(width > 0);
+    assert(height > 0);
+    assert(radius >= 0);
+    if (px < x) {
+        return false;
+    }
+    if (px > x + width) {
+        return false;
+    }
+    if (py < y) {
+        return false;
+    }
+    if (py > y + height) {
+        return false;
+    }
+    const dist = sdf_box(px - x, py - y, width, height, radius);
+    assert(dist == dist);
+    return dist <= 0;
+}
+
+/// True when `(x, y)` lies inside `instance`'s rounded face, inclusive of the boundary.
+/// Delegates to `contains_box` so a widget rect and an instance of that rect agree.
 pub fn contains(instance: Instance, x: f32, y: f32) bool {
     assert(instance.width > 0);
     assert(instance.height > 0);
     assert(instance.radius >= 0);
-    if (x < instance.x) {
-        return false;
-    }
-    if (x > instance.x + instance.width) {
-        return false;
-    }
-    if (y < instance.y) {
-        return false;
-    }
-    if (y > instance.y + instance.height) {
-        return false;
-    }
-    const local_x = x - instance.x;
-    const local_y = y - instance.y;
-    const dist = sdf_box(local_x, local_y, instance.width, instance.height, instance.radius);
-    return dist <= 0;
+    const hit = contains_box(
+        instance.x,
+        instance.y,
+        instance.width,
+        instance.height,
+        instance.radius,
+        x,
+        y,
+    );
+    assert(instance.pad1 == instance.pad1);
+    return hit;
 }
 
 /// Test construction record. `face` writes `pad1` as 0 so every call site stores
@@ -872,6 +908,8 @@ test "contains accepts the sharp edge and rejects a rounded corner" {
     });
     try std.testing.expect(contains(footer, 1144, 680));
     try std.testing.expect(!contains(footer, 1025, 657));
+    try std.testing.expect(contains_box(1024, 656, 240, 48, 24, 1144, 680));
+    try std.testing.expect(!contains_box(1024, 656, 240, 48, 24, 1025, 657));
 }
 
 test "a full list rejects the next append" {

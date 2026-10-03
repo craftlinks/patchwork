@@ -58,9 +58,10 @@
 //! - Only then is the stack frame popped.
 //! - This achieves zero heap allocation, zero serialization, and zero garbage collection overhead.
 //!
-//! ## 5. Power-Optimal Frame Pacing (0% Idle CPU)
-//! Traditional WebGL/WebGPU applications run a continuous loop with `requestAnimationFrame`.
-//! This burns CPU and GPU power even when displaying static documents or idle user interfaces.
+//! ## 5. Power-Optimal Frame Pacing and Animation Chaining (0% Idle CPU)
+//! Traditional WebGL/WebGPU applications run an unconditional continuous loop with
+//! `requestAnimationFrame`. This burns CPU and GPU power even when displaying static documents
+//! or idle user interfaces.
 //!
 //! In Patchwork:
 //! - `start()` initializes state (`frame`, `list`, `cursor`) and leaves the draw list empty
@@ -69,30 +70,41 @@
 //!   actual physical dimensions, configuring the logical coordinate space and setting `redraw`.
 //! - `resize()` and `start()` return a `u32` dirty flag (1 if dirty, 0 if clean).
 //! - `web/shell.js` schedules a `requestAnimationFrame` **only** when the dirty flag is 1.
-//! - In `tick()`:
-//!   - Evaluates `frame.redraw`. If clean or dimensions are zero, returns 0 immediately.
-//!   - Evaluates `frame.relayout`. When `relayout` is set, invokes `turtle.paint_column` before
-//!     `fill_header`, walking the column hierarchy and populating instance rectangles, then
-//!     clears `relayout` via `frame.mark_laid_out()`. If only scale changed, this layout walk
-//!     is completely bypassed, keeping the instance list and its revision intact.
-//!   - Constructs `PresentHeader` on the stack and populates it via `draw.fill_header`.
-//!   - Invokes `present_js` across the FFI boundary, updates `cursor.mark()`, and clears
-//!     `frame.redraw` via `state.frame.mark_presented()`.
-//! - `pointer_move`, `pointer_button`, and `pointer_leave` apply the hit test immediately
-//!   and return the same dirty flag. `shell.js` schedules a frame only when that flag is 1.
-//!   A pointer moving inside one panel returns 0, so `requestAnimationFrame` stays idle.
-//! - After a relayout, `tick` applies the stored pointer again. `paint_column` writes
-//!   every weight as 0, and a resize would otherwise clear the highlight.
-//! - Subsequent animation frames are halted until a window resize or a hit change.
+//! - `tick(now_ms)` advances `animator.Clock`, feeds the delta to `scene.handle_event`,
+//!   presents if the frame is dirty, and returns 1 while any animator is live.
+//! - `web/shell.js` chains `requestAnimationFrame` strictly while `tick()` returns 1:
+//!   ```javascript
+//!   if (wasm.tick(Math.floor(now)) === 1) {
+//!       schedule();
+//!   }
+//!   ```
+//!   Once every animator settles, `tick()` returns 0 and the animation frame callback loop
+//!   terminates. The first timestamp after idle produces dt 0, so a fade starts on the following
+//!   frame.
+//! - `pointer_move`, `pointer_down`, `pointer_up`, and `pointer_leave` call
+//!   `scene.handle_event` directly and return the dirty flag. Press and release carry
+//!   device-pixel coordinates (`offsetX * devicePixelRatio`).
+//! - Layout runs only when `frame.relayout` is set. `scene.layout` re-dispatches the
+//!   stored pointer, so a resize keeps hover on the widget that still contains it.
+//! - A scale-only present leaves `scene.dirty` false and does not rebuild instances.
 //! - When idle, the browser tab consumes 0.0% CPU and 0.0% GPU cycles.
+//!
+//! ## 6. TigerStyle Invariants
+//! - **Static Allocation:** `State` is statically allocated in Wasm BSS linear memory.
+//!   Zero dynamic memory allocations at runtime.
+//! - **Comptime Consistency:** Hardware buffer byte counts (`quad_bytes`, `uniform_bytes`,
+//!   `instance_stride = 48`) are asserted at compile time.
+//! - **Bounded Operations:** `tick`, `start`, `resize`, and pointer entry points execute in
+//!   bounded O(1) time without unbounded recursion or dynamic reallocation.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const animator = @import("animator.zig");
 const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
-const hit = @import("hit.zig");
-const turtle = @import("turtle.zig");
+const input = @import("input.zig");
+const scene = @import("scene.zig");
 
 /// Global application state for the WebAssembly runtime.
 /// Statically allocated in Wasm linear memory at startup (BSS segment).
@@ -101,15 +113,16 @@ const State = struct {
     frame: frame.Frame,
     list: draw.DrawList,
     cursor: draw.UploadCursor,
-    /// Stored pointer position and button state from browser DOM event listeners.
-    pointer: hit.Pointer,
+    scene: scene.Scene,
+    clock: animator.Clock,
 };
 
 var state: State = .{
     .frame = frame.Frame.init(),
     .list = draw.DrawList.init(),
     .cursor = draw.UploadCursor.init(),
-    .pointer = hit.Pointer.init(),
+    .scene = scene.Scene.init_demo(),
+    .clock = animator.Clock.init(),
 };
 
 /// Returns the memory address of the embedded WGSL shader source code.
@@ -162,11 +175,12 @@ export fn start() u32 {
     state.frame = frame.Frame.init();
     state.list = draw.DrawList.init();
     state.cursor = draw.UploadCursor.init();
-    state.pointer = hit.Pointer.init();
+    state.scene = scene.Scene.init_demo();
+    state.clock = animator.Clock.init();
     assert(state.frame.running);
     assert(state.frame.relayout);
     assert(state.list.count == 0);
-    assert(!state.pointer.inside);
+    assert(!state.scene.live());
     return dirty_flag();
 }
 
@@ -180,73 +194,83 @@ export fn resize(width_px: u32, height_px: u32) u32 {
     return dirty_flag();
 }
 
-/// Updates pointer coordinates in physical/device pixel space and executes hit test.
-///
-/// Coordinate Space & Units:
-/// - `(x, y)`: Device pixels matching the canvas backing store resolution.
-/// - In JavaScript, `shell.js` scales `(event.offsetX * dpr, event.offsetY * dpr)`.
-/// Returns 1 if visual state changed and a `requestAnimationFrame` must be scheduled, or 0 if idle.
+/// Pointer moved. `(x, y)` are device pixels, matching the canvas backing store.
+/// `shell.js` passes `offsetX * devicePixelRatio`. Returns 1 when a frame is owed.
 export fn pointer_move(x: f32, y: f32) u32 {
     assert(state.frame.running);
-    state.pointer.move(x, y);
-    assert(state.pointer.inside);
-    return note_pointer();
+    assert(x == x);
+    return note_event(.{ .pointer_move = .{ .x = x, .y = y } });
 }
 
-/// Updates primary mouse button state (1 = pressed, 0 = released).
-///
-/// Preconditions: `pressed` must be 0 or 1.
-/// Returns 1 if visual state changed and a `requestAnimationFrame` must be scheduled, or 0 if idle.
-export fn pointer_button(pressed: u32) u32 {
+/// Primary button pressed at device-pixel `(x, y)`.
+export fn pointer_down(x: f32, y: f32) u32 {
     assert(state.frame.running);
-    assert(pressed <= 1);
-    state.pointer.button(pressed == 1);
-    assert(state.pointer.down == (pressed == 1));
-    return note_pointer();
+    assert(x == x);
+    return note_event(.{ .pointer_down = .{ .x = x, .y = y } });
 }
 
-/// Signals that the pointer left the canvas element or pointer gesture was cancelled.
-///
-/// Clears `inside = false` and resets `down = false` to guarantee drags do not stick.
-/// Returns 1 if an active hover/press state was cleared and redraw is needed, or 0 if idle.
+/// Primary button released at device-pixel `(x, y)`.
+export fn pointer_up(x: f32, y: f32) u32 {
+    assert(state.frame.running);
+    assert(x == x);
+    return note_event(.{ .pointer_up = .{ .x = x, .y = y } });
+}
+
+/// Pointer left the canvas or the gesture was cancelled. A press in progress
+/// becomes an outside release so capture cannot stick.
 export fn pointer_leave() u32 {
     assert(state.frame.running);
-    state.pointer.leave();
-    assert(!state.pointer.inside);
-    return note_pointer();
+    const flag = note_event(.pointer_leave);
+    assert(!state.scene.pointer.inside);
+    return flag;
 }
 
-/// Renders a frame if the dirty flag (`redraw`) is set.
-///
-/// Execution Lifecycle:
-/// 1. Verifies that `frame.redraw` is true and physical dimensions are non-zero (`width_px != 0`).
-/// 2. If `frame.relayout` is set, walks the column via `turtle.paint_column` from the logical
-///    window dimensions before filling the header, then clears the flag via
-///    `frame.mark_laid_out()`, then `hit.apply` restores weights for the stored pointer.
-///    A scale-only frame leaves `relayout` false and leaves the instance list untouched.
-/// 3. Constructs `draw.PresentHeader` on the call stack and populates it via `draw.fill_header`.
-/// 4. Synchronously invokes `present_js` across the FFI boundary via `gpu.present`.
-/// 5. Records uploaded revision in `state.cursor.mark` and resets `frame.redraw` via
-///    `state.frame.mark_presented()`.
-///
-/// Returns 0 to inform JavaScript that the frame is clean and no further `requestAnimationFrame`
-/// loop should be scheduled.
-export fn tick() u32 {
+/// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1
+/// while any animator is still live so `shell.js` chains `requestAnimationFrame`.
+/// The first sample after idle has dt 0. A settled scene returns 0 and the chain stops.
+export fn tick(now_ms: u32) u32 {
     assert(state.frame.running);
-    if (!state.frame.redraw) {
+    const dt_ms = state.clock.advance(now_ms);
+    if (state.scene.handle_event(.{ .frame = dt_ms })) {
+        state.frame.request_redraw();
+    }
+    present_frame();
+    if (!state.scene.live()) {
+        state.clock.reset();
+        assert(!state.scene.live());
         return 0;
+    }
+    assert(state.scene.live());
+    return 1;
+}
+
+fn note_event(event: input.Event) u32 {
+    if (state.scene.handle_event(event)) {
+        state.frame.request_redraw();
+    }
+    assert(state.frame.running);
+    return dirty_flag();
+}
+
+fn present_frame() void {
+    if (!state.frame.redraw) {
+        assert(!state.frame.redraw);
+        assert(state.frame.running);
+        return;
     }
     if (state.frame.width_px == 0) {
-        return 0;
+        assert(state.frame.height_px == 0);
+        return;
     }
     if (state.frame.relayout) {
-        turtle.paint_column(&state.list, state.frame.width_logical, state.frame.height_logical);
+        state.scene.layout(state.frame.width_logical, state.frame.height_logical);
         state.frame.mark_laid_out();
-        // The walk writes every weight as 0. Apply the stored pointer again so a
-        // resize does not clear a highlight. Redraw is already owed.
-        _ = hit.apply(&state.list, state.pointer);
     }
     assert(!state.frame.relayout);
+    if (state.scene.dirty) {
+        state.scene.draw(&state.list);
+    }
+    assert(!state.scene.dirty);
     // The header lives on this stack until present_js returns, so JS can read it safely.
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{
@@ -266,17 +290,7 @@ export fn tick() u32 {
     state.cursor.mark(&state.list, state.frame.width_logical, state.frame.height_logical);
     state.frame.mark_presented();
     assert(!state.frame.redraw);
-    return 0;
-}
-
-/// Evaluates hit testing against `state.list` and requests redraw if weights changed.
-/// Returns 1 if `state.frame.redraw` is set with valid dimensions, otherwise 0.
-fn note_pointer() u32 {
-    if (hit.apply(&state.list, state.pointer)) {
-        state.frame.request_redraw();
-    }
-    assert(state.frame.running);
-    return dirty_flag();
+    assert(!state.scene.dirty);
 }
 
 /// Helper that checks if a redraw is owed and the window has valid dimensions.

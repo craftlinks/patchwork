@@ -8,8 +8,10 @@
 //! - Statically allocates `DrawList` (256 instances), `UploadCursor`, and `Pointer`.
 //! - Runs the power-optimal blocking Wayland event loop to completion until the window is closed.
 
-const hit = @import("hit.zig");
+const animator = @import("animator.zig");
+const input = @import("input.zig");
 const linux_window = @import("linux_window.zig");
+const scene = @import("scene.zig");
 
 pub fn main() !void {
     var state: linux_window.State = .{
@@ -23,7 +25,22 @@ pub fn main() !void {
         .gpu = undefined,
         .list = .init(),
         .cursor = .init(),
-        .pointer = hit.Pointer.init(),
+        .scene = scene.Scene.init_demo(),
+        .clock = animator.Clock.init(),
+        .queue = input.EventQueue.init(),
+        .last_x = 0,
+        .last_y = 0,
+        .frame_callback = null,
+        .frame_done = false,
+        .frame_time_ms = 0,
+        .present_at_ns = 0,
+        .refresh_ns = linux_window.refresh_ns_initial,
+        .last_callback_ns = 0,
+        .presentation = null,
+        .presentation_clock = 0,
+        .vblank_ns = 0,
+        .vblank_refresh_ns = 0,
+        .feedback_in_flight = 0,
         .seat = null,
         .pointer_proxy = null,
         .configure_serial = 0,

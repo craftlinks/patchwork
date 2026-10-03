@@ -31,10 +31,9 @@
 //! and scroll axis changes). In Patchwork, this is completely unnecessary:
 //! - Our blocking event loop in `linux_window.zig` reads all available socket events in batch
 //!   via `wl_display_dispatch_pending()`.
-//! - Pointer callbacks are pure leaf writers that only record the latest sample onto
-//!   `State.pointer`.
-//! - `sync_pointer()` runs once per loop wake, amortizing dozens of motion events into a single
-//!   hit test and at most one frame presentation.
+//! - Pointer callbacks are pure leaf writers that push `input.Event` records into `State.queue`.
+//! - `sync_input()` runs once per loop wake, draining the event queue and feeding `scene.handle_event()`,
+//!   amortizing motion events into at most one layout/draw pass and presentation.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces: `wl_fixed_t` (24.8)
 //!
@@ -101,17 +100,17 @@
 //!          |     |      Store in state.pointer_proxy
 //!          |     v
 //!          |     PointerListener events stream:
-//!          |       enter  --> hit.Pointer.move(x, y)
-//!          |       motion --> hit.Pointer.move(x, y)
-//!          |       button --> hit.Pointer.button(pressed) (BTN_LEFT only)
-//!          |       leave  --> hit.Pointer.leave() (clears inside and down)
+//!          |       enter  --> push_move(sx, sy) -> queue.push(.pointer_move)
+//!          |       motion --> push_move(sx, sy) -> queue.push(.pointer_move)
+//!          |       button --> queue.push(.pointer_down / .pointer_up) (BTN_LEFT only)
+//!          |       leave  --> queue.push(.pointer_leave)
 //!          |       axis   --> ignored
 //!          |
 //!          +-- NO (Pointer Removed / Unplugged):
 //!                |--> If state.pointer_proxy != null:
 //!                |      wl_seat.destroy_pointer()
 //!                |      state.pointer_proxy = null
-//!                |      state.pointer.leave()
+//!                |      state.queue.push(.pointer_leave)
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI

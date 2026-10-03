@@ -2,108 +2,205 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. What is Wayland?
-//! On modern Linux desktops, the window management system is **Wayland** (replacing legacy X11).
-//! In the Wayland architecture:
-//! - The **Compositor** (e.g. Hyprland, Sway, GNOME Mutter, KDE KWin) acts as the display server.
-//!   It directly controls physical monitors, graphics scanout, and input devices (keyboard, mouse).
-//! - The **Client** (our application) connects to the compositor via a Unix domain socket
-//!   located at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` (typically `/run/user/1000/wayland-0`).
-//! - Unlike X11, Wayland provides no server-side 2D drawing primitives. The client is solely
-//!   responsible for allocating and rendering complete pixel buffers (via WebGPU or shared memory)
-//!   and attaching them to a `wl_surface`.
+//! ## 1. Core Problem & Rationale ("Why")
+//! On modern Linux desktop environments, display serving and window management are governed by
+//! the **Wayland** protocol (superseding legacy X11).
 //!
-//! ## 2. Wayland Discovery and the Registry (`wl_registry`)
-//! When a client first connects, it receives only a raw handle to `wl_display`. To determine what
-//! features and protocols the compositor supports, the client instantiates a `wl_registry`.
-//! The compositor broadcasts available "globals" (e.g. `wl_compositor` version 6, `xdg_wm_base`
-//! version 1). The client inspects interface names and dynamically binds to the required globals.
+//! ### Architectural Principles of Wayland:
+//! - **The Compositor as Authority:** The compositor (e.g. Hyprland, Sway, GNOME Mutter, KDE KWin)
+//!   acts as the display server, directly controlling video outputs, graphics page-flipping,
+//!   and kernel input devices (libinput mice, keyboards, touchpads).
+//! - **Client Pixel Ownership:** The client connects to the compositor via a Unix domain socket
+//!   (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, typically `/run/user/1000/wayland-0`). Unlike X11,
+//!   Wayland provides no server-side drawing primitives; clients render complete pixel buffers
+//!   (via WebGPU or shared memory) and attach them to a `wl_surface`.
+//! - **Compositor-Dictated Sizing:** The compositor—not the client—dictates window sizes through
+//!   asynchronous configure transactions.
 //!
-//! ## 3. Desktop Windows and the `xdg_shell` Protocol
-//! A raw `wl_surface` is an unpositioned rectangular pixel canvas with no window borders or
-//! desktop behavior. To turn it into a standard application window, Wayland uses `xdg_shell`:
-//! - `xdg_wm_base`: The global factory interface for creating desktop surfaces.
-//! - `xdg_surface`: Assigns desktop window roles to a `wl_surface`.
-//! - `xdg_toplevel`: Implements desktop application window semantics (window title, app ID,
-//!   minimize, maximize, interactive resize, and close operations).
-//!
-//! ### The Configure-Acknowledge State Machine:
-//! In Wayland, the compositor—not the client—dictates window sizing:
-//! 1. When the window is mapped or resized, the compositor sends
-//!    `toplevel.configure(width, height)`.
-//! 2. It then sends `xdg_surface.configure(serial)` with a unique 32-bit transaction ID.
-//! 3. The client MUST acknowledge this transaction (`xdg_surface.ack_configure(serial)`) before
-//!    presenting a newly sized framebuffer texture.
-//!
-//! ## 4. The Power-Optimal Blocking Event Loop (0% Idle CPU)
-//! Many GUI frameworks use an unconditional polling loop or timer tick (e.g. `sleep(16ms)`),
-//! which consumes CPU cycles, wakes CPU cores from low-power C-states, and drains laptop batteries.
-//!
-//! Patchwork's event loop implements the libwayland multi-thread reader protocol:
+//! ### The Power-Optimal Blocking Event Loop (0.0% Idle CPU):
+//! Many UI toolkits run continuous rendering loops or use timer ticks (e.g. `sleep(16ms)`), which
+//! wake CPU cores from low-power sleep states, wasting battery and warming devices.
+//! Patchwork implements the libwayland multi-thread reader protocol with an infinite poll sleep:
 //! 1. `wl_display_prepare_read()`: Atomically registers intent to read socket events.
-//! 2. `wl_display_flush()`: Flushes any pending client requests over the Unix socket.
-//! 3. `std.posix.poll(&fds, -1)`: Puts the calling OS thread into an **uninterruptible sleep**
-//!    with timeout `-1` (infinite). The thread consumes 0.0% CPU until compositor writes bytes.
-//! 4. `wl_display_read_events()`: Reads incoming bytes from socket into libwayland buffers.
-//! 5. `wl_display_dispatch_pending()`: Invokes registered C ABI event callbacks.
+//! 2. `wl_display_flush()`: Flushes pending client requests across the Unix socket.
+//! 3. `ppoll` with a null timeout: Puts the OS thread to sleep until the compositor writes.
+//!    The thread consumes exactly 0.0% CPU while idle. A latched commit passes a nanosecond
+//!    timeout instead, so the wake lands on the deadline rather than the next millisecond.
+//! 4. `wl_display_read_events()`: Reads incoming bytes into libwayland's ring buffers in one
+//!    syscall.
+//! 5. `wl_display_dispatch_pending()`: Dispatches registered C ABI event callbacks.
 //!
-//! ### Pointer Event Batching & Amortization:
-//! High-frequency gaming mice and trackpads can generate 1,000+ events per second.
-//! If every `motion` callback executed a CPU hit test and GPU present, the UI thread would
-//! choke and thrash VRAM.
+//! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
-//! Patchwork's event loop decouples input reception from rendering:
+//! ### Coordinate Spaces:
+//! - **UI Logical Pixels:** Screen-space coordinates with origin `(0, 0)` at the top-left, `+X`
+//!   right, and `+Y` down.
+//! - **Physical Device Pixels:** The actual pixel resolution of the GPU swapchain framebuffer
+//!   texture:
+//!   ```text
+//!   width_px  = width_logical  * scale
+//!   height_px = height_logical * scale
+//!   ```
+//!
+//! ### Wayland Signed 24.8 Fixed-Point (`wl_fixed_t`):
+//! - Pointer motion delivered by `wl_pointer` uses 24.8 signed fixed-point integers.
+//! - Conversion to logical pixels:
+//!   ```text
+//!   logical = @as(f32, @floatFromInt(fixed)) / 256.0
+//!   ```
+//! - By Wayland specification, surface coordinates are strictly invariant to `set_buffer_scale`,
+//!   matching the logical pixel frame of `turtle` and `scene`.
+//!
+//! ## 3. Hardware, Spec Limits, and C ABI Layouts
+//!
+//! ### C ABI Callbacks and Listeners:
+//! - `RegistryListener`: 2 function pointers (16 bytes, alignment 8).
+//! - `SurfaceListener`: 4 function pointers (32 bytes, alignment 8).
+//! - `SeatListener`: 1 function pointer (8 bytes, alignment 8). Bound to `wl_seat` version 1.
+//! - `PointerListener`: 5 function pointers (40 bytes, alignment 8). Bound to `wl_pointer` v1.
+//! - `CallbackListener`: 1 function pointer (8 bytes, alignment 8). For `wl_callback` opcode 0.
+//! - `PresentationListener`: 1 function pointer (8 bytes, alignment 8). `wp_presentation.clock_id`.
+//! - `FeedbackListener`: 3 function pointers (24 bytes, alignment 8). Opcodes 0..2 for
+//!   `sync_output`, `presented`, and `discarded`.
+//!
+//! ### Pinned Limits:
+//! - `global_cap = 256`: Maximum compositor globals scanned during registry roundtrip.
+//! - `compositor_version_max = 6`: Pinned maximum version of `wl_compositor`.
+//! - `seat_version = 1`: Guarantees compositor emits opcodes 0..4 only, preventing overrun.
+//! - `wp_presentation` is bound at `min(advertised, 2)`.
+//! - `feedback_in_flight_max = 4`: Most `wp_presentation_feedback` proxies awaiting an answer.
+//!   Steady state is two. A commit that would exceed the bound requests no feedback.
+//! - `present_margin_ns = 3 ms` (3_000_000 ns): Dispatch margin prior to projected display vblank.
+//!   Guarantees the commit completes before Hyprland's ~2 ms pre-vblank latch point.
+//!
+//! ## 4. State Machines & Data Flow
+//!
+//! ### The Strict Main Loop Order:
+//! In `loop()`, the execution order is strictly deterministic:
 //! ```text
-//! Socket Event Batch:       [motion] [motion] [motion] [button]
-//!                             |        |        |        |
-//! dispatch_pending():       Leaf writes update State.pointer (4 memory writes)
-//!                             |
-//! sync_pointer():           hit.apply() runs ONCE for the entire batch
-//!                             |
-//! present_if_dirty():       Uploads modified instances and presents ONCE
+//! 1. ack_if_needed(state)
+//! 2. sync_input(state)
+//! 3. sync_clock(state)
+//! 4. present_if_dirty(state)
+//! 5. wait_for_events(state.display)
 //! ```
-//! Pointer callbacks are leaf writers: they store `x`, `y`, `inside`, and `down` on
-//! `State.pointer` and return immediately. The loop applies that sample once per wake:
-//! `ack_if_needed`, then `sync_pointer`, then `present_if_dirty`, then `wait_for_events`.
-//! Twenty motion events in one dispatch therefore cost one hit test and at most one present.
-//! `wl_pointer.frame` is not bound. The seat is `wl_seat` version 1, so the listener tables
-//! in `wl_seat.zig` match the event opcodes exactly.
 //!
-//! ## 5. Graphics Pipeline Integration
-//! In `run()`:
-//! - State contains `DrawList` and `UploadCursor` on the thread's stack.
-//! - Initializes `Gpu` via `gpu.create(display, wl_surface)`.
-//! - No hard-coded demo scene is populated on startup: `draw.demo` does not exist.
-//!   Instead, `state.list` remains completely empty (`state.list.count == 0`) and
-//!   `state.frame.relayout` is initialized to `true`.
-//! - In `loop()`, incoming configure events trigger `ack_if_needed()`, which calls
-//!   `frame.apply_configure(pending_width, pending_height)`. `sync_pointer` then runs
-//!   `hit.apply` and requests a redraw only when a weight changed.
-//! - In `present_if_dirty()`:
-//!   - Evaluates `frame.redraw`. Returns early if clean or unconfigured (`width_px == 0`).
-//!   - Evaluates `frame.relayout`. Only while `relayout` is set does it invoke
-//!     `turtle.paint_column(&state.list, ...)` to lay out the column and populate instance
-//!     rectangles, followed by `state.frame.mark_laid_out()`. `hit.apply` runs immediately
-//!     after that, so a resize keeps the highlight under the last pointer position.
-//!   - Preserves instance list across scale changes: When a scale change occurs (via
-//!     `surface_preferred_scale`), `frame.apply_scale()` sets `redraw = true` while leaving
-//!     `relayout = false`. `present_if_dirty()` skips `turtle.paint_column()`, reusing the
-//!     existing draw list and avoiding an unnecessary revision bump.
-//!   - Calls `set_buffer_scale()` to inform Wayland of the framebuffer scale factor.
-//!   - Fills `PresentHeader` with upload flags computed by `UploadCursor.flags()`.
-//!   - Invokes `gpu.present()` to transfer modified buffers and draw instanced quads.
-//!   - Calls `cursor.mark()` and `state.frame.mark_presented()`, returning to kernel sleep
-//!     in `poll(-1)` where the process consumes 0.0% CPU until the compositor writes bytes.
+//! ### Loop Stage Details:
+//! 1. **`ack_if_needed` (Configure-Acknowledge State Machine):**
+//!    If an `xdg_surface.configure(serial)` was received, sends `xdg_surface.ack_configure(serial)`
+//!    and updates window dimensions via `frame.apply_configure()`.
+//! 2. **`sync_input` (Pointer Event Draining):**
+//!    Wayland pointer callbacks (`pointer_motion`, `pointer_button`) are pure leaf writers that
+//!    push `input.Event` records into `state.queue: input.EventQueue`. Motion events are coalesced.
+//!    `sync_input` drains this queue once per wake, feeding `scene.handle_event(event)`. If widget
+//!    state changes, it flags `frame.request_redraw()`.
+//! 3. **`sync_clock` (Frame Timing Synchronization):**
+//!    When `wl_callback.done` fires, `frame_done_callback` records the timestamp and sets
+//!    `frame_done`.
+//!    `sync_clock` passes this timestamp to `clock.advance(now_ms)`. If animators move, or any
+//!    animator is still live, it requests a redraw. A `done` with `redraw` set schedules the
+//!    commit 3 ms before the next vblank (`schedule_present`). That vblank is projected from
+//!    the last `wp_presentation.presented` pageflip (`frame.present_deadline`):
+//!    ```text
+//!    earliest = now + margin
+//!    k        = ceil((earliest - anchor) / refresh)   (0 if anchor >= earliest)
+//!    vblank   = anchor + k * refresh
+//!    deadline = vblank - margin
+//!    ```
+//!    Because the anchor is the pageflip itself, whatever the compositor or the driver does
+//!    between pageflip and `done` cannot move the deadline. When no fresh pageflip is known
+//!    (no `wp_presentation`, a non-monotonic compositor clock, or older than `anchor_age_max_ns`
+//!    = 1 s), the `done` receipt is the anchor and the rule reduces to `done + refresh - 3 ms`.
+//!    The period is the one `presented` reports; without one, callback gaps are snapped to a
+//!    known rate and a doubled gap is ignored. The commit draws the pointer sample that has
+//!    arrived by the deadline. If all animators have settled, `clock.reset()` is called.
+//! 4. **`present_if_dirty` (Conditional Presentation & Frame Callback Request):**
+//!    - Early returns if clean (`!frame.redraw`) or unconfigured (`width_px == 0`).
+//!    - If a frame callback is in flight, or the late-latch deadline has not arrived, leaves
+//!      `redraw` set and returns. Layout and the instance rebuild wait for the commit.
+//!    - If `frame.relayout` is true, calls `scene.layout()`, re-dispatching pointer hover.
+//!    - If `scene.dirty` is true, calls `scene.draw()` to rebuild the 48-byte instance list.
+//!    - **Frame Callback Request:** Every commit requests `wl_surface.frame` immediately before
+//!      `gpu.present()`, and only while `state.frame_callback == null`. A `done` with nothing
+//!      dirty arms nothing.
+//!    - **Presentation Feedback Request:** Every commit also requests
+//!      `wp_presentation.feedback` (bounded by `feedback_in_flight_max`). Its `presented`
+//!      event is the pageflip timestamp the next schedule anchors on.
+//!    - Invokes `gpu.present()` and marks cursor and frame clean.
+//! 5. **`wait_for_events` (Sleep):**
+//!    Flushes the socket and blocks in `ppoll`. The timeout is infinite when idle, and the
+//!    remaining nanoseconds until `present_at_ns` while a commit is latched. A millisecond
+//!    `poll` woke up to a jiffy late, which spent the 3 ms margin and missed the latch. A
+//!    timeout cancels the read and presents; it does not call `read_events` on an empty socket.
+//!    After a `done` finds nothing dirty, the process sleeps at 0.0% CPU until the user interacts.
+//!
+//! ### Measured Cadence on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz, 6-8 s hover sweep):
+//! Hyprland latches client content about 2 ms before the vblank and pageflips at the vblank.
+//! Commits dispatched 3 ms before the projected vblank reach the screen in 2.6-2.7 ms (median),
+//! and `wl_callback.done` arrives ~0.35 ms after the pageflip (p95 0.55 ms).
+//!
+//! Pacing mode comparison:
+//! - FIFO (`wp_fifo_v1`): Mesa issues two commits per present (attach, set_barrier, wait_barrier,
+//!   commit, wait_barrier, commit). The held second commit causes every other `done` to arrive
+//!   one refresh late, yielding 105 one-period vs 89 two-period gaps in alternating pairs
+//!   and holes.
+//! - Mailbox (single attach and commit per present): In a 6 s hover sweep, yielded 267 one-period
+//!   vs 3 two-period gaps. In an 8 s hover sweep over 377 presents, yielded 348 one-period vs 7
+//!   two-period gaps, with zero scheduled commits shown later than their targeted vblank.
+//! - Presentation feedback: Observed flags = 0x5 (`vsync | hw_completion`, no `hw_clock`),
+//!   reported refresh = 16666666 ns, and `clock_id` = `CLOCK_MONOTONIC` (1). The 1 s anchor
+//!   freshness limit (`anchor_age_max_ns`) never engaged during continuous sweeps.
+//!
+//! ## 5. Cross-Platform Seams & FFI
+//! - **libwayland-client FFI:** Dynamically linked against `libwayland-client.so.0`. Direct
+//!   C calling convention callbacks (`callconv(.c)`) recover `*State` from user data pointers.
+//! - **wgpu-native Graphics:** Passes `display` and `wl_surface` pointers to `gpu.create()` to
+//!   instantiate an XDG-Wayland WebGPU surface, swapchain, and pipeline.
+//! - **Two clients on one socket:** Mesa's Wayland WSI binds its own `wp_presentation`,
+//!   `wp_fifo_v1`, and `linux-drm-syncobj` globals through a wrapped display on a private
+//!   event queue. Its requests interleave with ours on the wire, which is why the present
+//!   mode matters to our frame callback: under FIFO the driver's barrier-held second commit
+//!   carries our `wl_surface.frame` with it.
+//! - **Clock domain:** `presented` timestamps are compared to `clock_gettime(CLOCK_MONOTONIC)`
+//!   only after `wp_presentation.clock_id` has named that clock (`CLOCK_MONOTONIC` is 1 on Linux).
+//!   Any other clock disables the vblank anchor, causing the scheduler to fall back to `done`.
+//!
+//! ## 6. TigerStyle Invariants
+//! - **Static Allocation:** `State` is stack-allocated in `run()`; zero heap allocations in loop.
+//! - **Split Defensive Assertions:** Assertions check versions, return codes, and bounds.
+//! - **Leaf Callbacks:** Wayland C callbacks perform zero rendering, layout, or animator math.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const animator = @import("animator.zig");
 const draw = @import("draw.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
-const hit = @import("hit.zig");
-const turtle = @import("turtle.zig");
+const input = @import("input.zig");
+const scene = @import("scene.zig");
+const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
+const wp_presentation = @import("wp_presentation.zig");
 const xdg = @import("xdg_shell.zig");
+
+/// First refresh guess, re-exported for `main`. 60 Hz in nanoseconds.
+pub const refresh_ns_initial: u64 = frame.refresh_ns_initial;
+/// Commit this many nanoseconds before the next callback is due, so the sample
+/// includes pointer motion from the rest of the frame. `ppoll` sleeps until that
+/// instant. A millisecond timeout was coarse enough to miss the latch.
+const present_margin_ns: u64 = 3_000_000;
+
+/// Maximum concurrent `wp_presentation_feedback` proxies allowed in flight.
+/// Two is the steady state: the feedback for the frame currently on screen arrives after the
+/// subsequent commit has already been dispatched. If a compositor stops responding, further
+/// feedback requests are suppressed once this bound is reached to guarantee bounded memory.
+const feedback_in_flight_max: u32 = 4;
+
+comptime {
+    assert(refresh_ns_initial > present_margin_ns);
+    assert(present_margin_ns == 3_000_000);
+    assert(feedback_in_flight_max >= 2);
+}
 
 /// Maximum number of advertised compositor globals to scan during registry roundtrip.
 /// Bounded to satisfy TigerStyle limits.
@@ -131,8 +228,44 @@ pub const State = struct {
     gpu: gpu.Gpu,
     list: draw.DrawList,
     cursor: draw.UploadCursor,
-    /// Latest pointer coordinates, surface entry state, and button state.
-    pointer: hit.Pointer,
+    /// Retained widgets. Hover and slider value live here, not on the draw list.
+    scene: scene.Scene,
+    /// Host timestamps from `wl_callback.done`. Reset when no animator is live.
+    clock: animator.Clock,
+    /// Pointer events queued by callbacks and drained once per wake.
+    queue: input.EventQueue,
+    /// Last surface position. Button events carry no coordinates.
+    last_x: f32,
+    last_y: f32,
+    /// In-flight `wl_surface.frame` proxy. Null when no commit is waiting on `done`.
+    frame_callback: ?*wl_callback.WlCallback,
+    /// Set by the `done` listener. `sync_clock` consumes it.
+    frame_done: bool,
+    frame_time_ms: u32,
+    /// Monotonic nanoseconds when the coalesced commit should run. 0 means not waiting.
+    present_at_ns: u64,
+    /// Refresh period in use. From `wp_presentation` when it reports one, otherwise
+    /// measured from frame-callback gaps. The first guess is 60 Hz.
+    refresh_ns: u64,
+    /// Monotonic nanoseconds of the previous `done`. 0 before the first callback.
+    last_callback_ns: u64,
+    /// Bound `wp_presentation` global proxy. Null when the compositor does not advertise the
+    /// protocol; the scheduler then falls back to anchoring commit deadlines on `done` receipts.
+    presentation: ?*wp_presentation.WpPresentation,
+    /// Clock identifier reported by `wp_presentation.clock_id` (opcode 0). Value 0 until the
+    /// event is received. Timestamps are accepted only when
+    /// `presentation_clock == clock_monotonic`.
+    presentation_clock: u32,
+    /// Hardware vertical blanking / pageflip timestamp in nanoseconds on `CLOCK_MONOTONIC`
+    /// from the most recent `presented` event. Value 0 before the first valid presentation.
+    /// The commit deadline in `schedule_present` is projected from this anchor.
+    vblank_ns: u64,
+    /// Fixed output refresh period in nanoseconds reported by `presented`. Value 0 if the
+    /// output has no fixed rate (e.g. VRR). When valid, overrides heuristic callback gap tracking.
+    vblank_refresh_ns: u64,
+    /// Number of active `WpPresentationFeedback` proxies currently awaiting an event.
+    /// Bounded by `feedback_in_flight_max` (4).
+    feedback_in_flight: u32,
     /// Bound Wayland seat proxy (`wl_seat` version 1) from the compositor registry.
     seat: ?*wl_seat.WlSeat,
     /// Active Wayland pointer proxy (`wl_pointer` version 1) instantiated from `seat`.
@@ -296,6 +429,20 @@ const pointer_listener: wl_seat.PointerListener = .{
     .axis = pointer_axis,
 };
 
+const callback_listener: wl_callback.CallbackListener = .{
+    .done = frame_done_callback,
+};
+
+const presentation_listener: wp_presentation.PresentationListener = .{
+    .clock_id = presentation_clock_id,
+};
+
+const feedback_listener: wp_presentation.FeedbackListener = .{
+    .sync_output = feedback_sync_output,
+    .presented = feedback_presented,
+    .discarded = feedback_discarded,
+};
+
 /// Orchestrates the entire Wayland application lifecycle:
 /// 1. Connects to the Wayland display socket and binds core globals
 ///    (`wl_compositor`, `xdg_wm_base`).
@@ -371,30 +518,62 @@ fn create_device(state: *State) !void {
     assert(state.gpu.configured_height == 0);
 }
 
-/// Main blocking event loop: acknowledges configure, applies the pointer once,
-/// renders dirty frames, and sleeps in poll.
+/// Blocking loop. Callbacks only write the queue and the frame-done flag.
+/// Order is ack, drain input, step the clock, present if due, then sleep in poll.
+/// A commit arms `wl_surface.frame`. The next commit waits until just before the
+/// following refresh. A `done` with nothing dirty arms nothing, so poll blocks.
 fn loop(state: *State) !void {
     assert(@intFromPtr(state.display) != 0);
     while (state.frame.running) {
-        // Handle any compositor resize configure.
         ack_if_needed(state);
-        // Hit-test once.
-        sync_pointer(state);
-        // Present once if dirty.
+        sync_input(state);
+        sync_clock(state);
         try present_if_dirty(state);
-        // Sleep until the compositor sends new bytes.
-        try wait_for_events(state.display);
+        try wait_for_events(state);
     }
     assert(!state.frame.running);
 }
 
-/// Evaluates hit testing against `state.list` using the latest stored `state.pointer` sample.
-/// Runs once per event loop wake after flushing socket events, amortizing multiple motion packets.
-/// Requests a frame redraw only if any instance's hover or down weight changed.
-fn sync_pointer(state: *State) void {
-    if (hit.apply(&state.list, state.pointer)) {
+/// Drains the pointer queue once per wake. A press and a release in the same
+/// Wayland batch stay two events, so a click is not collapsed.
+fn sync_input(state: *State) void {
+    assert(state.frame.running);
+    var guard: u32 = 0;
+    while (guard < input.queue_cap) : (guard += 1) {
+        const event = state.queue.pop() orelse break;
+        if (state.scene.handle_event(event)) {
+            state.frame.request_redraw();
+        }
+    }
+    assert(guard <= input.queue_cap);
+    assert(state.frame.running);
+}
+
+/// Steps animators from the frame-callback timestamp. The first sample after
+/// idle has dt 0, so a hover pays one frame before it moves. A live scene
+/// requests another present even when this step did not move a value. If a
+/// redraw is owed, the commit is scheduled just before the next refresh so
+/// pointer motion during the wait is included. A settled scene resets the clock.
+fn sync_clock(state: *State) void {
+    if (!state.frame_done) {
+        assert(!state.frame_done);
+        return;
+    }
+    state.frame_done = false;
+    note_refresh(state);
+    const dt_ms = state.clock.advance(state.frame_time_ms);
+    const changed = state.scene.handle_event(.{ .frame = dt_ms });
+    if (changed) {
         state.frame.request_redraw();
     }
+    if (state.scene.live()) {
+        state.frame.request_redraw();
+    }
+    if (!state.scene.live()) {
+        state.clock.reset();
+    }
+    schedule_present(state);
+    assert(!state.frame_done);
     assert(state.frame.running);
 }
 
@@ -411,35 +590,57 @@ fn ack_if_needed(state: *State) void {
     assert(!state.ack_pending);
 }
 
-/// Renders and presents a frame if the dirty flag (`redraw`) is set.
-///
-/// Execution Lifecycle:
-/// 1. Early-out if `!frame.redraw` or if window dimensions are unconfigured (`width_px == 0`).
-/// 2. Conditional layout: If `frame.relayout` is true (set on startup or after dimension
-///    changes), calls `turtle.paint_column` to walk the column and populate `state.list`, then
-///    clears the flag via `frame.mark_laid_out()`. If only scale changed, this step is bypassed.
-/// 3. Informs the compositor of buffer scaling via `wl_surface.set_buffer_scale`.
-/// 4. Constructs a `PresentHeader` on the stack with upload flags from `state.cursor.flags()`.
-/// 5. Transfers modified GPU buffers and draws instances via `gpu.present()`.
-/// 6. Updates `state.cursor.mark()` and clears presentation dirtying via
-///    `state.frame.mark_presented()`.
+/// Presents when `redraw` is set, no frame callback is in flight, and the
+/// late-latch deadline has arrived. A callback already in flight, or a deadline
+/// still in the future, leaves `redraw` set so pointer motion during the wait
+/// is in the queue when the commit runs. Layout and the instance rebuild run
+/// only on that commit. A scale-only present uploads nothing. Every commit
+/// arms `wl_surface.frame`.
 fn present_if_dirty(state: *State) !void {
     if (!state.frame.redraw) {
+        assert(!state.frame.redraw);
         return;
     }
     if (state.frame.width_px == 0) {
         assert(state.frame.height_px == 0);
         return;
     }
+    if (state.frame_callback != null) {
+        assert(state.frame.redraw);
+        assert(state.frame_callback != null);
+        return;
+    }
+    if (state.present_at_ns != 0) {
+        const now_ns = monotonic_ns();
+        if (now_ns < state.present_at_ns) {
+            assert(state.frame.redraw);
+            return;
+        }
+    }
+    state.present_at_ns = 0;
+    prepare_scene(state);
+    set_buffer_scale(state);
+    // Both requests attach to the next commit, and `gpu.present` is that commit.
+    arm_frame(state);
+    arm_feedback(state);
+    try submit_frame(state);
+}
+
+fn prepare_scene(state: *State) void {
     if (state.frame.relayout) {
-        turtle.paint_column(&state.list, state.frame.width_logical, state.frame.height_logical);
+        state.scene.layout(state.frame.width_logical, state.frame.height_logical);
         state.frame.mark_laid_out();
-        // The walk writes every weight as 0. Apply the stored pointer again so a
-        // resize does not clear a highlight. Redraw is already owed.
-        _ = hit.apply(&state.list, state.pointer);
     }
     assert(!state.frame.relayout);
-    set_buffer_scale(state);
+    if (state.scene.dirty) {
+        state.scene.draw(&state.list);
+    }
+    assert(!state.scene.dirty);
+}
+
+fn submit_frame(state: *State) !void {
+    assert(state.frame.redraw);
+    assert(state.frame.width_px != 0);
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{
         .list = &state.list,
@@ -457,6 +658,54 @@ fn present_if_dirty(state: *State) !void {
     state.cursor.mark(&state.list, state.frame.width_logical, state.frame.height_logical);
     state.frame.mark_presented();
     assert(!state.frame.redraw);
+    assert(!state.scene.dirty);
+}
+
+/// Requests one frame callback before the commit. `wl_surface.frame` takes effect
+/// on the next commit, so this runs before `gpu.present`. `present_if_dirty`
+/// already returned if a callback was in flight; a second one is a bug.
+fn arm_frame(state: *State) void {
+    assert(state.frame_callback == null);
+    assert(state.frame.redraw);
+    const surface = state.surface orelse {
+        assert(state.surface == null);
+        assert(state.frame_callback == null);
+        return;
+    };
+    const callback = wl_callback.request_frame(surface);
+    wl_callback.add_callback_listener(callback, &callback_listener, state);
+    state.frame_callback = callback;
+    assert(state.frame_callback != null);
+    assert(state.frame.redraw);
+}
+
+/// Requests hardware presentation timing feedback for the upcoming surface commit.
+///
+/// Preconditions: `state.frame.redraw` must be true.
+/// Skipped when `state.presentation == null`, `state.surface == null`, or when
+/// `state.feedback_in_flight >= feedback_in_flight_max`. In the skipped case, `schedule_present`
+/// continues projecting from the most recent valid anchor.
+/// When armed, allocates a one-shot `WpPresentationFeedback` proxy, installs `feedback_listener`,
+/// and increments `state.feedback_in_flight` (steady state is 2, ceiling is 4).
+fn arm_feedback(state: *State) void {
+    assert(state.frame.redraw);
+    const presentation = state.presentation orelse {
+        assert(state.presentation == null);
+        return;
+    };
+    const surface = state.surface orelse {
+        assert(state.surface == null);
+        return;
+    };
+    if (state.feedback_in_flight >= feedback_in_flight_max) {
+        assert(state.feedback_in_flight == feedback_in_flight_max);
+        return;
+    }
+    const feedback = wp_presentation.request_feedback(presentation, surface);
+    wp_presentation.add_feedback_listener(feedback, &feedback_listener, state);
+    state.feedback_in_flight += 1;
+    assert(state.feedback_in_flight >= 1);
+    assert(state.feedback_in_flight <= feedback_in_flight_max);
 }
 
 /// Informs the compositor of our buffer scale factor (HiDPI scaling).
@@ -473,8 +722,11 @@ fn set_buffer_scale(state: *State) void {
     _ = wl_proxy_marshal_flags(proxy, 8, null, version, 0, @as(i32, @intCast(scale)));
 }
 
-/// Blocks execution in `poll(-1)` until the Wayland compositor sends events.
-fn wait_for_events(display: *Display) !void {
+/// Blocks until the compositor writes, or until the late-latch deadline.
+/// A timeout cancels the prepared read. `read_events` runs only when the socket
+/// is readable. Idle passes a null timeout to `ppoll`.
+fn wait_for_events(state: *State) !void {
+    const display = state.display;
     assert(@intFromPtr(display) != 0);
     assert(wl_display_get_fd(display) >= 0);
     if (wl_display_prepare_read(display) != 0) {
@@ -489,17 +741,21 @@ fn wait_for_events(display: *Display) !void {
         wl_display_cancel_read(display);
         return error.FlushFailed;
     }
-    // Sleep until the compositor writes. A 0 timeout was the splash demo spin.
+    // Sleep until the compositor writes, or until the latched commit is due.
     var fds = [_]std.posix.pollfd{.{
         .fd = wl_display_get_fd(display),
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
-    // puts the thread into an OS kernel sleep with zero CPU usage.
-    _ = std.posix.poll(fds[0..], -1) catch {
+    const ready = poll_wayland(state, fds[0..]) catch {
         wl_display_cancel_read(display);
         return error.PollFailed;
     };
+    if (ready == 0) {
+        wl_display_cancel_read(display);
+        assert(state.present_at_ns != 0);
+        return;
+    }
     // Poll wakes up because data is ready.
     // Reads all pending bytes off the socket into libwayland's ring buffer in one syscall.
     if (wl_display_read_events(display) != 0) {
@@ -510,6 +766,119 @@ fn wait_for_events(display: *Display) !void {
     if (pending < 0) {
         return error.DispatchFailed;
     }
+}
+
+/// Blocks in `ppoll` until the socket is readable or the latched commit is due.
+/// `EINTR` retries, bounded, without cancelling the prepared read.
+fn poll_wayland(state: *State, fds: []std.posix.pollfd) !usize {
+    assert(fds.len == 1);
+    var guard: u32 = 0;
+    while (guard < 8) : (guard += 1) {
+        var timeout = poll_timeout(state);
+        const ready = std.posix.ppoll(
+            fds,
+            if (timeout) |*spec| spec else null,
+            null,
+        ) catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return error.PollFailed,
+        };
+        assert(ready <= fds.len);
+        return ready;
+    }
+    return error.PollFailed;
+}
+
+/// Remaining time until the latched commit. Null blocks until the compositor writes.
+fn poll_timeout(state: *const State) ?std.posix.timespec {
+    if (state.present_at_ns == 0) {
+        assert(state.present_at_ns == 0);
+        return null;
+    }
+    const now_ns = monotonic_ns();
+    if (now_ns >= state.present_at_ns) {
+        assert(now_ns >= state.present_at_ns);
+        return .{ .sec = 0, .nsec = 0 };
+    }
+    const remain = state.present_at_ns - now_ns;
+    assert(remain <= frame.refresh_ns_max);
+    return .{
+        .sec = @intCast(remain / 1_000_000_000),
+        .nsec = @intCast(remain % 1_000_000_000),
+    };
+}
+
+/// CLOCK_MONOTONIC in nanoseconds. `clock_gettime` of this clock does not fail.
+fn monotonic_ns() u64 {
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+    const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    assert(rc == 0);
+    assert(ts.sec >= 0);
+    assert(ts.nsec >= 0);
+    assert(ts.nsec < 1_000_000_000);
+    const sec_ns = @as(u64, @intCast(ts.sec)) * 1_000_000_000;
+    const now_ns = sec_ns + @as(u64, @intCast(ts.nsec));
+    assert(now_ns >= sec_ns);
+    return now_ns;
+}
+
+/// Updates the active refresh period `state.refresh_ns` in nanoseconds.
+///
+/// Preconditions: `state.refresh_ns` must be within `[frame.refresh_ns_min, frame.refresh_ns_max]`.
+/// Prioritizes `state.vblank_refresh_ns` from hardware presentation feedback when valid
+/// (`frame.refresh_ns_min <= reported <= frame.refresh_ns_max`). If absent or invalid, calculates
+/// the elapsed callback delta `now_ns - state.last_callback_ns` and updates the estimate via
+/// `frame.refresh_after`. Doubled gaps from missed latches are ignored.
+/// Postconditions: `state.refresh_ns` is asserted within valid bounds, and `last_callback_ns`
+/// records `now_ns`.
+fn note_refresh(state: *State) void {
+    const now_ns = monotonic_ns();
+    const reported = state.vblank_refresh_ns;
+    const reported_ok = reported >= frame.refresh_ns_min and reported <= frame.refresh_ns_max;
+    if (reported_ok) {
+        state.refresh_ns = reported;
+    } else if (state.last_callback_ns != 0) {
+        const delta = now_ns - state.last_callback_ns;
+        state.refresh_ns = frame.refresh_after(state.refresh_ns, delta);
+    }
+    state.last_callback_ns = now_ns;
+    assert(state.refresh_ns >= frame.refresh_ns_min);
+    assert(state.refresh_ns <= frame.refresh_ns_max);
+}
+
+/// Computes the monotonic nanosecond deadline `state.present_at_ns` for the upcoming commit.
+///
+/// Preconditions: `!state.frame_done`.
+/// If no redraw is owed (`!state.frame.redraw`), clears `state.present_at_ns = 0` so the event loop
+/// can enter an unbounded sleep.
+/// If a redraw is owed, queries `monotonic_ns()` and checks
+/// `frame.anchor_is_fresh(state.vblank_ns, now_ns)`.
+/// If fresh (age <= `anchor_age_max_ns` = 1 s), projects forward from `state.vblank_ns`. Otherwise,
+/// falls back to anchoring on `now_ns` (the receipt time of `wl_callback.done`).
+/// Calls `frame.present_deadline(anchor_ns, state.refresh_ns, now_ns, present_margin_ns)`
+/// to place the commit `present_margin_ns` (3 ms) before the next achievable vblank.
+/// Cross-references: `frame.present_deadline`.
+fn schedule_present(state: *State) void {
+    assert(!state.frame_done);
+    if (!state.frame.redraw) {
+        state.present_at_ns = 0;
+        assert(state.present_at_ns == 0);
+        return;
+    }
+    assert(state.refresh_ns > present_margin_ns);
+    const now_ns = monotonic_ns();
+    var anchor_ns = now_ns;
+    if (frame.anchor_is_fresh(state.vblank_ns, now_ns)) {
+        anchor_ns = state.vblank_ns;
+    }
+    state.present_at_ns = frame.present_deadline(
+        anchor_ns,
+        state.refresh_ns,
+        now_ns,
+        present_margin_ns,
+    );
+    assert(state.present_at_ns >= now_ns);
+    assert(state.present_at_ns != 0);
 }
 
 /// Instantiates a `wl_registry` proxy for discovering server globals.
@@ -600,6 +969,26 @@ fn registry_global(
     }
     if (std.mem.eql(u8, iface, "xdg_wm_base")) {
         state.xdg_base = @ptrCast(bind_global(live_registry, name, &xdg.xdg_wm_base_interface, 1));
+        return;
+    }
+    if (std.mem.eql(u8, iface, "wp_presentation")) {
+        if (state.presentation != null) {
+            return;
+        }
+        const bind_version = if (version < wp_presentation.presentation_version)
+            version
+        else
+            wp_presentation.presentation_version;
+        const bound = bind_global(
+            live_registry,
+            name,
+            &wp_presentation.wp_presentation_interface,
+            bind_version,
+        );
+        const presentation: *wp_presentation.WpPresentation = @ptrCast(bound);
+        wp_presentation.add_presentation_listener(presentation, &presentation_listener, state);
+        state.presentation = presentation;
+        assert(state.presentation != null);
         return;
     }
     if (std.mem.eql(u8, iface, "wl_seat")) {
@@ -721,9 +1110,9 @@ fn seat_capabilities(
     const pointer = state.pointer_proxy orelse return;
     wl_seat.destroy_pointer(pointer);
     state.pointer_proxy = null;
-    state.pointer.leave();
+    state.queue.push(.pointer_leave);
     assert(state.pointer_proxy == null);
-    assert(!state.pointer.down);
+    assert(state.queue.count >= 1);
 }
 
 /// C ABI callback for `wl_pointer.enter` (opcode 0).
@@ -741,7 +1130,7 @@ fn pointer_enter(
     _ = surface;
     assert(data != null);
     const state: *State = @ptrCast(@alignCast(data.?));
-    move_pointer(state, sx, sy);
+    push_move(state, sx, sy);
 }
 
 /// C ABI callback for `wl_pointer.leave` (opcode 1).
@@ -757,12 +1146,12 @@ fn pointer_leave(
     _ = surface;
     assert(data != null);
     const state: *State = @ptrCast(@alignCast(data.?));
-    state.pointer.leave();
-    assert(!state.pointer.inside);
+    state.queue.push(.pointer_leave);
+    assert(state.queue.count >= 1);
 }
 
 /// C ABI callback for `wl_pointer.motion` (opcode 2).
-/// Updates stored pointer coordinates from 24.8 fixed-point surface coordinates.
+/// Queues the raw point. The commit draws the newest coalesced sample.
 fn pointer_motion(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -774,7 +1163,7 @@ fn pointer_motion(
     _ = time;
     assert(data != null);
     const state: *State = @ptrCast(@alignCast(data.?));
-    move_pointer(state, sx, sy);
+    push_move(state, sx, sy);
 }
 
 /// C ABI callback for `wl_pointer.button` (opcode 3).
@@ -792,12 +1181,19 @@ fn pointer_button(
     _ = time;
     assert(data != null);
     if (button != wl_seat.button_code_left) {
+        assert(button != wl_seat.button_code_left);
         return;
     }
     const state: *State = @ptrCast(@alignCast(data.?));
+    const point: input.Point = .{ .x = state.last_x, .y = state.last_y };
     const pressed = button_state == wl_seat.button_state_pressed;
-    state.pointer.button(pressed);
-    assert(state.pointer.down == pressed);
+    if (pressed) {
+        state.queue.push(.{ .pointer_down = point });
+    } else {
+        state.queue.push(.{ .pointer_up = point });
+    }
+    assert(state.queue.count >= 1);
+    assert(point.x == state.last_x);
 }
 
 /// C ABI callback for `wl_pointer.axis` (opcode 4).
@@ -816,12 +1212,133 @@ fn pointer_axis(
     _ = value;
 }
 
-/// Converts surface-local 24.8 fixed-point coordinates into UI logical pixels and stores them.
-fn move_pointer(state: *State, sx: i32, sy: i32) void {
-    const x = hit.fixed_to_logical(sx);
-    const y = hit.fixed_to_logical(sy);
-    state.pointer.move(x, y);
-    assert(state.pointer.inside);
+/// Queues a move in UI logical pixels and remembers the point for button events.
+fn push_move(state: *State, sx: i32, sy: i32) void {
+    const x = input.fixed_to_logical(sx);
+    const y = input.fixed_to_logical(sy);
+    state.last_x = x;
+    state.last_y = y;
+    state.queue.push(.{ .pointer_move = .{ .x = x, .y = y } });
+    assert(state.last_x == x);
+    assert(state.last_y == y);
+}
+
+/// Leaf writer for `wl_callback.done`. Destroys the one-shot proxy and stores the
+/// millisecond timestamp. `sync_clock` steps the animators after dispatch returns.
+fn frame_done_callback(
+    data: ?*anyopaque,
+    callback: ?*wl_callback.WlCallback,
+    callback_data: u32,
+) callconv(.c) void {
+    assert(data != null);
+    assert(callback != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    const live = callback.?;
+    wl_callback.destroy_callback(live);
+    state.frame_callback = null;
+    state.frame_time_ms = callback_data;
+    state.frame_done = true;
+    assert(state.frame_callback == null);
+    assert(state.frame_done);
+}
+
+/// Leaf C ABI callback for `wp_presentation.clock_id` (opcode 0).
+///
+/// Preconditions: `data != null`.
+/// Emitted once by the compositor following the initial global binding.
+/// Records `clock_id` into `state.presentation_clock`. Presentation timestamps from
+/// `feedback_presented` are accepted only if `clock_id == wp_presentation.clock_monotonic` (1).
+fn presentation_clock_id(
+    data: ?*anyopaque,
+    presentation: ?*wp_presentation.WpPresentation,
+    clock_id: u32,
+) callconv(.c) void {
+    _ = presentation;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    state.presentation_clock = clock_id;
+    assert(state.presentation_clock == clock_id);
+}
+
+/// Leaf C ABI callback for `wp_presentation_feedback.sync_output` (opcode 0).
+///
+/// Identifies the `wl_output` display proxy to which the committed frame was presented.
+/// This application renders into a single window across a primary output; output synchronization
+/// is not tracked, making this a deliberate no-op.
+fn feedback_sync_output(
+    data: ?*anyopaque,
+    feedback: ?*wp_presentation.WpPresentationFeedback,
+    output: ?*anyopaque,
+) callconv(.c) void {
+    _ = data;
+    _ = feedback;
+    _ = output;
+}
+
+/// Leaf C ABI callback for `wp_presentation_feedback.presented` (opcode 1).
+///
+/// Preconditions: `data != null`, `feedback != null`.
+/// Protocol destructor: destroys the one-shot proxy via `wp_presentation.destroy_feedback` and
+/// decrements `state.feedback_in_flight`.
+/// Validates that `state.presentation_clock == wp_presentation.clock_monotonic` (1) and that
+/// `tv_nsec < 1_000_000_000`. If valid, assembles the timestamp via `wp_presentation.presented_ns`
+/// and stores it in `state.vblank_ns`. Also records `state.vblank_refresh_ns = refresh`.
+/// Zero `refresh` indicates a variable refresh rate output and defers cadence tracking to the gap
+/// estimator.
+/// Observed flags on Hyprland 0.56.2 / Mesa 26.2.2: 0x5 (`vsync | hw_completion`, no `hw_clock`),
+/// refresh = 16666666 ns.
+/// Cross-reference: `schedule_present` projects the next commit deadline from `state.vblank_ns`.
+fn feedback_presented(
+    data: ?*anyopaque,
+    feedback: ?*wp_presentation.WpPresentationFeedback,
+    tv_sec_hi: u32,
+    tv_sec_lo: u32,
+    tv_nsec: u32,
+    refresh: u32,
+    seq_hi: u32,
+    seq_lo: u32,
+    flags: u32,
+) callconv(.c) void {
+    _ = seq_hi;
+    _ = seq_lo;
+    _ = flags;
+    assert(data != null);
+    assert(feedback != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    wp_presentation.destroy_feedback(feedback.?);
+    assert(state.feedback_in_flight >= 1);
+    state.feedback_in_flight -= 1;
+    if (state.presentation_clock != wp_presentation.clock_monotonic) {
+        assert(state.presentation_clock != wp_presentation.clock_monotonic);
+        return;
+    }
+    if (tv_nsec >= 1_000_000_000) {
+        assert(tv_nsec >= 1_000_000_000);
+        return;
+    }
+    state.vblank_ns = wp_presentation.presented_ns(tv_sec_hi, tv_sec_lo, tv_nsec);
+    state.vblank_refresh_ns = refresh;
+    assert(state.vblank_ns != 0);
+    assert(state.feedback_in_flight < feedback_in_flight_max);
+}
+
+/// Leaf C ABI callback for `wp_presentation_feedback.discarded` (opcode 2).
+///
+/// Preconditions: `data != null`, `feedback != null`.
+/// Protocol destructor: indicates the surface buffer was discarded or superseded before
+/// presentation. Destroys the one-shot proxy via `wp_presentation.destroy_feedback` and
+/// decrements `state.feedback_in_flight`. Retains existing `vblank_ns` and `vblank_refresh_ns`.
+fn feedback_discarded(
+    data: ?*anyopaque,
+    feedback: ?*wp_presentation.WpPresentationFeedback,
+) callconv(.c) void {
+    assert(data != null);
+    assert(feedback != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    wp_presentation.destroy_feedback(feedback.?);
+    assert(state.feedback_in_flight >= 1);
+    state.feedback_in_flight -= 1;
+    assert(state.feedback_in_flight < feedback_in_flight_max);
 }
 
 /// Callback when the user clicks the window close button.

@@ -37,16 +37,24 @@
 // - JavaScript safely reads `PresentHeader` and instance records directly from Wasm stack memory.
 // - When `present_js()` returns, Zig resumes and unwinds the stack.
 //
-// ## 4. Power-Optimal Frame Pacing (0% Idle CPU / GPU)
+// ## 4. Power-Optimal Frame Pacing and rAF Chaining (0% Idle CPU / GPU)
 // Traditional web games run an unconditional `requestAnimationFrame` loop that paints 60-144 times
 // a second. For an application UI toolkit, this wastes battery and heats the device while reading
 // or idling.
 //
 // In Patchwork:
-// - `requestAnimationFrame` is scheduled **only** when Zig signals that a frame is dirty.
-// - Once `wasm.tick()` presents the frame, the dirty flag is cleared.
-// - No further animation frames are requested until a resize or user interaction event occurs.
-// - The browser tab consumes 0.0% CPU and 0.0% GPU cycles when idle.
+// - `requestAnimationFrame` is scheduled when Zig signals that a frame is dirty (`resize`, `pointer_*`).
+// - When the rAF callback fires, `wasm.tick(Math.floor(now))` steps animators and presents dirty frames.
+// - `wasm.tick(now)` returns 1 while any widget animator is still moving (`scene.live()`), and
+//   `schedule()` chains another `requestAnimationFrame` only while `wasm.tick()` returns 1:
+//   ```javascript
+//   if (wasm.tick(Math.floor(now)) === 1) {
+//       schedule();
+//   }
+//   ```
+// - When all animators settle, `tick()` returns 0, terminating the rAF chain.
+// - A resting hover does not keep the callback running.
+// - The browser tab consumes 0.0% CPU and 0.0% GPU cycles once every animator has settled.
 //
 // ## 5. The 48-Byte Instance and the Shape Attribute
 // Zig's `Instance` is three `vec4` groups. The pipeline below fetches them as `float32x4`:
@@ -72,12 +80,12 @@
 //   Because `resize` currently passes the physical canvas dimensions (`width * dpr`), pointer
 //   coordinates are multiplied by `window.devicePixelRatio` before calling `wasm.pointer_move()`.
 // - **Adaptive Frame Scheduling:** Every pointer export returns a `u32` dirty flag.
-//   `schedule()` is called only when the return is 1. If the pointer moves entirely within a
-//   single panel, Wasm hit testing returns 0, and `requestAnimationFrame` remains idle (0% CPU).
+//   `schedule()` is called only when the return is 1. A move inside the already hovered
+//   button returns 0. While a fade is running, `tick` returns 1 and the chain continues.
 // - **Pointer Capture:** On `pointerdown`, `canvas.setPointerCapture(event.pointerId)` is invoked.
-//   This ensures that dragging the mouse outside the canvas or browser window continues to route
-//   input events to the canvas until `pointerup` occurs, preventing stuck button states.
-//   `pointerleave` and `pointercancel` call `wasm.pointer_leave()` to safely clear hover and press.
+//   Press and release pass `offsetX * devicePixelRatio` into `pointer_down` / `pointer_up`.
+//   `pointerleave` and `pointercancel` call `wasm.pointer_leave()`, which releases capture
+//   inside the scene so a drag off the canvas cannot stick.
 
 const canvas = document.getElementById("surface");
 
@@ -318,9 +326,13 @@ function schedule() {
     if (raf !== 0) {
         return;
     }
-    raf = requestAnimationFrame(() => {
+    raf = requestAnimationFrame((now) => {
         raf = 0;
-        wasm.tick();
+        // tick returns 1 only while an animator is still moving, so the chain
+        // stops once hover and press have settled.
+        if (wasm.tick(Math.floor(now)) === 1) {
+            schedule();
+        }
     });
 }
 
@@ -369,7 +381,8 @@ function on_pointer_down(event) {
         return;
     }
     canvas.setPointerCapture(event.pointerId);
-    if (wasm.pointer_button(1) === 1) {
+    const scale = pointer_scale();
+    if (wasm.pointer_down(event.offsetX * scale, event.offsetY * scale) === 1) {
         schedule();
     }
 }
@@ -382,7 +395,8 @@ function on_pointer_up(event) {
     if (event.button !== 0) {
         return;
     }
-    if (wasm.pointer_button(0) === 1) {
+    const scale = pointer_scale();
+    if (wasm.pointer_up(event.offsetX * scale, event.offsetY * scale) === 1) {
         schedule();
     }
 }

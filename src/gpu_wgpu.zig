@@ -43,6 +43,11 @@
 //! - We assign `next_in_chain = &source.chain`. The underlying C library inspects `s_type`,
 //!   casts the pointer to `SurfaceSourceWayland`, and extracts the Wayland handles.
 //! - A similar pattern is used for WGSL shader compilation via `ShaderSourceWgsl` (`s_type = 0x2`).
+//! - `configure_surface` chains `SurfaceConfigurationExtras` (`s_type = 0x00030008`, the
+//!   wgpu-native range) and sets `desiredMaximumFrameLatency` to 1. Mesa's Wayland image
+//!   minimum is 3 (FIFO) or 4 (mailbox), so a request of 1 clamps to the default of 2. That
+//!   knob cannot remove a frame here. The late latch in `linux_window.zig` is what moves the
+//!   sample, and the present mode (section 8) is what keeps one commit per refresh.
 //!
 //! ## 4. The Complete WebGPU Resource Hierarchy
 //! - **Instance:** The top-level entry point to the WebGPU runtime.
@@ -94,6 +99,41 @@
 //! causes an internal panic in Rust.
 //! To work around this upstream bug, `wait_future()` pumps `wgpuInstanceProcessEvents()` with a
 //! bounded sleep loop, ensuring deterministic completion without hangs.
+//!
+//! ## 8. Present Mode: Mailbox When Offered, Because the Loop Already Paces
+//! `pick_present_mode` selects `WGPUPresentMode_Mailbox` (0x4) if the surface lists it and
+//! `Fifo` (0x1) otherwise. The choice is about who paces, not how many images are queued.
+//!
+//! The window loop commits at most once per `wl_callback.done`, so the application never
+//! presents faster than the compositor refreshes, in either mode. Under FIFO the driver adds
+//! its own pacing on top. On Mesa's Wayland WSI (26.2.2) with a compositor that offers
+//! `wp_fifo_v1` (Hyprland 0.56.2), one FIFO present is two commits:
+//! ```text
+//! wl_surface.attach(buffer)
+//! wp_fifo_v1.set_barrier()
+//! wp_fifo_v1.wait_barrier()
+//! wl_surface.commit()            content
+//! wp_fifo_v1.wait_barrier()
+//! wl_surface.commit()            empty, held by the compositor until the barrier clears
+//! ```
+//! Our `wl_surface.frame` request is part of that held cycle. Measured with `wp_presentation`
+//! feedback on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz, continuous hover sweep):
+//! - Commit-to-pageflip latency was 2.6-2.7 ms (median), with Hyprland latching content ~2 ms
+//!   before the vblank. `wl_callback.done` arrived ~0.35 ms after the pageflip (p95 0.55 ms).
+//! - Under FIFO: The resulting `done` arrived at the pageflip for one present and a full refresh
+//!   after it for the next, alternating, yielding 105 one-period vs 89 two-period gaps (pair,
+//!   hole, pair, hole).
+//! - Under Mailbox: A present is one `attach` and one `commit`. Over a 6 s hover sweep, produced
+//!   267 one-period vs 3 two-period gaps. Over an 8 s hover sweep across 377 presents, produced
+//!   348 one-period vs 7 two-period gaps, with zero scheduled commits shown later than their
+//!   targeted vblank.
+//! - Observed presentation flags: 0x5 (`vsync | hw_completion`, no `hw_clock`), reported
+//!   refresh 16666666 ns, and `clock_id` = `CLOCK_MONOTONIC` (1).
+//!
+//! Mailbox has no tearing on Wayland: the compositor still latches whole buffers once per
+//! refresh (tearing requires explicit `wp_tearing_control_v1`). Mesa allocates four images for
+//! mailbox instead of three; `desiredMaximumFrameLatency` is still requested as 1 and clamped
+//! to 2, and no longer controls pacing.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -107,6 +147,9 @@ pub const Gpu = struct {
     queue: Queue,
     surface: Surface,
     format: TextureFormat,
+    /// `present_mailbox` when the surface offers it, otherwise `present_fifo`. Chosen once
+    /// in `create`; `configure_surface` passes it on every reconfigure.
+    present_mode: PresentMode,
     configured_width: u32,
     configured_height: u32,
     pipeline: RenderPipeline,
@@ -164,7 +207,20 @@ const usage_render_attachment: TextureUsage = 0x0000000000000010;
 const usage_copy_dst: Flags = 0x0000000000000008;
 const usage_vertex: Flags = 0x0000000000000020;
 const usage_uniform: Flags = 0x0000000000000040;
+/// `WGPUPresentMode_Fifo`. Required by WebGPU to be available everywhere.
 const present_fifo: PresentMode = 0x00000001;
+/// `WGPUPresentMode_Mailbox` (0x00000004). Swapchain presentation mode where new frames replace
+/// unrendered buffers. Under Mesa's Wayland WSI, performs 1 attach + 1 commit per present (unlike
+/// FIFO's two commits via `wp_fifo_v1`). Requires 4 swapchain images. Application pacing via
+/// `wl_surface.frame` ensures presentation does not exceed display refresh.
+const present_mailbox: PresentMode = 0x00000004;
+/// Hard upper bound on present modes queried from `SurfaceCapabilities` (WebGPU defines five).
+/// Bounded to satisfy TigerStyle invariants and prevent unbounded search loops.
+const present_mode_cap: u32 = 8;
+/// wgpu-native `WGPUSType_SurfaceConfigurationExtras`. Not a core WebGPU sType.
+const s_type_surface_configuration_extras: SType = 0x00030008;
+/// Refreshes between acquire and presentation. 1 is the minimum; 2 is the v29 default.
+const frame_latency: u32 = 1;
 const alpha_auto: CompositeAlphaMode = 0x00000000;
 const load_clear: LoadOp = 0x00000002;
 const store_store: StoreOp = 0x00000001;
@@ -270,6 +326,13 @@ const SurfaceCapabilities = extern struct {
     present_modes: ?[*]const PresentMode,
     alpha_mode_count: usize,
     alpha_modes: ?[*]const CompositeAlphaMode,
+};
+
+/// wgpu-native chain on `SurfaceConfiguration`. `desired_maximum_frame_latency` is
+/// the number of monitor refreshes from `GetCurrentTexture` to presentation.
+const SurfaceConfigurationExtras = extern struct {
+    chain: ChainedStruct,
+    desired_maximum_frame_latency: u32,
 };
 
 const SurfaceConfiguration = extern struct {
@@ -602,6 +665,8 @@ comptime {
     assert(@sizeOf(Future) == 8);
     assert(@sizeOf(SurfaceSourceWayland) == 32);
     assert(@sizeOf(ShaderSourceWgsl) == 32);
+    // chain (16) plus the latency u32, rounded up to the pointer alignment.
+    assert(@sizeOf(SurfaceConfigurationExtras) == 24);
 }
 
 const empty_label: StringView = .{ .data = null, .length = 0 };
@@ -670,15 +735,16 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     const adapter = try request_adapter(instance, surface);
     const device = try request_device(instance, adapter);
     const queue = wgpuDeviceGetQueue(device);
-    const format = try pick_format(surface, adapter);
-    const resources = try create_resources(device, queue, format);
+    const chosen = try pick_format(surface, adapter);
+    const resources = try create_resources(device, queue, chosen.format);
     return .{
         .instance = instance,
         .adapter = adapter,
         .device = device,
         .queue = queue,
         .surface = surface,
-        .format = format,
+        .format = chosen.format,
+        .present_mode = chosen.present_mode,
         .configured_width = 0,
         .configured_height = 0,
         .pipeline = resources.pipeline,
@@ -834,8 +900,29 @@ fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
     return error.WaitTimeout;
 }
 
-/// Queries surface capabilities and confirms support for BGRA8Unorm texture format.
-fn pick_format(surface: Surface, adapter: Adapter) !TextureFormat {
+/// Surface configuration parameters selected from hardware `SurfaceCapabilities`.
+///
+/// Contains the verified swapchain texture format and presentation mode:
+/// - `format: TextureFormat` (4 bytes): `format_bgra8_unorm` (0x1B).
+/// - `present_mode: PresentMode` (4 bytes): `present_mailbox` (0x4) or `present_fifo` (0x1).
+/// Total size: 8 bytes, alignment 4.
+const SurfaceChoice = struct {
+    format: TextureFormat,
+    present_mode: PresentMode,
+};
+
+/// Queries surface capabilities, confirms BGRA8Unorm support, and selects the presentation mode.
+///
+/// Preconditions: `surface != null` and `adapter != null` (asserted).
+/// Selects `present_mailbox` when advertised by the compositor/driver, otherwise falling back
+/// to mandatory `present_fifo`.
+/// Because the window event loop already throttles commits to at most one per `wl_callback.done`,
+/// mailbox cannot outrun display refresh. It eliminates the driver-side second barrier-held commit
+/// introduced by Mesa's `wp_fifo_v1` FIFO implementation, which delays every other callback.
+/// Frees query resources via `wgpuSurfaceCapabilitiesFreeMembers`.
+///
+/// Returns `SurfaceChoice` or an error (`CapabilitiesFailed`, `Bgra8Unsupported`).
+fn pick_format(surface: Surface, adapter: Adapter) !SurfaceChoice {
     assert(@intFromPtr(surface) != 0);
     assert(@intFromPtr(adapter) != 0);
     var capabilities: SurfaceCapabilities = std.mem.zeroes(SurfaceCapabilities);
@@ -847,9 +934,40 @@ fn pick_format(surface: Surface, adapter: Adapter) !TextureFormat {
         wgpuSurfaceCapabilitiesFreeMembers(capabilities);
         return error.Bgra8Unsupported;
     };
+    const present_mode = pick_present_mode(capabilities);
     wgpuSurfaceCapabilitiesFreeMembers(capabilities);
     assert(format == format_bgra8_unorm);
-    return format;
+    assert(present_mode == present_mailbox or present_mode == present_fifo);
+    return .{ .format = format, .present_mode = present_mode };
+}
+
+/// Selects `present_mailbox` (0x4) if supported in `capabilities`, otherwise `present_fifo` (0x1).
+///
+/// Preconditions:
+/// - If `capabilities.present_modes == null`, `count == 0`, or `count > present_mode_cap` (8),
+///   safely defaults to `present_fifo`.
+/// - Scans up to `present_mode_cap` modes for `present_mailbox`.
+/// WebGPU specification mandates that FIFO is always supported by every compliant surface.
+fn pick_present_mode(capabilities: SurfaceCapabilities) PresentMode {
+    const modes = capabilities.present_modes orelse return present_fifo;
+    const count_usize = capabilities.present_mode_count;
+    if (count_usize == 0) {
+        return present_fifo;
+    }
+    if (count_usize > present_mode_cap) {
+        return present_fifo;
+    }
+    assert(count_usize >= 1);
+    assert(count_usize <= present_mode_cap);
+    const count: u32 = @intCast(count_usize);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        if (modes[index] == present_mailbox) {
+            return present_mailbox;
+        }
+    }
+    assert(index == count);
+    return present_fifo;
 }
 
 /// Helper that searches the list of supported surface formats for BGRA8Unorm.
@@ -1137,7 +1255,13 @@ fn write_uploads(
     assert(@intFromPtr(self.queue) != 0);
 }
 
-/// Configures or reconfigures the swapchain when window pixel dimensions change.
+/// Configures or reconfigures the swapchain when window physical pixel dimensions change.
+///
+/// Preconditions: `width_px != 0` and `height_px != 0` (asserted).
+/// Idempotent: early returns if `width_px` and `height_px` match the existing configuration.
+/// Chains `SurfaceConfigurationExtras` (`s_type = 0x00030008`) requesting latency = 1.
+/// Mesa clamps this latency request to its swapchain image minimum (3 for FIFO, 4 for mailbox).
+/// Applies `self.present_mode` chosen during initialization (mailbox when supported).
 fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     assert(width_px != 0);
     assert(height_px != 0);
@@ -1148,8 +1272,12 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
             return;
         }
     }
+    var extras: SurfaceConfigurationExtras = .{
+        .chain = .{ .next = null, .s_type = s_type_surface_configuration_extras },
+        .desired_maximum_frame_latency = frame_latency,
+    };
     const config: SurfaceConfiguration = .{
-        .next_in_chain = null,
+        .next_in_chain = @ptrCast(&extras.chain),
         .device = self.device,
         .format = self.format,
         .usage = usage_render_attachment,
@@ -1158,11 +1286,13 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
         .view_format_count = 0,
         .view_formats = null,
         .alpha_mode = alpha_auto,
-        .present_mode = present_fifo,
+        .present_mode = self.present_mode,
     };
     wgpuSurfaceConfigure(self.surface, &config);
     self.configured_width = width_px;
     self.configured_height = height_px;
+    assert(extras.chain.s_type == s_type_surface_configuration_extras);
+    assert(extras.desired_maximum_frame_latency == frame_latency);
 }
 
 /// Acquires the current swapchain texture for rendering.

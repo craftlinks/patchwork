@@ -1,19 +1,28 @@
-//! Pure Platform-Agnostic Core Module and Unit Test Root.
+//! Pure platform-agnostic core and the unit-test root.
 //!
-//! # Architecture:
-//! Re-exports the pure logic modules (`frame.zig`, `draw.zig`, `turtle.zig`, and
-//! `hit.zig`) which contain zero platform-specific dependencies (no Wayland, no
-//! wgpu-native, no WebAssembly syscalls). This enables instantaneous unit testing
-//! across all host architectures.
+//! Re-exports the modules that do not touch Wayland, wgpu-native, or the browser.
+//! `zig build test` compiles this file and nothing else.
 
 pub const frame = @import("frame.zig");
 pub const draw = @import("draw.zig");
 pub const turtle = @import("turtle.zig");
-pub const hit = @import("hit.zig");
+pub const input = @import("input.zig");
+pub const animator = @import("animator.zig");
+pub const widgets = @import("widgets.zig");
+pub const scene = @import("scene.zig");
+/// Protocol interface tables, C ABI layout assertions, and pure `presented_ns` timestamp
+/// assembly. The extern `libwayland-client` functions are referenced only by runtime helper
+/// functions that unit tests never call, allowing `wp_presentation` to be tested without
+/// linking `wayland-client`.
+pub const wp_presentation = @import("wp_presentation.zig");
 
 test {
     _ = frame;
     _ = draw;
     _ = turtle;
-    _ = hit;
+    _ = input;
+    _ = animator;
+    _ = widgets;
+    _ = scene;
+    _ = wp_presentation;
 }
