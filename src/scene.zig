@@ -747,7 +747,6 @@ fn demo_slider() widgets.Slider {
             .align_x = 0,
         },
         .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-        .down = animator.Animator.init(widgets.down_rate_per_ms),
         .value = 0.5,
         .track = track_paint,
         .fill = fill_paint,
@@ -926,7 +925,8 @@ test "pointer leave during a press releases outside" {
     try std.testing.expect(!scene.pointer.down);
 }
 
-// The slider maps pointer x onto value. Zero omits the fill face.
+// The slider maps pointer x onto value. A held slider keeps the hover highlight
+// and writes no darken. Zero omits the fill face.
 test "slider drag sets an absolute value" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
@@ -935,6 +935,17 @@ test "slider drag sets an absolute value" {
     try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.hover.target);
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.target);
     try std.testing.expectEqual(@as(f32, 0.5), scene.widgets[slot_slider].slider.value);
+    try std.testing.expect(scene.handle_event(.{ .frame = widgets.hover_duration_ms }));
+    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.value);
+    var held = quads.DrawList.init();
+    scene.draw(&held);
+    // Column, header, body, then track, fill, and knob. Value is still 0.5.
+    try std.testing.expectEqual(@as(u32, 7), held.count);
+    var face: u32 = 3;
+    while (face < 6) : (face += 1) {
+        try std.testing.expectEqual(widgets.hover_lighten, held.items[face].hover);
+        try std.testing.expectEqual(@as(f32, 0), held.items[face].down);
+    }
     try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 28, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_slider].slider.value);
     var list = quads.DrawList.init();

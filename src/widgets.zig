@@ -12,9 +12,11 @@
 //! layout rebuilds discard the draw list, transient state (such as in-flight hover fades, button
 //! click counters, and slider thumb positions) could not survive a relayout.
 //! In Step 6, state lives permanently in retained widgets (`Panel`, `Button`, `Slider`):
-//! - Each widget owns its border-box `Rect`, layout `Walk`, and `Animator` pair (`hover`, `down`).
+//! - Each widget owns its border-box `Rect` and layout `Walk`.
+//! - `Panel` and `Button` own an `Animator` pair (`hover`, `down`).
 //! - `Button` retains its cumulative `clicks` counter.
-//! - `Slider` retains its normalized scalar `value: f32` in `[0.0, 1.0]`.
+//! - `Slider` retains its normalized scalar `value: f32` in `[0.0, 1.0]` and a hover animator.
+//!   Press and drag keep that highlight. They do not aim a darken.
 //! - On redraw, `draw()` copies current animated weights into fresh 48-byte GPU `Instance` records.
 //! - The WGSL shader remains completely decoupled: it receives standard 48-byte instance records
 //!   and has no knowledge of widgets.
@@ -26,6 +28,8 @@
 //! Instead, widgets scale the normalized animator values:
 //! - `hover_weight = animator.value * hover_lighten` (`0.18`, matching Step 5).
 //! - `down_weight = animator.value * down_darken` (`0.30`, applied after hover).
+//! - A slider face passes a resting down animator, so its `down_weight` stays `0`.
+//!   The hover lighten is the pressed color.
 //!
 //! ### Passive Occlusion vs. Interactive Response:
 //! - **Panel:** Passive container. It participates in the scene's reverse-order hit scan so that
@@ -36,7 +40,8 @@
 //!   true (pointer was released within button bounds).
 //! - **Slider:** Continuous control. Dragging and pressing map the absolute pointer X coordinate
 //!   directly into `[0.0, 1.0]`. Absolute positioning eliminates relative delta accumulation drift
-//!   and guarantees idempotent state for any pointer position.
+//!   and guarantees idempotent state for any pointer position. The gesture keeps the hover
+//!   highlight. It does not mix toward black the way a button press does.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -110,7 +115,8 @@
 //! - `Paint` (20 bytes, 4-byte aligned): `r, g, b, a, radius: f32`.
 //! - `Up` (12 bytes, 4-byte aligned): `x: f32, y: f32, inside: bool, pad: 3 bytes`.
 //! - `Point` (8 bytes, 4-byte aligned): `x: f32, y: f32`.
-//! - `Panel`, `Button`, `Slider`: Composed of primitive numeric types, `Rect`, `Walk`, and `Animator`.
+//! - `Panel` and `Button`: `Rect`, `Walk`, `Paint`, and an `Animator` pair (`hover`, `down`).
+//! - `Slider`: `Rect`, `Walk`, three `Paint`s, one hover `Animator`, and `value`. No down animator.
 //!
 //! ### GPU Instance Emission (`append_weighted`):
 //! Each quad appended to `DrawList` occupies 48 bytes matching WebGPU Vertex Buffer 1 stride:
@@ -156,9 +162,9 @@
 //! ```text
 //! .hover_in  --> self.hover.set_target(1)
 //! .hover_out --> self.hover.set_target(0)
-//! .down(pt)  --> self.down.set_target(1), set_value_at(pt.x)
-//! .drag(pt)  --> set_value_at(pt.x) (absolute position update)
-//! .up        --> self.down.set_target(0)
+//! .down(pt)  --> set_value_at(pt.x)  (hover stays aimed at 1; no darken)
+//! .drag(pt)  --> set_value_at(pt.x)  (absolute position update)
+//! .up        --> no weight change; the scene redispatches hover
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
@@ -346,12 +352,14 @@ pub const Button = struct {
 };
 
 /// Absolute slider. Press and drag both set `value` from the pointer x.
+/// The hover animator is the highlight for the whole gesture. There is no
+/// press-darken channel: a held slider stays lightened, including while the
+/// pointer is captured outside the track.
 pub const Slider = struct {
     id: u32,
     rect: turtle.Rect,
     walk: turtle.Walk,
     hover: animator.Animator,
-    down: animator.Animator,
     value: f32,
     track: Paint,
     fill: Paint,
@@ -363,22 +371,27 @@ pub const Slider = struct {
         switch (hit) {
             .hover_in => return self.hover.set_target(1),
             .hover_out => return self.hover.set_target(0),
-            .down => |point| return self.press(point.x),
+            .down => |point| return self.set_value_at(point.x),
             .drag => |point| return self.set_value_at(point.x),
-            .up => return self.down.set_target(0),
+            .up => |up| {
+                assert(up.x == up.x);
+                assert(up.y == up.y);
+                return false;
+            },
         }
     }
 
     pub fn animate(self: *Slider, dt_ms: f32) bool {
         assert(dt_ms >= 0);
         assert(self.value >= 0);
-        return step_pair(&self.hover, &self.down, dt_ms);
+        assert(self.hover.rate_per_ms > 0);
+        return self.hover.step(dt_ms);
     }
 
     pub fn live(self: Slider) bool {
         assert(self.value >= 0);
         assert(self.value <= 1);
-        return pair_live(self.hover, self.down);
+        return self.hover.live();
     }
 
     /// The hit face is the widget rect, rounded by the knob radius, so the disc
@@ -402,26 +415,20 @@ pub const Slider = struct {
             return;
         }
         const track = track_rect(self.rect);
-        append_weighted(list, track, self.track, self.hover, self.down);
+        // The rate is unused. This animator is never stepped. Value and target
+        // stay 0 so the shader's darken mix does not run on a held slider.
+        const rest = animator.Animator.init(down_rate_per_ms);
+        assert(rest.value == 0);
+        assert(rest.target == 0);
+        append_weighted(list, track, self.track, self.hover, rest);
         if (self.value > 0) {
             var fill_rect = track;
             fill_rect.width = self.value * track.width;
-            append_weighted(list, fill_rect, self.fill, self.hover, self.down);
+            append_weighted(list, fill_rect, self.fill, self.hover, rest);
         }
         const knob = knob_rect(self.rect, self.value);
-        append_weighted(list, knob, self.knob, self.hover, self.down);
+        append_weighted(list, knob, self.knob, self.hover, rest);
         assert(list.count <= quads.instance_cap);
-    }
-
-    fn press(self: *Slider, x: f32) bool {
-        const pressed = self.down.set_target(1);
-        const moved = self.set_value_at(x);
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        if (pressed) {
-            return true;
-        }
-        return moved;
     }
 
     fn set_value_at(self: *Slider, x: f32) bool {
