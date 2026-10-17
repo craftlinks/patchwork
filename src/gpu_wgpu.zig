@@ -67,24 +67,25 @@
 //!   `stepMode = step_vertex`, `array_stride = 8`, `format = vertex_float32x2`.
 //!   Contains 6 static 2D coordinates representing two triangles in the range [0, 0] to [1, 1].
 //! - **Vertex Buffer 1 (Instances):**
-//!   `stepMode = step_instance`, `array_stride = 48`.
-//!   Contains three vertex attributes per instance:
+//!   `stepMode = step_instance`, `array_stride = 64`.
+//!   Contains four vertex attributes per instance:
 //!   - Slot 1: `rect` (`vertex_float32x4` at offset 0) -> `[x, y, w, h]`.
 //!   - Slot 2: `fill` (`vertex_float32x4` at offset 16) -> `[r, g, b, a]`.
-//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, down, pad]`.
-//!     Radius is the geometric corner radius in logical pixels. Hover is the mix
-//!     weight toward white. Down is the mix weight toward black, applied after hover.
-//!     The pad exists because this slot is a `vec4`, the same format as `rect` and
-//!     `fill`. WebGPU only requires the stride to be a multiple of 4. Fetching 16
-//!     bytes at offset 32 makes the stride 48. `append` writes the pad as 0 and stores
-//!     `down`. The fragment shader reads `.x`, `.y`, and `.z`.
+//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, down, kind]`.
+//!     Radius is the geometric corner radius (box) or stroke thickness (arc) in logical pixels.
+//!     Hover is the mix weight toward white (theme lighten). Down is the box darken weight,
+//!     or the arc sweep fraction in [0, 1]. Kind selects box (0) or arc (1).
+//!   - Slot 4: `clip` (`vertex_float32x4` at offset 48) -> `[clip_x0, clip_y0, clip_x1, clip_y1]`.
+//!     Exclusive-max clip boundary in logical pixels.
 //! - **Bind Group 0 (Uniform Buffer):**
-//!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix.
+//!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix
+//!   followed by the 192-byte theme at offset 64 (visibility `VERTEX | FRAGMENT`).
 //!
 //! ## 6. Swapchain Lifecycle and Command Submission
 //! For every presented frame in `present()`:
 //! 1. `configure_surface()`: Configures the swapchain when physical dimensions change.
-//! 2. `write_uploads()`: Selectively transfers modified uniform or instance data via `writeBuffer`.
+//! 2. `write_uploads()`: Selectively transfers modified uniform (matrix + theme) or instance data
+//!    via `writeBuffer`. A scale-only present uploads neither instance buffer.
 //! 3. `acquire_texture()`: Requests the next swapchain `Texture` from the display surface.
 //! 4. `encode_submit_present()`:
 //!    - Creates a `TextureView` and `CommandEncoder`.
@@ -165,7 +166,7 @@
 //!
 //! ### Dual Draw Pass Execution:
 //! Both pipelines bind Vertex Buffer 0 to the unit quad (stride 8, stepMode `vertex`).
-//! The glyph pipeline binds Vertex Buffer 1 to `glyph_buffer` (`glyph_cap * 48 = 12,288` bytes).
+//! The glyph pipeline binds Vertex Buffer 1 to `glyph_buffer` (`glyph_cap * 64 = 16,384` bytes).
 //! Within `encode_submit_present`:
 //! 1. `draw_quads(pass, instance_count)` draws rounded geometric quads.
 //! 2. `draw_glyphs(pass, glyph_count)` binds `glyph_pipeline`, Group 0, Group 1, and draws text.
@@ -175,6 +176,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("draw.zig");
 const font = @import("font.zig");
+const theme = @import("theme.zig");
 
 /// Hardware GPU state context encapsulating all native WebGPU resources.
 pub const Gpu = struct {
@@ -828,8 +830,8 @@ const unit_attr: VertexAttribute = .{
 
 /// Instance vertex fetch. Locations match `@location` in `quad.wgsl`.
 /// Location 1 is the rectangle, location 2 is the straight-alpha fill, and
-/// location 3 is `(radius, hover, down, pad)`. All three are `float32x4`, so
-/// the offsets are 0, 16, and 32 and `draw.instance_stride` is 48.
+/// location 3 is `(radius, hover, down, kind)`. Location 4 is the clip.
+/// All four are `float32x4`, so the offsets are 0, 16, 32, and 48 and the stride is 64.
 const instance_attrs = [_]VertexAttribute{
     .{
         .next_in_chain = null,
@@ -848,6 +850,12 @@ const instance_attrs = [_]VertexAttribute{
         .format = vertex_float32x4,
         .offset = 32,
         .shader_location = 3,
+    },
+    .{
+        .next_in_chain = null,
+        .format = vertex_float32x4,
+        .offset = 48,
+        .shader_location = 4,
     },
 };
 
@@ -949,7 +957,7 @@ const GlyphResources = struct {
 /// Orchestrates creation of all glyph text GPU pipelines, buffers, textures, and bind groups.
 ///
 /// Preconditions and Allocations:
-/// - Allocates a 12,288-byte instance vertex buffer (`glyph_cap * 48 = 256 * 48`).
+/// - Allocates a 16,384-byte instance vertex buffer (`glyph_cap * 64 = 256 * 64`).
 /// - Creates and writes the static 512 x 256 `r8unorm` coverage atlas texture.
 /// - Configures a clamp-to-edge linear filtering sampler.
 /// - Builds Group 1 bind group layout (atlas texture at binding 0, sampler at binding 1).
@@ -1213,8 +1221,9 @@ fn create_shader(device: Device) ShaderModule {
 /// Allocates the static unit quad buffer, instance buffer, and uniform buffer in GPU VRAM.
 fn create_buffers(device: Device) !Buffers {
     assert(@intFromPtr(device) != 0);
-    // Fixed for the life of the device: 256 records times the 48-byte stride.
-    // A frame uploads only `count` records. Radius, hover, and down live in that stride.
+    // Fixed for the life of the device: 256 records times the 64-byte stride.
+    // A frame uploads only `count` records. Radius, hover, down, kind, and
+    // clip live in that stride.
     const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
     const vertex_usage: Flags = usage_vertex | usage_copy_dst;
     const uniform_usage: Flags = usage_uniform | usage_copy_dst;
@@ -1249,19 +1258,19 @@ fn write_quad(queue: Queue, buffer: Buffer) void {
     wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
 }
 
-/// Defines the bind group layout for binding slot 0 (the orthographic projection matrix uniform).
+/// Defines the bind group layout for slot 0: 256-byte uniform, VERTEX | FRAGMENT visibility.
 fn create_bind_group_layout(device: Device) BindGroupLayout {
     assert(@intFromPtr(device) != 0);
     const entry: BindGroupLayoutEntry = .{
         .next_in_chain = null,
         .binding = 0,
-        .visibility = shader_vertex,
+        .visibility = shader_vertex | shader_fragment,
         .binding_array_size = 0,
         .buffer = .{
             .next_in_chain = null,
             .type = buffer_uniform,
             .has_dynamic_offset = 0,
-            .min_binding_size = draw.matrix_bytes,
+            .min_binding_size = draw.uniform_bytes,
         },
         .sampler = std.mem.zeroes(SamplerBindingLayout),
         .texture = std.mem.zeroes(TextureBindingLayout),
@@ -1369,8 +1378,8 @@ fn create_pipeline(
 
 /// Configures the dual vertex buffer layout:
 /// Buffer 0: step_vertex, 8-byte stride (unit quad points).
-/// Buffer 1: step_instance, 48-byte stride. Three attributes: rect, fill, shape.
-/// `attribute_count` is 3 because location 3 carries radius, hover, and down.
+/// Buffer 1: step_instance, 64-byte stride. Four attributes: rect, fill, shape, clip.
+/// `attribute_count` is 4 because location 4 carries the clip rect.
 fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     buffers[0] = .{
         .next_in_chain = null,
@@ -1383,11 +1392,11 @@ fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
         .next_in_chain = null,
         .step_mode = step_instance,
         .array_stride = draw.instance_stride,
-        .attribute_count = 3,
+        .attribute_count = 4,
         .attributes = &instance_attrs,
     };
     assert(buffers[0].attribute_count == 1);
-    assert(buffers[1].attribute_count == 3);
+    assert(buffers[1].attribute_count == 4);
 }
 
 /// Configures the vertex stage descriptor referencing the `vs_main` entry point.
@@ -1420,7 +1429,8 @@ fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) Fragmen
     };
 }
 
-/// Conditionally uploads uniform matrix and instance buffer data based on header flags.
+/// Conditionally uploads uniform (matrix + theme), instance, and glyph buffer data.
+/// When flag_uniform is set, writes the 64-byte matrix then the 192-byte theme at offset 64.
 fn write_uploads(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -1437,11 +1447,18 @@ fn write_uploads(
             @ptrCast(&header.ortho),
             @intCast(draw.matrix_bytes),
         );
+        wgpuQueueWriteBuffer(
+            self.queue,
+            self.uniform_buffer,
+            draw.matrix_bytes,
+            @ptrCast(&theme.chrome),
+            @intCast(theme.bytes),
+        );
     }
     if ((header.flags & draw.flag_instances) != 0) {
         if (header.instance_count != 0) {
-            // Paired with the export and the browser. 48 is rect + fill + shape.
-            assert(draw.instance_stride == 48);
+            // Paired with the export and the browser. 64 is rect, fill, shape, clip.
+            assert(draw.instance_stride == 64);
             const byte_count: u32 = header.instance_count * draw.instance_stride;
             wgpuQueueWriteBuffer(
                 self.queue,
@@ -1454,7 +1471,7 @@ fn write_uploads(
     }
     if ((header.flags & draw.flag_glyphs) != 0) {
         if (header.glyph_count != 0) {
-            assert(font.glyph_stride == 48);
+            assert(font.glyph_stride == 64);
             const byte_count: u32 = header.glyph_count * font.glyph_stride;
             wgpuQueueWriteBuffer(
                 self.queue,
@@ -1825,12 +1842,12 @@ fn create_glyph_shader(device: Device) ShaderModule {
     };
     const shader = wgpuDeviceCreateShaderModule(device, &descriptor);
     assert(@intFromPtr(shader) != 0);
-    assert(font.glyph_stride == 48);
+    assert(font.glyph_stride == 64);
     return shader;
 }
 
 /// Builds the fixed-function render pipeline for instanced glyph text rendering.
-/// Reuses `fill_vertex_layouts` (48-byte instance stride) and `alpha_blend` compositing.
+/// Reuses `fill_vertex_layouts` (64-byte instance stride) and `alpha_blend` compositing.
 fn create_glyph_pipeline(
     device: Device,
     shader: ShaderModule,

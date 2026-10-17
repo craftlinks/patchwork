@@ -28,9 +28,9 @@
 //!   raw memory addresses across the FFI boundary to `present_js(header, instances, glyphs)`.
 //! - In the browser, JavaScript reads the 104-byte `PresentHeader` struct directly out of
 //!   Wasm linear memory using a `DataView(wasm.memory.buffer, headerPtr, 104)`.
-//! - If `flag_instances` is set and `instance_count > 0`, JavaScript uploads `instance_count * 48`
+//! - If `flag_instances` is set and `instance_count > 0`, JavaScript uploads `instance_count * 64`
 //!   bytes directly from `instancePtr`.
-//! - If `flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 48` bytes
+//! - If `flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 64` bytes
 //!   directly from `glyphPtr`.
 //! - Zero serialization, zero copying, zero JSON overhead, zero GC pressure.
 //!

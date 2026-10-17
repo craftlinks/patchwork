@@ -1,155 +1,150 @@
-//! Retained demo scene: a column of a header, a body panel, a slider, and a button.
+//! Retained demo: one right-hand scroll container of knobs, a meter, and toggles.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Core Problem & Rationale ("Why")
-//! In Step 5, the layout engine (`turtle.paint_column`) directly appended instance quads into
-//! the draw list. While straightforward, direct geometry emission creates significant architectural
-//! limitations:
-//! - Geometry is ephemeral: when the window resizes or scale changes, the draw list is wiped,
-//!   destroying hover weights, click counters, and slider values.
-//! - The turtle only understands geometry: it cannot manage pointer capture, button press
-//!   gestures, or multi-stage color palettes.
+//! User interfaces in production audio workstations, synthesizers, and creative tools rely on
+//! dense inspector sidebars and channel strips containing continuous dials, peak meters,
+//! switches, and scrollable container viewports.
 //!
-//! `Scene` introduces a retained UI architecture:
-//! - **Retained State:** Fixed-capacity array of widgets (`[widget_cap]Widget`).
-//! - **Separation of Layout and Drawing:** `Scene.layout()` queries the turtle to calculate
-//!   border-box rectangles for each widget's walk. `Scene.draw()` generates GPU instances from
-//!   widget state only when `dirty` is set.
-//! - **Pointer Capture Semantics:** When a pointer press occurs over a widget, that widget
-//!   captures all subsequent motion events (`.drag`), and hover state remains locked to that
-//!   widget until release. On pointer release, the scene computes whether the pointer was released
-//!   inside the widget (`up.inside`), sends `.up`, releases capture, checks for state changes
-//!   (such as advancing the body palette on a button click), and re-dispatches hover for the
-//!   current pointer location.
-//! - **Pointer Cancellation:** If `pointer_leave` fires while capture is held (e.g. cursor moves
-//!   outside the window), the scene sends `.up` with `inside: false` to release the press cleanly
-//!   without triggering an activation.
-//! - **Passive Occlusion:** The body panel returns `false` from `handle()` (ignoring hits), but
-//!   participates in reverse-order hit testing, shielding any widgets underneath it.
+//! Rather than laying out a flat list of disparate top-level widgets across the window, Step 8
+//! consolidates the retained UI into a single right-hand `Scroll` container widget:
+//! - **The Channel Strip Inspector:** A 320 px wide column anchored to the right window edge.
+//! - **Two-Tier Pointer Dispatch:** The top-level `Scene` manages coarse spatial routing across
+//!   the root widget array (`widget_cap = 32`), tracking `scene.capture` and `scene.hovered`.
+//!   When interacting with the scroll column, `scene.capture` is set to `slot_scroll` (0).
+//!   The `Scroll` container then internally arbitrates sub-element interactions via `Scroll.press`
+//!   (`.none`, `.child(u32)`, or `.thumb`).
+//! - **Hierarchical Scissor-Free Clipping:** The scroll container background panel and
+//!   the scrollbar thumb carry the unclipped window clip (`[0, 0, width, height]`), ensuring
+//!   the gutter is never masked. All child control faces and text glyphs carry the inner
+//!   viewport clip rect, masking straddling elements analytically in shaders with zero
+//!   GPU scissor changes or render pass breaks.
+//! - **Zero Allocation & Viewport Culling:** Stored child rectangles are unscrolled. Children
+//!   outside the visible viewport are completely omitted from draw lists, saving GPU vertex
+//!   bandwidth while strictly maintaining O(1) memory guarantees.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
 //! ### Coordinate Spaces:
-//! All positions and dimensions are expressed in UI logical pixels, top-left origin `(0, 0)`,
-//! `+X` right, and `+Y` down.
+//! All positions are defined in UI logical pixels, top-left origin `(0, 0)`, `+X` right, `+Y` down.
 //!
-//! ### Column Layout Budget & Derivations:
-//! - Column padding: `column_padding = 16` on all sides (`left, top, right, bottom`).
-//! - Inner logical width: `inner_w = width_logical - 32`.
-//! - Inner logical height: `inner_h = height_logical - 32`.
+//! ### Root Column and Channel Strip Geometry:
+//! Root container column has outer padding 16 px on all sides.
+//! The `Scroll` widget specifies: `width = .fixed(320)`, `height = .fill`, `align_x = 1.0` (right),
+//! and internal `padding = Inset(8, 8, 8, 8)`.
 //!
-//! #### Fixed Main-Axis Heights:
-//! 1. Header: `fixed 64`, zero margin. Main-axis cost = `64`.
-//! 2. Body Panel: `margin.top = 16`, `height = .fill`. Main-axis margin cost = `16`.
-//! 3. Slider: `margin.top = 16`, `fixed 24`. Main-axis cost = `16 + 24 = 40`.
-//! 4. Button: `margin.top = 16`, height `fixed 48`, width `fit = measure("Cycle") + 32`,
-//!    `align_x = 1.0`. Main-axis cost = `16 + 48 = 64`. The fit payload is not a fill share.
+//! - **At 1280 x 720:**
+//!   - Available width after padding: `1280 - 32 = 1248`.
+//!   - Scroll border box: `x = 16 + (1248 - 320) = 944`, `y = 16`, `width = 320`, `height = 688`.
+//!   - Border box rect: `(944, 16, 320, 688)`.
+//!   - Viewport rect (inset by padding 8): `(952, 24, 304, 672)`.
+//!   - Content column (inset by 16 px gutter): `(952, 24, 288, 672)`.
+//! - **At 800 x 600:**
+//!   - Available width after padding: `800 - 32 = 768`.
+//!   - Scroll border box: `x = 16 + (768 - 320) = 464`, `y = 16`, `width = 320`, `height = 568`.
+//!   - Viewport rect: `(472, 24, 304, 552)`.
+//!   - Content column: `(472, 24, 288, 552)`.
 //!
-//! Total fixed main-axis cost:
+//! ### Children Content Span and Scroll Limits:
+//! The scroll container hosts 11 children with `margin.top = 8` and `width = .fill`:
+//! - 8 Knobs: height 72 px each -> `8 * (72 + 8) = 640 px`.
+//! - 1 Meter: height 160 px -> `1 * (160 + 8) = 168 px`.
+//! - 2 Toggles: height 40 px each -> `2 * (40 + 8) = 96 px`.
+//! - Total content span: `content_h = 640 + 168 + 96 = 904 px`.
+//!
+//! Maximum scroll span is `max_scroll = max(content_h - viewport_h, 0)`:
+//! - At 1280 x 720: `viewport_h = 672`, `max_scroll = 904 - 672 = 232 px`.
+//! - At 800 x 600: `viewport_h = 552`, `max_scroll = 904 - 552 = 352 px`.
+//!
+//! ### Scrolled Child Coordinates and Viewport Overlap:
+//! Stored child rectangles are stored unscrolled (`rect.y` is layout position).
+//! During rendering and hit testing:
 //! ```text
-//! fixed_sum = 64 + 16 + 40 + 64 = 184
+//! row.x = rect.x
+//! row.y = rect.y - scroll_y
 //! ```
-//! Share allocated to fill children (`fill_count = 1` for body):
+//! Viewport overlap condition:
 //! ```text
-//! body_height = max(inner_h - fixed_sum, 0) / 1
+//! overlaps = (row.y < view.y + view.height) and (row.y + row.height > view.y)
 //! ```
+//! Children with `overlaps == false` are omitted. Straddling rows are drawn with the viewport clip.
 //!
-//! ### Worked Verification Cases:
+//! ### Scrollbar Thumb Geometry & Travel Projection:
+//! Let `view_h = viewport.height`, `content_h = 904`.
+//! ```text
+//! thumb_h = max(24.0, view_h * view_h / content_h)
+//! travel  = max(view_h - thumb_h, 0.0)
+//! unit    = scroll_y / max_scroll       (in [0.0, 1.0])
+//! thumb.y = view.y + unit * travel
+//! ```
+//! When dragged by pointer:
+//! ```text
+//! unit = clamp((pointer_y - view.y - thumb_h * 0.5) / travel, 0.0, 1.0)
+//! scroll_y = unit * max_scroll
+//! ```
+//! A press on the thumb jumps to center on pointer; a press on the gutter outside the thumb
+//! is ignored.
 //!
-//! #### 1. Standard Desktop Size (1280 x 720):
-//! - `inner_h = 720 - 32 = 688`
-//! - `body_height = 688 - 184 = 504`
-//! - Header rect: `(16, 16, 1248, 64)`, corner radius 8.
-//! - Body rect: `(16, 96, 1248, 504)`, corner radius 16.
-//! - Slider rect: `(16, 616, 1248, 24)`. Track: `(28, 625, 1224, 6)`.
-//!   At default `value = 0.5`: Fill `(28, 625, 612, 6)`, Knob disc `(628, 616, 24, 24)`.
-//! - Button rect: y 656, height 48.
-//!   `width = fit = measure("Cycle") + 32 = 39.104 + 32 = 71.104`.
-//!   `x = 16 + (1248 - 71.104) = 1192.896` because `align_x` is 1.0 (right-aligned).
-//!   Bottom boundary check: `656 + 48 + 16 = 720` (exact pixel match with window height).
-//! - Face Instances: 1 root + 1 header + 1 body + 3 slider faces + 1 button = 7 instances.
-//!   (At `slider.value == 0`, fill is omitted, yielding 6 instances).
-//! - Glyph Instance count: 9 quads ("Patchwork") + 5 quads ("Cycle") = 14 quads.
-//!
-//! #### 2. Compact Size (800 x 600):
-//! - `inner_h = 600 - 32 = 568`
-//! - `body_height = 568 - 184 = 384`
-//! - Header rect: `(16, 16, 768, 64)`
-//! - Body rect: `(16, 96, 768, 384)`
-//! - Slider rect: `(16, 496, 768, 24)`
-//! - Button rect: y 536, height 48, `width = 71.104`, `x = 16 + (768 - 71.104) = 712.896`.
+//! ### Wheel Event Routing:
+//! - Over a visible knob ring: nudges that knob by `-dy / 120.0` and consumes the event
+//!   without scrolling.
+//! - Elsewhere within the viewport: adds `dy` to `scroll_y`, clamped to `[0, max_scroll]`.
+//! - Horizontal wheel axis is ignored.
 //!
 //! ## 3. Hardware, Spec Limits, and C ABI Layouts
 //!
-//! ### Capacity Constraints:
-//! - `widget_cap = 32`: Maximum retained widgets in one scene.
-//! - Draw list allocation invariant:
-//!   `comptime assert(1 + widget_cap * 3 <= quads.instance_cap)` (1 + 32 * 3 = 97 <= 256).
-//!   1 root column instance + up to 3 instances per widget fits entirely in the 256-quad buffer.
+//! ### Static Memory Budgets:
+//! - `widget_cap = 32`: Root scene capacity.
+//! - `scroll_child_cap = 16`: Scroll container child capacity (11 used in demo).
+//! - **Instance Budget:** `1 + 1 + scroll_child_cap * 2 <= instance_cap`:
+//!   1 (scroll background) + 1 (thumb) + 16 * 2 (max 2 faces per child) = 34 <= 256.
+//! - **Glyph Budget:** `scroll_child_cap * 12 <= font.glyph_cap`:
+//!   16 * 12 = 192 <= 256.
 //!
-//! ### Memory Layout:
-//! - `Widget`: Tagged union of `Panel`, `Button`, `Slider`.
-//! - `Scene`: Statically allocated record containing:
-//!   - `widgets: [widget_cap]Widget`
-//!   - `count: u32`
-//!   - `pointer: input.Pointer`
-//!   - `capture: ?u32` (index of captured widget, or null)
-//!   - `hovered: ?u32` (index of hovered widget, or null)
-//!   - `dirty: bool` (true when state changed and draw list must be rebuilt)
-//!   - `palette_index: u32` (active index in `body_palette`)
-//!   - `width_logical, height_logical: u32`
+//! ### Demo Controls Roster & Initial Values:
+//! - Knobs (8):
+//!   - `gain`:  0.25 (accent purple)
+//!   - `slope`: 0.50 (accent green)
+//!   - `twice`: 0.75 (accent orange)
+//!   - `skew`:  0.00 (accent yellow, value arc omitted at 0)
+//!   - `echo`:  1.00 (accent purple)
+//!   - `room`:  0.50 (accent green)
+//!   - `out`:   0.50 (accent orange)
+//!   - `drive`: 0.50 (accent yellow)
+//! - Meter (1): `meter` (0.50)
+//! - Toggles (2): `take` (true / on), `drums` (false / off)
+//!
+//! Note: `Panel`, `Button`, and `Slider` remain in `widgets.zig` and are tested, but are not in
+//! the demo scene.
 //!
 //! ## 4. State Machines & Data Flow
 //!
-//! ### Pointer Dispatch and Capture Architecture:
+//! ### Scene vs. Scroll Gesture Arbitration:
 //! ```text
-//! Event Received:
-//!   |
-//!   +---> .pointer_move(pt)
-//!   |       |
-//!   |       +-- capture != null ? --> send(capture, .drag(pt))
-//!   |       |
-//!   |       +-- capture == null ? --> topmost(pt) -> update hovered
-//!   |                                 send .hover_out and .hover_in
-//!   |
-//!   +---> .pointer_down(pt)
-//!   |       topmost(pt) -> capture = hit_index
-//!   |       send(capture, .down(pt))
-//!   |
-//!   +---> .pointer_up(pt)
-//!   |       inside = widget_contains(capture, pt)
-//!   |       send(capture, .up{inside})
-//!   |       capture = null
-//!   |       note_clicks() (advance body palette if button clicked)
-//!   |       dispatch_hover(pt)
-//!   |
-//!   +---> .pointer_leave
-//!   |       if capture != null: send(capture, .up{inside = false})
-//!   |       capture = null
-//!   |       clear_hover()
-//!   |       pointer.leave()
-//!   |
-//!   +---> .frame(dt_ms)
-//!           step animators on all widgets
+//! [pointer_down]
+//!       |
+//!       v
+//! scene.capture = slot_scroll
+//!       |
+//!       v
+//! scroll.press_at(point)
+//!       |---> Inside thumb rect?   ==> scroll.press = .thumb (drags scroll_y)
+//!       |---> Inside gutter?       ==> scroll.press = .none (ignores)
+//!       |---> Inside child?        ==> scroll.press = .child(i) (dispatches to child)
+//!       +---> Outside children?    ==> scroll.press = .none
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - **Pointer Preservation Across Relayout:**
-//!   When a window resize occurs, `Scene.layout()` updates all widget rectangles, then calls
-//!   `redispatch()` using `self.pointer.x` and `self.pointer.y`. If a button moved beneath the
-//!   cursor during resize, hover target stays aimed at 1.0.
-//! - **Selective Draw Rebuilds:**
-//!   `Scene.draw()` is executed only when `scene.dirty` is set. Scale-only window presents leave
-//!   `scene.dirty` false, ensuring zero CPU overhead and zero GPU buffer uploads.
+//! - **Platform Wheel Translation:** Wayland sends `wl_pointer.axis` opcode 4 (axis 0), converted
+//!   to logical pixels via `input.fixed_to_logical`. In the browser, `web/shell.js` handles `wheel`
+//!   with `deltaMode` scaling, calling `wasm.pointer_wheel`. Both feed `input.Event.wheel`.
 //!
 //! ## 6. TigerStyle Invariants
-//! - **Zero Runtime Allocation:** All widget arrays, geometry slices, and event dispatches are
-//!   statically allocated at compile time.
-//! - **Bounded Reverse Scans:** Hit testing scans from `count` down to 0, terminating at O(N)
-//!   where `N <= widget_cap = 32`.
-//! - **Strict Preconditions:** Checked assertions on all array indexes, logical dimensions,
-//!   and palette boundaries.
+//! - **Bounded Arrays:** Fixed 32-element widget array. Fixed 16-element scroll child array.
+//! - **Zero Runtime Allocation:** Scene and scroll initialization allocate no dynamic heap memory.
+//! - **Split Preconditions:** Invariants (`width_logical != 0`, `height_logical != 0`, bounds)
+//!   are asserted individually at function boundaries.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -160,89 +155,38 @@ const input = @import("input.zig");
 const turtle = @import("turtle.zig");
 const widgets = @import("widgets.zig");
 
-/// Maximum widgets in one scene. A slider emits up to three instances.
+/// Maximum widgets in one scene. The demo stores one scroll.
 pub const widget_cap: u32 = 32;
 
-/// Body fills the button cycles through. Index 0 is the resting blue-gray.
-pub const palette_len: u32 = 3;
+pub const slot_scroll: u32 = 0;
+pub const demo_count: u32 = 1;
 
-pub const slot_header: u32 = 0;
-pub const slot_body: u32 = 1;
-pub const slot_slider: u32 = 2;
-pub const slot_button: u32 = 3;
-pub const demo_count: u32 = 4;
+const id_scroll: u32 = 1;
 
-const id_header: u32 = 1;
-const id_body: u32 = 2;
-const id_slider: u32 = 3;
-const id_button: u32 = 4;
-
-const zero_margin: turtle.Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-const top_margin: turtle.Inset = .{ .left = 0, .top = 16, .right = 0, .bottom = 0 };
 const column_padding: turtle.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
-const header_padding: turtle.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
-const button_padding: turtle.Inset = .{ .left = 16, .top = 0, .right = 16, .bottom = 0 };
-const zero_padding: turtle.Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+const scroll_padding: turtle.Inset = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 };
+const row_margin: turtle.Inset = .{ .left = 0, .top = 8, .right = 0, .bottom = 0 };
+const zero_margin: turtle.Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 
-const column_paint: widgets.Paint = .{
-    .r = 0.18,
-    .g = 0.19,
-    .b = 0.24,
-    .a = 1,
-    .radius = 0,
+const knob_specs = [_]struct { name: []const u8, value: f32 }{
+    .{ .name = "gain", .value = 0.25 },
+    .{ .name = "slope", .value = 0.50 },
+    .{ .name = "twice", .value = 0.75 },
+    .{ .name = "skew", .value = 0 },
+    .{ .name = "echo", .value = 1 },
+    .{ .name = "room", .value = 0.50 },
+    .{ .name = "out", .value = 0.50 },
+    .{ .name = "drive", .value = 0.50 },
 };
 
-const header_paint: widgets.Paint = .{
-    .r = 0.24,
-    .g = 0.32,
-    .b = 0.42,
-    .a = 1,
-    .radius = 8,
-};
-
-const button_paint: widgets.Paint = .{
-    .r = 0.30,
-    .g = 0.46,
-    .b = 0.70,
-    .a = 1,
-    .radius = 24,
-};
-
-const track_paint: widgets.Paint = .{
-    .r = 0.12,
-    .g = 0.13,
-    .b = 0.16,
-    .a = 1,
-    .radius = widgets.track_radius,
-};
-
-const fill_paint: widgets.Paint = .{
-    .r = 0.30,
-    .g = 0.46,
-    .b = 0.70,
-    .a = 1,
-    .radius = widgets.track_radius,
-};
-
-const knob_paint: widgets.Paint = .{
-    .r = 0.86,
-    .g = 0.88,
-    .b = 0.92,
-    .a = 1,
-    .radius = widgets.knob_radius,
-};
-
-const body_palette: [palette_len]widgets.Paint = .{
-    .{ .r = 0.20, .g = 0.26, .b = 0.34, .a = 1, .radius = 16 },
-    .{ .r = 0.42, .g = 0.28, .b = 0.24, .a = 1, .radius = 16 },
-    .{ .r = 0.22, .g = 0.36, .b = 0.32, .a = 1, .radius = 16 },
-};
+const empty_rect: turtle.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
 
 /// One retained widget. The tag selects the behavior; the scene scans the array.
 pub const Widget = union(enum) {
     panel: widgets.Panel,
     button: widgets.Button,
     slider: widgets.Slider,
+    scroll: widgets.Scroll,
 };
 
 /// Retained demo. `capture` and `hovered` are slots in `widgets`, or null.
@@ -254,15 +198,10 @@ pub const Scene = struct {
     capture: ?u32,
     hovered: ?u32,
     dirty: bool,
-    palette_index: u32,
-    seen_clicks: u32,
-    body_slot: u32,
-    button_slot: u32,
     width_logical: u32,
     height_logical: u32,
 
-    /// Header, body, slider at 0.5, and a right-aligned button. Rects are empty
-    /// until `layout`. The body starts on palette entry 0.
+    /// One right-aligned scroll. Rects are empty until `layout`.
     pub fn init_demo() Scene {
         var scene: Scene = .{
             .widgets = undefined,
@@ -272,25 +211,16 @@ pub const Scene = struct {
             .capture = null,
             .hovered = null,
             .dirty = false,
-            .palette_index = 0,
-            .seen_clicks = 0,
-            .body_slot = slot_body,
-            .button_slot = slot_button,
             .width_logical = 0,
             .height_logical = 0,
         };
-        scene.widgets[slot_header] = .{ .panel = header_panel() };
-        scene.widgets[slot_body] = .{ .panel = body_panel() };
-        scene.widgets[slot_slider] = .{ .slider = demo_slider() };
-        scene.widgets[slot_button] = .{ .button = demo_button() };
+        scene.widgets[slot_scroll] = .{ .scroll = demo_scroll() };
         assert(scene.count == demo_count);
         assert(!scene.pointer.inside);
         return scene;
     }
 
-    /// Places every walk in a padded column of the logical window, then re-hits
-    /// the stored pointer so a resize does not leave hover on a widget that moved
-    /// away. Sets `dirty` so the next present rebuilds instances.
+    /// Places the scroll, then its children, then re-hits the stored pointer.
     pub fn layout(self: *Scene, width_logical: u32, height_logical: u32) void {
         assert(width_logical != 0);
         assert(height_logical != 0);
@@ -315,7 +245,7 @@ pub const Scene = struct {
         index = 0;
         while (index < self.count) : (index += 1) {
             widget_set_rect(&self.widgets[index], rects[index]);
-            widget_place_label(&self.widgets[index]);
+            widget_place(&self.widgets[index]);
         }
         self.width_logical = width_logical;
         self.height_logical = height_logical;
@@ -325,17 +255,18 @@ pub const Scene = struct {
         assert(self.width_logical == width_logical);
     }
 
-    /// Applies one event. Returns true when widget state changed, and sets
-    /// `dirty` in that case. A repeated move inside the same widget returns false.
+    /// Applies one event. A move inside the scroll is forwarded so child hover
+    /// can change without the scene slot changing.
     pub fn handle_event(self: *Scene, event: input.Event) bool {
         assert(self.count <= widget_cap);
-        assert(self.palette_index < palette_len);
+        assert(self.width_logical == self.width_logical);
         switch (event) {
             .pointer_move => |point| return self.on_move(point),
             .pointer_down => |point| return self.on_down(point),
             .pointer_up => |point| return self.on_up(point),
             .pointer_leave => return self.on_leave(),
             .frame => |dt_ms| return self.on_frame(dt_ms),
+            .wheel => |wheel| return self.on_wheel(wheel),
         }
     }
 
@@ -353,18 +284,21 @@ pub const Scene = struct {
         return false;
     }
 
-    /// Clears both lists, appends the column and faces, then the labels.
-    /// Clears `dirty`. Call only when `dirty` is set; a scale-only present
-    /// skips this and uploads neither instance buffer.
+    /// Clears both lists and draws the scroll. The window clip is the full frame.
     pub fn draw(self: *Scene, list: *quads.DrawList, glyphs: *font.GlyphList) void {
         assert(self.width_logical != 0);
         assert(self.height_logical != 0);
         list.clear();
         glyphs.clear();
-        append_column(list, self.width_logical, self.height_logical);
+        const clip: font.Clip = .{
+            .x0 = 0,
+            .y0 = 0,
+            .x1 = @floatFromInt(self.width_logical),
+            .y1 = @floatFromInt(self.height_logical),
+        };
         var index: u32 = 0;
         while (index < self.count) : (index += 1) {
-            widget_draw(&self.widgets[index], list, glyphs);
+            widget_draw(&self.widgets[index], list, glyphs, clip);
         }
         self.dirty = false;
         assert(!self.dirty);
@@ -381,8 +315,13 @@ pub const Scene = struct {
             assert(self.pointer.down);
             return self.mark(self.send(index, .{ .drag = point }));
         }
-        assert(self.capture == null);
-        return self.mark(self.dispatch_hover(point));
+        var changed = self.dispatch_hover(point);
+        if (self.hovered) |index| {
+            if (self.send(index, .{ .move = point })) {
+                changed = true;
+            }
+        }
+        return self.mark(changed);
     }
 
     fn on_down(self: *Scene, point: input.Point) bool {
@@ -391,6 +330,9 @@ pub const Scene = struct {
         self.was_down = true;
         var changed = self.dispatch_hover(point);
         if (self.hovered) |index| {
+            if (self.send(index, .{ .move = point })) {
+                changed = true;
+            }
             self.capture = index;
             if (self.send(index, .{ .down = point })) {
                 changed = true;
@@ -414,11 +356,13 @@ pub const Scene = struct {
             }
             self.capture = null;
         }
-        if (self.note_clicks()) {
-            changed = true;
-        }
         if (self.dispatch_hover(point)) {
             changed = true;
+        }
+        if (self.hovered) |index| {
+            if (self.send(index, .{ .move = point })) {
+                changed = true;
+            }
         }
         assert(!self.pointer.down);
         assert(self.capture == null);
@@ -444,9 +388,6 @@ pub const Scene = struct {
             }
             self.hovered = null;
         }
-        if (self.note_clicks()) {
-            changed = true;
-        }
         self.pointer.leave();
         self.was_down = false;
         assert(self.capture == null);
@@ -468,6 +409,29 @@ pub const Scene = struct {
         return self.mark(changed);
     }
 
+    fn on_wheel(self: *Scene, wheel: input.Wheel) bool {
+        assert(wheel.dy == wheel.dy);
+        self.pointer.move(wheel.x, wheel.y);
+        var changed = false;
+        if (self.capture == null) {
+            if (self.dispatch_hover(.{ .x = wheel.x, .y = wheel.y })) {
+                changed = true;
+            }
+            if (self.hovered) |index| {
+                if (self.send(index, .{ .move = .{ .x = wheel.x, .y = wheel.y } })) {
+                    changed = true;
+                }
+            }
+        }
+        if (self.topmost(wheel.x, wheel.y)) |index| {
+            if (self.send(index, .{ .wheel = wheel })) {
+                changed = true;
+            }
+        }
+        assert(self.count <= widget_cap);
+        return self.mark(changed);
+    }
+
     fn redispatch(self: *Scene) void {
         assert(self.count <= widget_cap);
         if (!self.pointer.inside) {
@@ -482,6 +446,9 @@ pub const Scene = struct {
             return;
         }
         _ = self.dispatch_hover(point);
+        if (self.hovered) |index| {
+            _ = self.send(index, .{ .move = point });
+        }
         assert(self.pointer.inside);
     }
 
@@ -531,22 +498,6 @@ pub const Scene = struct {
         return null;
     }
 
-    fn note_clicks(self: *Scene) bool {
-        assert(self.button_slot < self.count);
-        assert(self.body_slot < self.count);
-        const clicks = self.widgets[self.button_slot].button.clicks;
-        if (clicks == self.seen_clicks) {
-            assert(clicks == self.seen_clicks);
-            return false;
-        }
-        self.seen_clicks = clicks;
-        self.palette_index = clicks % palette_len;
-        self.widgets[self.body_slot].panel.paint = body_palette[self.palette_index];
-        assert(self.palette_index < palette_len);
-        assert(self.seen_clicks == clicks);
-        return true;
-    }
-
     fn send(self: *Scene, index: u32, hit: widgets.Hit) bool {
         assert(index < self.count);
         assert(self.count <= widget_cap);
@@ -558,7 +509,7 @@ pub const Scene = struct {
             self.dirty = true;
         }
         assert(self.count <= widget_cap);
-        assert(self.palette_index < palette_len);
+        assert(self.capture == null or self.capture.? < self.count);
         return changed;
     }
 };
@@ -587,6 +538,7 @@ fn widget_handle(widget: *Widget, hit: widgets.Hit) bool {
         .panel => |*panel| panel.handle(hit),
         .button => |*button| button.handle(hit),
         .slider => |*slider| slider.handle(hit),
+        .scroll => |*scroll| scroll.handle(hit),
     };
     assert(widget_id(widget) == before);
     return changed;
@@ -599,24 +551,17 @@ fn widget_animate(widget: *Widget, dt_ms: f32) bool {
         .panel => |*panel| panel.animate(dt_ms),
         .button => |*button| button.animate(dt_ms),
         .slider => |*slider| slider.animate(dt_ms),
+        .scroll => |*scroll| scroll.animate(dt_ms),
     };
 }
 
 fn widget_live(widget: *const Widget) bool {
     assert(widget_id(widget) != 0);
     switch (widget.*) {
-        .panel => |*panel| {
-            assert(panel.id != 0);
-            return panel.live();
-        },
-        .button => |*button| {
-            assert(button.id != 0);
-            return button.live();
-        },
-        .slider => |*slider| {
-            assert(slider.id != 0);
-            return slider.live();
-        },
+        .panel => |*panel| return panel.live(),
+        .button => |*button| return button.live(),
+        .slider => |*slider| return slider.live(),
+        .scroll => |*scroll| return scroll.live(),
     }
 }
 
@@ -627,46 +572,46 @@ fn widget_contains(widget: *const Widget, x: f32, y: f32) bool {
         .panel => |*panel| panel.contains(x, y),
         .button => |*button| button.contains(x, y),
         .slider => |*slider| slider.contains(x, y),
+        .scroll => |*scroll| scroll.contains(x, y),
     };
 }
 
-fn widget_draw(widget: *const Widget, list: *quads.DrawList, glyphs: *font.GlyphList) void {
+fn widget_draw(
+    widget: *const Widget,
+    list: *quads.DrawList,
+    glyphs: *font.GlyphList,
+    clip: font.Clip,
+) void {
     assert(list.count <= quads.instance_cap);
-    assert(glyphs.count <= font.glyph_cap);
+    assert(clip.x1 > clip.x0);
     switch (widget.*) {
-        .panel => |*panel| panel.draw(list, glyphs),
-        .button => |*button| button.draw(list, glyphs),
-        .slider => |*slider| slider.draw(list),
+        .panel => |*panel| panel.draw(list, glyphs, clip),
+        .button => |*button| button.draw(list, glyphs, clip),
+        .slider => |*slider| slider.draw(list, clip),
+        .scroll => |*scroll| scroll.draw(list, glyphs, clip),
     }
     assert(list.count <= quads.instance_cap);
     assert(glyphs.count <= font.glyph_cap);
 }
 
-fn widget_place_label(widget: *Widget) void {
+fn widget_place(widget: *Widget) void {
     assert(widget_id(widget) != 0);
     switch (widget.*) {
         .panel => |*panel| widgets.place_label(&panel.label, panel.rect, panel.padding),
         .button => |*button| widgets.place_label(&button.label, button.rect, button.padding),
         .slider => assert(widget_id(widget) != 0),
+        .scroll => |*scroll| scroll.layout_children(),
     }
 }
 
 fn widget_walk(widget: *const Widget) turtle.Walk {
     switch (widget.*) {
-        .panel => |*panel| {
-            assert(panel.walk.align_x >= 0);
-            assert(panel.walk.align_x <= 1);
-            return panel.walk;
-        },
-        .button => |*button| {
-            assert(button.walk.align_x >= 0);
-            assert(button.walk.align_x <= 1);
-            return button.walk;
-        },
-        .slider => |*slider| {
-            assert(slider.walk.align_x >= 0);
-            assert(slider.walk.align_x <= 1);
-            return slider.walk;
+        .panel => |*panel| return panel.walk,
+        .button => |*button| return button.walk,
+        .slider => |*slider| return slider.walk,
+        .scroll => |*scroll| {
+            assert(scroll.walk.align_x == 1);
+            return scroll.walk;
         },
     }
 }
@@ -678,160 +623,128 @@ fn widget_set_rect(widget: *Widget, rect: turtle.Rect) void {
         .panel => |*panel| panel.rect = rect,
         .button => |*button| button.rect = rect,
         .slider => |*slider| slider.rect = rect,
+        .scroll => |*scroll| scroll.rect = rect,
     }
 }
 
 fn widget_id(widget: *const Widget) u32 {
     switch (widget.*) {
-        .panel => |*panel| {
-            assert(panel.paint.a == 1);
-            return panel.id;
-        },
-        .button => |*button| {
-            assert(button.paint.a == 1);
-            return button.id;
-        },
-        .slider => |*slider| {
-            assert(slider.value >= 0);
-            return slider.id;
+        .panel => |*panel| return panel.id,
+        .button => |*button| return button.id,
+        .slider => |*slider| return slider.id,
+        .scroll => |*scroll| {
+            assert(scroll.child_count <= widgets.scroll_child_cap);
+            return scroll.id;
         },
     }
 }
 
-fn append_column(list: *quads.DrawList, width: u32, height: u32) void {
-    assert(width != 0);
-    assert(height != 0);
-    list.append(.{
-        .x = 0,
-        .y = 0,
-        .width = @floatFromInt(width),
-        .height = @floatFromInt(height),
-        .r = column_paint.r,
-        .g = column_paint.g,
-        .b = column_paint.b,
-        .a = column_paint.a,
-        .radius = column_paint.radius,
-        .hover = 0,
-        .down = 0,
-        .pad1 = 0,
-    }) catch unreachable;
-    assert(list.count >= 1);
-    assert(list.items[0].radius == 0);
-}
-
-fn header_panel() widgets.Panel {
-    const panel: widgets.Panel = .{
-        .id = id_header,
-        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+fn demo_scroll() widgets.Scroll {
+    var scroll: widgets.Scroll = .{
+        .id = id_scroll,
+        .rect = empty_rect,
         .walk = .{
             .margin = zero_margin,
-            .width = .fill,
-            .height = .{ .fixed = 64 },
-            .align_x = 0,
-        },
-        .padding = header_padding,
-        .label = white_label("Patchwork"),
-        .paint = header_paint,
-        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-        .down = animator.Animator.init(widgets.down_rate_per_ms),
-    };
-    assert(panel.id == id_header);
-    assert(panel.walk.height.fixed == 64);
-    return panel;
-}
-
-fn body_panel() widgets.Panel {
-    const panel: widgets.Panel = .{
-        .id = id_body,
-        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-        .walk = .{
-            .margin = top_margin,
-            .width = .fill,
+            .width = .{ .fixed = 320 },
             .height = .fill,
-            .align_x = 0,
-        },
-        .padding = zero_padding,
-        .label = white_label(""),
-        .paint = body_palette[0],
-        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-        .down = animator.Animator.init(widgets.down_rate_per_ms),
-    };
-    assert(panel.id == id_body);
-    assert(panel.walk.height == .fill);
-    return panel;
-}
-
-fn demo_slider() widgets.Slider {
-    const slider: widgets.Slider = .{
-        .id = id_slider,
-        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-        .walk = .{
-            .margin = top_margin,
-            .width = .fill,
-            .height = .{ .fixed = 24 },
-            .align_x = 0,
-        },
-        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-        .value = 0.5,
-        .track = track_paint,
-        .fill = fill_paint,
-        .knob = knob_paint,
-    };
-    assert(slider.value == 0.5);
-    assert(slider.walk.height.fixed == 24);
-    return slider;
-}
-
-fn demo_button() widgets.Button {
-    const button: widgets.Button = .{
-        .id = id_button,
-        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-        .walk = .{
-            .margin = top_margin,
-            .width = .{ .fit = font.measure("Cycle") + 32 },
-            .height = .{ .fixed = 48 },
             .align_x = 1,
         },
-        .padding = button_padding,
-        .label = white_label("Cycle"),
-        .paint = button_paint,
-        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-        .down = animator.Animator.init(widgets.down_rate_per_ms),
-        .clicks = 0,
+        .padding = scroll_padding,
+        .children = undefined,
+        .child_count = 11,
+        .scroll_y = 0,
+        .content_h = 0,
+        .press = .none,
+        .hot = null,
     };
-    assert(button.clicks == 0);
-    assert(button.walk.align_x == 1);
-    return button;
+    var index: u32 = 0;
+    while (index < knob_specs.len) : (index += 1) {
+        scroll.children[index] = .{ .knob = demo_knob(index) };
+    }
+    scroll.children[8] = .{ .meter = demo_meter() };
+    scroll.children[9] = .{ .toggle = demo_toggle(11, "take", true) };
+    scroll.children[10] = .{ .toggle = demo_toggle(12, "drums", false) };
+    assert(scroll.child_count == 11);
+    assert(scroll.children[0].knob.value == 0.25);
+    return scroll;
 }
 
-fn white_label(text: []const u8) widgets.Label {
-    assert(text.len <= font.text_cap);
-    const label: widgets.Label = .{
-        .text = text,
-        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
+fn demo_knob(index: u32) widgets.Knob {
+    assert(index < knob_specs.len);
+    const spec = knob_specs[index];
+    var knob: widgets.Knob = .{
+        .id = index + 2,
+        .rect = empty_rect,
+        .walk = row_walk(widgets.knob_height),
+        .name = spec.name,
+        .value_text = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .value = spec.value,
+        .accent = widgets.accents[index % widgets.accent_count],
+        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
+        .drag_y = 0,
     };
-    assert(label.a == 1);
-    assert(label.text.len == text.len);
-    return label;
+    knob.set_value(spec.value);
+    assert(knob.name.len <= 8);
+    assert(knob.value == spec.value);
+    return knob;
+}
+
+fn demo_meter() widgets.Meter {
+    const meter: widgets.Meter = .{
+        .id = 10,
+        .rect = empty_rect,
+        .walk = row_walk(widgets.meter_height),
+        .name = "meter",
+        .value = 0.50,
+    };
+    assert(meter.value == 0.50);
+    assert(meter.walk.height.fixed == widgets.meter_height);
+    return meter;
+}
+
+fn demo_toggle(id: u32, name: []const u8, on: bool) widgets.Toggle {
+    assert(name.len <= 8);
+    const toggle: widgets.Toggle = .{
+        .id = id,
+        .rect = empty_rect,
+        .walk = row_walk(widgets.toggle_height),
+        .name = name,
+        .on = on,
+        .hover = animator.Animator.init(widgets.hover_rate_per_ms),
+        .thumb = widgets.settled(widgets.hover_rate_per_ms, on),
+    };
+    assert(toggle.on == on);
+    assert(!toggle.thumb.live());
+    return toggle;
+}
+
+fn row_walk(height: f32) turtle.Walk {
+    assert(height > 0);
+    const walk: turtle.Walk = .{
+        .margin = row_margin,
+        .width = .fill,
+        .height = .{ .fixed = height },
+        .align_x = 0,
+    };
+    assert(walk.margin.top == 8);
+    assert(walk.height.fixed == height);
+    return walk;
 }
 
 comptime {
     assert(widget_cap == 32);
-    assert(1 + widget_cap * 3 <= quads.instance_cap);
+    assert(1 + 1 + widgets.scroll_child_cap * 2 <= quads.instance_cap);
+    assert(widgets.scroll_child_cap * 12 <= font.glyph_cap);
     assert(widget_cap <= turtle.child_cap);
-    assert(demo_count == 4);
-    assert(palette_len == 3);
+    assert(demo_count == 1);
     assert(column_padding.left == 16);
-    assert(header_paint.radius == 8);
-    assert(button_paint.radius == 24);
-    assert(body_palette[0].radius == 16);
-    assert("Patchwork".len + "Cycle".len == 14);
-    assert(header_padding.left == 16);
-    assert(button_padding.top == 0);
+    assert(scroll_padding.left == 8);
+    assert(knob_specs.len == 8);
+}
+
+fn scroll_of(scene: *Scene) *widgets.Scroll {
+    assert(scene.count >= 1);
+    return &scene.widgets[slot_scroll].scroll;
 }
 
 fn expect_rect(rect: turtle.Rect, x: f32, y: f32, width: f32, height: f32) !void {
@@ -848,179 +761,301 @@ fn expect_box(instance: quads.Instance, x: f32, y: f32, width: f32, height: f32)
     try std.testing.expectEqual(height, instance.height);
 }
 
-// 1280 by 720 places the four widgets and emits seven faces at slider value 0.5.
+const view_clip: font.Clip = .{ .x0 = 952, .y0 = 24, .x1 = 1256, .y1 = 696 };
+
+fn glyph_has_clip(glyph: font.Glyph, clip: font.Clip) bool {
+    if (glyph.clip_x0 != clip.x0) {
+        return false;
+    }
+    if (glyph.clip_y0 != clip.y0) {
+        return false;
+    }
+    if (glyph.clip_x1 != clip.x1) {
+        return false;
+    }
+    if (glyph.clip_y1 != clip.y1) {
+        return false;
+    }
+    return true;
+}
+
+// 1280 by 720 parks the column on the right. The first ring is the gain knob.
 test "demo layout at 1280 by 720" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    const header = scene.widgets[slot_header].panel.rect;
-    const body = scene.widgets[slot_body].panel.rect;
-    const slider = scene.widgets[slot_slider].slider.rect;
-    const button = scene.widgets[slot_button].button.rect;
-    const width = font.measure("Cycle") + 32;
-    const fitted_x = 16 + (1248 - width);
-    try expect_rect(header, 16, 16, 1248, 64);
-    try expect_rect(body, 16, 96, 1248, 504);
-    try expect_rect(slider, 16, 616, 1248, 24);
-    try expect_rect(button, fitted_x, 656, width, 48);
-    try std.testing.expectEqual(@as(f32, 720), button.y + button.height + column_padding.bottom);
+    const scroll = scroll_of(&scene);
+    try expect_rect(scroll.rect, 944, 16, 320, 688);
+    try expect_rect(scroll.viewport(), 952, 24, 304, 672);
+    try expect_rect(scroll.content_column(), 952, 24, 288, 672);
+    try std.testing.expectEqual(@as(f32, 904), scroll.content_h);
+    try std.testing.expectEqual(@as(f32, 232), scroll.max_scroll());
+    try expect_rect(scroll.children[0].knob.rect, 952, 32, 288, 72);
+    try expect_rect(widgets.ring_of(scroll.children[0].knob.rect), 960, 40, 56, 56);
     var list = quads.DrawList.init();
     var glyphs = font.GlyphList.init();
     scene.draw(&list, &glyphs);
-    try std.testing.expectEqual(@as(u32, 7), list.count);
-    try std.testing.expectEqual(@as(u32, 14), glyphs.count);
-    try expect_box(list.items[0], 0, 0, 1280, 720);
-    try expect_box(list.items[1], 16, 16, 1248, 64);
-    try expect_box(list.items[2], 16, 96, 1248, 504);
-    try expect_box(list.items[3], 28, 625, 1224, 6);
-    try expect_box(list.items[4], 28, 625, 612, 6);
-    try expect_box(list.items[5], 628, 616, 24, 24);
-    try expect_box(list.items[6], fitted_x, 656, width, 48);
-    try std.testing.expectEqual(@as(f32, 8), list.items[1].radius);
-    try std.testing.expectEqual(@as(f32, 16), list.items[2].radius);
-    try std.testing.expectEqual(@as(f32, 3), list.items[3].radius);
-    try std.testing.expectEqual(@as(f32, 12), list.items[5].radius);
-    try std.testing.expectEqual(@as(f32, 24), list.items[6].radius);
+    try expect_box(list.items[1], 960, 40, 56, 56);
+    try std.testing.expectEqual(quads.kind_arc, list.items[1].kind);
+    try std.testing.expectEqual(@as(f32, 1), list.items[1].down);
+    try expect_box(list.items[2], 960, 40, 56, 56);
+    try std.testing.expectEqual(@as(f32, 0.25), list.items[2].down);
     try std.testing.expect(!scene.dirty);
 }
 
-// 800 by 600 shrinks the body and parks the button on the right.
 test "demo layout at 800 by 600" {
     var scene = Scene.init_demo();
     scene.layout(800, 600);
-    const width = font.measure("Cycle") + 32;
-    try expect_rect(scene.widgets[slot_header].panel.rect, 16, 16, 768, 64);
-    try expect_rect(scene.widgets[slot_body].panel.rect, 16, 96, 768, 384);
-    try expect_rect(scene.widgets[slot_slider].slider.rect, 16, 496, 768, 24);
-    try expect_rect(scene.widgets[slot_button].button.rect, 16 + (768 - width), 536, width, 48);
+    const scroll = scroll_of(&scene);
+    try expect_rect(scroll.rect, 464, 16, 320, 568);
+    try std.testing.expectEqual(@as(f32, 904), scroll.content_h);
+    try std.testing.expectEqual(@as(f32, 352), scroll.max_scroll());
 }
 
-// Widening the window moves the right-aligned button, and the stored pointer
-// still lands on it, so hover stays aimed at 1.
-test "relayout keeps hover on the moved button" {
+test "scroll 0 clips the meter and omits the toggles" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    const first = scene.widgets[slot_button].button.rect;
-    const point: input.Point = .{
-        .x = first.x + first.width - 4,
-        .y = first.y + first.height * 0.5,
-    };
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = point }));
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
-    scene.layout(1288, 720);
-    const width = font.measure("Cycle") + 32;
-    const expected_x = 16 + ((1288 - 32) - width);
-    try expect_rect(scene.widgets[slot_button].button.rect, expected_x, 656, width, 48);
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
-    try std.testing.expectEqual(slot_button, scene.hovered.?);
+    var list = quads.DrawList.init();
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
+    var meter_faces: u32 = 0;
+    var index: u32 = 0;
+    while (index < list.count) : (index += 1) {
+        const face = list.items[index];
+        if (face.y >= 840) {
+            try std.testing.expect(false);
+        }
+        if (face.width == widgets.meter_track_w) {
+            meter_faces += 1;
+            try std.testing.expectEqual(view_clip.x0, face.clip_x0);
+            try std.testing.expectEqual(view_clip.y0, face.clip_y0);
+            try std.testing.expectEqual(view_clip.x1, face.clip_x1);
+            try std.testing.expectEqual(view_clip.y1, face.clip_y1);
+        }
+    }
+    try std.testing.expect(meter_faces >= 1);
+    var gain_glyph = false;
+    var meter_glyph = false;
+    index = 0;
+    while (index < glyphs.count) : (index += 1) {
+        const glyph = glyphs.items[index];
+        try std.testing.expect(glyph_has_clip(glyph, view_clip));
+        if (glyph.y < 80) {
+            gain_glyph = true;
+        }
+        if (glyph.y > 700) {
+            meter_glyph = true;
+        }
+    }
+    try std.testing.expect(gain_glyph);
+    try std.testing.expect(meter_glyph);
 }
 
-// Hover eases to 1. After the present that shows the settled value, a further
-// frame changes nothing and leaves the scene clean.
-test "hover eases and then rests" {
+test "value 0 omits the value arc" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    const bc = button_center(&scene);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = bc.x, .y = bc.y } }));
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
-    try std.testing.expect(scene.live());
-    try std.testing.expect(scene.dirty);
+    const skew = scroll_of(&scene).children[3].knob.rect;
+    const ring = widgets.ring_of(skew);
+    var list = quads.DrawList.init();
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
+    var arcs: u32 = 0;
+    var index: u32 = 0;
+    while (index < list.count) : (index += 1) {
+        const face = list.items[index];
+        if (face.kind != quads.kind_arc) {
+            continue;
+        }
+        if (face.y != ring.y) {
+            continue;
+        }
+        arcs += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), arcs);
+}
+
+test "a tall window draws the short toggle rows" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 1000);
+    const scroll = scroll_of(&scene);
+    try std.testing.expectEqual(@as(f32, 0), scroll.max_scroll());
+    var list = quads.DrawList.init();
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
+    const drums = scroll.children[10].toggle.rect;
+    const pill_y = drums.y + (drums.height - widgets.pill_h) * 0.5;
+    var found = false;
+    var index: u32 = 0;
+    while (index < list.count) : (index += 1) {
+        if (list.items[index].y == pill_y) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(glyphs.count > 0);
+}
+
+test "scroll 232 shows drums and clamps a further wheel" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const scroll = scroll_of(&scene);
+    const view = scroll.viewport();
+    const wheel_x = view.x + view.width - 8;
+    const wheel_y = view.y + 40;
+    try std.testing.expect(scene.handle_event(.{ .wheel = .{
+        .x = wheel_x,
+        .y = wheel_y,
+        .dy = 232,
+    } }));
+    try std.testing.expectEqual(@as(f32, 232), scroll.scroll_y);
+    const drums = scroll.children[10].toggle.rect;
+    const bottom = drums.y - scroll.scroll_y + drums.height;
+    try std.testing.expectEqual(view.y + view.height, bottom);
+    try std.testing.expect(!scene.handle_event(.{ .wheel = .{
+        .x = wheel_x,
+        .y = wheel_y,
+        .dy = 40,
+    } }));
+    try std.testing.expectEqual(@as(f32, 232), scroll.scroll_y);
+}
+
+test "knob drag from the ring center clamps at both ends" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const ring = widgets.ring_of(scroll_of(&scene).children[0].knob.rect);
+    const cx = ring.x + ring.width * 0.5;
+    const cy = ring.y + ring.height * 0.5;
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = cx, .y = cy } }));
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = cx, .y = cy - 60 } }));
+    try std.testing.expectEqual(@as(f32, 0.75), scroll_of(&scene).children[0].knob.value);
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = cx, .y = cy + 4000 } }));
+    try std.testing.expectEqual(@as(f32, 0), scroll_of(&scene).children[0].knob.value);
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = cx, .y = cy - 4000 } }));
+    try std.testing.expectEqual(@as(f32, 1), scroll_of(&scene).children[0].knob.value);
+}
+
+test "wheel on the ring nudges and wheel on the label scrolls" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const ring = widgets.ring_of(scroll_of(&scene).children[0].knob.rect);
+    const cx = ring.x + ring.width * 0.5;
+    const cy = ring.y + ring.height * 0.5;
+    try std.testing.expect(scene.handle_event(.{ .wheel = .{ .x = cx, .y = cy, .dy = -60 } }));
+    try std.testing.expectEqual(@as(f32, 0.75), scroll_of(&scene).children[0].knob.value);
+    try std.testing.expectEqual(@as(f32, 0), scroll_of(&scene).scroll_y);
+    try std.testing.expect(scene.handle_event(.{ .wheel = .{
+        .x = ring.x + 80,
+        .y = cy,
+        .dy = 40,
+    } }));
+    try std.testing.expectEqual(@as(f32, 0.75), scroll_of(&scene).children[0].knob.value);
+    try std.testing.expectEqual(@as(f32, 40), scroll_of(&scene).scroll_y);
+}
+
+test "toggle up inside drums slides the thumb" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const scroll = scroll_of(&scene);
+    const view = scroll.viewport();
+    try std.testing.expect(scene.handle_event(.{ .wheel = .{
+        .x = view.x + view.width - 8,
+        .y = view.y + 40,
+        .dy = 232,
+    } }));
+    const row = scroll.children[10].toggle.rect;
+    const visual_y = row.y - scroll.scroll_y;
+    const pill_x = row.x + widgets.ring_inset + widgets.pill_w * 0.5;
+    const pill_y = visual_y + row.height * 0.5;
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = pill_x, .y = pill_y } }));
+    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = pill_x, .y = pill_y } }));
+    try std.testing.expect(scroll.children[10].toggle.on);
+    try std.testing.expectEqual(@as(f32, 1), scroll.children[10].toggle.thumb.target);
     try std.testing.expect(scene.handle_event(.{ .frame = 50 }));
     try std.testing.expectApproxEqAbs(
         @as(f32, 0.5),
-        scene.widgets[slot_button].button.hover.value,
+        scroll.children[10].toggle.thumb.value,
         0.0001,
     );
-    try std.testing.expect(scene.dirty);
     try std.testing.expect(scene.handle_event(.{ .frame = 1000 }));
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.value);
+    try std.testing.expectEqual(@as(f32, 1), scroll.children[10].toggle.thumb.value);
+}
+
+test "toggle up outside does not flip" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const scroll = scroll_of(&scene);
+    const view = scroll.viewport();
+    try std.testing.expect(scene.handle_event(.{ .wheel = .{
+        .x = view.x + view.width - 8,
+        .y = view.y + 40,
+        .dy = 232,
+    } }));
+    const row = scroll.children[10].toggle.rect;
+    const pill_x = row.x + widgets.ring_inset + widgets.pill_w * 0.5;
+    const pill_y = row.y - scroll.scroll_y + row.height * 0.5;
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = pill_x, .y = pill_y } }));
+    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = 0, .y = 0 } }));
+    try std.testing.expect(!scroll.children[10].toggle.on);
+    try std.testing.expectEqual(@as(f32, 0), scroll.children[10].toggle.thumb.target);
+}
+
+test "hover on gain eases and a later frame stays clean" {
+    var scene = Scene.init_demo();
+    scene.layout(1280, 720);
+    const ring = widgets.ring_of(scroll_of(&scene).children[0].knob.rect);
+    const point: input.Point = .{
+        .x = ring.x + ring.width * 0.5,
+        .y = ring.y + ring.height * 0.5,
+    };
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = point }));
+    try std.testing.expectEqual(@as(f32, 1), scroll_of(&scene).children[0].knob.hover.target);
+    try std.testing.expect(scene.live());
+    try std.testing.expect(scene.handle_event(.{ .frame = 50 }));
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.5),
+        scroll_of(&scene).children[0].knob.hover.value,
+        0.0001,
+    );
+    try std.testing.expect(scene.handle_event(.{ .frame = 1000 }));
+    try std.testing.expectEqual(@as(f32, 1), scroll_of(&scene).children[0].knob.hover.value);
     try std.testing.expect(!scene.live());
     var list = quads.DrawList.init();
     var glyphs = font.GlyphList.init();
     scene.draw(&list, &glyphs);
     try std.testing.expect(!scene.dirty);
-    try std.testing.expectEqual(widgets.hover_lighten, list.items[6].hover);
     try std.testing.expect(!scene.handle_event(.{ .frame = 16 }));
     try std.testing.expect(!scene.dirty);
-    try std.testing.expect(!scene.handle_event(.{ .pointer_move = .{ .x = 1200, .y = 680 } }));
 }
 
-// A press and release on the button counts one click and advances the body palette.
-test "a click cycles the body palette" {
+test "relayout by 8 px keeps gain hover" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    const bc = button_center(&scene);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
-    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = bc.x, .y = bc.y } }));
-    try std.testing.expectEqual(@as(u32, 1), scene.widgets[slot_button].button.clicks);
-    try std.testing.expectEqual(@as(u32, 1), scene.palette_index);
-    try std.testing.expectEqual(body_palette[1].r, scene.widgets[slot_body].panel.paint.r);
+    const ring = widgets.ring_of(scroll_of(&scene).children[0].knob.rect);
+    const point: input.Point = .{
+        .x = ring.x + ring.width * 0.5,
+        .y = ring.y + ring.height * 0.5,
+    };
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = point }));
+    scene.layout(1288, 720);
+    try std.testing.expectEqual(@as(f32, 1), scroll_of(&scene).children[0].knob.hover.target);
+    try std.testing.expectEqual(slot_scroll, scene.hovered.?);
+    try std.testing.expectEqual(@as(u32, 0), scroll_of(&scene).hot.?);
 }
 
-// Dragging off the button before release is not a click, and hover follows the pointer.
-test "a drag off the button does not click" {
+test "pointer leave during a knob press releases capture" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    const bc = button_center(&scene);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
-    // The drag is captured by the button and does not change its value. Hover
-    // stays locked until release, so this move is not a state change.
-    try std.testing.expect(!scene.handle_event(.{ .pointer_move = .{ .x = 640, .y = 368 } }));
-    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = 640, .y = 368 } }));
-    try std.testing.expectEqual(@as(u32, 0), scene.widgets[slot_button].button.clicks);
-    try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.down.target);
-    try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.hover.target);
-    try std.testing.expect(scene.hovered.? != slot_button);
-    try std.testing.expect(scene.capture == null);
-}
-
-// Leaving the surface during a press delivers an outside release and drops capture.
-test "pointer leave during a press releases outside" {
-    var scene = Scene.init_demo();
-    scene.layout(1280, 720);
-    const bc = button_center(&scene);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
+    const ring = widgets.ring_of(scroll_of(&scene).children[0].knob.rect);
+    const point: input.Point = .{
+        .x = ring.x + ring.width * 0.5,
+        .y = ring.y + ring.height * 0.5,
+    };
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = point }));
     try std.testing.expect(scene.handle_event(.pointer_leave));
-    try std.testing.expectEqual(@as(u32, 0), scene.widgets[slot_button].button.clicks);
-    try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.down.target);
     try std.testing.expect(scene.capture == null);
     try std.testing.expect(!scene.pointer.inside);
-    try std.testing.expect(!scene.pointer.down);
+    try std.testing.expectEqual(@as(f32, 0.25), scroll_of(&scene).children[0].knob.value);
 }
 
-// The slider maps pointer x onto value. A held slider keeps the hover highlight
-// and writes no darken. Zero omits the fill face.
-test "slider drag sets an absolute value" {
-    var scene = Scene.init_demo();
-    scene.layout(1280, 720);
-    const bc = button_center(&scene);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = bc.x, .y = bc.y } }));
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = 640, .y = 628 } }));
-    try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.hover.target);
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.target);
-    try std.testing.expectEqual(@as(f32, 0.5), scene.widgets[slot_slider].slider.value);
-    try std.testing.expect(scene.handle_event(.{ .frame = widgets.hover_duration_ms }));
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.value);
-    var held = quads.DrawList.init();
-    var held_glyphs = font.GlyphList.init();
-    scene.draw(&held, &held_glyphs);
-    // Column, header, body, then track, fill, and knob. Value is still 0.5.
-    try std.testing.expectEqual(@as(u32, 7), held.count);
-    var face: u32 = 3;
-    while (face < 6) : (face += 1) {
-        try std.testing.expectEqual(widgets.hover_lighten, held.items[face].hover);
-        try std.testing.expectEqual(@as(f32, 0), held.items[face].down);
-    }
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 28, .y = 628 } }));
-    try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_slider].slider.value);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    scene.draw(&list, &glyphs);
-    try std.testing.expectEqual(@as(u32, 6), list.count);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 2000, .y = 628 } }));
-    try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.value);
-}
-
-// After a rebuild, an unchanged logical size uploads nothing.
 test "a settled scene does not rebuild on a scale-style present" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
@@ -1033,15 +1068,4 @@ test "a settled scene does not rebuild on a scale-style present" {
     try std.testing.expect(!scene.dirty);
     try std.testing.expectEqual(@as(u32, 0), cursor.flags(&list, &glyphs, 1280, 720));
     try std.testing.expectEqual(revision, list.revision);
-}
-
-fn button_center(scene: *const Scene) input.Point {
-    const rect = scene.widgets[slot_button].button.rect;
-    const point: input.Point = .{
-        .x = rect.x + rect.width * 0.5,
-        .y = rect.y + rect.height * 0.5,
-    };
-    assert(point.x > rect.x);
-    assert(point.y > rect.y);
-    return point;
 }

@@ -19,9 +19,9 @@
 // - **Shared Hardware Unit Quad:** The exact same static 48-byte unit quad vertex buffer
 //   (6 vertices spanning `(0, 0)` to `(1, 1)`) is bound to both the face quad pipeline and the
 //   glyph text pipeline.
-// - **Separate 48-Byte Instance Records:** Face instance buffer packs `(rect, fill, shape)`,
-//   while glyph buffer packs `(dest_rect, uv_rect, color)`. Both strides are 48 bytes,
-//   matching WebGPU 16-byte attribute alignment rules (`float32x4`).
+// - **Separate 64-Byte Instance Records:** Face instance buffer packs
+//   `(rect, fill, shape, bounds)`, while glyph buffer packs `(dest_rect, uv_rect, color, bounds)`.
+//   Both strides are 64 bytes, matching WebGPU 16-byte attribute alignment rules (`float32x4`).
 // - **Two Draws in One Pass:** The active pass executes `draw_quads(6, quad_count)` then
 //   `draw_glyphs(6, glyph_count)`. Sharing color target, depth, and blend avoids pass teardown.
 // - **Pre-Baked Coverage:** The CPU pre-bakes ASCII glyphs into a 512 x 256 `r8unorm` atlas.
@@ -95,29 +95,35 @@
 //
 // ### Bind Group Layouts:
 // - **Group 0 (Uniform Buffer):**
-//   - Binding 0: `var<uniform> ortho: mat4x4<f32>` (64 bytes of matrix data, padded to 256 bytes
-//     to satisfy the WebGPU `minUniformBufferOffsetAlignment` specification rule).
-//   - Stage Visibility: `GPUShaderStage.VERTEX`.
+//   - Binding 0: `var<uniform> frame: Frame` (256 bytes total: 64 bytes matrix + 192 bytes
+//     `Theme` to satisfy the WebGPU `minUniformBufferOffsetAlignment` specification rule).
+//   - Stage Visibility: `GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT`.
 // - **Group 1 (Glyph Atlas & Sampler):**
 //   - Binding 0: `var atlas: texture_2d<f32>` (texture format `r8unorm`, view dimension `2d`).
 //     Stage Visibility: `GPUShaderStage.FRAGMENT`.
 //   - Binding 1: `var samp: sampler` (filtering sampler, clamp-to-edge, linear min/mag).
 //     Stage Visibility: `GPUShaderStage.FRAGMENT`.
 //
-// ### Vertex Attribute Locations (Stride: 48 Bytes):
+// ### Vertex Attribute Locations (Stride: 64 Bytes):
 // - `location(0)`: `unit: vec2<f32>` (Buffer 0, arrayStride 8, stepMode `vertex`).
-// - `location(1)`: `rect: vec4<f32>` (Buffer 1, arrayStride 48, stepMode `instance`, offset 0).
-// - `location(2)`: `uv_rect: vec4<f32>` (Buffer 1, arrayStride 48, stepMode `instance`, offset 16).
-// - `location(3)`: `color: vec4<f32>` (Buffer 1, arrayStride 48, stepMode `instance`, offset 32).
+// - `location(1)`: `rect: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 0).
+// - `location(2)`: `uv_rect: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 16).
+// - `location(3)`: `color: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 32).
+// - `location(4)`: `bounds: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 48).
 //
 // ## 4. State Machines & Data Flow
 // 1. Host records face instances into `DrawList` and glyph instances into `GlyphList`.
-// 2. If `flag_glyphs` and `glyph_count > 0`, host writes `glyph_count * 48` B into `glyph_buffer`.
+// 2. If `flag_glyphs` and `glyph_count > 0`, host writes `glyph_count * 64` B into `glyph_buffer`.
 // 3. Command encoder opens render pass with background clear color.
 // 4. `draw_quads` executes with `quadPipeline`, binding `quadBuffer` (0) and `instanceBuffer` (1).
 // 5. If `glyph_count > 0`, host sets `glyphPipeline`, binds group 0 (`uniform`),
 //    group 1 (`atlas + sampler`), binds buffers 0 and 1, and issues `draw(6, glyph_count)`.
-// 6. Render pass closes and commands submit to hardware queue.
+// 6. Hard clip mask is applied in fragment shader:
+//    `inside = step(bounds.x, pos.x) * step(bounds.y, pos.y)`
+//            `* step(pos.x, bounds.z) * step(pos.y, bounds.w)`
+//    `alpha = color.a * coverage * inside`
+//    Glyphs straddling container viewports are cleanly clipped with zero scissor state changes.
+// 7. Render pass closes and commands submit to hardware queue.
 //
 // ## 5. Cross-Platform Seams & FFI
 // - **Shader Compilation:** Native targets compile this source via `wgpuDeviceCreateShaderModule`
@@ -129,7 +135,29 @@
 // - **Bounded Execution:** Zero loops, zero recursion, zero dynamic branch conditions.
 // - **Deterministic Output:** No screen-space derivative functions (`fwidth`) or non-uniform flow.
 
-@group(0) @binding(0) var<uniform> ortho: mat4x4<f32>;
+// Same uniform as `quad.wgsl` so both pipelines share one 256-byte bind group.
+// This shader reads `frame.ortho`. The theme slots keep the struct the same size.
+struct Theme {
+    panel: vec4<f32>,
+    text: vec4<f32>,
+    track: vec4<f32>,
+    value: vec4<f32>,
+    control: vec4<f32>,
+    meter: vec4<f32>,
+    lighten: vec4<f32>,
+    darken: vec4<f32>,
+    arc: vec4<f32>,
+    pad0: vec4<f32>,
+    pad1: vec4<f32>,
+    pad2: vec4<f32>,
+}
+
+struct Frame {
+    ortho: mat4x4<f32>,
+    theme: Theme,
+}
+
+@group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var atlas: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
 
@@ -137,6 +165,9 @@ struct VertexOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) origin: vec2<f32>,
+    @location(3) local: vec2<f32>,
+    @location(4) bounds: vec4<f32>,
 };
 
 @vertex
@@ -145,19 +176,26 @@ fn vs_main(
     @location(1) rect: vec4<f32>,
     @location(2) uv_rect: vec4<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) bounds: vec4<f32>,
 ) -> VertexOut {
     var out: VertexOut;
     let local = unit * rect.zw;
     let pos = rect.xy + local;
-    out.clip = ortho * vec4<f32>(pos, 0.0, 1.0);
+    out.clip = frame.ortho * vec4<f32>(pos, 0.0, 1.0);
     out.uv = mix(uv_rect.xy, uv_rect.zw, unit);
     out.color = color;
+    out.origin = rect.xy;
+    out.local = local;
+    out.bounds = bounds;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let coverage = textureSample(atlas, samp, in.uv).r;
-    let alpha = in.color.a * coverage;
+    let pos = in.origin + in.local;
+    let inside = step(in.bounds.x, pos.x) * step(in.bounds.y, pos.y)
+        * step(pos.x, in.bounds.z) * step(pos.y, in.bounds.w);
+    let alpha = in.color.a * coverage * inside;
     return vec4<f32>(in.color.rgb, alpha);
 }

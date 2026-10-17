@@ -11,6 +11,7 @@ pub const input = @import("input.zig");
 pub const animator = @import("animator.zig");
 pub const widgets = @import("widgets.zig");
 pub const scene = @import("scene.zig");
+pub const theme = @import("theme.zig");
 /// Protocol interface tables, C ABI layout assertions, and pure `presented_ns` timestamp
 /// assembly. The extern `libwayland-client` functions are referenced only by runtime helper
 /// functions that unit tests never call, allowing `wp_presentation` to be tested without
@@ -26,5 +27,6 @@ test {
     _ = animator;
     _ = widgets;
     _ = scene;
+    _ = theme;
     _ = wp_presentation;
 }

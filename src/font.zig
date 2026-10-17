@@ -25,10 +25,10 @@
 //! - **Zero Runtime Allocation:** Both binaries are compiled directly into linear memory via
 //!   `@embedFile`. The frame path allocates zero bytes of dynamic heap memory and performs zero
 //!   font parsing or scale division.
-//! - **Separation of Concerns:** Quad faces (`quad.wgsl`) retain their 48-byte instance stride
-//!   `(rect, fill, radius, hover, down, 0)`. Glyph quads (`glyph.wgsl`) use a separate 48-byte
-//!   stride `(rect, uv_rect, color)`. Text does not carry an `Animator`, so static labels do not
-//!   keep frame loops alive (0% idle CPU invariant).
+//! - **Separation of Concerns:** Quad faces (`quad.wgsl`) retain their 64-byte instance stride
+//!   `(rect, fill, shape, clip)`. Glyph quads (`glyph.wgsl`) use a separate 64-byte stride
+//!   `(dest_rect, uv_rect, color, clip)`. Text does not carry an `Animator`, so static labels
+//!   do not keep frame loops alive (0% idle CPU invariant).
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -99,7 +99,7 @@
 //!
 //! ## 3. Hardware, Spec Limits, and C ABI Layouts
 //!
-//! ### 1. `Glyph` Instance Layout (48 Bytes):
+//! ### 1. `Glyph` Instance Layout (64 Bytes):
 //! `Glyph` instances are sent to the GPU in Vertex Buffer 1. Marked as `extern struct` to guarantee
 //! exact C ABI field ordering and alignment with zero compiler padding:
 //!
@@ -110,9 +110,10 @@
 //! |  0..15  (16 bytes, float32x4)     | Location 1: dest_rect (x,y,w,h)   |
 //! | 16..31  (16 bytes, float32x4)     | Location 2: uv_rect (u0,v0,u1,v1) |
 //! | 32..47  (16 bytes, float32x4)     | Location 3: color (r,g,b,a)       |
+//! | 48..63  (16 bytes, float32x4)     | Location 4: bounds (clip rect)    |
 //! +-----------------------------------+-----------------------------------+
 //! ```
-//! Total size: exactly 48 bytes (`@sizeOf(Glyph) == 48`). Matches the 48-byte instance stride
+//! Total size: exactly 64 bytes (`@sizeOf(Glyph) == 64`). Matches the 64-byte instance stride
 //! of the face buffer, enabling vertex layout sharing while strictly separating shader logic.
 //!
 //! ### 2. `font_metrics.bin` Binary File Format:
@@ -159,7 +160,7 @@
 //! [font.place()]   (Measures text, computes pen_x & baseline_y, looks up metrics)
 //!       │
 //!       ▼
-//! [GlyphList.append()] (Appends 48-byte Glyph to items array, bumps revision)
+//! [GlyphList.append()] (Appends 64-byte Glyph to items array, bumps revision)
 //!       │
 //!       ▼
 //! [UploadCursor.flags()] ─── revision != glyph_revision? ──► flag_glyphs = 4
@@ -205,7 +206,7 @@ const metrics_file: []const u8 = @embedFile("font_metrics.bin");
 /// Coverage atlas, 512 by 256, one `r8` byte per texel.
 pub const atlas_bytes: []const u8 = @embedFile("font_atlas.bin");
 
-/// Glyph shader. Separate from `quad.wgsl` so the face instance stays 48 bytes.
+/// Glyph shader. Separate from `quad.wgsl` while sharing the 64-byte instance stride.
 pub const shader_file: []const u8 = @embedFile("glyph.wgsl");
 
 pub const atlas_width: u32 = 512;
@@ -217,8 +218,8 @@ pub const glyph_cap: u32 = 256;
 /// Hard cap on a label string, in bytes. The demo strings are shorter.
 pub const text_cap: u32 = 64;
 
-/// Byte size of one glyph quad. Twelve floats, no trailing pad.
-pub const glyph_stride: u32 = 48;
+/// Byte size of one glyph quad. Sixteen floats: dest, uv, color, and the clip.
+pub const glyph_stride: u32 = 64;
 
 /// Total number of printable ASCII codepoints supported (32 through 126 inclusive).
 const codepoint_count: u32 = 95;
@@ -235,7 +236,7 @@ const record_bytes: u32 = 40;
 /// One instanced glyph quad submitted to the GPU in Vertex Buffer 1.
 ///
 /// Marked as `extern struct` to guarantee exact C ABI memory layout with no compiler padding.
-/// Memory Layout (48 bytes total):
+/// Memory Layout (64 bytes total):
 /// - Offset  0: `x` (f32) - Left destination edge in UI logical pixels.
 /// - Offset  4: `y` (f32) - Top destination edge in UI logical pixels.
 /// - Offset  8: `width` (f32) - Rendered quad width in UI logical pixels.
@@ -248,6 +249,8 @@ const record_bytes: u32 = 40;
 /// - Offset 36: `g` (f32) - Straight green color component in [0.0, 1.0].
 /// - Offset 40: `b` (f32) - Straight blue color component in [0.0, 1.0].
 /// - Offset 44: `a` (f32) - Base alpha component before coverage modulation in [0.0, 1.0].
+/// - Offset 48: `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1` - Exclusive-max clip.
+///   The fragment multiplies coverage by a hard inside mask. There is no unclipped sentinel.
 pub const Glyph = extern struct {
     x: f32,
     y: f32,
@@ -261,6 +264,18 @@ pub const Glyph = extern struct {
     g: f32,
     b: f32,
     a: f32,
+    clip_x0: f32,
+    clip_y0: f32,
+    clip_x1: f32,
+    clip_y1: f32,
+};
+
+/// Exclusive-max clip in logical pixels. `x1 > x0` and `y1 > y0`, all finite.
+pub const Clip = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
 };
 
 /// Bounding rectangle in UI logical pixels.
@@ -329,6 +344,7 @@ pub const GlyphList = struct {
         EdgeNotPositive,
         UvOutOfRange,
         ListFull,
+        ClipUnordered,
     };
 
     /// Appends one ink quad to the glyph list.
@@ -357,28 +373,19 @@ pub const GlyphList = struct {
         if (!uv_ok(glyph.v0, glyph.v1)) {
             return error.UvOutOfRange;
         }
+        if (!clip_ordered(glyph)) {
+            return error.ClipUnordered;
+        }
         if (self.count == glyph_cap) {
             return error.ListFull;
         }
         assert(glyph.width > 0);
         assert(glyph.u0 < glyph.u1);
-        self.items[self.count] = .{
-            .x = glyph.x,
-            .y = glyph.y,
-            .width = glyph.width,
-            .height = glyph.height,
-            .u0 = glyph.u0,
-            .v0 = glyph.v0,
-            .u1 = glyph.u1,
-            .v1 = glyph.v1,
-            .r = glyph.r,
-            .g = glyph.g,
-            .b = glyph.b,
-            .a = glyph.a,
-        };
+        self.items[self.count] = glyph;
         self.count += 1;
         self.revision += 1;
         assert(self.items[self.count - 1].width > 0);
+        assert(self.items[self.count - 1].clip_x1 > self.items[self.count - 1].clip_x0);
         assert(self.count <= glyph_cap);
     }
 
@@ -397,9 +404,9 @@ pub const GlyphList = struct {
 };
 
 comptime {
-    assert(@sizeOf(Glyph) == 48);
+    assert(@sizeOf(Glyph) == 64);
     assert(@alignOf(Glyph) >= 4);
-    assert(glyph_stride == 48);
+    assert(glyph_stride == 64);
     assert(glyph_cap == 256);
     assert(text_cap == 64);
     assert(atlas_width == 512);
@@ -445,10 +452,12 @@ pub fn measure(text: []const u8) f32 {
 /// Centers `text` in `rect` and appends one quad per glyph with positive width.
 ///
 /// The caller must have left at least `text.len` free slots. Space advances the
-/// pen and appends nothing. `append` after that capacity check uses
-/// `catch unreachable`.
-pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color) void {
+/// pen and appends nothing. Every quad copies `clip`. `append` after that
+/// capacity check uses `catch unreachable`.
+pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color, clip: Clip) void {
     assert(text.len <= text_cap);
+    assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
     const count: u32 = @intCast(text.len);
     assert(glyph_cap - list.count >= count);
     const text_width = measure(text);
@@ -473,6 +482,10 @@ pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color) void 
                 .g = color.g,
                 .b = color.b,
                 .a = color.a,
+                .clip_x0 = clip.x0,
+                .clip_y0 = clip.y0,
+                .clip_x1 = clip.x1,
+                .clip_y1 = clip.y1,
             }) catch unreachable;
         }
         pen_x += metric.advance;
@@ -483,6 +496,41 @@ pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color) void 
 
 /// Validates normalized texture coordinates.
 /// Returns true if and only if 0.0 <= min_c < max_c <= 1.0.
+fn finite_f32(value: f32) bool {
+    if (value != value) {
+        return false;
+    }
+    if (std.math.isInf(value)) {
+        return false;
+    }
+    assert(value == value);
+    return true;
+}
+
+fn clip_ordered(glyph: Glyph) bool {
+    if (!finite_f32(glyph.clip_x0)) {
+        return false;
+    }
+    if (!finite_f32(glyph.clip_y0)) {
+        return false;
+    }
+    if (!finite_f32(glyph.clip_x1)) {
+        return false;
+    }
+    if (!finite_f32(glyph.clip_y1)) {
+        return false;
+    }
+    if (!(glyph.clip_x1 > glyph.clip_x0)) {
+        return false;
+    }
+    if (!(glyph.clip_y1 > glyph.clip_y0)) {
+        return false;
+    }
+    assert(glyph.clip_x1 > glyph.clip_x0);
+    assert(glyph.clip_y1 > glyph.clip_y0);
+    return true;
+}
+
 fn uv_ok(min_c: f32, max_c: f32) bool {
     if (min_c < 0) {
         return false;
@@ -577,6 +625,8 @@ const white: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
 /// Sample bounding rectangle for test assertions.
 const sample_rect: Rect = .{ .x = 10, .y = 20, .width = 400, .height = 64 };
 
+const sample_clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+
 /// Constructs a valid 1x1 unit glyph with full UV range [0, 1] for queue capacity testing.
 fn unit_glyph() Glyph {
     const glyph: Glyph = .{
@@ -592,6 +642,10 @@ fn unit_glyph() Glyph {
         .g = 1,
         .b = 1,
         .a = 1,
+        .clip_x0 = 0,
+        .clip_y0 = 0,
+        .clip_x1 = 1,
+        .clip_y1 = 1,
     };
     assert(glyph.width > 0);
     assert(glyph.u0 < glyph.u1);
@@ -625,12 +679,12 @@ test "measure of Cycle is the five advances" {
 // resulting in 'A' landing exactly (advance(' ') * 0.5) further right.
 test "space places no quad and a positive pen delta" {
     var blank = GlyphList.init();
-    place(&blank, " ", sample_rect, white);
+    place(&blank, " ", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 0), blank.count);
     var alone = GlyphList.init();
-    place(&alone, "A", sample_rect, white);
+    place(&alone, "A", sample_rect, white, sample_clip);
     var spaced = GlyphList.init();
-    place(&spaced, " A", sample_rect, white);
+    place(&spaced, " A", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 1), alone.count);
     try std.testing.expectEqual(@as(u32, 1), spaced.count);
     const delta = spaced.items[0].x - alone.items[0].x;
@@ -642,7 +696,7 @@ test "space places no quad and a positive pen delta" {
 // lie strictly within the interior of the unit square [0, 1] due to half-texel insetting.
 test "Patchwork places nine quads inside the unit square" {
     var list = GlyphList.init();
-    place(&list, "Patchwork", sample_rect, white);
+    place(&list, "Patchwork", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 9), list.count);
     var index: u32 = 0;
     while (index < list.count) : (index += 1) {

@@ -31,8 +31,10 @@
 //! - `shader_ptr()` and `shader_len()` expose the embedded `quad.wgsl` source code.
 //! - `glyph_shader_ptr()` and `glyph_shader_len()` expose the embedded `glyph.wgsl` source code.
 //! - `quad_ptr()` and `quad_bytes()` expose the static unit quad vertex coordinates.
-//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (48 bytes).
-//! - `glyph_stride()` exposes the byte stride of the `Glyph` struct (48 bytes).
+//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (64 bytes).
+//! - `glyph_stride()` exposes the byte stride of the `Glyph` struct (64 bytes).
+//! - `theme_ptr()` and `theme_len()` expose the 192-byte `Theme` uniform tail.
+//! - `pointer_wheel()` forwards DOM wheel deltas in logical pixels to the event queue.
 //! - `atlas_ptr()` and `atlas_len()` expose the pre-baked 131,072-byte `r8unorm` font atlas buffer.
 //! - `atlas_width()` (512) and `atlas_height()` (256) expose atlas dimensions.
 //!
@@ -40,13 +42,11 @@
 //! compile both fixed-function pipelines, and upload the atlas texture. If the shaders or struct
 //! layouts change in Zig, JavaScript adapts automatically without code duplication.
 //!
-//! The 48-byte stride is the instance: rectangle, fill, and a shape `vec4` of
-//! `(radius, hover, down, 0)`. `instance_stride` asserts 48 here, and `shell.js` asserts 48
-//! again before it builds the pipeline and before it uploads. The third vertex attribute
-//! (shader location 3, offset 32, `float32x4`) must stay in lockstep with `quad.wgsl` and
-//! with the native `instance_attrs` table. A stride mismatch would silently fetch hover
-//! from the wrong bytes. `down` occupies offset 40.
-//! Similarly, `glyph_stride` asserts 48 bytes for `(dest_rect, uv_rect, color)`.
+//! The 64-byte stride is the instance: rectangle, fill, shape `vec4` (radius, hover, down, kind),
+//! and clip bounds `(clip_x0, clip_y0, clip_x1, clip_y1)`. `instance_stride` asserts 64 here,
+//! and `shell.js` asserts 64 again before it builds the pipeline and before it uploads.
+//! Vertex attribute location 4 at offset 48 carries the clip bounds.
+//! Similarly, `glyph_stride` asserts 64 bytes for `(dest_rect, uv_rect, color, clip)`.
 //!
 //! ## 4. Synchronous Stack-Frame Memory Sharing (Zero-Copy & Zero-Heap)
 //! In `present_frame()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
@@ -59,9 +59,9 @@
 //!   halts Zig execution at that instruction while preserving its stack frame in linear memory.
 //! - JavaScript receives `headerPtr`, wraps it in a typed `DataView` over `wasm.memory.buffer`,
 //!   and reads the 104-byte header directly (dimensions, flags, clear, matrix, glyph count).
-//! - If `flags & flag_instances` is set and `count > 0`, JavaScript uploads `count * 48` bytes
+//! - If `flags & flag_instances` is set and `count > 0`, JavaScript uploads `count * 64` bytes
 //!   directly from `instance_ptr`.
-//! - If `flags & flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 48`
+//! - If `flags & flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 64`
 //!   bytes directly from `glyph_ptr`.
 //! - When JavaScript returns, control resumes in Zig. Zig marks the cursor and updates the frame.
 //! - Only then is the stack frame popped.
@@ -102,7 +102,7 @@
 //! - **Static Allocation:** `State` is statically allocated in Wasm BSS linear memory.
 //!   Zero dynamic memory allocations at runtime.
 //! - **Comptime Consistency:** Hardware buffer byte counts (`quad_bytes`, `uniform_bytes`,
-//!   `instance_stride = 48`) are asserted at compile time.
+//!   `instance_stride = 64`) are asserted at compile time.
 //! - **Bounded Operations:** `tick`, `start`, `resize`, and pointer entry points execute in
 //!   bounded O(1) time without unbounded recursion or dynamic reallocation.
 
@@ -115,6 +115,7 @@ const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const input = @import("input.zig");
 const scene = @import("scene.zig");
+const theme = @import("theme.zig");
 
 /// Global application state for the WebAssembly runtime.
 /// Statically allocated in Wasm linear memory at startup (BSS segment).
@@ -141,7 +142,7 @@ var state: State = .{
 /// JavaScript uses this pointer to decode the WGSL string and compile the pipeline.
 export fn shader_ptr() [*]const u8 {
     assert(draw.shader_file.len >= 1);
-    assert(draw.instance_stride == 48);
+    assert(draw.instance_stride == 64);
     return draw.shader_file.ptr;
 }
 
@@ -164,20 +165,19 @@ export fn quad_bytes() u32 {
     return draw.quad_bytes;
 }
 
-/// Returns the byte stride between instances (48 bytes).
+/// Returns the byte stride between instances (64 bytes).
 ///
-/// JavaScript asserts the same 48 before creating the pipeline and again before
-/// `writeBuffer`. The stride covers three `vec4` groups. The third is radius, hover,
-/// down, and one zero pad. See the module guide in `draw.zig`.
+/// JavaScript asserts the same 64 before creating the pipeline and again before
+/// `writeBuffer`. Four `vec4` attributes: rect, fill, shape, and clip.
 export fn instance_stride() u32 {
-    assert(draw.instance_stride == 48);
+    assert(draw.instance_stride == 64);
     return draw.instance_stride;
 }
 
 /// Glyph shader source. `shell.js` compiles this as the second module.
 export fn glyph_shader_ptr() [*]const u8 {
     assert(font.shader_file.len >= 1);
-    assert(font.glyph_stride == 48);
+    assert(font.glyph_stride == 64);
     return font.shader_file.ptr;
 }
 
@@ -187,10 +187,22 @@ export fn glyph_shader_len() u32 {
     return @intCast(font.shader_file.len);
 }
 
-/// Byte stride of one glyph quad. The browser asserts 48 before upload.
+/// Byte stride of one glyph quad (64 bytes). The browser asserts 64 before upload.
 export fn glyph_stride() u32 {
-    assert(font.glyph_stride == 48);
+    assert(font.glyph_stride == 64);
     return font.glyph_stride;
+}
+
+/// Address of the 192-byte theme. `shell.js` writes it at uniform offset 64.
+export fn theme_ptr() [*]const u8 {
+    assert(@sizeOf(theme.Theme) == 192);
+    return @ptrCast(&theme.chrome);
+}
+
+/// Byte length of the theme uniform tail.
+export fn theme_len() u32 {
+    assert(theme.bytes == 192);
+    return theme.bytes;
 }
 
 /// Returns the memory address of the pre-baked 512 x 256 `r8unorm` font coverage atlas.
@@ -275,6 +287,15 @@ export fn pointer_up(x: f32, y: f32) u32 {
 
 /// Pointer left the canvas or the gesture was cancelled. A press in progress
 /// becomes an outside release so capture cannot stick.
+/// Wheel at device-pixel `(x, y)`. `dy` is in the same pixel unit as the pointer.
+/// Positive `dy` scrolls the column downward.
+export fn pointer_wheel(x: f32, y: f32, dy: f32) u32 {
+    assert(state.frame.running);
+    assert(x == x);
+    assert(dy == dy);
+    return note_event(.{ .wheel = .{ .x = x, .y = y, .dy = dy } });
+}
+
 export fn pointer_leave() u32 {
     assert(state.frame.running);
     const flag = note_event(.pointer_leave);

@@ -19,9 +19,10 @@
 //! - A single canonical "unit quad" of 6 vertices representing a 1 x 1 square spanning
 //!   from `(0, 0)` to `(1, 1)` is uploaded to GPU memory **once** at startup (48 bytes total).
 //! - Per-quad parameters (position `x, y`, dimension `width, height`, color `r, g, b, a`,
-//!   corner `radius`, and a baked `hover` lighten) are packed into a compact array called
-//!   **instances** (48 bytes per instance, three `vec4` groups). Section 6 derives the
-//!   rounded-box field those extra floats drive.
+//!   corner `radius` or arc stroke thickness, `hover` lighten, `down` darken or arc sweep,
+//!   `kind`, and `clip` bounds) are packed into a compact array called **instances**
+//!   (64 bytes per instance, four `vec4` groups). Section 6 derives the distance fields
+//!   and clip masks those extra floats drive.
 //! - Drawing all 256 quads requires just **one single draw call**: `draw(6, instance_count)`.
 //! - The GPU hardware vertex fetch unit advances unit quad attributes once per vertex,
 //!   and advances instance attributes once per instance. The vertex shader expands each
@@ -88,8 +89,10 @@
 //!   offsets and bind group ranges. Compliant hardware requires at least **256 bytes**.
 //! - Even though our 4x4 matrix is exactly 64 bytes (16 * 4 bytes), allocating 64 bytes
 //!   violates the minimum binding size on certain Vulkan and Metal backends.
-//! - Therefore, we set `uniform_bytes = 256` for the GPU allocation, leaving bytes 64..255
-//!   zeroed as safe padding.
+//! - Therefore, we set `uniform_bytes = 256` for the GPU allocation: bytes 0..63 store the
+//!   64-byte 4x4 orthographic matrix (`ortho`), and bytes 64..255 store the 192-byte
+//!   `Theme` record (see `src/theme.zig`). The uniform buffer is bound once to both pipelines
+//!   with visibility `VERTEX | FRAGMENT`.
 //!
 //! ### `PresentHeader` C ABI Binary Memory Layout (104 Bytes):
 //! `PresentHeader` communicates frame dimensions, clear colors, upload dirty flags, the projection
@@ -147,83 +150,95 @@
 //! fragment shader asks the field whether that pixel is inside the rounded outline, then turns
 //! the distance into coverage. Radius 0 reproduces the sharp rectangle from step 2.
 //!
-//! ### The 48-byte instance
-//! `Instance` is twelve `f32`s in three groups the GPU fetches as `float32x4`:
-//! - Offset  0: rectangle `(x, y, width, height)` in logical pixels, origin top-left.
-//! - Offset 16: straight-alpha fill `(r, g, b, a)`.
-//! - Offset 32: `(radius, hover, down, 0)`.
+//! ### The 64-byte instance
+//! `Instance` is sixteen `f32`s in four groups the GPU fetches as `float32x4`:
+//! - Location 1 (Offset  0): rectangle `(x, y, width, height)` in logical pixels, origin top-left.
+//! - Location 2 (Offset 16): straight-alpha fill `(r, g, b, a)`.
+//! - Location 3 (Offset 32): `(radius, hover, down, kind)`.
+//!   `kind` selects the primitive: `kind_box` (0.0) or `kind_arc` (1.0).
+//!   - For a box: `radius` is the geometric corner radius; `hover` is lighten weight; `down` is
+//!     darken weight.
+//!   - For an arc: `radius` is the stroke thickness; `hover` is lighten weight; `down` is the
+//!     sweep fraction in `[0.0, 1.0]`. The shader does not darken an arc.
+//! - Location 4 (Offset 48): exclusive-max clip
+//!   `(clip_x0, clip_y0, clip_x1, clip_y1)` in logical pixels.
 //!
-//! WebGPU requires a vertex `arrayStride` that is a multiple of 4. It does not require a
-//! multiple of 16. The third attribute is still a `float32x4`, the same format as the
-//! rectangle and the fill, so the record occupies bytes 32..48 and the stride is 48.
-//! `radius`, `hover`, and `down` are the live values. The last float is a pad so that one
-//! attribute format is shared by `quad.wgsl`, the native pipeline, and `web/shell.js`.
-//! `append` writes the pad as 0 and stores `down`. A later reader of `.w` then sees a
-//! defined value, and two uploads of the same face compare equal.
+//! Note the critical architectural distinction between the unit quad and the instance buffer:
+//! - The static unit quad vertex buffer remains **48 bytes** (6 vertices * 2 floats * 4 bytes).
+//! - The instance buffer is `instance_cap * instance_stride` = 256 * 64 = **16,384 bytes**.
+//! Only `count` instances are uploaded per dirty frame.
 //!
-//! The instance buffer stays fixed at `instance_cap * instance_stride` bytes (256 * 48).
-//! Only `count` instances are uploaded.
+//! ### Radius and Arc Stroke Thickness
+//! For a box (`kind = 0`), `radius` is the geometric corner radius in logical pixels. `append`
+//! rejects a negative radius. `sdf_box` and the shader both clamp it to half the shorter edge, so
+//! a wide box becomes a capsule and a square becomes a disc.
+//! For an open ring (`kind = 1`), `radius` is the stroke thickness (e.g. knob thickness 4 px).
 //!
-//! ### Radius
-//! `radius` is the geometric corner radius in logical pixels. `append` rejects a negative
-//! radius, because `min(radius, half_edge)` would keep the negative value and the field
-//! would invert. A radius larger than the box is stored as given. `sdf_box` and the shader
-//! both clamp it to half the shorter edge, so the two implementations cannot drift. A wide
-//! box becomes a capsule. A square becomes a disc whose diameter is the side. Makepad's
-//! older button shader multiplied the radius by 2 as a compatibility clamp. This field uses
-//! the geometric radius, so a value of 16 is a 16-pixel corner.
-//!
-//! ### Hover and Down Shader Blend Weights
-//! `hover` is a mix weight in `[0.0, 1.0]` toward white (`vec3<f32>(1.0)`).
-//! `down` is a mix weight in `[0.0, 1.0]` toward black (`vec3<f32>(0.0)`), applied after hover.
-//! In `quad.wgsl`, the fragment shader computes:
-//! ```text
-//! let lightened = mix(fill.rgb, vec3<f32>(1.0), in.shape.y); // shape.y is hover
-//! let final_rgb = mix(lightened, vec3<f32>(0.0), in.shape.z); // shape.z is down
-//! ```
-//! The shader alpha remains strictly `fill.a * coverage`.
+//! ### Hover, Down, and Sweep Shader Blend Weights
+//! `hover` is a mix weight in `[0.0, 1.0]` toward theme lighten (white).
+//! For boxes (`kind = 0`), `down` is a mix weight in `[0.0, 1.0]` toward theme darken (black).
+//! For arcs (`kind = 1`), `down` is the sweep fraction in `[0.0, 1.0]` scaling the theme's
+//! full 270-degree arc sweep (`3pi/2`), and the shader does not darken the arc.
 //!
 //! #### Widget Ownership and Weight Scaling:
-//! Widgets own continuous `Animator` instances in `[0.0, 1.0]`. When writing instance records:
+//! Continuous `Animator` instances travel across `[0.0, 1.0]`. When populating instance records:
 //! - Hover weight: `instance.hover = animator.value * hover_lighten` (`0.18`).
 //! - Down weight: `instance.down = animator.value * down_darken` (`0.30`).
-//! The shader is completely unchanged and unaware of widgets; it receives raw 48-byte instances.
-//! Direct writing of unscaled `1.0` weights would wash the fill completely out to pure white or black.
-//! Weights outside `[0.0, 1.0]` would extrapolate beyond the color boundaries, so `append` rejects them.
-//! `set_state` updates stored weights in place and bumps `revision` only when values differ, so resting
-//! pointers upload zero bytes to the GPU.
+//! The shader receives standard 64-byte instance records and evaluates lighting
+//! entirely in registers.
 //!
-//! ### CPU Twin and Shader Paint
-//! `sdf_box` is the exact CPU mathematical twin of the WGSL function. Coordinates are in the same
-//! local logical pixels that the vertex shader interpolates (`unit * size`, origin at top-left).
-//! Automated tests verify the CPU field without requiring a GPU: center, sharp edge midpoint,
-//! exterior corner, corner sample pushed outside by a grown radius, and disc saturation.
-//! The WGSL fragment shader handles screen-space antialiasing via `fwidth` coverage calculation.
+//! ### CPU Twins: `sdf_box` and `sdf_arc`
+//! - `sdf_box` is the exact CPU mathematical twin of the WGSL box function.
+//! - `sdf_arc` is the CPU twin of `sdf_arc` in `quad.wgsl`.
+//!   - Uses Y-down `atan2`, where 0 is 3 o'clock and positive angles rotate clockwise.
+//!   - Arc starts at 7 o'clock (`2pi/3`) and sweeps across 270 degrees (`3pi/2`), leaving an open
+//!     gap at the bottom quarter.
+//!   - Round caps are evaluated as distance to the swept centerline minus half the stroke
+//!     thickness.
+//!   - Locked test verification (56x56 ring, thickness 4, sweep fraction 1.0):
+//!     - start-cap local about (15, 50.51666) yields distance -2.0;
+//!     - rect center (28, 28) yields distance 24.0;
+//!     - 6 o'clock on the mid-radius is outside the sweep (positive distance);
+//!     - down 0 is `-thickness / 2` (-2.0) only at the start point.
+//!
+//! ### Hard Clip Masking
+//! Rather than issuing driver scissor calls or breaking render passes, clipping is evaluated
+//! per-fragment in shaders:
+//! ```text
+//! pos = rect.xy + local
+//! inside = step(clip.x, pos.x) * step(clip.y, pos.y) * step(pos.x, clip.z) * step(pos.y, clip.w)
+//! alpha = fill.a * coverage * inside
+//! ```
+//! The stored clip is exclusive-max, but WGSL `step` makes the max edge inclusive.
+//! There is no unclipped sentinel: chrome elements use the window rectangle, while scrollable
+//! content uses the scroll viewport clip rectangle.
 //!
 //! ### Who Writes the Rectangles
 //! This module (`draw.zig`) provides graphics primitives, buffer layouts, and distance fields; it
 //! does NOT place scene geometry or widgets.
-//! `scene.Scene.draw` clears the `DrawList`, appends the root column background instance, and iterates
-//! through its retained widgets so each widget appends its own visual faces (`Panel` and `Button` append
-//! 1 instance; `Slider` appends up to 3 instances: track, fill, and knob).
+//! `scene.Scene.draw` clears `DrawList` and `GlyphList`, appends the scroll container background
+//! and thumb, and iterates through its retained controls.
 //!
 //! That rebuild executes ONLY when `scene.dirty` is set:
 //! 1. Window layout changes (`Frame.relayout` is true),
-//! 2. User input updates widget state (mouse enter/leave, button press/release, slider drag), or
+//! 2. User input updates widget state (mouse enter/leave, knob drag, toggle click, wheel), or
 //! 3. An in-flight animator steps by `dt_ms` and alters an animated weight.
 //!
 //! A scale-only present (same logical size, new physical pixels) leaves `scene.dirty` false.
-//! `UploadCursor.flags` returns 0, so neither the face buffer nor the glyph buffer is uploaded.
+//! `UploadCursor.flags` returns 0, so neither instance buffer is uploaded.
 //!
-//! Capacity invariant: `1 + widget_cap * 3 <= instance_cap` (1 + 32 * 3 = 97 <= 256), guaranteeing
-//! that the full scene never exceeds the static instance capacity.
+//! Capacity invariant: `1 + 1 + scroll_child_cap * 2 <= instance_cap` (1 panel + 1 thumb +
+//! 16 * 2 child faces = 34 <= 256), guaranteeing that the full scene never exceeds
+//! the static capacity.
 //!
 //! `contains_box` is the low-level analytic rounded-box point test used across the codebase;
-//! `contains` delegates directly to it so instance hit testing and widget bounds checking can never drift.
+//! `contains` delegates directly to it so instance hit testing and widget bounds checking
+//! can never drift.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const font = @import("font.zig");
+const theme = @import("theme.zig");
 
 /// The WebGPU Shading Language source embedded directly into the binary at compile time.
 /// Both native Linux (via wgpu-native) and the browser (via WebAssembly) compile this same source.
@@ -233,11 +248,17 @@ pub const shader_file: []const u8 = @embedFile("quad.wgsl");
 /// In TigerStyle, all buffer sizes are statically bounded at compile time.
 pub const instance_cap: u32 = 256;
 
-/// Byte size of one instance (12 floats * 4 bytes = 48 bytes).
-/// Three `float32x4` attributes at offsets 0, 16, and 32. WebGPU only requires the
-/// buffer stride to be a multiple of 4. The third attribute is a full `vec4`, so the
-/// record is 48 bytes. `down` occupies the former first pad. `pad1` stays 0.
-pub const instance_stride: u32 = 48;
+/// Byte size of one instance (16 floats * 4 bytes = 64 bytes).
+/// Four `float32x4` attributes at offsets 0, 16, 32, and 48. `kind` selects the
+/// box or the arc. The fourth attribute is the clip rect. There is no unclipped sentinel.
+pub const instance_stride: u32 = 64;
+
+/// Box face. The fragment shader evaluates `sdf_box` and may darken by `down`.
+pub const kind_box: f32 = 0;
+
+/// Open ring. `radius` is the stroke thickness and `down` is the sweep fraction.
+/// The shader does not darken an arc.
+pub const kind_arc: f32 = 1;
 
 /// Number of vertices in a quad drawn as a triangle list (2 triangles * 3 vertices = 6).
 pub const vertex_count: u32 = 6;
@@ -282,14 +303,13 @@ pub const unit_quad: [12]f32 = .{
 /// - Offset  8: `width` (f32) - Width in logical UI pixels.
 /// - Offset 12: `height` (f32) - Height in logical UI pixels.
 /// - Offset 16: `r`, `g`, `b`, `a` (4 f32) - Fill color.
-/// - Offset 32: `radius` (f32) - Geometric corner radius in logical pixels.
-///   Oversized values are stored here and clamped inside `sdf_box`.
-/// - Offset 36: `hover` (f32) - Mix weight toward white, range [0, 1].
-///   Widgets write `animator.value * hover_lighten`. The shader applies it before `down`.
-/// - Offset 40: `down` (f32) - Mix weight toward black, range [0, 1].
-///   Applied after the hover lighten. `append` stores the caller's value.
-/// - Offset 44: `pad1` (f32) - Written as 0. It completes the third `vec4`.
-/// Total size: 48 bytes.
+/// - Offset 32: `radius` (f32) - Corner radius for a box, stroke thickness for an arc.
+/// - Offset 36: `hover` (f32) - Mix weight toward the theme lighten color, range [0, 1].
+/// - Offset 40: `down` (f32) - Box darken weight, or arc sweep fraction, range [0, 1].
+/// - Offset 44: `kind` (f32) - `kind_box` (0) or `kind_arc` (1). Stored as given.
+/// - Offset 48: `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1` - Exclusive-max clip in
+///   logical pixels. `clip_x1 > clip_x0` and `clip_y1 > clip_y0`, all finite.
+/// Total size: 64 bytes.
 pub const Instance = extern struct {
     x: f32,
     y: f32,
@@ -302,7 +322,11 @@ pub const Instance = extern struct {
     radius: f32,
     hover: f32,
     down: f32,
-    pad1: f32,
+    kind: f32,
+    clip_x0: f32,
+    clip_y0: f32,
+    clip_x1: f32,
+    clip_y1: f32,
 };
 
 /// The binary header passed to the graphics backend before rendering a frame.
@@ -360,6 +384,8 @@ pub const DrawList = struct {
         NegativeRadius,
         HoverOutOfRange,
         DownOutOfRange,
+        KindUnknown,
+        ClipUnordered,
     };
 
     /// Appends one rectangle instance to the draw list.
@@ -380,9 +406,9 @@ pub const DrawList = struct {
     ///   extrapolates past white.
     /// - `error.ListFull`: Returned if `self.count == instance_cap` (256).
     ///
-    /// Attribute Padding & Revision:
-    /// - `down` is stored. `pad1` is zeroed so the unused `.w` of the third `vec4` is defined.
-    /// - Increments both `count` and `revision` on success.
+    /// `kind` and the clip are stored as given. A kind other than box or arc is
+    /// `error.KindUnknown`. A clip that is non-finite or not exclusive-max is
+    /// `error.ClipUnordered`. There is no unclipped sentinel.
     pub fn append(self: *DrawList, instance: Instance) AppendError!void {
         assert(self.count <= instance_cap);
         if (instance.width <= 0) {
@@ -406,20 +432,22 @@ pub const DrawList = struct {
         if (instance.down > 1) {
             return error.DownOutOfRange;
         }
+        if (!kind_known(instance.kind)) {
+            return error.KindUnknown;
+        }
+        if (!clip_ordered(instance)) {
+            return error.ClipUnordered;
+        }
         if (self.count == instance_cap) {
             return error.ListFull;
         }
         assert(instance.radius >= 0);
-        assert(instance.hover >= 0);
-        assert(instance.down >= 0);
-        var stored: Instance = instance;
-        stored.pad1 = 0;
-        self.items[self.count] = stored;
+        assert(kind_known(instance.kind));
+        self.items[self.count] = instance;
         self.count += 1;
         self.revision += 1;
-        assert(self.items[self.count - 1].hover <= 1);
-        assert(self.items[self.count - 1].down <= 1);
-        assert(self.items[self.count - 1].pad1 == 0);
+        assert(self.items[self.count - 1].kind == instance.kind);
+        assert(self.items[self.count - 1].clip_x1 > self.items[self.count - 1].clip_x0);
     }
 
     /// Writes `hover` and `down` on one live slot.
@@ -675,6 +703,72 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
     return inside + outside - k;
 }
 
+/// Signed distance of an open ring. CPU twin of `sdf_arc` in `quad.wgsl`.
+///
+/// `(px, py)` is local logical pixels, origin at the face top-left, Y down.
+/// `thickness` is the stroke width. `sweep_fraction` in `[0, 1]` scales the theme
+/// sweep (`3π/2`). Angle 0 is 3 o'clock. Positive is clockwise because Y grows down.
+/// The start angle is the theme's 7 o'clock (`2π/3`). The gap is the bottom quarter.
+/// Round caps are the distance to the swept centerline, minus half the thickness.
+///
+/// ```text
+/// center = size * 0.5
+/// p      = local - center
+/// mid    = min(center.x, center.y) - thickness * 0.5
+/// sweep  = sweep_fraction * arc_sweep
+/// rel    = wrap(atan2(p.y, p.x) - arc_start, 0, tau)
+/// ang    = min(rel, sweep)
+/// dir    = (cos(arc_start + ang), sin(arc_start + ang))
+/// dist   = length(p - dir * mid) - thickness * 0.5
+/// ```
+pub fn sdf_arc(
+    px: f32,
+    py: f32,
+    width: f32,
+    height: f32,
+    thickness: f32,
+    sweep_fraction: f32,
+) f32 {
+    assert(width > 0);
+    assert(height > 0);
+    assert(thickness >= 0);
+    assert(sweep_fraction >= 0);
+    assert(sweep_fraction <= 1);
+    const center_x: f32 = width * 0.5;
+    const center_y: f32 = height * 0.5;
+    const local_x = px - center_x;
+    const local_y = py - center_y;
+    const mid = @min(center_x, center_y) - thickness * 0.5;
+    const sweep = sweep_fraction * theme.arc_sweep;
+    const turned = std.math.atan2(local_y, local_x) - theme.arc_start;
+    const rel = wrap_tau(turned);
+    const ang = @min(rel, sweep);
+    const dir_x = @cos(theme.arc_start + ang);
+    const dir_y = @sin(theme.arc_start + ang);
+    const dx = local_x - dir_x * mid;
+    const dy = local_y - dir_y * mid;
+    const dist = @sqrt(dx * dx + dy * dy) - thickness * 0.5;
+    assert(dist == dist);
+    assert(rel >= 0);
+    return dist;
+}
+
+/// Wraps one turn into `[0, tau)`. `atan2` minus the start angle stays within one turn.
+fn wrap_tau(angle: f32) f32 {
+    assert(angle == angle);
+    const span = std.math.tau;
+    var value = angle;
+    if (value < 0) {
+        value += span;
+    }
+    if (value >= span) {
+        value -= span;
+    }
+    assert(value >= 0);
+    assert(value < span);
+    return value;
+}
+
 /// True when `(px, py)` lies inside the rounded rectangle, inclusive of the boundary.
 ///
 /// Coordinate space: UI logical pixels, top-left origin, Y down. `(x, y)` is the
@@ -725,12 +819,58 @@ pub fn contains(instance: Instance, x: f32, y: f32) bool {
         x,
         y,
     );
-    assert(instance.pad1 == instance.pad1);
+    assert(instance.kind == instance.kind);
     return hit;
 }
 
-/// Test construction record. `face` writes `pad1` as 0 so every call site stores
-/// a defined shape `vec4`.
+fn kind_known(kind: f32) bool {
+    if (kind == kind_box) {
+        assert(kind == kind_box);
+        return true;
+    }
+    if (kind == kind_arc) {
+        assert(kind == kind_arc);
+        return true;
+    }
+    return false;
+}
+
+fn finite_f32(value: f32) bool {
+    if (value != value) {
+        return false;
+    }
+    if (std.math.isInf(value)) {
+        return false;
+    }
+    assert(value == value);
+    return true;
+}
+
+fn clip_ordered(instance: Instance) bool {
+    if (!finite_f32(instance.clip_x0)) {
+        return false;
+    }
+    if (!finite_f32(instance.clip_y0)) {
+        return false;
+    }
+    if (!finite_f32(instance.clip_x1)) {
+        return false;
+    }
+    if (!finite_f32(instance.clip_y1)) {
+        return false;
+    }
+    if (!(instance.clip_x1 > instance.clip_x0)) {
+        return false;
+    }
+    if (!(instance.clip_y1 > instance.clip_y0)) {
+        return false;
+    }
+    assert(instance.clip_x1 > instance.clip_x0);
+    assert(instance.clip_y1 > instance.clip_y0);
+    return true;
+}
+
+/// Test construction record. Omitted `kind` is a box. Omitted clip is `(0, 0, 1, 1)`.
 const Face = struct {
     x: f32,
     y: f32,
@@ -743,6 +883,11 @@ const Face = struct {
     radius: f32,
     hover: f32,
     down: f32,
+    kind: f32 = kind_box,
+    clip_x0: f32 = 0,
+    clip_y0: f32 = 0,
+    clip_x1: f32 = 1,
+    clip_y1: f32 = 1,
 };
 
 fn face(spec: Face) Instance {
@@ -758,19 +903,26 @@ fn face(spec: Face) Instance {
         .radius = spec.radius,
         .hover = spec.hover,
         .down = spec.down,
-        .pad1 = 0,
+        .kind = spec.kind,
+        .clip_x0 = spec.clip_x0,
+        .clip_y0 = spec.clip_y0,
+        .clip_x1 = spec.clip_x1,
+        .clip_y1 = spec.clip_y1,
     };
     assert(instance.down >= 0);
-    assert(instance.pad1 == 0);
+    assert(instance.kind == spec.kind);
     return instance;
 }
 
 comptime {
     // Assert struct sizes and alignments to prevent C ABI mismatches across compilers.
-    assert(@sizeOf(Instance) == 48);
+    assert(@sizeOf(Instance) == 64);
     assert(@alignOf(Instance) >= 4);
-    assert(instance_stride == 48);
-    // 48 is three vec4 groups, not a WebGPU minimum. The spec only requires a multiple of 4.
+    assert(instance_stride == 64);
+    assert(kind_box == 0);
+    assert(kind_arc == 1);
+    assert(theme.bytes + matrix_bytes == uniform_bytes);
+    // 64 is four vec4 groups. The spec only requires a stride multiple of 4.
     assert(instance_stride % 16 == 0);
     assert(@sizeOf(PresentHeader) == 104);
     assert(flag_glyphs == 4);
@@ -803,7 +955,7 @@ fn rect(width: f32, height: f32) Instance {
         .down = 0,
     });
     assert(instance.down == 0);
-    assert(instance.pad1 == 0);
+    assert(instance.kind == kind_box);
     return instance;
 }
 
@@ -893,15 +1045,41 @@ test "hover outside 0 to 1 is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
-// Locks storage of down weight at offset 40 and deterministically zeroed pad1 at offset 44.
-test "append stores down and zeros the pad" {
+// Kind 0 and kind 1 round-trip. Kind is no longer forced to 0.
+test "append stores box and arc kinds" {
+    var list = DrawList.init();
+    var box = rect(10, 10);
+    box.down = 0.25;
+    box.kind = kind_box;
+    try list.append(box);
+    var arc = rect(10, 10);
+    arc.kind = kind_arc;
+    arc.down = 1;
+    try list.append(arc);
+    try std.testing.expectEqual(kind_box, list.items[0].kind);
+    try std.testing.expectEqual(@as(f32, 0.25), list.items[0].down);
+    try std.testing.expectEqual(kind_arc, list.items[1].kind);
+    try std.testing.expectEqual(@as(f32, 1), list.items[1].down);
+}
+
+test "an unknown kind is rejected" {
     var list = DrawList.init();
     var instance = rect(10, 10);
-    instance.down = 0.25;
-    instance.pad1 = 8;
-    try list.append(instance);
-    try std.testing.expectEqual(@as(f32, 0.25), list.items[0].down);
-    try std.testing.expectEqual(@as(f32, 0), list.items[0].pad1);
+    instance.kind = 2;
+    try std.testing.expectError(error.KindUnknown, list.append(instance));
+    try std.testing.expectEqual(@as(u32, 0), list.count);
+}
+
+test "a reversed clip is rejected" {
+    var list = DrawList.init();
+    var instance = rect(10, 10);
+    instance.clip_x0 = 4;
+    instance.clip_x1 = 4;
+    try std.testing.expectError(error.ClipUnordered, list.append(instance));
+    instance = rect(10, 10);
+    instance.clip_y1 = -1;
+    try std.testing.expectError(error.ClipUnordered, list.append(instance));
+    try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
 // Locks defensive bounds validation: down weights outside [0, 1] return DownOutOfRange.
@@ -1006,6 +1184,28 @@ test "sdf grown radius puts a former inner corner outside" {
     const rounded = sdf_box(0.5, 0.5, 20, 20, 8);
     try std.testing.expect(sharp < 0);
     try std.testing.expect(rounded > 0);
+}
+
+// 56×56 ring, thickness 4, full sweep. The start-cap center is inside by half the stroke.
+// The rect center is 24 px outside that stroke. 6 o'clock on the mid-radius sits in the gap.
+test "sdf arc locks the open ring" {
+    const size: f32 = 56;
+    const thickness: f32 = 4;
+    const mid: f32 = size * 0.5 - thickness * 0.5;
+    const start_x = size * 0.5 + @cos(theme.arc_start) * mid;
+    const start_y = size * 0.5 + @sin(theme.arc_start) * mid;
+    try std.testing.expectApproxEqAbs(@as(f32, 15), start_x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50.51666), start_y, 0.001);
+    const at_start = sdf_arc(start_x, start_y, size, size, thickness, 1);
+    const at_center = sdf_arc(28, 28, size, size, thickness, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, -2), at_start, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 24), at_center, 0.0001);
+    const six = sdf_arc(28, 28 + mid, size, size, thickness, 1);
+    try std.testing.expect(six > 0);
+    const cap = sdf_arc(start_x, start_y, size, size, thickness, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, -2), cap, 0.0001);
+    const away = sdf_arc(28, 28, size, size, thickness, 0);
+    try std.testing.expect(away > 0);
 }
 
 test "sdf oversized radius saturates into a disc" {

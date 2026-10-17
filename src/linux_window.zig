@@ -119,7 +119,7 @@
 //!    - If a frame callback is in flight, or the late-latch deadline has not arrived, leaves
 //!      `redraw` set and returns. Layout and the instance rebuild wait for the commit.
 //!    - If `frame.relayout` is true, calls `scene.layout()`, re-dispatching pointer hover.
-//!    - If `scene.dirty` is true, calls `scene.draw()` to rebuild the 48-byte instance list.
+//!    - If `scene.dirty` is true, calls `scene.draw()` to rebuild the 64-byte instance list.
 //!    - **Frame Callback Request:** Every commit requests `wl_surface.frame` immediately before
 //!      `gpu.present()`, and only while `state.frame_callback == null`. A `done` with nothing
 //!      dirty arms nothing.
@@ -164,6 +164,12 @@
 //! - **Clock domain:** `presented` timestamps are compared to `clock_gettime(CLOCK_MONOTONIC)`
 //!   only after `wp_presentation.clock_id` has named that clock (`CLOCK_MONOTONIC` is 1 on Linux).
 //!   Any other clock disables the vblank anchor, causing the scheduler to fall back to `done`.
+//! - **Wayland Pointer Axis Seam:** Vertical wheel scrolling arrives via `wl_pointer.axis`
+//!   (opcode 4). Only vertical axis 0 is processed; horizontal axes are ignored. Values arrive
+//!   as `wl_fixed_t` (signed 24.8) and are converted to UI logical pixels via
+//!   `input.fixed_to_logical`. Non-zero deltas are paired with `state.last_x` / `state.last_y`
+//!   and pushed onto `EventQueue` as `Event.wheel`. Positive `dy` increases `scroll_y`
+//!   (scrolls content downward).
 //!
 //! ## 6. TigerStyle Invariants
 //! - **Static Allocation:** `State` is stack-allocated in `run()`; zero heap allocations in loop.
@@ -1208,8 +1214,10 @@ fn pointer_button(
     assert(point.x == state.last_x);
 }
 
-/// C ABI callback for `wl_pointer.axis` (opcode 4).
-/// Satisfies version 1 listener vtable layout; scroll input is deferred to step 8.
+/// Vertical `wl_pointer.axis`. Opcode 4, axis 0. Horizontal axes are ignored.
+/// A zero value is not queued. Positive `dy` increases `scroll_y`.
+const axis_vertical: u32 = 0;
+
 fn pointer_axis(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1217,11 +1225,26 @@ fn pointer_axis(
     axis: u32,
     value: i32,
 ) callconv(.c) void {
-    _ = data;
     _ = pointer;
     _ = time;
-    _ = axis;
-    _ = value;
+    assert(data != null);
+    if (axis != axis_vertical) {
+        assert(axis != axis_vertical);
+        return;
+    }
+    const dy = input.fixed_to_logical(value);
+    if (dy == 0) {
+        assert(dy == 0);
+        return;
+    }
+    const state: *State = @ptrCast(@alignCast(data.?));
+    state.queue.push(.{ .wheel = .{
+        .x = state.last_x,
+        .y = state.last_y,
+        .dy = dy,
+    } });
+    assert(state.queue.count >= 1);
+    assert(dy != 0);
 }
 
 /// Queues a move in UI logical pixels and remembers the point for button events.

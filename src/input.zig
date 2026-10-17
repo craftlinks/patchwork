@@ -7,13 +7,14 @@
 //! system or display server must not be coupled directly to rendering and layout operations.
 //!
 //! ### The Dispatch Batching Hazard:
-//! Wayland delivers incoming socket messages in large batches during `wl_display_dispatch_pending()`.
-//! If the application only recorded the latest pointer state into a single global variable, a rapid
-//! mouse click (a `pointer_button(pressed)` immediately followed by `pointer_button(released)` in
-//! the same read batch) would overwrite itself into `down == false` before the main application loop
-//! could execute a single tick. The button click edge would be completely lost.
+//! Wayland delivers incoming socket messages in large batches during
+//! `wl_display_dispatch_pending()`. If the application only recorded the latest pointer state
+//! into a single global variable, a rapid mouse click (a `pointer_button(pressed)` immediately
+//! followed by `pointer_button(released)` in the same read batch) would overwrite itself into
+//! `down == false` before the main application loop could execute a single tick.
+//! The button click edge would be completely lost.
 //!
-//! ### Ordered Event Queue with Motion Coalescing:
+//! ### Ordered Event Queue with Motion and Wheel Coalescing:
 //! `EventQueue` preserves the chronological sequence of events across socket batches:
 //! - Presses (`.pointer_down`), releases (`.pointer_up`), and surface leaves (`.pointer_leave`)
 //!   are strictly preserved in FIFO order so click transitions are never missed.
@@ -21,18 +22,18 @@
 //!   sample. High-frequency gaming mice (1000 Hz+) can flood the socket with dozens of motion
 //!   reports in a single compositor frame; coalescing preserves the current pointer location
 //!   while preventing queue exhaustion.
-//! - The queue's coalesced point is the sample the commit draws. A 125 Hz mouse against a 60 Hz
-//!   refresh does not divide evenly, so that point jumps by one report, then two.
+//! - Consecutive wheel events (`.wheel`) are automatically coalesced: consecutive deltas sum
+//!   their vertical travel `dy` while updating the pointer anchor `(x, y)` to the latest sample.
 //! - The queue capacity is fixed at `queue_cap = 32`. Pushing past the capacity increments the
 //!   `dropped` counter and safely drops the excess event without corrupting queued history or
 //!   allocating dynamic heap memory.
 //!
 //! ### Native vs. Web Execution:
-//! - On native Linux, `linux_window.zig` drains the `EventQueue` once per loop wake in `sync_input()`,
-//!   passing events sequentially to `scene.handle_event()`.
-//! - In the browser, DOM pointer events are delivered individually and asynchronously to JavaScript;
-//!   `web/shell.js` calls the Wasm exports (`pointer_move`, `pointer_down`, etc.) directly, which
-//!   invoke `scene.handle_event()` immediately without queuing.
+//! - On native Linux, `linux_window.zig` drains the `EventQueue` once per loop wake in
+//!   `sync_input()`, passing events sequentially to `scene.handle_event()`.
+//! - In the browser, DOM pointer events are delivered individually and asynchronously to
+//!   JavaScript; `web/shell.js` calls the Wasm exports (`pointer_move`, `pointer_down`, etc.)
+//!   directly, which invoke `scene.handle_event()` immediately without queuing.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -65,6 +66,7 @@
 //!
 //! ### Memory Layouts:
 //! - `Point`: 8 bytes total (`x: f32, y: f32`), 4-byte aligned.
+//! - `Wheel`: 12 bytes total (`x: f32, y: f32, dy: f32`), 4-byte aligned.
 //! - `Pointer`: 16 bytes total:
 //!   - Offset 0: `x: f32` (4 bytes)
 //!   - Offset 4: `y: f32` (4 bytes)
@@ -73,7 +75,7 @@
 //!   - Offset 10..15: Padding (6 bytes)
 //!   - Alignment: 4 bytes.
 //! - `Event`: Tagged union representation of input facts (`pointer_move`, `pointer_down`,
-//!   `pointer_up`, `pointer_leave`, `frame`).
+//!   `pointer_up`, `pointer_leave`, `frame`, `wheel`).
 //! - `EventQueue`: Ring buffer containing:
 //!   - `items: [queue_cap]Event` (fixed storage)
 //!   - `head: u32` (read index)
@@ -84,26 +86,27 @@
 //!
 //! ### Queue Ingestion and Coalescing Logic:
 //! ```text
-//!                     push(event)
-//!                          |
-//!               +----------+----------+
-//!               | Is event a move AND |
-//!               | last item is move?  |
-//!               +---------------------+
-//!                     /          \
-//!               YES  /            \  NO
-//!                   v              v
-//!            +-------------+  +-------------------+
-//!            | Overwrite   |  | Is queue full?    |
-//!            | last item   |  | (count == cap 32) |
-//!            +-------------+  +-------------------+
-//!                                 /           \
-//!                           YES  /             \  NO
-//!                               v               v
-//!                       +-------------+   +-------------------+
-//!                       | dropped += 1|   | Append at count,  |
-//!                       | (drop event)|   | count += 1        |
-//!                       +-------------+   +-------------------+
+//!                          push(event)
+//!                               |
+//!                   +-----------+-----------+
+//!                   | Can coalesce with     |
+//!                   | last item in queue?   |
+//!                   | (move+move, whl+whl)  |
+//!                   +-----------------------+
+//!                          /         \
+//!                    YES  /           \  NO
+//!                        v             v
+//!                 +-------------+  +-------------------+
+//!                 | Overwrite / |  | Is queue full?    |
+//!                 | sum into    |  | (count == cap 32) |
+//!                 | last item   |  +-------------------+
+//!                 +-------------+         /     \
+//!                                   YES  /       \  NO
+//!                                       v         v
+//!                               +-------------+  +-------------------+
+//!                               | dropped += 1|  | Append at count,  |
+//!                               | (drop event)|  | count += 1        |
+//!                               +-------------+  +-------------------+
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
@@ -117,7 +120,8 @@
 //! - **Static Memory Bounds:** `queue_cap = 32`. No dynamic memory allocations.
 //! - **Strict Bounded Execution:** All queue operations (`push`, `pop`, `index_at`) are O(1).
 //! - **Defensive Assertions:** Preconditions and postconditions asserted on every function.
-//! - **Explicit Error Tracking:** Drops are counted and reported via `dropped`, never silently lost.
+//! - **Explicit Error Tracking:** Drops are counted and reported via `dropped`, never
+//!   silently lost.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -135,12 +139,20 @@ pub const Point = struct {
 /// One input fact, in the order the platform observed it.
 /// `frame` carries the clock delta in milliseconds. The native loop pushes pointer
 /// events from Wayland callbacks and injects `frame` from `sync_clock`.
+/// One wheel sample in UI logical pixels. Positive `dy` scrolls content downward.
+pub const Wheel = struct {
+    x: f32,
+    y: f32,
+    dy: f32,
+};
+
 pub const Event = union(enum) {
     pointer_move: Point,
     pointer_down: Point,
     pointer_up: Point,
     pointer_leave,
     frame: f32,
+    wheel: Wheel,
 };
 
 /// Latest pointer sample. Scene stores this so a relayout can re-hit the same point.
@@ -213,19 +225,14 @@ pub const EventQueue = struct {
     }
 
     /// Appends `event`. A move that follows a move replaces that move.
+    /// Consecutive wheels sum `dy` and keep the latest point.
     /// A push while `count == queue_cap` increments `dropped` and returns.
     pub fn push(self: *EventQueue, event: Event) void {
         assert(self.count <= queue_cap);
         assert(self.head < queue_cap);
-        if (self.count > 0) {
-            if (is_move(event)) {
-                const last = self.index_at(self.count - 1);
-                if (is_move(self.items[last])) {
-                    self.items[last] = event;
-                    assert(self.count >= 1);
-                    return;
-                }
-            }
+        if (coalesce(self, event)) {
+            assert(self.count >= 1);
+            return;
         }
         if (self.count == queue_cap) {
             self.dropped += 1;
@@ -284,6 +291,50 @@ pub fn fixed_to_logical(fixed: i32) f32 {
     return logical;
 }
 
+fn is_wheel(event: Event) bool {
+    switch (event) {
+        .wheel => {
+            assert(event == .wheel);
+            return true;
+        },
+        else => {
+            assert(event != .wheel);
+            return false;
+        },
+    }
+}
+
+/// Replaces a trailing move, or sums a trailing wheel. Returns true when the
+/// new event did not need its own slot.
+fn coalesce(self: *EventQueue, event: Event) bool {
+    assert(self.count <= queue_cap);
+    if (self.count == 0) {
+        assert(self.count == 0);
+        return false;
+    }
+    const last = self.index_at(self.count - 1);
+    if (is_move(event)) {
+        if (is_move(self.items[last])) {
+            self.items[last] = event;
+            assert(self.count >= 1);
+            return true;
+        }
+    }
+    if (is_wheel(event)) {
+        if (is_wheel(self.items[last])) {
+            const summed = self.items[last].wheel.dy + event.wheel.dy;
+            self.items[last] = .{ .wheel = .{
+                .x = event.wheel.x,
+                .y = event.wheel.y,
+                .dy = summed,
+            } };
+            assert(self.items[last].wheel.dy == summed);
+            return true;
+        }
+    }
+    return false;
+}
+
 fn is_move(event: Event) bool {
     switch (event) {
         .pointer_move => {
@@ -308,6 +359,37 @@ test "fixed_to_logical converts 24.8" {
     try std.testing.expectEqual(@as(f32, 1), fixed_to_logical(256));
     try std.testing.expectEqual(@as(f32, -0.5), fixed_to_logical(-128));
     try std.testing.expectEqual(@as(f32, 0), fixed_to_logical(0));
+    try std.testing.expectEqual(@as(f32, 10), fixed_to_logical(2560));
+}
+
+// Three wheels occupy one slot. dy is the sum. The latest point wins.
+test "consecutive wheels sum dy" {
+    var queue = EventQueue.init();
+    queue.push(.{ .wheel = .{ .x = 1, .y = 2, .dy = 3 } });
+    queue.push(.{ .wheel = .{ .x = 4, .y = 5, .dy = 6 } });
+    queue.push(.{ .wheel = .{ .x = 7, .y = 8, .dy = 9 } });
+    try std.testing.expectEqual(@as(u32, 1), queue.count);
+    const event = queue.pop().?;
+    switch (event) {
+        .wheel => |wheel| {
+            try std.testing.expectEqual(@as(f32, 7), wheel.x);
+            try std.testing.expectEqual(@as(f32, 8), wheel.y);
+            try std.testing.expectEqual(@as(f32, 18), wheel.dy);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+// A wheel splits the motion stream, so it cannot collapse into either move.
+test "a wheel between moves does not merge" {
+    var queue = EventQueue.init();
+    queue.push(.{ .pointer_move = .{ .x = 1, .y = 1 } });
+    queue.push(.{ .wheel = .{ .x = 1, .y = 1, .dy = 4 } });
+    queue.push(.{ .pointer_move = .{ .x = 2, .y = 2 } });
+    try std.testing.expectEqual(@as(u32, 3), queue.count);
+    try std.testing.expect(queue.pop().? == .pointer_move);
+    try std.testing.expect(queue.pop().? == .wheel);
+    try std.testing.expect(queue.pop().? == .pointer_move);
 }
 
 // Three motions occupy one slot. The latest point wins.

@@ -57,23 +57,24 @@
 //   so text does not keep `requestAnimationFrame` alive either.
 // - The browser tab consumes 0.0% CPU and 0.0% GPU cycles once every animator has settled.
 //
-// ## 5. The 48-Byte Instance and the Shape Attribute
-// Zig's `Instance` is three `vec4` groups. The pipeline below fetches them as `float32x4`:
+// ## 5. The 64-Byte Instance, the Shape Attribute, and the Clip Attribute
+// Zig's `Instance` is four `vec4` groups. The pipeline below fetches them as `float32x4`:
 // - Shader location 1, offset  0: rectangle `(x, y, width, height)` in logical pixels.
 // - Shader location 2, offset 16: straight-alpha fill `(r, g, b, a)`.
-// - Shader location 3, offset 32: `(radius, hover, down, pad)`.
+// - Shader location 3, offset 32: `(radius, hover, down, kind)`.
+// - Shader location 4, offset 48: exclusive-max clip `(clip_x0, clip_y0, clip_x1, clip_y1)`.
 //
-// Radius is the geometric corner radius. Hover mixes toward white. Down mixes that result
-// toward black. The pad completes the `vec4` the shader declares at `@location(3)`.
-// WebGPU requires `arrayStride` to be a multiple of 4. This buffer's stride is 48 because
-// location 3 reads 16 bytes at offset 32. `wasm.instance_stride()` is the authority. This
-// file asserts 48 at pipeline creation and again before `writeBuffer`, so a Zig layout
-// change fails loudly instead of sampling hover from the fill's alpha.
+// Radius is geometric corner radius (box) or stroke thickness (arc). Hover mixes toward
+// theme lighten (white). Down mixes toward theme darken (box) or scales sweep (arc).
+// Kind selects box (0) or arc (1).
+// WebGPU requires `arrayStride` to be a multiple of 4. This buffer's stride is 64 because
+// location 4 reads 16 bytes at offset 48. `wasm.instance_stride()` is the authority. This
+// file asserts 64 at pipeline creation and again before `writeBuffer`.
 //
-// The fragment shader evaluates a rounded-box distance in that local rectangle, antialiases
-// with `fwidth`, lightens RGB by hover, then darkens by down. Alpha is `fill.a * coverage`.
-// The blend below is source-over on straight alpha. A zero-coverage corner blends away and
-// shows the slate.
+// The fragment shader evaluates `sdf_box` or `sdf_arc`, antialiases with `fwidth`,
+// mixes toward theme lighten/darken, and multiplies coverage by a hard clip mask.
+// Alpha is `fill.a * coverage * inside`. The blend below is source-over on straight alpha.
+// A zero-coverage or clipped fragment blends away and shows the slate.
 //
 // ## 6. Pointer Event Handling, DPI Scaling, and Pointer Capture
 // The browser host manages pointer interactions via standard W3C Pointer Events:
@@ -111,8 +112,8 @@
 // 3. **104-Byte PresentHeader and Conditional Uploads:**
 //    The header is read via `DataView(wasm.memory.buffer, headerPtr, 104)`.
 //    Offset 96 contains `glyphCount: u32`.
-//    - If `(flags & FLAG_INSTANCES) !== 0` and `count > 0`: uploads `count * 48` bytes.
-//    - If `(flags & FLAG_GLYPHS) !== 0` and `glyphCount > 0`: uploads `glyphCount * 48` bytes.
+//    - If `(flags & FLAG_INSTANCES) !== 0` and `count > 0`: uploads `count * 64` bytes.
+//    - If `(flags & FLAG_GLYPHS) !== 0` and `glyphCount > 0`: uploads `glyphCount * 64` bytes.
 //    - If `glyphCount === 0`: glyph buffer upload and glyph draw call are skipped.
 //
 // 4. **Sequential Draws in Single Render Pass:**
@@ -185,14 +186,23 @@ function present_js(headerPtr, instancePtr, glyphPtr) {
             0,
             new Uint8Array(memory, headerPtr + 32, MATRIX_BYTES),
         );
+        const themeLen = wasm.theme_len();
+        if (themeLen !== 192) {
+            throw new Error("theme length mismatch: expected 192 bytes");
+        }
+        device.queue.writeBuffer(
+            uniformBuffer,
+            MATRIX_BYTES,
+            new Uint8Array(memory, wasm.theme_ptr(), themeLen),
+        );
     }
 
     // If the draw list contents changed, upload `count * stride` bytes to the instance buffer.
     if ((flags & FLAG_INSTANCES) !== 0) {
         if (count !== 0) {
             const stride = wasm.instance_stride();
-            if (stride !== 48) {
-                throw new Error("instance stride mismatch: expected 48 bytes");
+            if (stride !== 64) {
+                throw new Error("instance stride mismatch: expected 64 bytes");
             }
             device.queue.writeBuffer(
                 instanceBuffer,
@@ -206,8 +216,8 @@ function present_js(headerPtr, instancePtr, glyphPtr) {
     if ((flags & FLAG_GLYPHS) !== 0) {
         if (glyphCount !== 0) {
             const glyphStride = wasm.glyph_stride();
-            if (glyphStride !== 48) {
-                throw new Error("glyph stride mismatch: expected 48 bytes");
+            if (glyphStride !== 64) {
+                throw new Error("glyph stride mismatch: expected 64 bytes");
             }
             device.queue.writeBuffer(
                 glyphBuffer,
@@ -275,8 +285,12 @@ async function create_pipeline() {
     const quadByteCount = wasm.quad_bytes();
     const shaderLen = wasm.shader_len();
 
-    if (stride !== 48) {
-        throw new Error("instance stride mismatch: expected 48 bytes");
+    if (stride !== 64) {
+        throw new Error("instance stride mismatch: expected 64 bytes");
+    }
+    const glyphStride = wasm.glyph_stride();
+    if (glyphStride !== 64) {
+        throw new Error("glyph stride mismatch: expected 64 bytes");
     }
     if (quadByteCount !== 48) {
         throw new Error("unit quad size mismatch: expected 48 bytes");
@@ -299,7 +313,7 @@ async function create_pipeline() {
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    // 2. Instance buffer (12,288 bytes: 256 instances * 48 bytes).
+    // 2. Instance buffer (16,384 bytes: 256 instances * 64 bytes).
     instanceBuffer = device.createBuffer({
         size: INSTANCE_CAP * stride,
         usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -342,8 +356,8 @@ async function create_pipeline() {
     const group0 = device.createBindGroupLayout({
         entries: [{
             binding: 0,
-            visibility: GPUShaderStage.VERTEX,
-            buffer: { type: "uniform" },
+            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform", minBindingSize: 256 },
         }],
     });
     const group1 = device.createBindGroupLayout({
@@ -394,6 +408,7 @@ async function create_pipeline() {
                         { shaderLocation: 1, offset: 0, format: "float32x4" },
                         { shaderLocation: 2, offset: 16, format: "float32x4" },
                         { shaderLocation: 3, offset: 32, format: "float32x4" },
+                        { shaderLocation: 4, offset: 48, format: "float32x4" },
                     ],
                 },
             ],
@@ -414,12 +429,13 @@ async function create_pipeline() {
             buffers: [
                 unitBuffer,
                 {
-                    arrayStride: 48,
+                    arrayStride: glyphStride,
                     stepMode: "instance",
                     attributes: [
                         { shaderLocation: 1, offset: 0, format: "float32x4" },
                         { shaderLocation: 2, offset: 16, format: "float32x4" },
                         { shaderLocation: 3, offset: 32, format: "float32x4" },
+                        { shaderLocation: 4, offset: 48, format: "float32x4" },
                     ],
                 },
             ],
@@ -572,6 +588,23 @@ function on_pointer_up(event) {
 }
 
 /**
+ * Handles DOM `wheel` events. Normalizes line/pixel deltas, scales coordinates, and notifies Wasm.
+ * @param {WheelEvent} event
+ */
+function on_wheel(event) {
+    event.preventDefault();
+    const scale = pointer_scale();
+    let dy = event.deltaY;
+    if (event.deltaMode === 1) {
+        dy *= 16;
+    }
+    dy *= scale;
+    if (wasm.pointer_wheel(event.offsetX * scale, event.offsetY * scale, dy) === 1) {
+        schedule();
+    }
+}
+
+/**
  * Handles DOM `pointerleave` and `pointercancel` events. Resets hover and press states in Wasm.
  */
 function on_pointer_leave() {
@@ -618,6 +651,7 @@ async function main() {
     canvas.addEventListener("pointerup", on_pointer_up);
     canvas.addEventListener("pointerleave", on_pointer_leave);
     canvas.addEventListener("pointercancel", on_pointer_leave);
+    canvas.addEventListener("wheel", on_wheel, { passive: false });
 }
 
 main();
