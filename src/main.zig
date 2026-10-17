@@ -30,6 +30,7 @@ pub fn main() !void {
         .scene = scene.Scene.init_demo(),
         .clock = animator.Clock.init(),
         .queue = input.EventQueue.init(),
+        .meter_fd = -1,
         .last_x = 0,
         .last_y = 0,
         .frame_callback = null,

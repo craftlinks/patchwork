@@ -67,7 +67,7 @@
 //! - Only then is the stack frame popped.
 //! - This achieves zero heap allocation, zero serialization, and zero garbage collection overhead.
 //!
-//! ## 5. Power-Optimal Frame Pacing and Animation Chaining (0% Idle CPU)
+//! ## 5. Frame Pacing: `meter_clock` vs `tick` and Animation Chaining
 //! Traditional WebGL/WebGPU applications run an unconditional continuous loop with
 //! `requestAnimationFrame`. This burns CPU and GPU power even when displaying static documents
 //! or idle user interfaces.
@@ -79,24 +79,39 @@
 //!   actual physical dimensions, configuring the logical coordinate space and setting `redraw`.
 //! - `resize()` and `start()` return a `u32` dirty flag (1 if dirty, 0 if clean).
 //! - `web/shell.js` schedules a `requestAnimationFrame` **only** when the dirty flag is 1.
-//! - `tick(now_ms)` advances `animator.Clock`, feeds the delta to `scene.handle_event`,
-//!   presents if the frame is dirty, and returns 1 while any animator is live.
-//! - `web/shell.js` chains `requestAnimationFrame` strictly while `tick()` returns 1:
+//!
+//! ### `meter_clock(now_ms)` vs `tick(now_ms)`:
+//! - **`meter_clock(now_ms)` (Procedural Meter Clock):**
+//!   `web/shell.js` invokes `arm_meter_clock()`, setting a permanent `setInterval` at
+//!   `meter_period_ms()` (33 ms). On every interval tick, it invokes
+//!   `wasm.meter_clock(Math.floor(performance.now()))`. `meter_clock` calls
+//!   `state.scene.apply_meters(now_ms)`. If any meter bar height changes, it calls
+//!   `state.frame.request_redraw()` and returns 1. If it returns 1, `shell.js` calls `schedule()`
+//!   to request one `requestAnimationFrame`. Crucially, `meter_clock` does NOT advance widget
+//!   animators and does not chain rAF. The interval is never cleared.
+//! - **`tick(now_ms)` (Animator Step & Presentation):**
+//!   When rAF runs, it calls `wasm.tick(Math.floor(now))`. `tick` advances `animator.Clock`,
+//!   feeds the delta to `scene.handle_event`, presents if dirty, and returns 1 **only** while an
+//!   interactive animator is still moving (`scene.live()`):
 //!   ```javascript
 //!   if (wasm.tick(Math.floor(now)) === 1) {
 //!       schedule();
 //!   }
 //!   ```
-//!   Once every animator settles, `tick()` returns 0 and the animation frame callback loop
-//!   terminates. The first timestamp after idle produces dt 0, so a fade starts on the following
-//!   frame.
+//! - **Why rAF Stops When Animators Settle:**
+//!   Once hover and press transitions settle, `tick()` returns 0 and the animation frame
+//!   callback loop terminates. A resting pointer does not chain continuous rAF frames. Instead,
+//!   subsequent frame renders are triggered on demand by the ~30 Hz `setInterval` calling
+//!   `meter_clock()`.
+//! - **Zero Workers and No Shared Memory:**
+//!   This host-driven timing requires no background Web Workers, no `SharedArrayBuffer`, and no
+//!   cross-origin isolation headers (`COOP`/`COEP`); `serve.zig` is unchanged.
 //! - `pointer_move`, `pointer_down`, `pointer_up`, and `pointer_leave` call
 //!   `scene.handle_event` directly and return the dirty flag. Press and release carry
 //!   device-pixel coordinates (`offsetX * devicePixelRatio`).
 //! - Layout runs only when `frame.relayout` is set. `scene.layout` re-dispatches the
 //!   stored pointer, so a resize keeps hover on the widget that still contains it.
 //! - A scale-only present leaves `scene.dirty` false and does not rebuild instances.
-//! - When idle, the browser tab consumes 0.0% CPU and 0.0% GPU cycles.
 //!
 //! ## 6. TigerStyle Invariants
 //! - **Static Allocation:** `State` is statically allocated in Wasm BSS linear memory.
@@ -114,6 +129,7 @@ const font = @import("font.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const input = @import("input.zig");
+const levels = @import("levels.zig");
 const scene = @import("scene.zig");
 const theme = @import("theme.zig");
 
@@ -301,6 +317,24 @@ export fn pointer_leave() u32 {
     const flag = note_event(.pointer_leave);
     assert(!state.scene.pointer.inside);
     return flag;
+}
+
+/// Host meter period in milliseconds. `shell.js` uses this for `setInterval`.
+export fn meter_period_ms() u32 {
+    assert(levels.meter_period_ms == 33);
+    assert(levels.period_ns == 33_000_000);
+    return levels.meter_period_ms;
+}
+
+/// Writes the latest bar heights from `now_ms`. Returns 1 when a frame is owed.
+/// Does not step animators. The interval in `shell.js` requests the next frame.
+export fn meter_clock(now_ms: u32) u32 {
+    assert(state.frame.running);
+    if (state.scene.apply_meters(now_ms)) {
+        state.frame.request_redraw();
+    }
+    assert(state.frame.running);
+    return dirty_flag();
 }
 
 /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1

@@ -37,25 +37,31 @@
 // - JavaScript safely reads `PresentHeader` and instance records directly from Wasm stack memory.
 // - When `present_js()` returns, Zig resumes and unwinds the stack.
 //
-// ## 4. Power-Optimal Frame Pacing and rAF Chaining (0% Idle CPU / GPU)
-// Traditional web games run an unconditional `requestAnimationFrame` loop that paints 60-144 times
-// a second. For an application UI toolkit, this wastes battery and heats the device while reading
-// or idling.
+// ## 4. Host-Driven Meter Interval and Conditional rAF Chaining
+// Traditional web games run an unconditional `requestAnimationFrame` loop painting 60-144 times
+// a second. For an application UI toolkit, this wastes battery and heats mobile devices.
 //
 // In Patchwork:
-// - `requestAnimationFrame` is scheduled when Zig signals that a frame is dirty (`resize`).
-// - When rAF fires, `wasm.tick(Math.floor(now))` steps animators and presents dirty frames.
-// - `wasm.tick(now)` returns 1 while any widget animator is still moving (`scene.live()`), and
-//   `schedule()` chains another `requestAnimationFrame` only while `wasm.tick()` returns 1:
+// - **Host Meter Interval (`arm_meter_clock`):**
+//   After bootstrap, `arm_meter_clock()` establishes a permanent `setInterval` at
+//   `wasm.meter_period_ms()` (33 ms, ~30 Hz). The interval is never cleared. Each tick calls
+//   `wasm.meter_clock(Math.floor(performance.now()))`. If `meter_clock` returns 1 (levels changed),
+//   it invokes `schedule()` for a single `requestAnimationFrame`. Crucially, `meter_clock` does
+//   NOT step widget animators.
+// - **Animation Stepping & rAF Chaining (`schedule`):**
+//   When rAF fires, `wasm.tick(Math.floor(now))` advances continuous animators and presents dirty
+//   frames. `wasm.tick(now)` returns 1 **only** while an animator is moving (`scene.live()`):
 //   ```javascript
 //   if (wasm.tick(Math.floor(now)) === 1) {
 //       schedule();
 //   }
 //   ```
-// - When all animators settle, `tick()` returns 0, terminating the rAF chain.
-// - A resting hover does not keep the callback running. Labels are not animators,
-//   so text does not keep `requestAnimationFrame` alive either.
-// - The browser tab consumes 0.0% CPU and 0.0% GPU cycles once every animator has settled.
+// - **Why rAF Stops When Animators Settle:**
+//   When all hover and press transitions settle, `tick()` returns 0, immediately terminating the
+//   rAF chain. A resting pointer does NOT keep `requestAnimationFrame` alive.
+//   Text labels and passive meters are not animators. While the pointer rests, frame presentation
+//   occurs solely on demand at ~30 Hz when the meter interval fires, avoiding continuous 60/120 Hz
+//   GPU rendering loops.
 //
 // ## 5. The 64-Byte Instance, the Shape Attribute, and the Clip Attribute
 // Zig's `Instance` is four `vec4` groups. The pipeline below fetches them as `float32x4`:
@@ -515,11 +521,26 @@ function schedule() {
     raf = requestAnimationFrame((now) => {
         raf = 0;
         // tick returns 1 only while an animator is still moving, so the chain
-        // stops once hover and press have settled.
+        // stops once hover and press have settled. The meter interval requests
+        // the next frame on its own.
         if (wasm.tick(Math.floor(now)) === 1) {
             schedule();
         }
     });
+}
+
+/**
+ * Wakes the rack about 30 times a second and asks for one frame when a bar moved.
+ * The interval stays armed for the life of the page.
+ */
+function arm_meter_clock() {
+    const period = wasm.meter_period_ms();
+    setInterval(() => {
+        const now = Math.floor(performance.now());
+        if (wasm.meter_clock(now) === 1) {
+            schedule();
+        }
+    }, period);
 }
 
 /**
@@ -643,6 +664,7 @@ async function main() {
     await create_pipeline();
     wasm.start();
     fit_canvas();
+    arm_meter_clock();
 
     // Listen for window resize events.
     window.addEventListener("resize", fit_canvas);

@@ -17,18 +17,31 @@
 //! - **Compositor-Dictated Sizing:** The compositor—not the client—dictates window sizes through
 //!   asynchronous configure transactions.
 //!
-//! ### The Power-Optimal Blocking Event Loop (0.0% Idle CPU):
-//! Many UI toolkits run continuous rendering loops or use timer ticks (e.g. `sleep(16ms)`), which
-//! wake CPU cores from low-power sleep states, wasting battery and warming devices.
-//! Patchwork implements the libwayland multi-thread reader protocol with an infinite poll sleep:
-//! 1. `wl_display_prepare_read()`: Atomically registers intent to read socket events.
-//! 2. `wl_display_flush()`: Flushes pending client requests across the Unix socket.
-//! 3. `ppoll` with a null timeout: Puts the OS thread to sleep until the compositor writes.
-//!    The thread consumes exactly 0.0% CPU while idle. A latched commit passes a nanosecond
-//!    timeout instead, so the wake lands on the deadline rather than the next millisecond.
-//! 4. `wl_display_read_events()`: Reads incoming bytes into libwayland's ring buffers in one
-//!    syscall.
-//! 5. `wl_display_dispatch_pending()`: Dispatches registered C ABI event callbacks.
+//! ### The Dual-Source Blocking Event Loop & Timerfd Clock:
+//! Many UI toolkits run continuous rendering loops or spin threads, wasting battery and warming
+//! devices. Patchwork implements the libwayland multi-thread reader protocol integrated with a
+//! Linux `timerfd` for procedural level bars:
+//! 1. Before entering the loop, `timerfd_create(CLOCK_MONOTONIC, CLOEXEC|NONBLOCK)` opens a timer
+//!    file descriptor armed relatively with `period_ns` (33 ms) for both interval and initial
+//!    value, closed on scope exit with `defer`.
+//! 2. `wl_display_prepare_read()`: Atomically registers intent to read socket events. If events
+//!    are already pending (`rc != 0`), it dispatches pending events and immediately drains the
+//!    timer (`drain_meter`) so a busy Wayland socket cannot starve procedural metering.
+//! 3. `wl_display_flush()`: Flushes pending client requests across the Unix socket.
+//! 4. `ppoll` over two descriptors: `fds[0]` is the Wayland socket, and `fds[1]` is `meter_fd`.
+//!    The timeout is null unless a commit is latched (`present_at_ns != 0`), sleeping until an
+//!    event arrives or the present deadline is due.
+//! 5. **The Cancel-Read Rule:** A timer-only wake must NOT call `wl_display_read_events`.
+//!    If `fds[0]` is readable, `wl_display_read_events` reads incoming bytes into libwayland's
+//!    ring buffers and dispatches callbacks. If `fds[0]` is NOT readable (a timer-only wake or
+//!    timeout), the thread cancels the prepared read via `wl_display_cancel_read`.
+//! 6. When `meter_fd` is readable, `drain_meter` reads one `u64` expiration count and discards it.
+//!    Multiple missed periods collapse into one sample at `CLOCK_MONOTONIC`, requesting redraw.
+//! 7. **CPU Profile & Idle Characterization:** The previous "0.0% CPU while idle" claim is no
+//!    longer true while the rack is open. Instead, the thread sleeps in `ppoll` and wakes about
+//!    30 times a second for the meter timer, plus Wayland events and the present latch. Hover
+//!    animators still do not chain their own loop. Steady state is one present per timer wake,
+//!    then sleep in `ppoll`. This is not a spin, and it is not 0% CPU.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -127,12 +140,18 @@
 //!      `wp_presentation.feedback` (bounded by `feedback_in_flight_max`). Its `presented`
 //!      event is the pageflip timestamp the next schedule anchors on.
 //!    - Invokes `gpu.present()` and marks cursor and frame clean.
-//! 5. **`wait_for_events` (Sleep):**
-//!    Flushes the socket and blocks in `ppoll`. The timeout is infinite when idle, and the
-//!    remaining nanoseconds until `present_at_ns` while a commit is latched. A millisecond
-//!    `poll` woke up to a jiffy late, which spent the 3 ms margin and missed the latch. A
-//!    timeout cancels the read and presents; it does not call `read_events` on an empty socket.
-//!    After a `done` finds nothing dirty, the process sleeps at 0.0% CPU until the user interacts.
+//! 5. **`wait_for_events` (Sleep & Dual-Source Wake):**
+//!    Flushes the socket and blocks in `ppoll` across two file descriptors (`fds[0]` Wayland
+//!    socket, `fds[1]` meter `timerfd`). The timeout is null unless a commit is latched.
+//!    - If a timeout occurs, cancels the prepared read and returns to present.
+//!    - If `fds[0]` is readable, calls `wl_display_read_events` and dispatches pending events.
+//!    - **Cancel-Read Rule:** If `fds[0]` is not readable, cancels the prepared read via
+//!      `wl_display_cancel_read` to avoid blocking on an unreadable socket.
+//!    - If `fds[1]` is readable, `drain_meter` reads the 8-byte expiration counter, samples
+//!      `levels.sample(now_ms)`, and flags redraw if levels changed.
+//!    - Early return path: if `prepare_read` fails because events are pending, dispatches them
+//!      and immediately drains `meter_fd` to prevent meter starvation.
+//!    - Steady state is one present per timer wake, then sleep in `ppoll`.
 //!
 //! ### Measured Cadence on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz, 6-8 s hover sweep):
 //! Hyprland latches client content about 2 ms before the vblank and pageflips at the vblank.
@@ -170,6 +189,8 @@
 //!   `input.fixed_to_logical`. Non-zero deltas are paired with `state.last_x` / `state.last_y`
 //!   and pushed onto `EventQueue` as `Event.wheel`. Positive `dy` increases `scroll_y`
 //!   (scrolls content downward).
+//! - **Timerfd Wake Seam:** Linux drives level bars via `timerfd_create` and `ppoll` on the main
+//!   thread, whereas the browser host uses `setInterval` calling `wasm.meter_clock()`.
 //!
 //! ## 6. TigerStyle Invariants
 //! - **Static Allocation:** `State` is stack-allocated in `run()`; zero heap allocations in loop.
@@ -184,6 +205,7 @@ const font = @import("font.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const input = @import("input.zig");
+const levels = @import("levels.zig");
 const scene = @import("scene.zig");
 const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
@@ -242,6 +264,8 @@ pub const State = struct {
     clock: animator.Clock,
     /// Pointer events queued by callbacks and drained once per wake.
     queue: input.EventQueue,
+    /// `timerfd` for the rack bars. Negative until `arm_meter_timer`.
+    meter_fd: i32,
     /// Last surface position. Button events carry no coordinates.
     last_x: f32,
     last_y: f32,
@@ -466,6 +490,11 @@ pub fn run(state: *State) !void {
     try create_device(state);
     assert(state.list.count == 0);
     assert(state.frame.relayout);
+    state.meter_fd = try arm_meter_timer();
+    defer {
+        assert(state.meter_fd >= 0);
+        _ = std.os.linux.close(state.meter_fd);
+    }
     try loop(state);
 }
 
@@ -740,18 +769,20 @@ fn set_buffer_scale(state: *State) void {
     _ = wl_proxy_marshal_flags(proxy, 8, null, version, 0, @as(i32, @intCast(scale)));
 }
 
-/// Blocks until the compositor writes, or until the late-latch deadline.
-/// A timeout cancels the prepared read. `read_events` runs only when the socket
-/// is readable. Idle passes a null timeout to `ppoll`.
+/// Blocks until the compositor writes, the meter timer fires, or the latched
+/// commit is due. A timer-only wake cancels the prepared Wayland read.
+/// Idle, with no latched commit, passes a null timeout to `ppoll`.
 fn wait_for_events(state: *State) !void {
     const display = state.display;
     assert(@intFromPtr(display) != 0);
     assert(wl_display_get_fd(display) >= 0);
+    assert(state.meter_fd >= 0);
     if (wl_display_prepare_read(display) != 0) {
         const pending = wl_display_dispatch_pending(display);
         if (pending < 0) {
             return error.DispatchFailed;
         }
+        try drain_meter(state);
         return;
     }
     const flush_rc = wl_display_flush(display);
@@ -759,12 +790,18 @@ fn wait_for_events(state: *State) !void {
         wl_display_cancel_read(display);
         return error.FlushFailed;
     }
-    // Sleep until the compositor writes, or until the latched commit is due.
-    var fds = [_]std.posix.pollfd{.{
-        .fd = wl_display_get_fd(display),
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
+    var fds = [_]std.posix.pollfd{
+        .{
+            .fd = wl_display_get_fd(display),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+        .{
+            .fd = state.meter_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+    };
     const ready = poll_wayland(state, fds[0..]) catch {
         wl_display_cancel_read(display);
         return error.PollFailed;
@@ -774,22 +811,34 @@ fn wait_for_events(state: *State) !void {
         assert(state.present_at_ns != 0);
         return;
     }
-    // Poll wakes up because data is ready.
-    // Reads all pending bytes off the socket into libwayland's ring buffer in one syscall.
-    if (wl_display_read_events(display) != 0) {
-        return error.ReadFailed;
+    const wayland_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+    if (wayland_ready) {
+        if (wl_display_read_events(display) != 0) {
+            return error.ReadFailed;
+        }
+        const pending = wl_display_dispatch_pending(display);
+        if (pending < 0) {
+            return error.DispatchFailed;
+        }
+    } else {
+        wl_display_cancel_read(display);
     }
-    // Loops through all those messages in memory and invokes our C callbacks one by one.
-    const pending = wl_display_dispatch_pending(display);
-    if (pending < 0) {
-        return error.DispatchFailed;
+    const meter_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
+    if (meter_ready) {
+        try drain_meter(state);
     }
+    // A close event read above stops the loop. That wake is not a failure.
+    if (!state.frame.running) {
+        assert(!state.frame.running);
+        return;
+    }
+    assert(state.frame.running);
 }
 
 /// Blocks in `ppoll` until the socket is readable or the latched commit is due.
 /// `EINTR` retries, bounded, without cancelling the prepared read.
 fn poll_wayland(state: *State, fds: []std.posix.pollfd) !usize {
-    assert(fds.len == 1);
+    assert(fds.len == 2);
     var guard: u32 = 0;
     while (guard < 8) : (guard += 1) {
         var timeout = poll_timeout(state);
@@ -824,6 +873,63 @@ fn poll_timeout(state: *const State) ?std.posix.timespec {
         .sec = @intCast(remain / 1_000_000_000),
         .nsec = @intCast(remain % 1_000_000_000),
     };
+}
+
+/// Opens a nonblocking `timerfd` on `CLOCK_MONOTONIC` and arms one period.
+/// The caller closes the returned fd.
+fn arm_meter_timer() !i32 {
+    const flags: std.os.linux.TFD = .{ .NONBLOCK = true, .CLOEXEC = true };
+    const created = std.os.linux.timerfd_create(.MONOTONIC, flags);
+    const fd: i32 = switch (std.os.linux.errno(created)) {
+        .SUCCESS => @intCast(created),
+        else => return error.TimerCreateFailed,
+    };
+    assert(fd >= 0);
+    const period: std.os.linux.timespec = .{
+        .sec = 0,
+        .nsec = @intCast(levels.period_ns),
+    };
+    assert(period.nsec == 33_000_000);
+    const spec: std.os.linux.itimerspec = .{
+        .it_interval = period,
+        .it_value = period,
+    };
+    const armed = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
+    switch (std.os.linux.errno(armed)) {
+        .SUCCESS => {},
+        else => {
+            _ = std.os.linux.close(fd);
+            return error.TimerArmFailed;
+        },
+    }
+    assert(fd >= 0);
+    return fd;
+}
+
+/// Reads one expiration count and discards it. Several missed periods become
+/// one sample at the current monotonic time.
+fn drain_meter(state: *State) !void {
+    assert(state.meter_fd >= 0);
+    var expirations: u64 = 0;
+    const bytes = std.mem.asBytes(&expirations);
+    const read_n = std.posix.read(state.meter_fd, bytes) catch |err| switch (err) {
+        error.WouldBlock => return,
+        else => return error.MeterReadFailed,
+    };
+    assert(read_n == 8);
+    assert(expirations >= 1);
+    const now_ms = monotonic_ns() / 1_000_000;
+    if (state.scene.apply_meters(now_ms)) {
+        if (state.frame.running) {
+            assert(state.frame.running);
+            state.frame.request_redraw();
+        }
+    }
+    if (!state.frame.running) {
+        assert(!state.frame.running);
+        return;
+    }
+    assert(state.frame.running);
 }
 
 /// CLOCK_MONOTONIC in nanoseconds. `clock_gettime` of this clock does not fail.

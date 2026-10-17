@@ -21,11 +21,12 @@
 //! - **Panel:** Passive container. Hit-tested to occlude underlying elements, but ignores hits.
 //! - **Button:** Clickable trigger. Animates hover (100 ms) and down (50 ms). Tracks click counts.
 //! - **Slider:** Continuous horizontal bar. Maps absolute pointer X to `[0.0, 1.0]`.
-//!   *(Note: `Panel`, `Button`, and `Slider` remain fully implemented and tested in this module,
-//!   though Step 8 features an audio channel strip demo built with the widgets below).*
+//!   *(Note: `Panel`, `Button`, `Slider`, and `Scroll` remain fully implemented and tested in this
+//!   module; the running demo in Step 9 is the synthesizer rack).*
 //! - **Knob:** Continuous rotary control. Open-ring arc with relative vertical drag and mouse
 //!   wheel adjustments. Displays name and formatted numeric hundredths value string.
 //! - **Meter:** Passive vertical level indicator. Upward-growing fill column; ignores hits.
+//!   Values are written directly by the host clock (~30 Hz timer), with drawing reading `value`.
 //! - **Toggle:** Binary state capsule switch. Animated thumb travel over 100 ms on release inside.
 //! - **Scroll:** Viewport container managing a scrollable column of controls with a
 //!   draggable thumb, viewport culling, wheel routing, and per-child scissor-free clipping.
@@ -725,6 +726,23 @@ pub const Knob = struct {
         return self.hover.live();
     }
 
+    /// The ring disc, including the hole. The name beside the ring does not hit.
+    /// A cleared cell (the row had no room) is not a target.
+    pub fn contains(self: Knob, x: f32, y: f32) bool {
+        assert(self.value >= 0);
+        assert(self.value <= 1);
+        assert(x == x);
+        if (self.rect.width <= 0) {
+            assert(self.rect.width <= 0);
+            return false;
+        }
+        if (self.rect.height < ring_size) {
+            assert(self.rect.height < ring_size);
+            return false;
+        }
+        return ring_hit(self.rect, x, y);
+    }
+
     pub fn draw(
         self: Knob,
         list: *quads.DrawList,
@@ -734,6 +752,14 @@ pub const Knob = struct {
     ) void {
         assert(self.value >= 0);
         assert(self.value <= 1);
+        if (row.width <= 0) {
+            assert(row.width <= 0);
+            return;
+        }
+        if (row.height < ring_size) {
+            assert(row.height < ring_size);
+            return;
+        }
         const ring = ring_of(row);
         const track = paint_of(theme.chrome.track, ring_thickness);
         append_arc(list, ring, track, 0, 1, clip);
@@ -815,6 +841,27 @@ pub const Meter = struct {
         return false;
     }
 
+    /// Writes `value` when it differs. Drawing only reads the stored number.
+    pub fn set_value(self: *Meter, value: f32) bool {
+        assert(value >= 0);
+        assert(value <= 1);
+        if (self.value == value) {
+            assert(self.value == value);
+            return false;
+        }
+        self.value = value;
+        assert(self.value == value);
+        return true;
+    }
+
+    /// The cell occludes hits. `handle` ignores them.
+    pub fn contains(self: Meter, x: f32, y: f32) bool {
+        assert(self.value >= 0);
+        assert(self.value <= 1);
+        assert(x == x);
+        return point_inside(self.rect, x, y);
+    }
+
     pub fn draw(
         self: Meter,
         list: *quads.DrawList,
@@ -824,6 +871,14 @@ pub const Meter = struct {
     ) void {
         assert(self.value >= 0);
         assert(self.value <= 1);
+        if (row.width <= 0) {
+            assert(row.width <= 0);
+            return;
+        }
+        if (row.height <= 0) {
+            assert(row.height <= 0);
+            return;
+        }
         const track = meter_track(row);
         const rest = animator.Animator.init(down_rate_per_ms);
         append_weighted(list, track, paint_of(theme.chrome.track, meter_radius), rest, rest, clip);
