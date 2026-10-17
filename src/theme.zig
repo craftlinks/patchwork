@@ -90,8 +90,8 @@
 //! ## 5. Cross-Platform Seams & FFI
 //! - **Wasm Exports:** `theme_ptr()` and `theme_len()` expose the memory address and 192-byte
 //!   length to JavaScript in `web/shell.js`.
-//! - **Native & Web Parity:** Both `gpu_wgpu.zig` and `web/shell.js` upload the 64-byte matrix
-//!   then the 192-byte theme at uniform offset 64, binding minBindingSize 256.
+//! - **Native & Web Parity:** Both `src/host/gpu_wgpu.zig` and `web/shell.js` upload the
+//!   64-byte matrix then the 192-byte theme at uniform offset 64, binding minBindingSize 256.
 //!
 //! ## 6. TigerStyle Invariants
 //! - **Comptime Layout Locking:** Compile-time assertions lock `@sizeOf(Theme) == 192`,

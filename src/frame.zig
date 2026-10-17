@@ -56,16 +56,14 @@
 //! ### The `relayout` Flag (Layout Dirty):
 //! - **Lifecycle:** `init()` sets `relayout = true` because the initial frame must calculate
 //!   child geometry and populate the draw list. A changed configure event sets `relayout = true`
-//!   via `apply_configure()`, signaling that `scene.Scene.layout()` must re-walk the column
-//!   via `turtle.place_column()`.
+//!   via `apply_configure()`, signaling that `App.layout()` must recompute widget positions.
 //! - **Preservation Across Scale Changes:** Crucially, `apply_scale()` does NOT set `relayout`.
 //!   Logical UI dimensions are invariant to display scale; only the physical framebuffer size
-//!   changes. If a scale change re-ran layout, `scene.Scene.layout()` would unnecessarily
-//!   reposition widgets and dirty the scene. Because `relayout` remains false, a scale-only present
-//!   reuses existing instances without rebuilding, updating only `flag_uniform`.
-//! - **Clearance:** `mark_laid_out()` resets `relayout = false` immediately after
-//!   `scene.Scene.layout()` finishes positioning widgets. A same-size configure leaves a cleared
-//!   `relayout` cleared.
+//!   changes. If a scale change re-ran layout, `App.layout()` would unnecessarily reposition
+//!   widgets and dirty the scene. Because `relayout` remains false, a scale-only present reuses
+//!   existing instances without rebuilding, updating only `flag_uniform`.
+//! - **Clearance:** `mark_laid_out()` resets `relayout = false` immediately after `App.layout()`
+//!   finishes positioning widgets. A same-size configure leaves a cleared `relayout` cleared.
 //!
 //! ### Flag Transition Matrix:
 //! ```text
@@ -81,8 +79,8 @@
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - Pure Zig policy container shared across both Linux Wayland (`linux_window.zig`) and
-//!   WebAssembly browser harness (`web_exports.zig`).
+//! - Pure Zig policy container shared across both Linux Wayland (`src/host/linux_window.zig`) and
+//!   WebAssembly browser harness (`src/host/web_exports.zig`).
 //! - Neither host platform performs layout or damage policy calculations directly; both delegate
 //!   exclusively to `Frame`.
 //!
@@ -296,7 +294,7 @@ pub const Frame = struct {
     ///
     /// Input events (pointer hover, button press) use this entry point. Because pointer
     /// hit-state changes modify instance weights without altering window dimensions,
-    /// `relayout` is preserved unchanged, bypassing `scene.Scene.layout` layout passes.
+    /// `relayout` is preserved unchanged, bypassing `App.layout` layout passes.
     pub fn request_redraw(self: *Frame) void {
         assert(self.running);
         self.redraw = true;

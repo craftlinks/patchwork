@@ -18,7 +18,8 @@
 //!
 //! ### Makepad Timing Reference:
 //! Makepad's button hover duration is 0.1 s (100 ms). Press darken duration is half of that
-//! (50 ms). In `widgets.zig`, `hover_rate_per_ms = 1.0 / 100.0` and `down_rate_per_ms = 1.0 / 50.0`.
+//! (50 ms). In `widgets.zig`, `hover_rate_per_ms = 1.0 / 100.0` and
+//! `down_rate_per_ms = 1.0 / 50.0`.
 //!
 //! ### Exact Target Clamping (Zero Epsilon):
 //! Many animation frameworks use spring equations or exponential decays that asymptotically
@@ -135,11 +136,13 @@
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - **Wayland Protocol:** The Linux event loop in `linux_window.zig` requests `wl_surface.frame`.
+//! - **Wayland Protocol:** The Linux event loop in `src/host/linux_window.zig` requests
+//!   `wl_surface.frame`.
 //!   The compositor executes `wl_callback.done(data, callback, callback_data: u32)`.
 //!   `callback_data` is the compositor's presentation timestamp in milliseconds, passed to
 //!   `Clock.advance()`.
-//! - **Browser WebAssembly:** The JavaScript harness in `web/shell.js` invokes `requestAnimationFrame`.
+//! - **Browser WebAssembly:** The JavaScript harness in `web/shell.js` invokes
+//!   `requestAnimationFrame`.
 //!   The DOM callback receives `now` (`DOMHighResTimeStamp`), floored via `Math.floor(now)` and
 //!   passed as a 32-bit unsigned integer to the exported `tick(now_ms: u32)` function.
 //! - **Uniform Semantics:** Both platforms feed monotonic millisecond clocks into the identical

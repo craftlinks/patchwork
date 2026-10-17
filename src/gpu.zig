@@ -11,7 +11,7 @@
 //!
 //! In Zig, types and modules are first-class compile-time (`comptime`) values:
 //! - When compiling for native Linux (`x86_64`):
-//!   `gpu_wgpu.zig` is imported, linking directly against `libwgpu_native.so`.
+//!   `src/host/gpu_wgpu.zig` is imported, linking directly against `libwgpu_native.so`.
 //! - When compiling for the browser (`wasm32-freestanding`):
 //!   `gpu_wgpu` is evaluated to the primitive type `void`. The native WebGPU binding code is
 //!   completely omitted from compilation. `Gpu` evaluates to a zero-sized dummy struct,
@@ -49,7 +49,7 @@ const draw = @import("draw.zig");
 const font = @import("font.zig");
 
 /// Conditionally import native wgpu bindings only when compiling for non-Wasm targets.
-const gpu_wgpu = if (builtin.cpu.arch == .wasm32) void else @import("gpu_wgpu.zig");
+const gpu_wgpu = if (builtin.cpu.arch == .wasm32) void else @import("host/gpu_wgpu.zig");
 
 /// Standard 32-bit floating-point RGBA color representation (components in range 0.0 to 1.0).
 pub const Color = struct {

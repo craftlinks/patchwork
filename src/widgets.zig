@@ -22,7 +22,7 @@
 //! - **Button:** Clickable trigger. Animates hover (100 ms) and down (50 ms). Tracks click counts.
 //! - **Slider:** Continuous horizontal bar. Maps absolute pointer X to `[0.0, 1.0]`.
 //!   *(Note: `Panel`, `Button`, `Slider`, and `Scroll` remain fully implemented and tested in this
-//!   module; the running demo in Step 9 is the synthesizer rack).*
+//!   module; library examples include the synthesizer rack and the scroll column).*
 //! - **Knob:** Continuous rotary control. Open-ring arc with relative vertical drag and mouse
 //!   wheel adjustments. Displays name and formatted numeric hundredths value string.
 //! - **Meter:** Passive vertical level indicator. Upward-growing fill column; ignores hits.
@@ -431,8 +431,16 @@ pub const Slider = struct {
         return face_contains(self.rect, knob_radius, x, y);
     }
 
-    /// Track, then fill (omitted at value 0), then the knob on top.
-    pub fn draw(self: Slider, list: *quads.DrawList, clip: font.Clip) void {
+    /// Track, then fill (omitted at value 0), then the knob on top. A slider has no
+    /// text, so `glyphs` is only checked. It is here so every standalone widget draws
+    /// with the same signature.
+    pub fn draw(
+        self: Slider,
+        list: *quads.DrawList,
+        glyphs: *font.GlyphList,
+        clip: font.Clip,
+    ) void {
+        assert(glyphs.count <= font.glyph_cap);
         assert(self.value >= 0);
         assert(self.value <= 1);
         if (self.rect.width <= 0) {
@@ -743,7 +751,19 @@ pub const Knob = struct {
         return ring_hit(self.rect, x, y);
     }
 
+    /// Draws the knob in its own `rect`.
     pub fn draw(
+        self: Knob,
+        list: *quads.DrawList,
+        glyphs: *font.GlyphList,
+        clip: font.Clip,
+    ) void {
+        self.draw_row(list, glyphs, self.rect, clip);
+    }
+
+    /// Draws the knob into `row`, a rect other than `self.rect`. `Scroll` uses this for
+    /// children whose visual row is offset by the scroll position.
+    pub fn draw_row(
         self: Knob,
         list: *quads.DrawList,
         glyphs: *font.GlyphList,
@@ -862,7 +882,18 @@ pub const Meter = struct {
         return point_inside(self.rect, x, y);
     }
 
+    /// Draws the meter in its own `rect`.
     pub fn draw(
+        self: Meter,
+        list: *quads.DrawList,
+        glyphs: *font.GlyphList,
+        clip: font.Clip,
+    ) void {
+        self.draw_row(list, glyphs, self.rect, clip);
+    }
+
+    /// Draws the meter into `row`, a rect other than `self.rect`. See `Knob.draw_row`.
+    pub fn draw_row(
         self: Meter,
         list: *quads.DrawList,
         glyphs: *font.GlyphList,
@@ -1732,8 +1763,8 @@ fn control_draw(
     assert(clip.y1 > clip.y0);
     assert(list.count <= quads.instance_cap);
     switch (control.*) {
-        .knob => |*knob| knob.draw(list, glyphs, row, clip),
-        .meter => |*meter| meter.draw(list, glyphs, row, clip),
+        .knob => |*knob| knob.draw_row(list, glyphs, row, clip),
+        .meter => |*meter| meter.draw_row(list, glyphs, row, clip),
         .toggle => |*toggle| toggle.draw(list, glyphs, row, clip),
     }
 }
@@ -1954,7 +1985,8 @@ test "slider drag sets an absolute value" {
     try std.testing.expect(slider.animate(hover_duration_ms));
     try std.testing.expectEqual(@as(f32, 1), slider.hover.value);
     var held = quads.DrawList.init();
-    slider.draw(&held, sample_clip);
+    var held_glyphs = font.GlyphList.init();
+    slider.draw(&held, &held_glyphs, sample_clip);
     try std.testing.expectEqual(@as(u32, 3), held.count);
     var face: u32 = 0;
     while (face < 3) : (face += 1) {
@@ -1964,7 +1996,7 @@ test "slider drag sets an absolute value" {
     try std.testing.expect(slider.handle(.{ .drag = .{ .x = 28, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 0), slider.value);
     var list = quads.DrawList.init();
-    slider.draw(&list, sample_clip);
+    slider.draw(&list, &held_glyphs, sample_clip);
     try std.testing.expectEqual(@as(u32, 2), list.count);
     try std.testing.expect(slider.handle(.{ .drag = .{ .x = 2000, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 1), slider.value);

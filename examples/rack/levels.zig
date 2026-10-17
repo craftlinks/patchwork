@@ -84,10 +84,10 @@
 //! sampled = levels.sample(now_ms)
 //!          |
 //!          v
-//! scene.apply_meters(now_ms)
+//! app.timer(now_ms)
 //!          |---> writes slots 5, 11, 17
 //!          |---> Meter.set_value(new_val) (returns true if changed)
-//!          +---> if changed: scene.dirty = true
+//!          +---> if changed: app.scene.dirty = true
 //! ```
 //!
 //! ### Idempotent Evaluation:
@@ -95,11 +95,12 @@
 //! values and returns `false` when unchanged, preventing unnecessary frame invalidation.
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - **Linux (Wayland):** The event loop initializes a nonblocking `timerfd` armed at `period_ns`.
-//!   On wake, `drain_meter` reads the current timestamp and calls `state.scene.apply_meters()`.
-//! - **Browser (WebAssembly):** `web/shell.js` arms a `setInterval` at `meter_period_ms()` (33 ms),
-//!   calling the exported `wasm.meter_clock(Math.floor(performance.now()))`. If `meter_clock`
-//!   returns 1, `shell.js` schedules a single `requestAnimationFrame`.
+//! - **Linux (Wayland):** The event loop initializes a nonblocking `timerfd` armed at `period_ns`
+//!   when `config.timer_period_ms != 0`. On wake, `drain_timer` reads the current timestamp and
+//!   calls `app.timer(now_ms)`.
+//! - **Browser (WebAssembly):** `web/shell.js` arms a `setInterval` at `timer_period_ms()` (33 ms),
+//!   calling the exported `wasm.timer(Math.floor(performance.now()))`. If `timer` returns 1,
+//!   `shell.js` schedules a single `requestAnimationFrame`.
 //! - **Platform Neutrality:** `levels.zig` contains zero platform-specific imports, running
 //!   identically under native Linux, WebAssembly, and unit test harnesses.
 //!

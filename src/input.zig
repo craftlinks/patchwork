@@ -29,11 +29,11 @@
 //!   allocating dynamic heap memory.
 //!
 //! ### Native vs. Web Execution:
-//! - On native Linux, `linux_window.zig` drains the `EventQueue` once per loop wake in
-//!   `sync_input()`, passing events sequentially to `scene.handle_event()`.
+//! - On native Linux, `src/host/linux_window.zig` drains the `EventQueue` once per loop wake in
+//!   `sync_input()`, passing events sequentially to `app.event()`.
 //! - In the browser, DOM pointer events are delivered individually and asynchronously to
 //!   JavaScript; `web/shell.js` calls the Wasm exports (`pointer_move`, `pointer_down`, etc.)
-//!   directly, which invoke `scene.handle_event()` immediately without queuing.
+//!   directly, which invoke `app.event()` immediately without queuing.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -110,11 +110,11 @@
 //! ```
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - **Step 5 vs. Step 6 Division of Responsibility:**
-//!   In Step 5, hit testing and state resolution were coupled inside this file (`hit.zig`).
-//!   In Step 6, `input.zig` is strictly responsible for capturing raw device coordinates and
-//!   buffering input events. `scene.zig` owns hit testing, widget dispatch, and pointer capture.
-//!   `draw.contains_box` remains the low-level analytic signed distance test for rounded quads.
+//! - **Separation of Input from Dispatch:**
+//!   `input.zig` is strictly responsible for capturing raw device coordinates and buffering
+//!   input events. Dispatchers like `ui.Scene` (`src/ui.zig`) or applications own hit testing,
+//!   widget dispatch, and pointer capture. `draw.contains_box` remains the low-level analytic
+//!   signed distance test for rounded quads.
 //!
 //! ## 6. TigerStyle Invariants
 //! - **Static Memory Bounds:** `queue_cap = 32`. No dynamic memory allocations.
@@ -155,7 +155,7 @@ pub const Event = union(enum) {
     wheel: Wheel,
 };
 
-/// Latest pointer sample. Scene stores this so a relayout can re-hit the same point.
+/// Latest pointer sample. `ui.Scene` stores this so a relayout can re-hit the same point.
 /// Button callbacks on Wayland carry no coordinates, so the window also keeps
 /// `last_x` / `last_y` and copies them into the down and up events.
 /// Memory: 16 bytes (two f32, two bools, 6 bytes of padding).

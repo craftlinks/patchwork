@@ -216,20 +216,22 @@
 //! ### Who Writes the Rectangles
 //! This module (`draw.zig`) provides graphics primitives, buffer layouts, and distance fields; it
 //! does NOT place scene geometry or widgets.
-//! `scene.Scene.draw` clears `DrawList` and `GlyphList`, appends the scroll container background
-//! and thumb, and iterates through its retained controls.
+//! Widgets write rectangles to `DrawList` and glyphs to `GlyphList` via their own `draw` methods,
+//! calling append helpers such as `DrawList.append`. Applications own the overall draw order: an
+//! app's `draw(list, glyphs)` clears both lists and iterates through its retained controls in
+//! back-to-front painter order.
 //!
-//! That rebuild executes ONLY when `scene.dirty` is set:
+//! That rebuild executes ONLY when `app.dirty()` is set:
 //! 1. Window layout changes (`Frame.relayout` is true),
-//! 2. User input updates widget state (mouse enter/leave, knob drag, toggle click, wheel), or
-//! 3. An in-flight animator steps by `dt_ms` and alters an animated weight.
+//! 2. User input updates widget state (mouse enter/leave, knob drag, toggle click, wheel),
+//! 3. An in-flight animator steps by `dt_ms` and alters an animated weight, or
+//! 4. The host timer fires and updates dynamic application values (such as level meters).
 //!
-//! A scale-only present (same logical size, new physical pixels) leaves `scene.dirty` false.
+//! A scale-only present (same logical size, new physical pixels) leaves `app.dirty()` false.
 //! `UploadCursor.flags` returns 0, so neither instance buffer is uploaded.
 //!
-//! Capacity invariant: `1 + 1 + scroll_child_cap * 2 <= instance_cap` (1 panel + 1 thumb +
-//! 16 * 2 child faces = 34 <= 256), guaranteeing that the full scene never exceeds
-//! the static capacity.
+//! Capacity invariant: all quad instances emitted during a frame must fit within `instance_cap`
+//! (256 instances), guaranteeing that drawing never exceeds static GPU buffer capacity.
 //!
 //! `contains_box` is the low-level analytic rounded-box point test used across the codebase;
 //! `contains` delegates directly to it so instance hit testing and widget bounds checking

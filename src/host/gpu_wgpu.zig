@@ -174,9 +174,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const draw = @import("draw.zig");
-const font = @import("font.zig");
-const theme = @import("theme.zig");
+const draw = @import("../draw.zig");
+const font = @import("../font.zig");
+const theme = @import("../theme.zig");
 
 /// Hardware GPU state context encapsulating all native WebGPU resources.
 pub const Gpu = struct {

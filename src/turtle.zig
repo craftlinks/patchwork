@@ -13,10 +13,10 @@
 //! - They have no knowledge of colors, corner radiuses, shaders, widgets, or GPU draw lists.
 //! - The caller provides an array of `Walk` layout specifications and an output slice of `Rect`
 //!   border boxes of the exact same length.
-//! - `scene.Scene.layout` is that caller: it extracts `Walk` specifications from its retained
-//!   widgets, passes them to `place_column` (for top-level stacked panels) and `place_row`
-//!   (for horizontal knob rows inside panel bodies), writes the resolved border boxes back to
-//!   the widgets, and updates scene bounds. `scene.Scene.draw` later appends GPU instances.
+//! - An application layout pass (such as `App.layout`) is that caller: it extracts `Walk`
+//!   specifications from retained widgets, passes them to `place_column` (for top-level stacked
+//!   panels) and `place_row` (for horizontal knob rows inside panel bodies), writes the resolved
+//!   border boxes back to the widgets, and updates bounds. `App.draw` later appends GPU instances.
 //!
 //! ### Why `place_row` Exists (Horizontal Axis Transpose):
 //! While top-level layouts commonly flow vertically as a column, complex UI components—such as
@@ -123,7 +123,7 @@
 //! ### Struct Layouts:
 //! - `Rect`: 16 bytes (`x, y, width, height: f32`). Alignment: 4 bytes.
 //! - `Inset`: 16 bytes (`left, top, right, bottom: f32`). Alignment: 4 bytes.
-//! - `Size`: Tagged union (`fixed: f32`, `fill`). Size: 8 bytes. Alignment: 4 bytes.
+//! - `Size`: Tagged union (`fixed: f32`, `fit: f32`, `fill`). Size: 8 bytes. Alignment: 4 bytes.
 //! - `Walk`: 36 bytes (`margin: Inset`, `width: Size`, `height: Size`, `align_x: f32`).
 //! - `Column`: 32 bytes (`rect: Rect`, `padding: Inset`).
 //!
@@ -163,19 +163,14 @@
 //!   only when logical window bounds change.
 //!
 //! ## 6. TigerStyle Invariants
-//! - **Bounded Operations:** Layout functions take pre-allocated output slices of bounded size
-//!   (`walks.len <= child_cap`).
-//! - **Zero Runtime Allocation:** All operations execute strictly in-place on caller-supplied
-//!   buffers without heap allocation.
-//! - **Split Preconditions:** Invariants (`walks.len == out.len`, padding bounds, margin bounds)
-//!   are asserted independently at function boundaries.
-//!
-//! ## 6. TigerStyle Invariants
 //! - **Bounded Execution:** Layout runs in strictly two bounded linear passes over `walks.len`.
-//! - **Zero Dynamic Allocation:** Uses caller-supplied output slices; zero heap allocations.
-//! - **Precondition Assertions:** Validates non-negative insets, non-negative fixed sizes,
-//!   `align_x in [0, 1]`, and `walks.len == out.len <= child_cap`.
-//! - **No Recursion:** Fully iterative column cursor arithmetic.
+//! - **Bounded Capacity:** Functions take pre-allocated output slices of bounded size
+//!   (`walks.len == out.len <= child_cap`).
+//! - **Zero Dynamic Allocation:** Uses caller-supplied output slices; zero heap allocation at
+//!   run time.
+//! - **Split Preconditions:** Invariants (`walks.len == out.len`, padding bounds, margin bounds,
+//!   `align_x in [0, 1]`, non-negative fixed sizes) are asserted independently.
+//! - **No Recursion:** Fully iterative column and row cursor arithmetic.
 
 const std = @import("std");
 const assert = std.debug.assert;

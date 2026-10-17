@@ -151,7 +151,7 @@
 //! ## 4. State Machines & Data Flow
 //!
 //! ```text
-//! [Scene.layout()]
+//! [App.layout()]
 //!       │
 //!       ▼
 //! [place_label()]  (Calculates border box inset by padding)
@@ -177,10 +177,10 @@
 //!
 //! ## 5. Cross-Platform Seams & FFI
 //! - **WebAssembly Linear Memory Access:**
-//!   In `src/web_exports.zig`, `atlas_ptr()` and `atlas_len()` expose the embedded atlas buffer
-//!   directly to JavaScript without copying.
+//!   In `src/host/web_exports.zig`, `atlas_ptr()` and `atlas_len()` expose the embedded atlas
+//!   buffer directly to JavaScript without copying.
 //! - **WebGPU Texture Copy Rules:**
-//!   `shell.js` and `gpu_wgpu.zig` upload the atlas once during initialization using
+//!   `shell.js` and `src/host/gpu_wgpu.zig` upload the atlas once during initialization using
 //!   `queue.writeTexture`. The native backend utilizes `texture_usage_copy_dst = 0x2`
 //!   (avoiding buffer `0x8` which represents `STORAGE_BINDING` on textures).
 //! - **Two Pipeline Layouts with Shared Group 0:**

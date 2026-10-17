@@ -32,7 +32,7 @@
 //! - Our blocking event loop in `linux_window.zig` reads all available socket events in batch
 //!   via `wl_display_dispatch_pending()`.
 //! - Pointer callbacks are pure leaf writers that push `input.Event` records into `State.queue`.
-//! - `sync_input()` runs once per loop wake, draining the event queue and feeding `scene.handle_event()`,
+//! - `sync_input()` runs once per loop wake, draining the event queue and feeding `app.event()`,
 //!   amortizing motion events into at most one layout/draw pass and presentation.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces: `wl_fixed_t` (24.8)

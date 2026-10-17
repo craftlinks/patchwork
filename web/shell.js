@@ -30,27 +30,27 @@
 // - Zero heap allocations, zero string parsing, zero GC pauses.
 //
 // ## 3. Synchronous Call-Stack Longevity
-// In `web_exports.zig:tick()`, `PresentHeader` is allocated directly on Zig's call stack.
+// In `src/host/web_exports.zig` `tick()`, `PresentHeader` is allocated on Zig's call stack.
 // Zig calls the host import `present_js(headerPtr, instancePtr, glyphPtr)` synchronously.
 // Because WebAssembly and JavaScript run synchronously on the main UI thread:
 // - The Zig stack frame remains active and frozen while `present_js()` executes.
 // - JavaScript safely reads `PresentHeader` and instance records directly from Wasm stack memory.
 // - When `present_js()` returns, Zig resumes and unwinds the stack.
 //
-// ## 4. Host-Driven Meter Interval and Conditional rAF Chaining
+// ## 4. The Optional App Timer and Conditional rAF Chaining
 // Traditional web games run an unconditional `requestAnimationFrame` loop painting 60-144 times
 // a second. For an application UI toolkit, this wastes battery and heats mobile devices.
 //
 // In Patchwork:
-// - **Host Meter Interval (`arm_meter_clock`):**
-//   After bootstrap, `arm_meter_clock()` establishes a permanent `setInterval` at
-//   `wasm.meter_period_ms()` (33 ms, ~30 Hz). The interval is never cleared. Each tick calls
-//   `wasm.meter_clock(Math.floor(performance.now()))`. If `meter_clock` returns 1 (levels changed),
-//   it invokes `schedule()` for a single `requestAnimationFrame`. Crucially, `meter_clock` does
-//   NOT step widget animators.
+// - **App Timer (`arm_timer`):**
+//   After bootstrap, `arm_timer()` reads `wasm.timer_period_ms()`. The app sets that period in
+//   its config. A period of 0 means the app has no timer, so no interval is created and the
+//   page idles between events. A non-zero period creates one permanent `setInterval`. Each tick
+//   calls `wasm.timer(Math.floor(performance.now()))`. If `timer` returns 1, `schedule()`
+//   requests a single `requestAnimationFrame`. `timer` does NOT step widget animators.
 // - **Animation Stepping & rAF Chaining (`schedule`):**
 //   When rAF fires, `wasm.tick(Math.floor(now))` advances continuous animators and presents dirty
-//   frames. `wasm.tick(now)` returns 1 **only** while an animator is moving (`scene.live()`):
+//   frames. `wasm.tick(now)` returns 1 **only** while an animator is moving (`App.live()`):
 //   ```javascript
 //   if (wasm.tick(Math.floor(now)) === 1) {
 //       schedule();
@@ -59,9 +59,8 @@
 // - **Why rAF Stops When Animators Settle:**
 //   When all hover and press transitions settle, `tick()` returns 0, immediately terminating the
 //   rAF chain. A resting pointer does NOT keep `requestAnimationFrame` alive.
-//   Text labels and passive meters are not animators. While the pointer rests, frame presentation
-//   occurs solely on demand at ~30 Hz when the meter interval fires, avoiding continuous 60/120 Hz
-//   GPU rendering loops.
+//   Text labels and passive meters are not animators. With a timer, a resting page presents
+//   only when the timer reports a change. Without one it presents only on input.
 //
 // ## 5. The 64-Byte Instance, the Shape Attribute, and the Clip Attribute
 // Zig's `Instance` is four `vec4` groups. The pipeline below fetches them as `float32x4`:
@@ -157,7 +156,7 @@ const MATRIX_BYTES = 64;
 const INSTANCE_CAP = 256;
 
 /**
- * Host import invoked synchronously from Zig's `web_exports.zig:tick()`.
+ * Host import invoked synchronously from Zig's `src/host/web_exports.zig` `tick()`.
  * Reads the `PresentHeader` from Wasm stack memory, conditionally uploads modified
  * buffers to GPU VRAM, and executes the instanced draw render pass.
  *
@@ -521,8 +520,8 @@ function schedule() {
     raf = requestAnimationFrame((now) => {
         raf = 0;
         // tick returns 1 only while an animator is still moving, so the chain
-        // stops once hover and press have settled. The meter interval requests
-        // the next frame on its own.
+        // stops once hover and press have settled. The app timer, when there is one,
+        // requests the next frame on its own.
         if (wasm.tick(Math.floor(now)) === 1) {
             schedule();
         }
@@ -530,14 +529,19 @@ function schedule() {
 }
 
 /**
- * Wakes the rack about 30 times a second and asks for one frame when a bar moved.
- * The interval stays armed for the life of the page.
+ * Arms the app timer. The app sets `timer_period_ms` in its config, and 0 means the app
+ * has no timer, so no interval is created and the page idles between events. A non-zero
+ * period wakes the app with `timer(now_ms)` and asks for one frame when it reports a
+ * change. The interval stays armed for the life of the page.
  */
-function arm_meter_clock() {
-    const period = wasm.meter_period_ms();
+function arm_timer() {
+    const period = wasm.timer_period_ms();
+    if (period === 0) {
+        return;
+    }
     setInterval(() => {
         const now = Math.floor(performance.now());
-        if (wasm.meter_clock(now) === 1) {
+        if (wasm.timer(now) === 1) {
             schedule();
         }
     }, period);
@@ -664,7 +668,7 @@ async function main() {
     await create_pipeline();
     wasm.start();
     fit_canvas();
-    arm_meter_clock();
+    arm_timer();
 
     // Listen for window resize events.
     window.addEventListener("resize", fit_canvas);
