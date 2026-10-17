@@ -1,176 +1,98 @@
-//! Native Linux WebGPU Implementation using wgpu-native (v29.0.1.1 C ABI).
+//! Native Linux WebGPU backend over the wgpu-native C ABI (pinned to v29.0.1.1).
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. What is wgpu-native?
-//! `wgpu-native` is a high-performance WebGPU implementation written in Rust (the core of
-//! Mozilla Firefox's WebGPU engine) that exports a standard C ABI defined by the W3C `webgpu.h`
-//! specification.
-//! Instead of using third-party package managers, C++ wrappers, or heavyweight abstraction layers,
-//! Patchwork interfaces directly with `libwgpu_native.so` using Zig's native C ABI calling
-//! conventions (`callconv(.c)`).
+//! ## 1. Why a Hand-Written C ABI Binding
+//! The backend links `libwgpu_native.so` through `webgpu.h` types declared here with
+//! `extern struct` and `callconv(.c)`, so the build needs no wrapper library, code generator,
+//! or package manager. Every declaration is pinned to the wgpu-native version above; a version
+//! bump must re-check each struct against the new header (the `comptime` block after the
+//! struct declarations enforces the sizes this file depends on).
 //!
-//! ## 2. Type-Safe Opaque Handles in Zig
-//! In traditional C graphics programming, handles are often declared as untyped `void*` or
-//! incomplete pointer types (`typedef struct WGPUDeviceImpl* WGPUDevice;`). This allows dangerous
-//! bugs where an `Adapter` handle is accidentally passed to a function expecting a `Device`.
+//! ## 2. Opaque Handles and Chained Structs
+//! Each handle is a distinct `*opaque {}` type, so passing an `Adapter` where a `Device` is
+//! expected is a compile error rather than a driver crash.
 //!
-//! In Zig, we declare handles as distinct opaque types:
-//! ```zig
-//! const Instance = *opaque {};
-//! const Device = *opaque {};
-//! ```
-//! In Zig's type system, each `*opaque {}` is a strictly unique type. If a function argument is
-//! mismatched, the Zig compiler rejects the code at compile time with zero runtime overhead.
+//! Extensible descriptors start with `next_in_chain: ?*ChainedStruct`, a singly linked list of
+//! tagged structs. The native library reads `s_type` and casts the node to the matching
+//! struct, so every chained struct must begin with `chain: ChainedStruct` and carry the right
+//! tag (`s_type_wayland_surface`, `s_type_shader_source_wgsl`,
+//! `s_type_surface_configuration_extras`). The last tag lives in wgpu-native's extension
+//! range, not in core WebGPU. Chain nodes must outlive the call that consumes them, which is
+//! why each is a local in the function that passes it.
 //!
-//! ## 3. The Chained Struct Extensibility Pattern (`ChainedStruct` and `s_type`)
-//! Modern graphics specifications (Vulkan and WebGPU) require extensible configuration structs
-//! that allow platform-specific extensions without breaking C ABI binary compatibility.
-//! They implement a singly-linked list of tagged structs:
+//! ## 3. Vertex Layout Contract
+//! Both pipelines use the same two-buffer layout (`fill_vertex_layouts`):
+//! - Buffer 0, `step_vertex`: the shared unit quad (`draw.unit_quad`), one `float32x2`
+//!   attribute at location 0.
+//! - Buffer 1, `step_instance`: four `float32x4` attributes at locations 1 to 4, stride
+//!   `draw.instance_stride`. For quads they are rect, fill, shape `(radius, hover, down,
+//!   kind)`, and clip. `font.Glyph` is fetched through the same attributes.
+//!
+//! The attribute offsets are the field offsets of `draw.Instance` and `font.Glyph`;
+//! `instance_attrs` is pinned to them by `comptime` asserts so a struct edit cannot desync
+//! the vertex fetch. The browser host (`web/shell.js`) mirrors the same locations.
+//!
+//! ## 4. Frame Lifecycle (`present`)
 //! ```text
-//! [ SurfaceDescriptor ]
-//!   next_in_chain ───────► [ SurfaceSourceWayland ]
-//!                            chain.next ──► null
-//!                            chain.s_type ═ s_type_wayland_surface (0x7)
-//!                            display ═════► *wl_display
-//!                            surface ═════► *wl_surface
+//! configure_surface  -> only when the physical size differs from the configured size
+//! write_uploads      -> only the buffers named by header.flags (see draw.UploadCursor)
+//! acquire_texture    -> current swapchain texture, or an error
+//! encode_submit_present
+//!     clear pass -> draw_quads -> draw_glyphs -> submit -> present -> release handles
 //! ```
-//! Every extensible struct begins with `chain: ChainedStruct` (16 bytes: `next: ?*ChainedStruct`,
-//! `s_type: SType`, plus 4 bytes padding).
-//! When creating a Wayland surface:
-//! - `SurfaceSourceWayland` begins with `chain: ChainedStruct` and sets `s_type = 0x00000007`.
-//! - `SurfaceDescriptor` has `next_in_chain: ?*ChainedStruct`.
-//! - We assign `next_in_chain = &source.chain`. The underlying C library inspects `s_type`,
-//!   casts the pointer to `SurfaceSourceWayland`, and extracts the Wayland handles.
-//! - A similar pattern is used for WGSL shader compilation via `ShaderSourceWgsl` (`s_type = 0x2`).
-//! - `configure_surface` chains `SurfaceConfigurationExtras` (`s_type = 0x00030008`, the
-//!   wgpu-native range) and sets `desiredMaximumFrameLatency` to 1. Mesa's Wayland image
-//!   minimum is 3 (FIFO) or 4 (mailbox), so a request of 1 clamps to the default of 2. That
-//!   knob cannot remove a frame here. The late latch in `linux_window.zig` is what moves the
-//!   sample, and the present mode (section 8) is what keeps one commit per refresh.
+//! `present` must be called with nonzero dimensions and with counts within the capacities
+//! the buffers were created for. Every per-frame handle (texture, view, encoder, pass,
+//! command buffer) is released before `encode_submit_present` returns.
 //!
-//! ## 4. The Complete WebGPU Resource Hierarchy
-//! - **Instance:** The top-level entry point to the WebGPU runtime.
-//! - **Adapter:** The physical graphics processor (Intel, AMD, NVIDIA).
-//! - **Device:** The logical GPU context used to allocate VRAM buffers, textures, and pipelines.
-//! - **Queue:** The hardware execution queue where command buffers are scheduled.
-//! - **Surface:** The display presentation target bound to the Linux Wayland `wl_surface`.
-//! - **Texture / TextureView:** The swapchain framebuffers rendered into and presented.
-//! - **Buffer:** GPU VRAM memory allocations (unit quad, instances, uniform matrix).
-//! - **BindGroupLayout & BindGroup:** Describes and binds uniform resources to shader slots.
-//! - **PipelineLayout & RenderPipeline:** Monolithic compiled graphics state (shaders, blending).
-//! - **CommandEncoder & RenderPassEncoder:** Records drawing commands into a `CommandBuffer`.
+//! ## 5. Uniform Buffer and Bind Groups
+//! Group 0 is one uniform buffer (matrix at offset 0, theme at offset `draw.matrix_bytes`),
+//! sized `draw.uniform_bytes` (see `draw.zig` for the WebGPU uniform alignment rule). It is
+//! visible to vertex and fragment stages and shared by both pipelines through one explicit
+//! layout, because `layout: auto` layouts are private to a pipeline and cannot be shared.
+//! Group 1 (glyph pipeline only) holds the atlas texture and a filtering sampler with
+//! clamp-to-edge addressing; the baker's half-texel UV inset (see `font.zig`) keeps linear
+//! filtering from sampling outside a glyph cell.
 //!
-//! ## 5. The Hardware-Instanced Render Pipeline
-//! Patchwork configures a dual vertex buffer layout:
-//! - **Vertex Buffer 0 (Unit Quad):**
-//!   `stepMode = step_vertex`, `array_stride = 8`, `format = vertex_float32x2`.
-//!   Contains 6 static 2D coordinates representing two triangles in the range [0, 0] to [1, 1].
-//! - **Vertex Buffer 1 (Instances):**
-//!   `stepMode = step_instance`, `array_stride = 64`.
-//!   Contains four vertex attributes per instance:
-//!   - Slot 1: `rect` (`vertex_float32x4` at offset 0) -> `[x, y, w, h]`.
-//!   - Slot 2: `fill` (`vertex_float32x4` at offset 16) -> `[r, g, b, a]`.
-//!   - Slot 3: `shape` (`vertex_float32x4` at offset 32) -> `[radius, hover, down, kind]`.
-//!     Radius is the geometric corner radius (box) or stroke thickness (arc) in logical pixels.
-//!     Hover is the mix weight toward white (theme lighten). Down is the box darken weight,
-//!     or the arc sweep fraction in [0, 1]. Kind selects box (0) or arc (1).
-//!   - Slot 4: `clip` (`vertex_float32x4` at offset 48) -> `[clip_x0, clip_y0, clip_x1, clip_y1]`.
-//!     Exclusive-max clip boundary in logical pixels.
-//! - **Bind Group 0 (Uniform Buffer):**
-//!   Binding 0: 256-byte uniform buffer holding the 64-byte 4x4 orthographic projection matrix
-//!   followed by the 192-byte theme at offset 64 (visibility `VERTEX | FRAGMENT`).
+//! ## 6. Texture Upload Rules
+//! - Texture and buffer usage flags use different bit assignments: `COPY_DST` is
+//!   `texture_usage_copy_dst` for textures but `usage_copy_dst` for buffers, and the buffer
+//!   value is `STORAGE_BINDING` on a texture, which `r8unorm` forbids and which makes
+//!   `wgpuDeviceCreateTexture` panic. `create_atlas` asserts the two differ.
+//! - WebGPU requires `bytesPerRow` to be a multiple of 256 for buffer-to-texture copies
+//!   (`GPUCommandEncoder.copyBufferToTexture`). `wgpuQueueWriteTexture` does not enforce it,
+//!   but the atlas rows satisfy it anyway so a staging-buffer upload would need no repacking;
+//!   the `comptime` block asserts it.
+//! - Texture writes use `TexelCopyTextureInfo` and `TexelCopyBufferLayout`, which must match
+//!   `wgpuQueueWriteTexture` field for field.
 //!
-//! ## 6. Swapchain Lifecycle and Command Submission
-//! For every presented frame in `present()`:
-//! 1. `configure_surface()`: Configures the swapchain when physical dimensions change.
-//! 2. `write_uploads()`: Selectively transfers modified uniform (matrix + theme) or instance data
-//!    via `writeBuffer`. A scale-only present uploads neither instance buffer.
-//! 3. `acquire_texture()`: Requests the next swapchain `Texture` from the display surface.
-//! 4. `encode_submit_present()`:
-//!    - Creates a `TextureView` and `CommandEncoder`.
-//!    - Begins a render pass with `load_op = load_clear` and background slate color.
-//!    - Binds the pipeline, bind group 0, vertex buffers 0 and 1.
-//!    - Executes `wgpuRenderPassEncoderDraw(pass, 6, count, 0, 0)`.
-//!    - Finishes encoding, submits the command buffer to `Queue`, and presents the surface.
-//!    - Releases all temporary C ABI handles (`Texture`, `TextureView`, encoders, command buffer).
+//! ## 7. wgpu-native v29.0.1.1 Workarounds
+//! Delete each when the pin moves to a release that fixes it.
+//! - `wgpuInstanceWaitAny` is declared in the header but panics inside Rust. `wait_future`
+//!   instead pumps `wgpuInstanceProcessEvents` in a loop bounded by `wait_max`.
+//! - `wgpuShaderModuleGetCompilationInfo` panics, so shader and pipeline creation is checked
+//!   only by a non-null handle.
+//! - `desiredMaximumFrameLatency` is requested as `frame_latency` through
+//!   `SurfaceConfigurationExtras`, but Mesa's Wayland WSI clamps it to its swapchain image
+//!   minimum. It is therefore not a pacing control; pacing comes from the window loop (see
+//!   `linux_window.zig`) and the present mode (section 8).
 //!
-//! ## 7. Future Polling Workaround in v29.0.1.1
-//! `wgpu-native` v29.0.1.1 ships a header definition for `wgpuInstanceWaitAny`, but calling it
-//! causes an internal panic in Rust.
-//! To work around this upstream bug, `wait_future()` pumps `wgpuInstanceProcessEvents()` with a
-//! bounded sleep loop, ensuring deterministic completion without hangs.
+//! ## 8. Present Mode: Mailbox When Offered
+//! `pick_present_mode` prefers `present_mailbox` and falls back to `present_fifo`, which
+//! WebGPU requires every surface to support. The window loop already commits at most once
+//! per `wl_callback.done`, so mailbox cannot outrun the display. The reason to prefer it is
+//! a Mesa behavior: with a compositor that offers `wp_fifo_v1` (observed on Mesa 26.2.2 with
+//! Hyprland 0.56.2), each FIFO present becomes two commits, one with content and one empty
+//! commit held behind a FIFO barrier. The held commit delays every other `wl_surface.frame`
+//! callback and the loop then alternates between one-refresh and two-refresh gaps. Mailbox
+//! presents with one attach and one commit. Mailbox does not tear on Wayland because the
+//! compositor still latches whole buffers; tearing needs `wp_tearing_control_v1`. Remove the
+//! preference if a Mesa release makes FIFO a single commit per present.
 //!
-//! ## 8. Present Mode: Mailbox When Offered, Because the Loop Already Paces
-//! `pick_present_mode` selects `WGPUPresentMode_Mailbox` (0x4) if the surface lists it and
-//! `Fifo` (0x1) otherwise. The choice is about who paces, not how many images are queued.
-//!
-//! The window loop commits at most once per `wl_callback.done`, so the application never
-//! presents faster than the compositor refreshes, in either mode. Under FIFO the driver adds
-//! its own pacing on top. On Mesa's Wayland WSI (26.2.2) with a compositor that offers
-//! `wp_fifo_v1` (Hyprland 0.56.2), one FIFO present is two commits:
-//! ```text
-//! wl_surface.attach(buffer)
-//! wp_fifo_v1.set_barrier()
-//! wp_fifo_v1.wait_barrier()
-//! wl_surface.commit()            content
-//! wp_fifo_v1.wait_barrier()
-//! wl_surface.commit()            empty, held by the compositor until the barrier clears
-//! ```
-//! Our `wl_surface.frame` request is part of that held cycle. Measured with `wp_presentation`
-//! feedback on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz, continuous hover sweep):
-//! - Commit-to-pageflip latency was 2.6-2.7 ms (median), with Hyprland latching content ~2 ms
-//!   before the vblank. `wl_callback.done` arrived ~0.35 ms after the pageflip (p95 0.55 ms).
-//! - Under FIFO: The resulting `done` arrived at the pageflip for one present and a full refresh
-//!   after it for the next, alternating, yielding 105 one-period vs 89 two-period gaps (pair,
-//!   hole, pair, hole).
-//! - Under Mailbox: A present is one `attach` and one `commit`. Over a 6 s hover sweep, produced
-//!   267 one-period vs 3 two-period gaps. Over an 8 s hover sweep across 377 presents, produced
-//!   348 one-period vs 7 two-period gaps, with zero scheduled commits shown later than their
-//!   targeted vblank.
-//! - Observed presentation flags: 0x5 (`vsync | hw_completion`, no `hw_clock`), reported
-//!   refresh 16666666 ns, and `clock_id` = `CLOCK_MONOTONIC` (1).
-//!
-//! Mailbox has no tearing on Wayland: the compositor still latches whole buffers once per
-//! refresh (tearing requires explicit `wp_tearing_control_v1`). Mesa allocates four images for
-//! mailbox instead of three; `desiredMaximumFrameLatency` is still requested as 1 and clamped
-//! to 2, and no longer controls pacing.
-//!
-//! ## 9. Glyph Atlas Architecture, Dual Bind Groups, and Second Draw Pass
-//! Text is rendered via a dedicated fixed-function pipeline (`glyph_pipeline`) within the exact
-//! same active render pass as the geometric quads (`pipeline`), eliminating framebuffer attachment
-//! thrashing and color target clears.
-//!
-//! ### Pipeline Layouts and Shared Group 0:
-//! - **Quad Pipeline Layout:** Holds one bind group: Group 0 (256-byte uniform buffer containing
-//!   the orthographic projection matrix, vertex stage visibility).
-//! - **Glyph Pipeline Layout:** Holds two bind groups: Group 0 (shared with the quad pipeline) plus
-//!   Group 1 (dedicated texture atlas and filtering sampler).
-//! - **Group 1 Bindings:**
-//!   - Binding 0: `texture_2d<f32>` (sample type `float`, view dimension `2d`, format `r8unorm`),
-//!     fragment stage visibility (`shader_fragment = 0x2`).
-//!   - Binding 1: `sampler` (filtering sampler, address mode `clamp-to-edge`, linear min/mag),
-//!     fragment stage visibility (`shader_fragment = 0x2`).
-//!
-//! ### WebGPU Texture Copy Rules and wgpu-native v29 ABI:
-//! - **Texture vs. Buffer Copy Usage Flags:** In WebGPU, texture usage bit `0x2` represents
-//!   `COPY_DST`. For buffers, `COPY_DST` is bit `0x8`. Passing `0x8` to a texture descriptor
-//!   specifies `STORAGE_BINDING`, which is disallowed on `r8unorm` textures and causes validation
-//!   panics in `wgpuDeviceCreateTexture`. We define `texture_usage_copy_dst: TextureUsage = 0x2`.
-//! - **Hardware Copy Alignment:** WebGPU specification Section 24.1 dictates that buffer-to-texture
-//!   and data-to-texture copies must have `bytesPerRow` aligned to a multiple of 256 bytes.
-//!   The atlas is 512 x 256 texels. `bytesPerRow = 512` is an exact multiple (`512 = 2 * 256`),
-//!   satisfying hardware alignment with zero padding.
-//! - **wgpu-native v29 Texel Copy Structs:** Texture writes use `WGPUTexelCopyTextureInfo` and
-//!   `WGPUTexelCopyBufferLayout` matching `wgpuQueueWriteTexture` field-for-field.
-//!
-//! ### Dual Draw Pass Execution:
-//! Both pipelines bind Vertex Buffer 0 to the unit quad (stride 8, stepMode `vertex`).
-//! The glyph pipeline binds Vertex Buffer 1 to `glyph_buffer` (`glyph_cap * 64 = 16,384` bytes).
-//! Within `encode_submit_present`:
-//! 1. `draw_quads(pass, instance_count)` draws rounded geometric quads.
-//! 2. `draw_glyphs(pass, glyph_count)` binds `glyph_pipeline`, Group 0, Group 1, and draws text.
-//! If `glyph_count == 0`, `draw_glyphs` returns immediately with zero GPU overhead.
+//! ## 9. TigerStyle Invariants
+//! All GPU memory is created once in `create`; the frame path allocates nothing and never
+//! creates or destroys long-lived resources. Searches over driver-reported lists are
+//! bounded by `present_mode_cap` and `format_cap`, and waiting is bounded by `wait_max`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -178,7 +100,8 @@ const draw = @import("../draw.zig");
 const font = @import("../font.zig");
 const theme = @import("../theme.zig");
 
-/// Hardware GPU state context encapsulating all native WebGPU resources.
+/// Every native WebGPU handle the backend owns. Created once by `create`; never freed, since
+/// the process lifetime equals the window lifetime.
 pub const Gpu = struct {
     instance: Instance,
     adapter: Adapter,
@@ -186,8 +109,7 @@ pub const Gpu = struct {
     queue: Queue,
     surface: Surface,
     format: TextureFormat,
-    /// `present_mailbox` when the surface offers it, otherwise `present_fifo`. Chosen once
-    /// in `create`; `configure_surface` passes it on every reconfigure.
+    /// Chosen once in `create` by `pick_present_mode`; reused on every reconfigure.
     present_mode: PresentMode,
     configured_width: u32,
     configured_height: u32,
@@ -254,17 +176,16 @@ const usage_vertex: Flags = 0x0000000000000020;
 const usage_uniform: Flags = 0x0000000000000040;
 /// `WGPUPresentMode_Fifo`. Required by WebGPU to be available everywhere.
 const present_fifo: PresentMode = 0x00000001;
-/// `WGPUPresentMode_Mailbox` (0x00000004). Swapchain presentation mode where new frames replace
-/// unrendered buffers. Under Mesa's Wayland WSI, performs 1 attach + 1 commit per present (unlike
-/// FIFO's two commits via `wp_fifo_v1`). Requires 4 swapchain images. Application pacing via
-/// `wl_surface.frame` ensures presentation does not exceed display refresh.
+/// `WGPUPresentMode_Mailbox`. A new frame replaces any queued, unshown one. See module guide
+/// section 8 for why it is preferred over FIFO.
 const present_mailbox: PresentMode = 0x00000004;
-/// Hard upper bound on present modes queried from `SurfaceCapabilities` (WebGPU defines five).
-/// Bounded to satisfy TigerStyle invariants and prevent unbounded search loops.
+/// Upper bound on driver-reported present modes we are willing to scan. WebGPU defines fewer
+/// modes than this, so a larger count means a malformed report and selects FIFO.
 const present_mode_cap: u32 = 8;
 /// wgpu-native `WGPUSType_SurfaceConfigurationExtras`. Not a core WebGPU sType.
 const s_type_surface_configuration_extras: SType = 0x00030008;
-/// Refreshes between acquire and presentation. 1 is the minimum; 2 is the v29 default.
+/// Requested `desiredMaximumFrameLatency`, in refreshes between acquire and presentation.
+/// The driver may clamp it upward (module guide section 7), so it is a request only.
 const frame_latency: u32 = 1;
 const alpha_auto: CompositeAlphaMode = 0x00000000;
 const load_clear: LoadOp = 0x00000002;
@@ -802,6 +723,22 @@ comptime {
     assert(@sizeOf(ShaderSourceWgsl) == 32);
     // chain (16) plus the latency u32, rounded up to the pointer alignment.
     assert(@sizeOf(SurfaceConfigurationExtras) == 24);
+
+    // The glyph pipeline reuses the instance vertex layout, so both structs must expose the
+    // same four vec4 groups at the offsets in `instance_attrs`, and the unit-quad buffer
+    // stride in `fill_vertex_layouts` must match `draw.unit_quad`.
+    assert(instance_attrs[0].offset == @offsetOf(draw.Instance, "x"));
+    assert(instance_attrs[1].offset == @offsetOf(draw.Instance, "r"));
+    assert(instance_attrs[2].offset == @offsetOf(draw.Instance, "radius"));
+    assert(instance_attrs[3].offset == @offsetOf(draw.Instance, "clip_x0"));
+    assert(instance_attrs[0].offset == @offsetOf(font.Glyph, "x"));
+    assert(instance_attrs[1].offset == @offsetOf(font.Glyph, "u0"));
+    assert(instance_attrs[2].offset == @offsetOf(font.Glyph, "r"));
+    assert(instance_attrs[3].offset == @offsetOf(font.Glyph, "clip_x0"));
+    assert(@sizeOf(draw.Instance) == @sizeOf(font.Glyph));
+    assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
+    // Buffer-to-texture copy rows must be 256-byte aligned (module guide section 6).
+    assert(font.atlas_width % 256 == 0);
 }
 
 const empty_label: StringView = .{ .data = null, .length = 0 };
@@ -828,10 +765,9 @@ const unit_attr: VertexAttribute = .{
     .shader_location = 0,
 };
 
-/// Instance vertex fetch. Locations match `@location` in `quad.wgsl`.
-/// Location 1 is the rectangle, location 2 is the straight-alpha fill, and
-/// location 3 is `(radius, hover, down, kind)`. Location 4 is the clip.
-/// All four are `float32x4`, so the offsets are 0, 16, 32, and 48 and the stride is 64.
+/// Per-instance vertex fetch shared by the quad and glyph pipelines. `shader_location` values
+/// match `@location` in `quad.wgsl` and `glyph.wgsl`. Offsets are pinned to the field offsets
+/// of `draw.Instance` and `font.Glyph` by the `comptime` block below.
 const instance_attrs = [_]VertexAttribute{
     .{
         .next_in_chain = null,
@@ -859,15 +795,10 @@ const instance_attrs = [_]VertexAttribute{
     },
 };
 
-/// Initializes the complete WebGPU graphics pipeline for Linux Wayland.
-///
-/// Execution Steps:
-/// 1. Connects to the WebGPU runtime (`Instance`).
-/// 2. Binds the Wayland window to WebGPU (`Surface`) via `SurfaceSourceWayland`.
-/// 3. Queries a physical GPU adapter compatible with the surface (`Adapter`).
-/// 4. Opens a logical GPU device and execution queue (`Device`, `Queue`).
-/// 5. Verifies and selects the `BGRA8Unorm` swapchain texture format.
-/// 6. Compiles the WGSL shader and constructs the render pipeline, bind group, and VRAM buffers.
+/// Creates the instance, Wayland-backed surface, adapter, device, queue, and every long-lived
+/// GPU resource. `display` and `wl_surface` must be live Wayland handles that outlive the
+/// returned `Gpu`. The swapchain is left unconfigured until the first `present`.
+/// Errors: any failed handle request, `error.WaitTimeout`, or `error.Bgra8Unsupported`.
 pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(wl_surface) != 0);
@@ -914,8 +845,7 @@ const PipelineResources = struct {
     glyph_sampler: Sampler,
 };
 
-/// Compiles the WGSL shader, allocates VRAM buffers, uploads the static unit quad,
-/// and builds the pipeline layout, bind group, and render pipeline.
+/// Builds every GPU resource for both pipelines and uploads the static unit quad and atlas.
 fn create_resources(
     device: Device,
     queue: Queue,
@@ -945,7 +875,7 @@ fn create_resources(
     };
 }
 
-/// Encapsulates all GPU resources dedicated to instanced glyph text rendering.
+/// GPU resources owned by the glyph pipeline alone.
 const GlyphResources = struct {
     pipeline: RenderPipeline,
     buffer: Buffer,
@@ -954,15 +884,9 @@ const GlyphResources = struct {
     sampler: Sampler,
 };
 
-/// Orchestrates creation of all glyph text GPU pipelines, buffers, textures, and bind groups.
-///
-/// Preconditions and Allocations:
-/// - Allocates a 16,384-byte instance vertex buffer (`glyph_cap * 64 = 256 * 64`).
-/// - Creates and writes the static 512 x 256 `r8unorm` coverage atlas texture.
-/// - Configures a clamp-to-edge linear filtering sampler.
-/// - Builds Group 1 bind group layout (atlas texture at binding 0, sampler at binding 1).
-/// - Assembles a two-group pipeline layout combining shared uniform Group 0 and glyph Group 1.
-/// - Compiles `glyph.wgsl` into the second fixed-function render pipeline.
+/// Creates the glyph instance buffer (`font.glyph_cap` records of `font.glyph_stride` bytes),
+/// the uploaded atlas texture, sampler, group 1 layout and bind group, and the glyph pipeline.
+/// `uniform_layout` is the shared group 0 layout so both pipelines can bind one bind group.
 fn create_glyph_resources(
     device: Device,
     queue: Queue,
@@ -992,11 +916,10 @@ fn create_glyph_resources(
     };
 }
 
-/// Presents a frame onto the Wayland surface:
-/// 1. Reconfigures the swapchain if the physical pixel size changed.
-/// 2. Selectively transfers modified uniform or instance data into GPU VRAM.
-/// 3. Acquires the current swapchain framebuffer texture from the compositor.
-/// 4. Records the clear and instanced draw commands and submits them to the GPU queue.
+/// Presents one frame; the sequence is module guide section 4. `header` dimensions must be
+/// nonzero and its counts within capacity. `instances` and `glyphs` must hold at least the
+/// header's counts when the matching upload flag is set. Returns the error from
+/// `acquire_texture` when no swapchain texture is available.
 pub fn present(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -1013,9 +936,8 @@ pub fn present(
     encode_submit_present(self, texture, header);
 }
 
-/// Creates the top-level WebGPU instance handle.
-/// wgpu-native v29.0.1.1 panics if `TimedWaitAny` is invoked, so startup waiting
-/// uses `ProcessEvents` instead.
+/// Creates the top-level WebGPU instance handle. Startup waits use `wait_future`, not
+/// `WaitAny` (module guide section 7).
 fn create_instance() !Instance {
     const instance = wgpuCreateInstance(null) orelse return error.InstanceFailed;
     assert(@intFromPtr(instance) != 0);
@@ -1023,8 +945,8 @@ fn create_instance() !Instance {
     return instance;
 }
 
-/// Creates a WebGPU Surface bound to a Linux Wayland `wl_display` and `wl_surface`.
-/// Utilizes the tagged `ChainedStruct` mechanism with `s_type_wayland_surface`.
+/// Creates a surface for a Wayland `wl_display` and `wl_surface` via a chained
+/// `SurfaceSourceWayland` node.
 fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaque) !Surface {
     assert(@intFromPtr(instance) != 0);
     var source: SurfaceSourceWayland = .{
@@ -1043,7 +965,7 @@ fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaqu
     return surface;
 }
 
-/// Asynchronously requests a physical GPU adapter compatible with the window surface.
+/// Requests an adapter compatible with `surface` and blocks (bounded) until it resolves.
 fn request_adapter(instance: Instance, surface: Surface) !Adapter {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(surface) != 0);
@@ -1070,7 +992,7 @@ fn request_adapter(instance: Instance, surface: Surface) !Adapter {
     return adapter;
 }
 
-/// Asynchronously requests a logical WebGPU Device and execution queue from the Adapter.
+/// Requests a device from `adapter` and blocks (bounded) until it resolves.
 fn request_device(instance: Instance, adapter: Adapter) !Device {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(adapter) != 0);
@@ -1089,10 +1011,10 @@ fn request_device(instance: Instance, adapter: Adapter) !Device {
     return device;
 }
 
-/// Pumps the wgpu event loop synchronously until an asynchronous future resolves.
-/// Loops with bounded timeout, calling `wgpuInstanceProcessEvents` and nanosleep.
+/// Pumps `wgpuInstanceProcessEvents` until a callback sets `ok`, at most `wait_max`
+/// iterations of a short sleep each. `future` is unused because `WaitAny` is unavailable
+/// (module guide section 7). Returns `error.WaitTimeout` if the callback never fires.
 fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
-    // wgpu-native v29.0.1.1 ships WaitAny in the header and panics if it is called.
     _ = future;
     assert(@intFromPtr(instance) != 0);
     assert(wait_max >= 1);
@@ -1106,28 +1028,16 @@ fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
     return error.WaitTimeout;
 }
 
-/// Surface configuration parameters selected from hardware `SurfaceCapabilities`.
-///
-/// Contains the verified swapchain texture format and presentation mode:
-/// - `format: TextureFormat` (4 bytes): `format_bgra8_unorm` (0x1B).
-/// - `present_mode: PresentMode` (4 bytes): `present_mailbox` (0x4) or `present_fifo` (0x1).
-/// Total size: 8 bytes, alignment 4.
+/// Swapchain format and present mode chosen from the surface capabilities. The format is
+/// always `format_bgra8_unorm`, which the pipelines are built for.
 const SurfaceChoice = struct {
     format: TextureFormat,
     present_mode: PresentMode,
 };
 
-/// Queries surface capabilities, confirms BGRA8Unorm support, and selects the presentation mode.
-///
-/// Preconditions: `surface != null` and `adapter != null` (asserted).
-/// Selects `present_mailbox` when advertised by the compositor/driver, otherwise falling back
-/// to mandatory `present_fifo`.
-/// Because the window event loop already throttles commits to at most one per `wl_callback.done`,
-/// mailbox cannot outrun display refresh. It eliminates the driver-side second barrier-held commit
-/// introduced by Mesa's `wp_fifo_v1` FIFO implementation, which delays every other callback.
-/// Frees query resources via `wgpuSurfaceCapabilitiesFreeMembers`.
-///
-/// Returns `SurfaceChoice` or an error (`CapabilitiesFailed`, `Bgra8Unsupported`).
+/// Queries surface capabilities, requires BGRA8Unorm, and picks the present mode
+/// (module guide section 8). The capability lists are freed on every path.
+/// Errors: `error.CapabilitiesFailed`, `error.Bgra8Unsupported`.
 fn pick_format(surface: Surface, adapter: Adapter) !SurfaceChoice {
     assert(@intFromPtr(surface) != 0);
     assert(@intFromPtr(adapter) != 0);
@@ -1147,13 +1057,9 @@ fn pick_format(surface: Surface, adapter: Adapter) !SurfaceChoice {
     return .{ .format = format, .present_mode = present_mode };
 }
 
-/// Selects `present_mailbox` (0x4) if supported in `capabilities`, otherwise `present_fifo` (0x1).
-///
-/// Preconditions:
-/// - If `capabilities.present_modes == null`, `count == 0`, or `count > present_mode_cap` (8),
-///   safely defaults to `present_fifo`.
-/// - Scans up to `present_mode_cap` modes for `present_mailbox`.
-/// WebGPU specification mandates that FIFO is always supported by every compliant surface.
+/// Returns `present_mailbox` if listed, otherwise `present_fifo`. A null list, an empty list,
+/// or a count above `present_mode_cap` also yields FIFO, which WebGPU requires every surface
+/// to support. Locked by the test "present mode prefers mailbox and falls back to fifo".
 fn pick_present_mode(capabilities: SurfaceCapabilities) PresentMode {
     const modes = capabilities.present_modes orelse return present_fifo;
     const count_usize = capabilities.present_mode_count;
@@ -1176,7 +1082,8 @@ fn pick_present_mode(capabilities: SurfaceCapabilities) PresentMode {
     return present_fifo;
 }
 
-/// Helper that searches the list of supported surface formats for BGRA8Unorm.
+/// Returns `format_bgra8_unorm` if listed, else null. A null list, an empty list, or a count
+/// above `format_cap` yields null. Locked by the test "bgra8 lookup rejects malformed lists".
 fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     const formats = capabilities.formats orelse return null;
     const count_usize = capabilities.format_count;
@@ -1198,7 +1105,7 @@ fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     return null;
 }
 
-/// Compiles the embedded WGSL shader text into a WebGPU ShaderModule handle.
+/// Creates the quad shader module from `draw.shader_file`.
 fn create_shader(device: Device) ShaderModule {
     assert(@intFromPtr(device) != 0);
     assert(draw.shader_file.len >= 1);
@@ -1218,12 +1125,10 @@ fn create_shader(device: Device) ShaderModule {
     return shader;
 }
 
-/// Allocates the static unit quad buffer, instance buffer, and uniform buffer in GPU VRAM.
+/// Allocates the unit quad, instance, and uniform buffers. Sizes are fixed for the life of
+/// the device; a frame uploads only the records it has.
 fn create_buffers(device: Device) !Buffers {
     assert(@intFromPtr(device) != 0);
-    // Fixed for the life of the device: 256 records times the 64-byte stride.
-    // A frame uploads only `count` records. Radius, hover, down, kind, and
-    // clip live in that stride.
     const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
     const vertex_usage: Flags = usage_vertex | usage_copy_dst;
     const uniform_usage: Flags = usage_uniform | usage_copy_dst;
@@ -1235,7 +1140,7 @@ fn create_buffers(device: Device) !Buffers {
     return .{ .quad = quad, .instances = instances, .uniform = uniform };
 }
 
-/// Helper that creates a single WebGPU Buffer descriptor and allocates GPU memory.
+/// Creates one GPU buffer; `size` and `usage` must be nonzero.
 fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
     assert(size != 0);
     assert(usage != 0);
@@ -1251,14 +1156,14 @@ fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
     return buffer;
 }
 
-/// Writes the static unit quad vertex coordinates (48 bytes) into GPU buffer 0 once at startup.
+/// Uploads `draw.unit_quad` (`draw.quad_bytes` bytes) once at startup.
 fn write_quad(queue: Queue, buffer: Buffer) void {
     assert(@intFromPtr(queue) != 0);
     assert(@intFromPtr(buffer) != 0);
     wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
 }
 
-/// Defines the bind group layout for slot 0: 256-byte uniform, VERTEX | FRAGMENT visibility.
+/// Group 0 layout: one uniform buffer of `draw.uniform_bytes`, visible to vertex and fragment.
 fn create_bind_group_layout(device: Device) BindGroupLayout {
     assert(@intFromPtr(device) != 0);
     const entry: BindGroupLayoutEntry = .{
@@ -1287,7 +1192,7 @@ fn create_bind_group_layout(device: Device) BindGroupLayout {
     return layout;
 }
 
-/// Bundles the bind group layouts into a top-level pipeline layout.
+/// Quad pipeline layout: group 0 only.
 fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) PipelineLayout {
     assert(@intFromPtr(device) != 0);
     assert(@intFromPtr(bind_layout) != 0);
@@ -1303,7 +1208,7 @@ fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) Pipeline
     return layout;
 }
 
-/// Instantiates the bind group connecting the uniform buffer (at offset 0) to binding 0.
+/// Binds the whole uniform buffer to group 0 binding 0.
 fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) BindGroup {
     assert(@intFromPtr(device) != 0);
     assert(@intFromPtr(uniform) != 0);
@@ -1328,7 +1233,7 @@ fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) B
     return group;
 }
 
-/// Creates the complete render pipeline: vertex layouts, shaders, topology, and alpha blend.
+/// Quad render pipeline: shared vertex layout, triangle list, straight-alpha source-over blend.
 fn create_pipeline(
     device: Device,
     shader: ShaderModule,
@@ -1370,16 +1275,13 @@ fn create_pipeline(
         .fragment = &fragment,
     };
     const pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
-    // wgpu-native v29.0.1.1 panics on GetCompilationInfo. A non-null pipeline
-    // is the compile barrier for this pin.
+    // `GetCompilationInfo` is unusable on this pin (module guide section 7), so a non-null
+    // pipeline is the only compile check.
     assert(@intFromPtr(pipeline) != 0);
     return pipeline;
 }
 
-/// Configures the dual vertex buffer layout:
-/// Buffer 0: step_vertex, 8-byte stride (unit quad points).
-/// Buffer 1: step_instance, 64-byte stride. Four attributes: rect, fill, shape, clip.
-/// `attribute_count` is 4 because location 4 carries the clip rect.
+/// Fills the two-buffer vertex layout described in module guide section 3.
 fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     buffers[0] = .{
         .next_in_chain = null,
@@ -1399,7 +1301,7 @@ fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
     assert(buffers[1].attribute_count == 4);
 }
 
-/// Configures the vertex stage descriptor referencing the `vs_main` entry point.
+/// Vertex stage descriptor using entry point `vs_main`.
 fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) VertexState {
     assert(@intFromPtr(shader) != 0);
     assert(vs_main_name.len == 7);
@@ -1414,7 +1316,7 @@ fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) Vert
     };
 }
 
-/// Configures the fragment stage descriptor referencing the `fs_main` entry point.
+/// Fragment stage descriptor using entry point `fs_main`; `target` must be BGRA8Unorm.
 fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) FragmentState {
     assert(@intFromPtr(shader) != 0);
     assert(target.format == format_bgra8_unorm);
@@ -1429,8 +1331,9 @@ fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) Fragmen
     };
 }
 
-/// Conditionally uploads uniform (matrix + theme), instance, and glyph buffer data.
-/// When flag_uniform is set, writes the 64-byte matrix then the 192-byte theme at offset 64.
+/// Uploads the buffers selected by `header.flags`. The uniform upload writes the matrix at
+/// offset 0 and the theme at offset `draw.matrix_bytes`. Instance and glyph uploads write
+/// only the first `count` records and are skipped when the count is zero.
 fn write_uploads(
     self: *Gpu,
     header: *const draw.PresentHeader,
@@ -1457,7 +1360,7 @@ fn write_uploads(
     }
     if ((header.flags & draw.flag_instances) != 0) {
         if (header.instance_count != 0) {
-            // Paired with the export and the browser. 64 is rect, fill, shape, clip.
+            // Paired with the Wasm export and `web/shell.js`, which check the same stride.
             assert(draw.instance_stride == 64);
             const byte_count: u32 = header.instance_count * draw.instance_stride;
             wgpuQueueWriteBuffer(
@@ -1485,13 +1388,9 @@ fn write_uploads(
     assert(@intFromPtr(self.queue) != 0);
 }
 
-/// Configures or reconfigures the swapchain when window physical pixel dimensions change.
-///
-/// Preconditions: `width_px != 0` and `height_px != 0` (asserted).
-/// Idempotent: early returns if `width_px` and `height_px` match the existing configuration.
-/// Chains `SurfaceConfigurationExtras` (`s_type = 0x00030008`) requesting latency = 1.
-/// Mesa clamps this latency request to its swapchain image minimum (3 for FIFO, 4 for mailbox).
-/// Applies `self.present_mode` chosen during initialization (mailbox when supported).
+/// Configures the swapchain, or reconfigures it when the physical size differs from the last
+/// configuration; otherwise a no-op. Both dimensions must be nonzero. Requests `frame_latency`
+/// through a chained `SurfaceConfigurationExtras` and uses `self.present_mode`.
 fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     assert(width_px != 0);
     assert(height_px != 0);
@@ -1525,7 +1424,8 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
     assert(extras.desired_maximum_frame_latency == frame_latency);
 }
 
-/// Acquires the current swapchain texture for rendering.
+/// Acquires the current swapchain texture. Optimal and suboptimal statuses both succeed;
+/// the caller owns the texture and releases it after present.
 fn acquire_texture(surface: Surface) !Texture {
     assert(@intFromPtr(surface) != 0);
     var surface_texture: SurfaceTexture = .{
@@ -1544,7 +1444,8 @@ fn acquire_texture(surface: Surface) !Texture {
     return error.TextureAcquireFailed;
 }
 
-/// Encodes the clear and draw render pass, submits commands, and presents to the surface.
+/// Records the clear pass with both draws, submits, presents, and releases every handle it
+/// created plus `texture`.
 fn encode_submit_present(
     self: *Gpu,
     texture: Texture,
@@ -1569,7 +1470,7 @@ fn encode_submit_present(
     wgpuTextureRelease(texture);
 }
 
-/// Begins a render pass configured with `load_op = load_clear` and the background slate color.
+/// Begins a single-attachment pass that clears to the header's clear color and stores.
 fn begin_clear_pass(
     encoder: CommandEncoder,
     view: TextureView,
@@ -1603,7 +1504,7 @@ fn begin_clear_pass(
     return wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
 }
 
-/// Binds pipeline, bind group 0, vertex buffers 0 and 1, and draws 6 vertices instanced.
+/// Draws `instance_count` quads; zero is valid and draws nothing.
 fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
     assert(@intFromPtr(pass) != 0);
     assert(instance_count <= draw.instance_cap);
@@ -1614,12 +1515,9 @@ fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
     wgpuRenderPassEncoderDraw(pass, draw.vertex_count, instance_count, 0, 0);
 }
 
-/// Creates the static 512 x 256 `r8unorm` 2D texture for the baked font coverage atlas.
-///
-/// Hardware & WebGPU Invariants:
-/// - Uses `texture_usage_copy_dst` (`0x2`) combined with `usage_texture_binding` (`0x4`).
-///   Passing buffer `usage_copy_dst` (`0x8`) is forbidden because bit 0x8 represents
-///   `STORAGE_BINDING` on textures, triggering validation panics on `r8unorm`.
+/// Creates the single-mip `r8unorm` atlas texture sized `font.atlas_width` by
+/// `font.atlas_height`. Must use `texture_usage_copy_dst`, never the buffer flag
+/// (module guide section 6).
 fn create_atlas(device: Device) !Texture {
     assert(@intFromPtr(device) != 0);
     assert(texture_usage_copy_dst != usage_copy_dst);
@@ -1646,12 +1544,8 @@ fn create_atlas(device: Device) !Texture {
     return texture;
 }
 
-/// Uploads the 131,072 bytes of `font.atlas_bytes` into the GPU texture atlas once at startup.
-///
-/// WebGPU Spec Alignment:
-/// - `bytes_per_row = font.atlas_width` (= 512).
-/// - 512 is an exact multiple of the required 256-byte row copy alignment (`512 = 2 * 256`).
-/// - Employs wgpu-native v29 `WGPUTexelCopyTextureInfo` and `WGPUTexelCopyBufferLayout` ABI.
+/// Uploads `font.atlas_bytes` once at startup. Rows are tightly packed, so
+/// `bytes_per_row` equals `font.atlas_width` (alignment rule in module guide section 6).
 fn write_atlas(queue: Queue, texture: Texture) void {
     assert(@intFromPtr(queue) != 0);
     assert(@intFromPtr(texture) != 0);
@@ -1685,9 +1579,8 @@ fn write_atlas(queue: Queue, texture: Texture) void {
     assert(size.depth_or_array_layers == 1);
 }
 
-/// Creates a bilinear filtering sampler configured with clamp-to-edge addressing on U, V, and W.
-///
-/// Clamp-to-edge combined with half-texel UV insetting guarantees zero bleed along texture edges.
+/// Bilinear sampler with clamp-to-edge addressing on all axes; edge bleed is prevented by
+/// the baker's UV inset (module guide section 5).
 fn create_glyph_sampler(device: Device) Sampler {
     assert(@intFromPtr(device) != 0);
     const descriptor: SamplerDescriptor = .{
@@ -1710,11 +1603,8 @@ fn create_glyph_sampler(device: Device) Sampler {
     return sampler;
 }
 
-/// Creates the Bind Group Layout for Group 1 (atlas texture and filtering sampler).
-///
-/// Layout Bindings:
-/// - Binding 0: `texture_2d<f32>` (sample type `float`, view dimension `2d`), fragment visibility.
-/// - Binding 1: `sampler` (filtering sampler), fragment visibility.
+/// Group 1 layout: binding 0 is the float 2D atlas texture, binding 1 a filtering sampler,
+/// both fragment-only.
 fn create_glyph_bind_group_layout(device: Device) BindGroupLayout {
     assert(@intFromPtr(device) != 0);
     const entries = [2]BindGroupLayoutEntry{
@@ -1759,7 +1649,7 @@ fn create_glyph_bind_group_layout(device: Device) BindGroupLayout {
     return layout;
 }
 
-/// Constructs Bind Group 1 attaching the atlas texture view to slot 0 and sampler to slot 1.
+/// Group 1 bind group: a default view of `texture` at binding 0 and `sampler` at binding 1.
 fn create_glyph_bind_group(
     device: Device,
     layout: BindGroupLayout,
@@ -1803,7 +1693,7 @@ fn create_glyph_bind_group(
     return group;
 }
 
-/// Constructs the two-group pipeline layout combining shared uniform Group 0 and glyph Group 1.
+/// Glyph pipeline layout: shared group 0 followed by the atlas group 1.
 fn create_glyph_pipeline_layout(
     device: Device,
     uniform_layout: BindGroupLayout,
@@ -1825,7 +1715,7 @@ fn create_glyph_pipeline_layout(
     return layout;
 }
 
-/// Compiles `src/glyph.wgsl` into a WebGPU shader module for native execution.
+/// Creates the glyph shader module from `font.shader_file`.
 fn create_glyph_shader(device: Device) ShaderModule {
     assert(@intFromPtr(device) != 0);
     assert(font.shader_file.len >= 1);
@@ -1846,8 +1736,8 @@ fn create_glyph_shader(device: Device) ShaderModule {
     return shader;
 }
 
-/// Builds the fixed-function render pipeline for instanced glyph text rendering.
-/// Reuses `fill_vertex_layouts` (64-byte instance stride) and `alpha_blend` compositing.
+/// Glyph render pipeline. Reuses `fill_vertex_layouts` and `alpha_blend`, which is valid
+/// because `font.Glyph` has the same attribute layout as `draw.Instance`.
 fn create_glyph_pipeline(
     device: Device,
     shader: ShaderModule,
@@ -1894,8 +1784,7 @@ fn create_glyph_pipeline(
     return pipeline;
 }
 
-/// Binds glyph pipeline, bind groups 0 and 1, vertex buffers 0 and 1, and draws 6 vertices.
-/// Returns immediately without issuing GPU commands if `glyph_count == 0`.
+/// Draws `glyph_count` glyph quads in the already-open pass; issues no commands when zero.
 fn draw_glyphs(self: *Gpu, pass: RenderPassEncoder, glyph_count: u32) void {
     assert(@intFromPtr(pass) != 0);
     assert(glyph_count <= font.glyph_cap);
@@ -1911,7 +1800,7 @@ fn draw_glyphs(self: *Gpu, pass: RenderPassEncoder, glyph_count: u32) void {
     wgpuRenderPassEncoderDraw(pass, draw.vertex_count, glyph_count, 0, 0);
 }
 
-/// C ABI callback for adapter request completion.
+/// C ABI callback: `userdata1` is the `AdapterSlot` that `wait_future` polls.
 fn adapter_ready(
     status: RequestAdapterStatus,
     adapter: ?Adapter,
@@ -1930,7 +1819,7 @@ fn adapter_ready(
     }
 }
 
-/// C ABI callback for device request completion.
+/// C ABI callback: `userdata1` is the `DeviceSlot` that `wait_future` polls.
 fn device_ready(
     status: RequestDeviceStatus,
     device: ?Device,
@@ -1947,4 +1836,55 @@ fn device_ready(
     if (slot.ok) {
         assert(device != null);
     }
+}
+
+// Locks the present-mode policy: mailbox only when listed within the scan bound, FIFO for
+// every other input including malformed reports.
+test "present mode prefers mailbox and falls back to fifo" {
+    const with_mailbox = [_]PresentMode{ present_fifo, present_mailbox };
+    const fifo_only = [_]PresentMode{present_fifo};
+    var capabilities = std.mem.zeroes(SurfaceCapabilities);
+
+    try std.testing.expectEqual(present_fifo, pick_present_mode(capabilities));
+
+    capabilities.present_modes = &with_mailbox;
+    capabilities.present_mode_count = with_mailbox.len;
+    try std.testing.expectEqual(present_mailbox, pick_present_mode(capabilities));
+
+    capabilities.present_modes = &fifo_only;
+    capabilities.present_mode_count = fifo_only.len;
+    try std.testing.expectEqual(present_fifo, pick_present_mode(capabilities));
+
+    capabilities.present_mode_count = 0;
+    try std.testing.expectEqual(present_fifo, pick_present_mode(capabilities));
+
+    // A count past the scan bound is rejected before the list is read.
+    capabilities.present_modes = &with_mailbox;
+    capabilities.present_mode_count = present_mode_cap + 1;
+    try std.testing.expectEqual(present_fifo, pick_present_mode(capabilities));
+}
+
+// Locks the format lookup: BGRA8Unorm is found when listed, and null, empty, or oversized
+// lists are rejected.
+test "bgra8 lookup rejects malformed lists" {
+    const listed = [_]TextureFormat{ format_r8_unorm, format_bgra8_unorm };
+    const unlisted = [_]TextureFormat{format_r8_unorm};
+    var capabilities = std.mem.zeroes(SurfaceCapabilities);
+
+    try std.testing.expectEqual(@as(?TextureFormat, null), find_bgra8(capabilities));
+
+    capabilities.formats = &listed;
+    capabilities.format_count = listed.len;
+    try std.testing.expectEqual(@as(?TextureFormat, format_bgra8_unorm), find_bgra8(capabilities));
+
+    capabilities.formats = &unlisted;
+    capabilities.format_count = unlisted.len;
+    try std.testing.expectEqual(@as(?TextureFormat, null), find_bgra8(capabilities));
+
+    capabilities.formats = &listed;
+    capabilities.format_count = 0;
+    try std.testing.expectEqual(@as(?TextureFormat, null), find_bgra8(capabilities));
+
+    capabilities.format_count = format_cap + 1;
+    try std.testing.expectEqual(@as(?TextureFormat, null), find_bgra8(capabilities));
 }

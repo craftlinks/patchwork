@@ -54,11 +54,11 @@ patchwork/
 │   ├── widgets.zig             # Retained widgets (Panel, Button, Slider, Knob, Meter, Toggle, Scroll)
 │   ├── draw.zig                # Instanced quad drawing, DrawList, distance fields, UploadCursor
 │   ├── turtle.zig              # 2D turtle layout engine (place_column, place_row, Walk, Size)
-│   ├── font.zig                # Embedded font atlas (512x256), metrics, GlyphList
+│   ├── font.zig                # Embedded font atlas, metrics, GlyphList
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Pointer events and bounded EventQueue
-│   ├── theme.zig               # 192-byte theme uniform tail
+│   ├── theme.zig               # Theme uniform record packed behind the projection matrix
 │   ├── gpu.zig                 # Cross-platform GPU abstraction seam
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
 │   ├── quad.wgsl               # Instanced quad shader (SDF rounded boxes and ring arcs)
@@ -74,10 +74,10 @@ patchwork/
 │   ├── wp_presentation.zig     # Wayland presentation-time feedback listener
 │   └── xdg_shell.zig           # XDG shell surface and toplevel protocol
 ├── examples/                   # Example applications
-│   ├── rack/                   # Modular synthesizer rack (3 panels, 12 knobs, 3 meters)
+│   ├── rack/                   # Modular synthesizer rack
 │   │   ├── app.zig             # Rack App implementing the patchwork.app contract
 │   │   └── levels.zig          # Procedural triangle-wave meter sampling
-│   └── column/                 # Scroll column regression app (Scroll with 11 children)
+│   └── column/                 # Scroll column regression app
 │       └── app.zig             # Column App (config.timer_period_ms = 0)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
@@ -94,15 +94,15 @@ Use the distro `zig` (`/usr/bin/zig` on this machine; Zig 0.16.0).
 # Examples (Rack)
 zig build run             # Build and run the synthesizer rack natively (Wayland + wgpu-native)
 zig build wasm            # Compile the rack to zig-out/bin/rack.wasm (wasm32-freestanding)
-zig build serve           # Serve the rack WebGPU application on http://127.0.0.1:8080/
+zig build serve           # Serve the rack WebGPU application on localhost (prints the address)
 
 # Examples (Scroll Column)
 zig build run-column      # Build and run the scroll column natively
 zig build wasm-column     # Compile the scroll column to zig-out/bin/column.wasm
-zig build serve-column    # Serve the scroll column WebGPU application on http://127.0.0.1:8080/
+zig build serve-column    # Serve the scroll column WebGPU application on localhost (prints the address)
 
 # Validation
-zig build test            # Run unit tests across the library and both examples (111 tests)
+zig build test            # Run unit tests across the library and both examples
 zig build test-contract   # Verify compile error when an app is missing `draw`
 ```
 
@@ -281,102 +281,68 @@ alignment. Oversized fixed dimensions are not clamped. If a child resolves to a 
 edge, it is still placed and still advances the cursor so siblings keep their positions, but
 `DrawList.append` rejects it to protect the GPU from degenerate quads.
 
-Layout executes in two bounded passes with zero heap allocation (`child_cap = instance_cap - 1`,
-allowing up to 255 child walks alongside container background quads in the 256-instance draw list).
-Window resize sets `Frame.relayout`, rebuilding the instance list. A display scale change
-leaves `Frame.relayout` false, presenting the new physical framebuffer without re-walking
+Layout executes in two bounded passes with zero heap allocation. `turtle.child_cap` is derived
+from `draw.instance_cap` so every child walk still has room for its container background quad in
+one draw list. Window resize sets `Frame.relayout`, rebuilding the instance list. A display scale
+change leaves `Frame.relayout` false, presenting the new physical framebuffer without re-walking
 the column or bumping instance revisions.
 
-## Example Applications and Worked Numbers
+## Example Applications
+
+Worked coordinates, initial values, palettes, and budgets live in the examples' tests, not
+here, so they cannot drift. Run `zig build test` for the checked numbers.
 
 ### 1. Synthesizer Rack (`examples/rack/app.zig`)
 
-The rack example lays out a modular rack of three panels in a full-window column with
-16 px outer padding:
-- Panels: Oscillator (`osc`), Filter (`filter`), and Amplifier (`amp`).
-- Panel walk: `width = .fill`, `height = .fill`, `align_x = 0`. First panel has `margin.top = 0`;
-  the next two have `margin.top = 8`.
-- At 1280 x 720: each panel is 224 tall:
-  - `osc`: (16, 16, 1248, 224)
-  - `filter`: (16, 248, 1248, 224)
-  - `amp`: (16, 480, 1248, 224), bottom edge 704
-- At 800 x 600: each panel is 184 tall:
-  - `osc`: (16, 16, 768, 184)
-  - `filter`: (16, 208, 768, 184)
-  - `amp`: (16, 400, 768, 184), bottom edge 584
-- Panel padding is 8 px on all sides. The title band is 24 px at the top of the inner rect
-  (`place_label` centers the title in the panel, then layout sets label height to 24 px).
-- The panel body starts below the title band. A knob row of height 72 px sits at the top of
-  the body, packed left-to-right by `turtle.place_row`:
-  - Four knob cells: `margin.left = 8`, `width = .fixed(144)`, `height = .fixed(72)`,
-    `align_x = 0`. Four cells cost 608 px (`4 * 144 + 4 * 8 = 608`).
-  - At 1280 x 720: the `osc` body is (24, 48, 1232, 184). First knob cell is (32, 48, 144, 72).
-    First knob ring is (40, 56, 56, 56). Meter cell is (1176, 48, 80, 184), and its 144 px track
-    is (1206, 68, 12, 144).
-  - At 800 x 600: first knob ring is (40, 56, 56, 56). Meter cell is (696, 48, 80, 144), and
-    its 144 px track fills the body height.
-- Knob faces clip to the parent panel. Meter faces clip to the meter cell, so the 144 px
-  track cannot cover the title. A knob or meter whose box does not fit is omitted rather than
-  drawn over its neighbor. Panel faces carry the window clip.
-- Knobs (12) and initial values:
-  - `osc`: `rate` 0.25, `fine` 0.50, `wave` 0.75, `mix` 0.00 (active value arc omitted at 0).
-  - `filter`: `cut` 0.50, `res` 0.25, `env` 0.50, `key` 1.00.
-  - `amp`: `gain` 0.50, `pan` 0.50, `atk` 0.25, `rel` 0.75.
-- Knob accents cycle purple `(0.62, 0.45, 0.86)`, green `(0.40, 0.78, 0.48)`, orange
-  `(0.93, 0.55, 0.24)`, and yellow `(0.93, 0.80, 0.32)` by knob index.
-- Meters (3) have an empty name `""`. The cell is 80 px wide so the side-label box still has
-  positive width, and zero glyphs are emitted.
-- Procedural meter levels (`examples/rack/levels.zig`): triangle waves with integer periods and
-  phase offsets: `osc` (2000 ms, phase 500 ms), `filter` (3000 ms, phase 750 ms), `amp` (4000 ms,
-  phase 1000 ms). No trigonometry, no `f64`. At `now_ms = 0` all meters evaluate to 0.5. At
-  500 ms the first bar is 1.0; at 1500 ms it is 0.0; at 750 ms the second bar is 1.0. Sampling
-  does not read knobs, and dragging a knob never changes a bar.
-- Why the rack is a flat widget list: `demo_count = 18`, `widget_cap = 32`. The scene array
-  scans back to front on hit tests; later slots win, so rings and meters win over their backing
-  panel without introducing nested containers or duplicating `Scroll` dispatch.
-- Faces on the first frame: 32 (3 panels + 23 arcs [12 track arcs + 11 value arcs] + 6 meter
-  faces). Dragging `mix` off 0 makes 33.
-- Glyphs on the first frame: 100 (12 title letters + 40 name letters + 48 value letters).
-  The worst-case budget assertion is `3*8 + 12*8 + 12*4 = 168 <= 256`. Caps stay 256.
+A modular rack in a full-window column: a stack of panels, each holding a row of knobs and a
+level meter. It demonstrates:
+- **Flat widget list.** One `Scene` array holds panels, knobs, and meters. Hit testing scans
+  back to front and later slots win, so a knob or meter wins over its backing panel without
+  nested containers. The slot and instance budgets are `comptime` asserts in `app.zig`.
+- **Clipping.** Knob faces clip to the parent panel and meter faces clip to the meter cell,
+  so a track cannot cover the title. A knob or meter whose box does not fit is omitted rather
+  than drawn over its neighbor. Panel faces carry the window clip.
+- **Per-instance accents.** Knob accents are per-instance fills (`Instance.fill`), not theme
+  slots. The palette is `widgets.accents`.
+- **Procedural meters** (`examples/rack/levels.zig`). Integer-period triangle waves sampled
+  from the clock: no trigonometry, no `f64`. Sampling never reads knobs, and dragging a knob
+  never changes a bar. Sample values are locked by the test in `levels.zig`.
+- **Timer-driven redraw.** `config.timer_period_ms` is `levels.meter_period_ms`, so the
+  host calls `App.timer` to resample the meters.
 
-Knobs render two `kind_arc` faces on a 56 x 56 ring: a dark track using `theme.track`
-(sweep fraction 1.0) and an active value arc using a colorful accent. The active arc is
-omitted when value is 0.0. Dragging vertically adjusts value by `-dy / 120.0` (dragging up
-increases value). Mouse wheel over a visible knob ring nudges that knob by `-dy / 120.0`
-without scrolling. Knob accents are per-instance fills, not theme slots. The meter is a passive
-12 x 144 column with an upward-growing fill; `Meter.set_value` returns false when unchanged, and
-drawing only reads `value`.
+Knob interaction: a knob draws a track arc and, unless its value is at the minimum, a value
+arc. Dragging vertically adjusts the value in proportion to `-dy` (up increases). Wheel over
+a visible knob ring nudges it the same way instead of scrolling. `Meter.set_value` returns
+false when the value is unchanged, and drawing only reads `value`. The scale factors are
+`widgets` constants checked by "knob drag is relative and clamped".
 
 ### 2. Scroll Column (`examples/column/app.zig`)
 
-The scroll column example retains the Step 8 single-scroll column architecture, locking
-scroll regression tests and behaviors:
-- Root container column with 16 px outer padding.
-- Docked 320 px `Scroll` container parked on the right: `width = .fixed(320)`, `height = .fill`,
-  `align_x = 1`.
-  - At 1280 x 720: the scroll rectangle is `(944, 16, 320, 688)`.
-  - At 800 x 600: the scroll rectangle is `(464, 16, 320, 568)`.
-- `config.timer_period_ms = 0`: because the scroll column has no procedural animations or timers,
-  the native host sleeps in `ppoll` with `fds[1]` set to -1 (0.0% CPU idle), and the browser host
-  arms no `setInterval`.
-- Contains 11 scroll children (`widgets.scroll_child_cap = 16`): panel, buttons, sliders, knobs,
-  meter, and toggles.
-- `Scroll` owns `[16]Control` (`src/widgets.zig`). The scene captures the scroll container, and
-  the scroll arbitrates `press`: `.none`, `.child(i)`, or `.thumb`. Stored child rects are
-  unscrolled; drawing and hit testing subtract `scroll_y`. Non-overlapping children are culled
-  from draw lists. Partially visible straddlers carry the viewport clip rect. The scrollbar
-  thumb height is `max(24, viewport_h * viewport_h / content_h)` (hidden when `max_scroll == 0`),
-  and thumb drag maps absolute pointer travel to `[0, max_scroll]`. Wheel elsewhere in the
-  viewport scrolls the content column by adding `dy` to `scroll_y`. Horizontal wheel is ignored.
+A regression app for a single docked `Scroll` container beside a root column. It demonstrates:
+- **No timer.** `config.timer_period_ms = 0`, so the native host sleeps in `poll` with the
+  timer descriptor disabled and the browser host arms no `setInterval`. An idle app uses no CPU.
+- **Scroll ownership.** `Scroll` owns up to `widgets.scroll_child_cap` controls. The scene
+  captures the scroll container, and the scroll arbitrates `press` between no target, a child
+  index, and the thumb.
+- **Unscrolled storage.** Child rects are stored unscrolled; drawing and hit testing subtract
+  `scroll_y`. Children outside the viewport are culled from draw lists, and children that
+  cross the viewport edge carry the viewport clip rect.
+- **Thumb.** Its height is the viewport-to-content ratio of the viewport height, floored at
+  `widgets.thumb_min_px`, and hidden when nothing can scroll. Thumb drag maps absolute pointer
+  travel onto the scroll range. Wheel elsewhere in the viewport adds `dy` to `scroll_y`;
+  horizontal wheel is ignored.
+
+The docked rectangle's coordinates at specific window sizes are locked by the layout tests
+in `examples/column/app.zig`.
 
 ## GPU Pipeline and Memory Layouts
 
-Both `Instance` and `Glyph` records are 64 bytes (`instance_stride = 64`, `glyph_stride = 64`).
-The instance buffer is 256 * 64 = 16,384 bytes, and the glyph buffer is 256 * 64 = 16,384 bytes.
-The static unit quad vertex buffer remains **48 bytes** (6 vertices * 2 floats * 4 bytes).
-In both instance formats, the fourth `float32x4` attribute at byte offset 48 (shader location 4)
-is the exclusive-max clip rectangle `(clip_x0, clip_y0, clip_x1, clip_y1)`. `kind` selects the
-primitive (`kind_box = 0`, `kind_arc = 1`). Shaders evaluate an analytic hard clip mask:
+`Instance` and `Glyph` records share one stride (`draw.instance_stride`, `font.glyph_stride`),
+and `comptime` asserts in `draw.zig` and `font.zig` check their field offsets against the
+vertex attributes in `gpu_wgpu.zig`, `web_exports.zig`, and the WGSL structs. The static unit
+quad is `draw.quad_bytes`. In both instance formats the last `float32x4` attribute is the
+exclusive-max clip rectangle `(clip_x0, clip_y0, clip_x1, clip_y1)`. `kind` selects the
+primitive (`draw.kind_box`, `draw.kind_arc`). Shaders evaluate an analytic hard clip mask:
 
 ```text
 pos = rect.xy + local
@@ -385,15 +351,15 @@ alpha = fill.a * coverage * inside
 ```
 
 There is no unclipped sentinel: chrome and panel faces use the window rect, while panel
-children (knobs and meters) use the panel border box clip.
+children use the panel border box clip.
 
-The 256-byte uniform buffer stores the 64-byte 4x4 matrix at offset 0 followed by a 192-byte
-`Theme` record at offset 64 (`src/theme.zig`). `Theme` holds 12 `vec4` slots: panel, text,
-track, value, control, meter, lighten (white), darken (black), arc angles, and 3 zero pads.
-`arc.x` is start angle `2pi/3` (7 o'clock); `arc.y` is sweep `3pi/2` (270 degrees). `quad.wgsl`
-branches on `kind` (box vs arc), mixes toward theme lighten/darken, reads arc angles from the
-uniform (no WGSL color or angle literals), and applies the clip mask. `glyph.wgsl` shares the
-same 256-byte Frame uniform view and applies the same clip mask.
+The uniform buffer (`draw.uniform_bytes`) stores the 4x4 projection matrix first and the
+`Theme` record (`src/theme.zig`) after it. The size is a multiple of WebGPU's minimum uniform
+offset alignment so both pipelines bind one shared bind group. `quad.wgsl` branches on `kind`,
+mixes toward the theme's lighten and darken slots, reads arc angles from the uniform (no WGSL
+color or angle literals), and applies the clip mask. `glyph.wgsl` reads the same uniform view
+and applies the same clip mask. The exact `Theme` slot order is enforced by `comptime` asserts
+in `theme.zig` and the test "wgsl declarations match the Zig layouts".
 
 ## Platform Hosts
 
@@ -407,17 +373,16 @@ The event loop in `src/host/linux_window.zig` (`Host(App)`) implements the libwa
 multi-thread reader protocol integrated with an optional Linux `timerfd`:
 - `poll` descriptor set: `fds[0]` is the Wayland display socket, and `fds[1]` is `timer_fd`.
   When `App.config.timer_period_ms == 0`, `timer_fd` is -1 (`no_timer_fd`), which `poll`
-  ignores. The thread sleeps indefinitely while idle (0.0% CPU).
-- When `timer_period_ms != 0` (e.g. 33 ms for the rack), the timer wakes the thread to sample
-  values via `drain_timer` calling `App.timer(now_ms)`.
+  ignores. The thread sleeps indefinitely while idle.
+- When `timer_period_ms != 0`, the timer wakes the thread to sample values via `drain_timer`
+  calling `App.timer(now_ms)`.
 - Frame pacing during gestures: each commit requests `wl_surface.frame` and
-  `wp_presentation.feedback`. The `presented` event is the pageflip time and the
-  output's refresh period; the next commit is scheduled 3 ms before the vblank
-  projected from it, and that commit draws the pointer sample that has arrived.
-  Without `wp_presentation` the `done` receipt is the anchor instead. The swapchain uses
-  mailbox when the surface offers it. Measured on Hyprland 0.56 at 60 Hz, a commit
-  reaches the screen about 2.6 ms after it is sent, and 348 of 377 presents in a
-  continuous hover sweep were one refresh apart. Details are in `src/host/linux_window.zig`,
+  `wp_presentation.feedback`. The `presented` event carries the pageflip time and the
+  output's refresh period; the next commit is scheduled `present_margin_ns` before the vblank
+  projected from it, and that commit draws the pointer sample that has arrived. Without
+  `wp_presentation` the `done` receipt is the anchor instead. The swapchain prefers mailbox
+  when the surface offers it. The rationale, the Mesa/compositor behavior behind it, and the
+  conditions for removing the workaround are in `src/host/linux_window.zig`,
   `src/host/gpu_wgpu.zig`, and `src/host/wp_presentation.zig`.
 
 ### Browser (WebAssembly + WebGPU)

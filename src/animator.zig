@@ -2,159 +2,64 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! User interface interaction demands smooth visual feedback (such as button hover fades
-//! and press darkenings) without tieing animation speed to display hardware refresh cadences.
+//! ## 1. Why Rate per Millisecond?
+//! An animation that advances a fixed step per frame runs faster on a higher-refresh display.
+//! `Animator` instead stores `rate_per_ms` and is stepped with elapsed wall-clock milliseconds
+//! taken from the host's presentation timestamps, so a transition takes the same real time at
+//! any refresh rate.
 //!
-//! ### Rate per Millisecond vs. Fixed Frame Steps:
-//! In naive game loops, animations often advance by a constant step per frame (e.g. `0.016`
-//! per tick). On a 60 Hz display, an element takes ~16.6 ms per step; on a 144 Hz or 240 Hz
-//! gaming monitor, each frame callback arrives in 6.9 ms or 4.1 ms, causing the animation to
-//! complete 2.4x to 4x faster on high-refresh displays.
-//! `Animator` solves this by parameterizing travel speed as `rate_per_ms: f32` and consuming
-//! elapsed wall-clock milliseconds from host presentation timestamps. A 100 ms hover transition
-//! takes exactly 100 ms of real time regardless of whether the display refreshes at 60 Hz,
-//! 120 Hz, or 240 Hz.
+//! ### Exact Landing, No Epsilon
+//! Springs and exponential decay approach their target asymptotically and need an epsilon to
+//! stop. Here `step` moves linearly and clamps onto `target` exactly, and `live()` is the exact
+//! comparison `value != target`. A settled animator is therefore detectable with no tolerance,
+//! which is what lets the host go fully idle when nothing is moving.
 //!
-//! ### Makepad Timing Reference:
-//! Makepad's button hover duration is 0.1 s (100 ms). Press darken duration is half of that
-//! (50 ms). In `widgets.zig`, `hover_rate_per_ms = 1.0 / 100.0` and
-//! `down_rate_per_ms = 1.0 / 50.0`.
+//! ### The Clock and One-Frame Wake Latency
+//! While idle the host sleeps until an event arrives, so the last timestamp may be arbitrarily
+//! old. Differencing against it would fling every animator to its target in a single frame.
+//! `Clock.advance` therefore returns 0 for the first sample after `reset` and only records the
+//! baseline. The caller resets the clock once no animator is live. Each wake costs exactly one
+//! frame of latency, after which motion is continuous.
 //!
-//! ### Exact Target Clamping (Zero Epsilon):
-//! Many animation frameworks use spring equations or exponential decays that asymptotically
-//! approach their targets, requiring arbitrary epsilon thresholds (`abs(val - target) < 0.001`)
-//! to cease rendering. In Patchwork:
-//! - `step` calculates linear delta and clamps exactly to `target`.
-//! - Settling assigns `value = target` directly.
-//! - `live()` is strictly `value != target` with zero epsilon.
+//! ## 2. Units & Equations
+//! `value` and `target` are normalized to `[0, 1]`. Timestamps are `u32` milliseconds; deltas
+//! are `f32` milliseconds.
 //!
-//! ### The Clock and the One-Frame Wake Latency:
-//! Host frame callbacks (`wl_callback.done` in Wayland and `requestAnimationFrame` in the browser)
-//! provide millisecond timestamps. When the scene wakes from a prolonged sleep (where the thread
-//! consumed 0% CPU in `poll(-1)`), subtracting `now_ms` from `last_ms` would compute an enormous
-//! delta that would fling weights across their full range in a single frame.
-//! `Clock.advance(now_ms)` resolves this by returning `0.0` on the first sample after idle
-//! (`armed == false`). The caller resets the clock when every animator has settled. Each wake
-//! gesture therefore pays exactly one frame of latency to establish the baseline timestamp,
-//! after which motion proceeds continuously.
-//!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
-//!
-//! ### Coordinate Spaces & Value Ranges:
-//! - **Animator Domain:** `value` and `target` reside in the normalized unit interval `[0.0, 1.0]`.
-//! - **Time Units:** Timestamps are discrete milliseconds (`u32`). Elapsed deltas are continuous
-//!   floating-point milliseconds (`f32`).
-//!
-//! ### Linear Motion Equation:
-//! For an animator moving toward `target` at `rate_per_ms`:
+//! Stepping toward `target` by `delta = rate_per_ms * dt_ms`:
 //! ```text
-//! delta = rate_per_ms * dt_ms
-//! if (value < target):
-//!     value = min(value + delta, target)
-//! else:
-//!     value = max(value - delta, target)
+//! value = min(value + delta, target)    if value < target
+//! value = max(value - delta, target)    otherwise
 //! ```
-//! Because clamping assigns `target` exactly when `delta >= abs(target - value)`, no fractional
-//! undershoot or overshoot can occur.
-//!
-//! ### Clock Rollover and Clamping Algebra:
-//! Timestamps wrap as 32-bit unsigned integers (`u32`), which roll over every ~49.7 days:
+//! Clock deltas use wrapping subtraction so a `u32` timestamp rollover stays a small positive
+//! gap, then clamp so a stalled compositor or backgrounded tab cannot skip across states:
 //! ```text
-//! gap = now_ms -% last_ms   (wrapping subtraction)
-//! clamped_gap = min(gap, dt_max_ms)   (where dt_max_ms = 100)
+//! gap = now_ms -% last_ms
+//! dt  = min(gap, dt_max_ms)            (the discarded excess is not replayed)
 //! ```
-//! Wrapping subtraction `-%` guarantees that across a `u32` rollover (e.g. from `0xFFFF_FFF0` to
-//! `0x0000_0008`), `8 -% 0xFFFF_FFF0 = 24`, preserving a correct positive elapsed delta.
-//! If a compositor stalls or a browser tab is backgrounded for seconds, `clamped_gap` clamps to
-//! `dt_max_ms` (100 ms). A stalled compositor cannot leap across multiple animation states in a
-//! single frame; the discarded gap is not replayed, and `last_ms` updates immediately to `now_ms`.
+//! Worked values: see test "clock deltas wrap and clamp, and reset rearms" and test "step
+//! reaches the midpoint and clamps on the target".
 //!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### Struct Layout: `Animator` (12 Bytes, 4-Byte Alignment):
-//! - Offset 0: `value: f32` (4 bytes) - Current normalized blend weight `[0.0, 1.0]`.
-//! - Offset 4: `target: f32` (4 bytes) - Target normalized blend weight `[0.0, 1.0]`.
-//! - Offset 8: `rate_per_ms: f32` (4 bytes) - Fraction of unit range traversed per millisecond.
-//! Total size: 12 bytes. Alignment: 4 bytes. Plain value, zero pointers, register passable.
-//!
-//! ### Struct Layout: `Clock` (8 Bytes, 4-Byte Alignment):
-//! - Offset 0: `last_ms: u32` (4 bytes) - Previous host millisecond timestamp.
-//! - Offset 4: `armed: bool` (1 byte) - False until the first sample after `reset()`.
-//! - Offset 5..7: Padding (3 bytes) - Compiler padding to 4-byte boundary.
-//! Total size: 8 bytes. Alignment: 4 bytes. Plain value.
-//!
-//! ### Bounds:
-//! - `dt_max_ms = 100`: Hard upper bound on elapsed delta returned by `Clock.advance`.
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### Clock Lifecycle State Machine:
+//! ## 3. State Machines
 //! ```text
-//!               +-----------------------------+
-//!               |        Idle / Unarmed       |
-//!               |  (armed = false, last = 0)  |
-//!               +-----------------------------+
-//!                              |
-//!                 advance(now) | returns 0 ms
-//!               (wake latency) | arms clock, sets last = now
-//!                              v
-//!               +-----------------------------+
-//!  advance(now) |         Armed / Active      |
-//!  +------------| (armed = true, last = now)  |
-//!  |            +-----------------------------+
-//!  | returns min(now -% last, 100) |
-//!  +-------------------------------+
-//!                              |
-//!                      reset() | scene settled (no live animators)
-//!                              v
-//!               +-----------------------------+
-//!               |        Idle / Unarmed       |
-//!               +-----------------------------+
+//! Clock:     Unarmed --advance--> Armed (returns 0)
+//!            Armed   --advance--> Armed (returns min(now -% last, dt_max_ms))
+//!            Armed   --reset----> Unarmed
+//!
+//! Animator:  Resting --set_target(new value)--> Live
+//!            Live    --step(dt > 0)----------> Live, or Resting once value == target
 //! ```
 //!
-//! ### Animator Lifecycle State Machine:
-//! ```text
-//!               +-----------------------------+
-//!               |       Resting at Target     |
-//!               |    (value == target, !live) |
-//!               +-----------------------------+
-//!                              |
-//!            set_target(T != V)| returns true
-//!                              v
-//!               +-----------------------------+
-//!      step(dt) |       In-Flight Motion      |
-//!  +------------|     (value != target, live) |
-//!  |            +-----------------------------+
-//!  | advances delta            |
-//!  +---------------------------+ value reaches target (clamps exactly)
-//!                              v
-//!               +-----------------------------+
-//!               |       Resting at Target     |
-//!               |    (value == target, !live) |
-//!               +-----------------------------+
-//! ```
+//! ## 4. Cross-Platform Seams
+//! Both hosts feed monotonic millisecond timestamps into the same `Clock`: native uses the
+//! compositor's `wl_callback.done` timestamp (`linux_window.zig`), and the browser passes
+//! `Math.floor` of the `requestAnimationFrame` time to the `tick` export (`web_exports.zig`).
+//! The animator code is host-independent.
 //!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **Wayland Protocol:** The Linux event loop in `src/host/linux_window.zig` requests
-//!   `wl_surface.frame`.
-//!   The compositor executes `wl_callback.done(data, callback, callback_data: u32)`.
-//!   `callback_data` is the compositor's presentation timestamp in milliseconds, passed to
-//!   `Clock.advance()`.
-//! - **Browser WebAssembly:** The JavaScript harness in `web/shell.js` invokes
-//!   `requestAnimationFrame`.
-//!   The DOM callback receives `now` (`DOMHighResTimeStamp`), floored via `Math.floor(now)` and
-//!   passed as a 32-bit unsigned integer to the exported `tick(now_ms: u32)` function.
-//! - **Uniform Semantics:** Both platforms feed monotonic millisecond clocks into the identical
-//!   pure Zig `Clock` and `Animator` primitives.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Zero Dynamic Allocation:** `Animator` and `Clock` are fixed-size stack values.
-//! - **Bounded Execution:** Every function (`init`, `set_target`, `step`, `live`, `advance`,
-//!   `reset`) is strictly O(1) arithmetic with zero internal loops.
-//! - **Split Assertions:** All bounds (`dt_ms >= 0`, `target in [0, 1]`, `rate_per_ms > 0`)
-//!   are asserted independently rather than compounded.
-//! - **Zero Technical Debt:** Explicit handling of timer wraparound via wrapping operators (`-%`).
+//! ## 5. TigerStyle Invariants
+//! - `Animator` and `Clock` are plain fixed-size values (sizes asserted in the comptime block)
+//!   and every operation is O(1) with no loops and no allocation.
+//! - Preconditions (`dt_ms >= 0`, `target` in `[0, 1]`, `rate_per_ms` in `(0, 1]`) are asserted
+//!   individually.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -163,16 +68,14 @@ const assert = std.debug.assert;
 /// A single stalled frame cannot move an animator by more than this gap.
 pub const dt_max_ms: u32 = 100;
 
-/// A float moving toward `target` at `rate_per_ms`.
-/// `value` and `target` stay in `[0, 1]` for hover and down.
-/// Memory: three `f32` fields, 12 bytes, alignment 4.
+/// A float moving toward `target` at `rate_per_ms`. `value` and `target` stay in `[0, 1]`.
 pub const Animator = struct {
     value: f32,
     target: f32,
     rate_per_ms: f32,
 
-    /// Resting animator. `rate_per_ms` is the fraction of the unit range covered
-    /// in one millisecond. Hover uses `1/100`; down uses `1/50`.
+    /// Resting animator at 0. `rate_per_ms` is the fraction of the unit range covered per
+    /// millisecond. Callers name their rates (see `widgets.hover_rate_per_ms`).
     pub fn init(rate_per_ms: f32) Animator {
         assert(rate_per_ms > 0);
         assert(rate_per_ms <= 1);
@@ -186,8 +89,8 @@ pub const Animator = struct {
         return animator;
     }
 
-    /// Aims the animator at `target`. Returns false when the target is unchanged,
-    /// so a pointer that rests inside one widget does not dirty the frame.
+    /// Aims the animator at `target`. Returns false when the target is unchanged, so a pointer
+    /// resting inside one widget does not dirty the frame.
     pub fn set_target(self: *Animator, target: f32) bool {
         assert(target >= 0);
         assert(target <= 1);
@@ -203,9 +106,9 @@ pub const Animator = struct {
         return true;
     }
 
-    /// Moves `value` toward `target` by `rate_per_ms * dt_ms`, then clamps.
-    /// `dt_ms == 0` leaves `value` alone and returns false. Settling assigns
-    /// `target` exactly, so a later `step` is a no-op.
+    /// Moves `value` toward `target` by `rate_per_ms * dt_ms`, then clamps. Returns true when
+    /// `value` changed. `dt_ms == 0` leaves `value` alone. Settling assigns `target` exactly,
+    /// so a later `step` is a no-op.
     pub fn step(self: *Animator, dt_ms: f32) bool {
         assert(dt_ms >= 0);
         assert(dt_ms == dt_ms);
@@ -248,7 +151,8 @@ pub const Animator = struct {
     }
 };
 
-/// Host millisecond clock. `armed` is false until the first sample after `reset`.
+/// Host millisecond clock. `armed` is false until the first sample after `reset`, which makes
+/// that sample a baseline rather than a delta.
 pub const Clock = struct {
     last_ms: u32,
     armed: bool,
@@ -263,9 +167,8 @@ pub const Clock = struct {
         return clock;
     }
 
-    /// Elapsed milliseconds since the previous sample, or 0 if this is the first
-    /// sample after idle. Wrapping uses `-%` so a `u32` timestamp rollover stays
-    /// a small positive gap. Results above `dt_max_ms` clamp to that cap.
+    /// Elapsed milliseconds since the previous sample, or 0 for the first sample after idle.
+    /// Gaps above `dt_max_ms` clamp to it. The latest sample always becomes the baseline.
     pub fn advance(self: *Clock, now_ms: u32) f32 {
         assert(dt_max_ms > 0);
         if (!self.armed) {
@@ -286,9 +189,8 @@ pub const Clock = struct {
         return @floatFromInt(clamped);
     }
 
-    /// Forgets the last sample. The next `advance` returns 0.
-    /// Called when the scene has no live animator, so idle does not invent a dt
-    /// from a timestamp that is minutes old.
+    /// Forgets the last sample so the next `advance` returns 0. Called when no animator is
+    /// live, so idle never produces a delta from a stale timestamp.
     pub fn reset(self: *Clock) void {
         self.armed = false;
         self.last_ms = 0;
@@ -303,8 +205,9 @@ comptime {
     assert(@sizeOf(Clock) == 8);
 }
 
-// Locks linear animator travel: 100 ms duration, midpoint reach at 50 ms, exact target clamping at 60 ms.
-// Verifies that dt == 0 leaves value unchanged and that redundant set_target returns false.
+// Locks linear travel at 1/100 per ms: halfway after 50 ms, and exact clamping onto the target
+// when a later step overshoots. Also locks that dt == 0 leaves `value` unchanged and that a
+// redundant `set_target` returns false.
 test "step reaches the midpoint and clamps on the target" {
     var motion = Animator.init(1.0 / 100.0);
     try std.testing.expect(motion.set_target(1));
@@ -320,8 +223,9 @@ test "step reaches the midpoint and clamps on the target" {
     try std.testing.expect(!motion.step(10));
 }
 
-// Locks host clock delta derivation, one-frame wake latency (first sample returns 0),
-// u32 unsigned timestamp rollover wrapping via -%, 100 ms gap clamping, and reset rearming.
+// Locks the clock contract: the first sample returns 0 (wake latency), later samples return the
+// difference, a `u32` rollover (0xFFFF_FFF0 to 8 is a gap of 24) stays a small positive gap, a
+// gap past `dt_max_ms` clamps, and `reset` makes the next sample a baseline again.
 test "clock deltas wrap and clamp, and reset rearms" {
     var clock = Clock.init();
     try std.testing.expectEqual(@as(f32, 0), clock.advance(1000));

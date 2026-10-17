@@ -3,10 +3,10 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Why a Comptime Contract, Not a Vtable
-//! The native and browser hosts are compiled once per app and per target, so the app type
-//! is known at compile time. The hosts call `App.init`, `App.layout`, and the rest as
-//! ordinary functions. There is no function pointer, no dynamic dispatch, and no
-//! allocation. `check` makes a missing or mistyped declaration a build error that names it.
+//! Each host is compiled once per app and per target, so the app type is known at compile
+//! time and the hosts call `App.init`, `App.layout`, and the rest as ordinary functions: no
+//! function pointer, no dynamic dispatch, no allocation. `check` turns a missing or mistyped
+//! declaration into a build error that names it.
 //!
 //! ## 2. The Contract
 //! ```text
@@ -23,15 +23,16 @@
 //! ```
 //! - `init` runs once before any other call and leaves the app ready for `layout`.
 //! - `layout` places the widgets for a window of `width_logical` by `height_logical` UI
-//!   logical pixels. It runs only when the window size changed. It must leave `dirty()` true.
+//!   logical pixels. Hosts call it only when the logical window size changed (see
+//!   `Frame.relayout`). It must leave `dirty()` true so the next `draw` rebuilds the lists.
 //! - `event` applies one pointer, wheel, or `frame` event. The `frame` event carries the
 //!   animator step in milliseconds. It returns true when a visible value changed.
-//! - `timer` runs when the host timer expires. It exists only to satisfy the contract when
-//!   `config.timer_period_ms` is 0, and returns false then.
+//! - `timer` runs when the host timer expires. When `config.timer_period_ms` is 0 the hosts
+//!   never call it, and it exists only to satisfy the contract.
 //! - `live` is true while an animator has not settled. It gates frame callbacks, so a
 //!   settled app costs nothing.
 //! - `dirty` is true when `draw` has work to do. `draw` rebuilds both lists and must leave
-//!   `dirty()` false. The hosts assert both.
+//!   `dirty()` false. The hosts assert the latter after every `draw`.
 //!
 //! ## 3. Host Order Per Wake
 //! Drain queued events into `event`. When a frame callback completes, call `event(.frame)`.
@@ -41,6 +42,7 @@
 //! ## 4. The Optional Timer
 //! `timer_period_ms == 0` means no timer. The native host then creates no `timerfd` and
 //! sleeps in `poll` while nothing is live. The browser host arms no `setInterval`.
+//! `timer_period_ms_max` bounds the period so a value in the wrong unit fails the build.
 //!
 //! ## 5. TigerStyle Invariants
 //! The contract is checked at compile time and costs nothing at run time. The app owns all
@@ -60,12 +62,14 @@ pub const Config = struct {
     timer_period_ms: u32,
 };
 
-/// Upper bound for `Config.timer_period_ms`. One second keeps a timer from being mistaken
-/// for a period in the wrong unit.
+/// Upper bound for `Config.timer_period_ms`, chosen so a period given in the wrong unit is
+/// rejected at build time. The failure message in `conformance` repeats the number, which the
+/// comptime assert at the end of this file and the "slow timer" test keep in sync.
 pub const timer_period_ms_max: u32 = 1000;
 
 /// Returns null when `App` satisfies the contract, otherwise a message naming the first
-/// problem. Pure, so a test can check the failure cases without a compile error.
+/// problem. Pure, so tests can check failure cases without a compile error. Signature types
+/// are compared exactly, which is why `live` and `dirty` must take `*const App`.
 pub fn conformance(comptime App: type) ?[]const u8 {
     if (!@hasDecl(App, "config")) {
         return "App must declare `pub const config: patchwork.app.Config`";
@@ -202,22 +206,21 @@ const WrongLive = struct {
         _ = now_ms;
         return false;
     }
-    // Takes `*WrongLive`, so it could mutate. The contract demands `*const`.
+    // Takes a mutable pointer where the contract demands `*const`.
     pub fn live(app: *WrongLive) bool {
         _ = app;
         return false;
     }
 };
 
-// A complete app passes. This also pins the exact shape the hosts rely on.
+// Locks the positive space: a complete app passes and pins the exact shape hosts rely on.
 test "a complete app satisfies the contract" {
     try std.testing.expect(comptime conformance(GoodApp) == null);
     check(GoodApp);
 }
 
-// The negative space: a missing declaration is named, and `draw` is the one the review
-// called out. The build also compiles a file that calls `check` on such a type and
-// expects a compile error (`zig build test-contract`).
+// Locks the negative space: a missing declaration is named in the message. The compile-error
+// path of `check` itself is locked by `zig build test-contract`.
 test "a missing declaration is reported by name" {
     const missing = comptime conformance(NoDraw).?;
     try std.testing.expect(std.mem.indexOf(u8, missing, "draw") != null);
@@ -225,6 +228,8 @@ test "a missing declaration is reported by name" {
     try std.testing.expect(@hasDecl(NoDraw, "dirty"));
 }
 
+// Locks the remaining rejections: missing config, over-limit timer period, and a signature
+// mismatch (the message names both the member and the expected `*const` type).
 test "a missing config, a slow timer, and a mistyped live are rejected" {
     const no_config = comptime conformance(NoConfig).?;
     try std.testing.expect(std.mem.indexOf(u8, no_config, "config") != null);

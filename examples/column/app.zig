@@ -1,27 +1,28 @@
-//! The step 8 scroll column: one `Scroll` of knobs, a meter, and two toggles.
+//! Scroll column example: one `Scroll` of knobs, a meter, and toggles docked on the right.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Role
-//! This is the second regression app of the library. It has one widget, a 320 px `Scroll`
-//! docked on the right, and it asks for no host timer, so the native host sleeps in `poll`
-//! while the pointer rests. It locks the scroll, wheel, toggle, and hover behaviour that
-//! the rack does not exercise.
+//! ## 1. What It Demonstrates
+//! The scene holds a single widget, a fixed-width `Scroll` parked on the right edge of a
+//! padded full-window column, and requests no host timer. It exists to lock the scroll, wheel,
+//! toggle, and hover behavior that the rack example does not exercise. Every worked number
+//! lives in this file's tests, for example "demo layout at 1280 by 720".
 //!
 //! ## 2. Coordinate Space and Layout
-//! All measurements are UI logical pixels, top-left origin, `+Y` down. The root column has
-//! 16 px padding. The scroll has `width = fixed(320)`, `height = fill`, `align_x = 1`, so it
-//! parks on the right edge:
-//! - At 1280 x 720 the scroll rect is `(944, 16, 320, 688)`.
-//! - At 800 x 600 the scroll rect is `(464, 16, 320, 568)`.
+//! All measurements are UI logical pixels, top-left origin, `+Y` down. The scroll's walk is
+//! `width = fixed`, `height = fill`, `align_x = 1`, so `turtle.place_column` parks it against
+//! the right padding and stretches it to the padded height. `Scroll.layout_children` then
+//! places the controls and clamps the scroll offset.
 //!
-//! ## 3. Contract
-//! `App` implements the contract in `patchwork.app`. `config.timer_period_ms` is 0, so
-//! `timer` is a no-op that returns false. Static storage is one widget slot.
+//! ## 3. Contract With the Library
+//! `App` implements the contract in `patchwork.app`. Because `config.timer_period_ms` is 0 the
+//! host never calls `timer`, so a resting pointer causes no wakeups; `timer` exists only to
+//! satisfy the contract and always returns false.
 //!
 //! ## 4. TigerStyle Invariants
-//! - One fixed widget slot, no allocation.
-//! - Every loop is bounded by the 11 scroll children (`widgets.scroll_child_cap`).
+//! - One fixed widget slot and no allocation.
+//! - Every loop is bounded by `Scroll.child_count`, which is at most `widgets.scroll_child_cap`.
+//!   The comptime block asserts that a full scroll fits the instance and glyph caps.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -291,6 +292,8 @@ fn glyph_has_clip(glyph: font.Glyph, clip: font.Clip) bool {
     return true;
 }
 
+// Locks the scroll, viewport, and content column rects, the first knob's faces, and that
+// a draw clears the dirty flag.
 test "demo layout at 1280 by 720" {
     var app = new_app();
     app.layout(1280, 720);
@@ -313,6 +316,7 @@ test "demo layout at 1280 by 720" {
     try std.testing.expect(!app.dirty());
 }
 
+// Locks that the scroll rect and `max_scroll` follow the window while content height does not.
 test "demo layout at 800 by 600" {
     var app = new_app();
     app.layout(800, 600);
@@ -322,6 +326,8 @@ test "demo layout at 800 by 600" {
     try std.testing.expectEqual(@as(f32, 352), scroll.max_scroll());
 }
 
+// Locks that rows below the viewport are culled and visible meter faces carry the viewport
+// clip.
 test "scroll 0 clips the meter and omits the toggles" {
     var app = new_app();
     app.layout(1280, 720);
@@ -361,6 +367,7 @@ test "scroll 0 clips the meter and omits the toggles" {
     try std.testing.expect(meter_glyph);
 }
 
+// Locks that a zero-valued knob emits only its track arc.
 test "value 0 omits the value arc" {
     var app = new_app();
     app.layout(1280, 720);
@@ -384,6 +391,7 @@ test "value 0 omits the value arc" {
     try std.testing.expectEqual(@as(u32, 1), arcs);
 }
 
+// Locks that toggle rows, shorter than knob rows, still draw when nothing needs scrolling.
 test "a tall window draws the short toggle rows" {
     var app = new_app();
     app.layout(1280, 1000);
@@ -405,6 +413,7 @@ test "a tall window draws the short toggle rows" {
     try std.testing.expect(glyphs.count > 0);
 }
 
+// Locks wheel scrolling to the last row and its clamp at `max_scroll`.
 test "scroll 232 shows drums and clamps a further wheel" {
     var app = new_app();
     app.layout(1280, 720);
@@ -429,6 +438,7 @@ test "scroll 232 shows drums and clamps a further wheel" {
     try std.testing.expectEqual(@as(f32, 232), scroll.scroll_y);
 }
 
+// Locks the relative knob drag through the scene, including clamping at both ends.
 test "knob drag from the ring center clamps at both ends" {
     var app = new_app();
     app.layout(1280, 720);
@@ -444,6 +454,7 @@ test "knob drag from the ring center clamps at both ends" {
     try std.testing.expectEqual(@as(f32, 1), scroll_of(&app).children[0].knob.value);
 }
 
+// Locks wheel routing: a ring wheel nudges the knob, any other viewport wheel scrolls.
 test "wheel on the ring nudges and wheel on the label scrolls" {
     var app = new_app();
     app.layout(1280, 720);
@@ -462,6 +473,7 @@ test "wheel on the ring nudges and wheel on the label scrolls" {
     try std.testing.expectEqual(@as(f32, 40), scroll_of(&app).scroll_y);
 }
 
+// Locks that an inside release flips a scrolled toggle and the thumb eases to its target.
 test "toggle up inside drums slides the thumb" {
     var app = new_app();
     app.layout(1280, 720);
@@ -490,6 +502,7 @@ test "toggle up inside drums slides the thumb" {
     try std.testing.expectEqual(@as(f32, 1), scroll.children[10].toggle.thumb.value);
 }
 
+// Locks that a release outside the pill leaves the toggle unchanged.
 test "toggle up outside does not flip" {
     var app = new_app();
     app.layout(1280, 720);
@@ -509,6 +522,7 @@ test "toggle up outside does not flip" {
     try std.testing.expectEqual(@as(f32, 0), scroll.children[10].toggle.thumb.target);
 }
 
+// Locks hover easing and that a settled scene stays clean across frames.
 test "hover on gain eases and a later frame stays clean" {
     var app = new_app();
     app.layout(1280, 720);
@@ -537,6 +551,7 @@ test "hover on gain eases and a later frame stays clean" {
     try std.testing.expect(!app.dirty());
 }
 
+// Locks that a relayout re-hits the stored pointer and preserves hover state.
 test "relayout by 8 px keeps gain hover" {
     var app = new_app();
     app.layout(1280, 720);
@@ -552,6 +567,7 @@ test "relayout by 8 px keeps gain hover" {
     try std.testing.expectEqual(@as(u32, 0), scroll_of(&app).hot.?);
 }
 
+// Locks that pointer leave drops capture without changing the value.
 test "pointer leave during a knob press releases capture" {
     var app = new_app();
     app.layout(1280, 720);
@@ -567,6 +583,7 @@ test "pointer leave during a knob press releases capture" {
     try std.testing.expectEqual(@as(f32, 0.25), scroll_of(&app).children[0].knob.value);
 }
 
+// Locks that an unchanged scene produces no upload flags.
 test "a settled scene does not rebuild on a scale-style present" {
     var app = new_app();
     app.layout(1280, 720);

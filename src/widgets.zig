@@ -2,150 +2,100 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! In an instanced GPU user interface, there is a fundamental tension between retained widget
-//! state (interaction models, animators, value tracking, scroll offsets) and immediate-style
-//! GPU submission (draw lists and glyph lists wiped and rebuilt on dirty frames).
+//! ## 1. Why Retained Widgets Over Ephemeral Draw Lists
+//! The draw list and glyph list are wiped and rebuilt on every dirty frame, so no interaction
+//! state can live in them. Everything that must survive a frame (border-box `Rect`, layout
+//! `Walk`, `Animator`s, the normalized `value` in `[0, 1]`, the scroll offset) lives in the
+//! widget structs. `draw` only projects that state into fresh `quads.Instance` and `font.Glyph`
+//! records, so the shaders never learn about widget kinds.
 //!
-//! ### Retained Widgets vs. Ephemeral Draw Lists:
-//! All interactive and visual state lives permanently in retained widget structures:
-//! - Each widget owns its border-box `Rect` and layout `Walk`.
-//! - Active controls own continuous `Animator` instances (such as hover and thumb transitions).
-//! - Continuous controls retain their normalized scalar `value: f32` in `[0.0, 1.0]`.
-//! - On redraw, `draw()` copies current animated weights and shapes into fresh 64-byte GPU
-//!   `Instance` records and `Glyph` records.
-//! - Shaders remain completely decoupled: they receive standard 64-byte records and know nothing
-//!   about widget types or interaction trees.
+//! Widgets used directly as `ui.Scene` payloads implement the member set documented in the
+//! `ui.zig` guide. `Toggle` has no `contains` because it is only ever hit through `Scroll`.
 //!
-//! ### Widget Suite Taxonomy:
-//! - **Panel:** Passive container. Hit-tested to occlude underlying elements, but ignores hits.
-//! - **Button:** Clickable trigger. Animates hover (100 ms) and down (50 ms). Tracks click counts.
-//! - **Slider:** Continuous horizontal bar. Maps absolute pointer X to `[0.0, 1.0]`.
-//!   *(Note: `Panel`, `Button`, `Slider`, and `Scroll` remain fully implemented and tested in this
-//!   module; library examples include the synthesizer rack and the scroll column).*
-//! - **Knob:** Continuous rotary control. Open-ring arc with relative vertical drag and mouse
-//!   wheel adjustments. Displays name and formatted numeric hundredths value string.
-//! - **Meter:** Passive vertical level indicator. Upward-growing fill column; ignores hits.
-//!   Values are written directly by the host clock (~30 Hz timer), with drawing reading `value`.
-//! - **Toggle:** Binary state capsule switch. Animated thumb travel over 100 ms on release inside.
-//! - **Scroll:** Viewport container managing a scrollable column of controls with a
-//!   draggable thumb, viewport culling, wheel routing, and per-child scissor-free clipping.
+//! ### Blend Weights
+//! An `Animator` travels over `[0, 1]`. Written straight to the instance, a full hover would
+//! mix the fill entirely to white and a full press entirely to black. Widgets therefore scale:
+//! ```text
+//! hover_weight = hover.value * hover_lighten
+//! down_weight  = down.value  * down_darken      (applied after the hover mix)
+//! ```
+//! Test "slider drag sets an absolute value" locks the hover scaling. `Knob` lightens only the
+//! value arc and `Toggle` only the thumb disc; their tracks never lighten. `Slider` has no
+//! press channel: its hover animator is the highlight for the whole gesture.
 //!
-//! ### Scaled Shader Blend Weights:
-//! An `Animator` travels across `[0.0, 1.0]`. If written directly to the GPU instance,
-//! a hover weight of 1.0 would mix the fill color 100% to pure white, and down 1.0
-//! would mix 100% to solid black. Instead, widgets scale normalized animator values:
-//! - `hover_weight = animator.value * hover_lighten` (`0.18`).
-//! - `down_weight = animator.value * down_darken` (`0.30`, applied after hover).
-//! - For `Knob`, `hover` lightens the active value arc only; the track remains dark.
-//! - For `Toggle`, `hover` lightens the thumb disc; the track remains dark.
+//! ## 2. Coordinate Spaces and Geometry
+//! All geometry is UI logical pixels: origin top-left, `+X` right, `+Y` down. Stored child
+//! rects are unscrolled; a `Scroll` draws and hits a child at `row.y = child.rect.y - scroll_y`.
+//! Shared offsets are named constants (`ring_inset`, `ring_size`, and the other row metrics),
+//! and `row` below is the fixed-height cell a parent placed the control in.
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
+//! - **Slider:** `span = rect.width - 2 * knob_radius` and
+//!   `value = clamp((x - rect.x - knob_radius) / span, 0, 1)`; a non-positive span yields 0.
+//!   The track is inset by `knob_radius` at both ends. Worked values: test
+//!   "slider value at the worked pointer".
+//! - **Knob:** `ring_of(row)` is a `ring_size` square at `row.x + ring_inset`, centered
+//!   vertically. The hit test is the disc inscribed in that square (hole included). Drag and
+//!   wheel are relative: `value' = clamp(value - delta / drag_span_px, 0, 1)` with
+//!   `delta = point.y - drag_y` for drags and `delta = wheel.dy` for the wheel, so upward
+//!   motion increases the value. Test "knob drag is relative and clamped" locks this.
+//! - **Arc instances:** the ring is a `quads.kind_arc` face with `radius = ring_thickness`.
+//!   Its `hover` field is the lighten weight and its `down` field carries the sweep fraction
+//!   in `[0, 1]`. The track arc sweeps fully; the value arc sweeps `value` and is omitted
+//!   when `value == 0`.
+//! - **Value text:** hundredths are formatted as `d.dd` into the fixed `[8]u8` `value_text`,
+//!   with the unused tail zeroed so no stale bytes survive a shorter string.
+//! - **Meter:** the track is `meter_track_w` by `meter_track_h`, centered over the ring column
+//!   and vertically in `row`. The fill is anchored to the track bottom:
+//!   `fill.height = value * track.height`, `fill.y = track.y + track.height - fill.height`,
+//!   omitted when `value == 0`. The track may be taller than a short row, so callers clip.
+//!   Test "meter fill grows upward from the track bottom".
+//! - **Toggle:** `pill_of(row)` is a `pill_w` by `pill_h` capsule at `row.x + ring_inset`.
+//!   The thumb is a `thumb_side` disc inset by `thumb_inset`, with
+//!   `thumb.x = pill.x + thumb_inset + thumb.value * travel` and
+//!   `travel = pill_w - thumb_side - 2 * thumb_inset`. `toggle_thumb` hardcodes the travel;
+//!   the comptime block asserts the two agree. A release with `up.inside` flips `on` and aims
+//!   the thumb animator at 1 or 0; a release outside, a press, and a drag do nothing.
+//! - **Scroll:** `viewport = rect inset by padding`; the content column is the viewport
+//!   narrowed on the right by `gutter_px`, which holds the scrollbar thumb.
+//!   ```text
+//!   max_scroll = max(0, content_h - viewport.height)
+//!   thumb_h    = max(thumb_min_px, view_h * view_h / content_h)  (capped at view_h)
+//!   travel     = view_h - thumb_h
+//!   thumb.y    = viewport.y + (scroll_y / max_scroll) * travel
+//!   dragging:  scroll_y = clamp((pointer_y - viewport.y - thumb_h / 2) / travel, 0, 1)
+//!                         * max_scroll
+//!   ```
+//!   Test "scroll thumb follows the offset and the pointer" locks these formulas.
 //!
-//! ### Coordinate Spaces:
-//! Geometries are defined in UI logical pixels, top-left origin `(0, 0)`, `+X` right, `+Y` down.
+//! ## 3. Layout and Capacity Contracts
+//! Widgets write complete `quads.Instance` records through `append_weighted` and `append_arc`;
+//! the record layout and its size are owned and asserted by `draw.zig`, not restated here.
 //!
-//! ### Knob Analytical Ring & Relative Drag Derivation:
-//! A knob occupies a row bounding box of height 72 px. Within this row:
-//! - The ring bounds `ring_of(row)` is a square `(row.x + 8, row.y + 8, 56, 56)`.
-//! - Ring center: `(ring.x + 28, ring.y + 28)`.
-//! - Track thickness: `ring_thickness = 4.0`.
-//! - Two `kind_arc` (kind = 1) faces are emitted:
-//!   1. **Track Arc:** Backing ring with fill `theme.chrome.track`, hover 0, down 1 (full sweep).
-//!   2. **Value Arc:** Active ring segment with fill `knob.accent`, hover weight,
-//!      down = `knob.value`.
-//!      If `knob.value == 0`, the value arc instance is completely omitted.
-//! - **Hit Test:** Tested against the full 28 px radius bounding disc (`ring_contains`), so
-//!   clicking inside the inner hole still grabs and drags the knob.
-//! - **Relative Vertical Drag:**
-//!   `dy = point.y - knob.drag_y`
-//!   `value = clamp(value - dy / 120.0, 0.0, 1.0)`
-//!   Dragging upward (`-dy`) increases the value; downward decreases it. Drag span is 120 px.
-//! - **Wheel Nudge:** Wheel delta `wheel.dy` nudges the knob by `-wheel.dy / 120.0`.
-//! - **Text Labels:** Label names are static string slices. Values are formatted into an `[8]u8`
-//!   scratch buffer as four-character hundredths strings (`0.00` to `1.00`) with zero allocation.
+//! Every `Scroll` child draws with `clip = clip_of(viewport)`, so a partially visible row is
+//! masked by the fragment shader instead of a GPU scissor. A child whose row does not overlap
+//! the viewport emits no faces or glyphs and cannot be hit.
 //!
-//! ### Meter Analytical Vertical Fill:
-//! A meter occupies a row bounding box of height 160 px:
-//! - Track rectangle `meter_track(row)`: width 12 px, height 144 px, corner radius 6 px.
-//! - Fill rectangle: grows upward from the bottom of the track:
-//!   `fill.height = value * 144.0`
-//!   `fill.y = track.y + 144.0 - fill.height`
-//!   If `value == 0`, the fill instance is omitted.
+//! A scroll emits at most one panel face, one thumb face, and two faces per child (arc pair,
+//! meter track and fill, or pill and thumb). The comptime block asserts that
+//! `scroll_child_cap` children fit `quads.instance_cap` and `font.glyph_cap`.
 //!
-//! ### Toggle Analytical Capsule & Thumb:
-//! A toggle occupies a row bounding box of height 40 px:
-//! - Pill rectangle `pill_of(row)`: width 44 px, height 24 px, corner radius 12 px (capsule).
-//! - Thumb disc: diameter 20 px (width 20, height 20, radius 10), inset by 2 px.
-//! - Thumb horizontal travel:
-//!   `travel = pill.width - thumb_side - 2 * thumb_inset = 44 - 20 - 4 = 20 px`.
-//! - Thumb position: `thumb.x = pill.x + thumb_inset + thumb_animator.value * travel`.
-//! - Thumb Y position: `thumb.y = pill.y + thumb_inset`.
-//! - Release gesture: Releasing inside the pill (`up.inside == true`) flips `toggle.on` and
-//!   aims the thumb animator toward 1 (on) or 0 (off) over 100 ms. Releasing outside does not flip.
+//! ## 4. Scroll Event Delegation
+//! - `hover_out` clears the hot child; `move` retargets the hot child, sending it `hover_out`
+//!   and `hover_in`. Meters are never hover targets but do occlude presses.
+//! - `down` on the thumb grabs it, `down` in the gutter is swallowed, `down` on a child
+//!   captures that child; with no scrollable overflow the thumb and gutter do not exist.
+//! - `drag` moves the thumb or is forwarded to the captured child. `up` re-tests the
+//!   captured child against the pointer to compute `Up.inside` before forwarding.
+//! - `wheel` inside the viewport goes to the knob ring under the pointer if there is one;
+//!   otherwise it adds `wheel.dy` to `scroll_y`, clamped to `[0, max_scroll]`.
+//! - Children are scanned last to first, so a later child wins an overlap.
 //!
-//! ### Scroll Viewport, Content, and Gutter Geometry:
-//! A `Scroll` widget occupies `scroll.rect` with padding (8 px all sides):
-//! - `viewport = inset(scroll.rect, padding)`.
-//! - `content_column = (viewport.x, viewport.y, viewport.width - 16, viewport.height)`
-//!   (16 px gutter).
-//! - Children are laid out in the content column. Stored child rectangles are unscrolled.
-//! - **Scrolled Coordinates:** `row.y = child.rect.y - scroll_y`.
-//! - **Viewport Culling:** If `!overlaps(row, viewport)`, child faces and glyphs are omitted.
-//! - **Straddler Masking:** Children overlapping viewport boundaries carry
-//!   `clip = clip_of(viewport)`.
-//! - **Scrollbar Thumb:**
-//!   `thumb_h = max(24.0, viewport_h * viewport_h / content_h)`.
-//!   `travel = viewport_h - thumb_h`.
-//!   `thumb.y = viewport.y + (scroll_y / max_scroll) * travel`.
-//!   When dragged: `unit = clamp((pointer_y - view.y - thumb_h * 0.5) / travel, 0.0, 1.0)`.
-//!   `scroll_y = unit * max_scroll`.
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### GPU Instance Emission (64 Bytes per Record):
-//! Each quad appended to `DrawList` occupies 64 bytes matching WebGPU Vertex Buffer 1 stride:
-//! - Location 1 (Offset  0): `(x, y, width, height)` (4x f32)
-//! - Location 2 (Offset 16): `(r, g, b, a)` (4x f32)
-//! - Location 3 (Offset 32): `(radius, hover, down, kind)` (4x f32)
-//!   `kind` is `kind_box` (0.0) or `kind_arc` (1.0).
-//! - Location 4 (Offset 48): `(clip_x0, clip_y0, clip_x1, clip_y1)` (4x f32)
-//!   Exclusive-max clip boundary in logical screen pixels.
-//!
-//! ### Static Memory Budgets:
-//! - `scroll_child_cap = 16`.
-//! - `DrawList.items: [256]Instance` (256 * 64 = 16,384 bytes).
-//! - `GlyphList.items: [256]Glyph` (256 * 64 = 16,384 bytes).
-//! - Instance budget: `1 (panel) + 1 (thumb) + scroll_child_cap * 2 <= instance_cap` (34 <= 256).
-//! - Glyph budget: `scroll_child_cap * 12 <= font.glyph_cap` (192 <= 256).
-//!
-//! ### Knob Accent Palette (Demo Choice):
-//! Knob active arcs do not read theme slots; they use per-instance fills.
-//! The demo cycles four accents by knob index:
-//! - Purple: `(0.62, 0.45, 0.86, 1.0)`
-//! - Green:  `(0.40, 0.78, 0.48, 1.0)`
-//! - Orange: `(0.93, 0.55, 0.24, 1.0)`
-//! - Yellow: `(0.93, 0.80, 0.32, 1.0)`
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### Scroll Event Delegation:
-//! - `.hover_in` / `.hover_out`: Manages hot child tracking.
-//! - `.down`: Hits thumb rect -> grabs thumb; hits child -> records active child;
-//!   hits gutter -> ignores.
-//! - `.drag`: Drags thumb or forwards to active child.
-//! - `.wheel`: Over visible knob ring -> nudges knob; elsewhere in viewport -> scrolls viewport Y.
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - Pointer coordinates and wheel deltas are normalized to UI logical pixels
-//!   before entering widgets.
-//! - Wayland 24.8 fixed point is scaled by 1/256; browser CSS pixels are scaled
-//!   by `devicePixelRatio`.
-//!
-//! ## 6. TigerStyle Invariants
-//! - Zero runtime allocation: all structures, buffers, and text arrays are statically bounded.
-//! - Pure geometric calculations separated from mutating dispatchers.
-//! - Defensive assertion pairs on all function entries and exits.
+//! ## 5. TigerStyle Invariants
+//! - No allocation: children, text, and draw output live in fixed arrays bounded by
+//!   `scroll_child_cap`, `quads.instance_cap`, and `font.glyph_cap`.
+//! - Geometry helpers are pure; the `handle` dispatchers are the only mutators.
+//! - Hosts normalize pointer coordinates and wheel deltas to logical pixels before they
+//!   reach any widget.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -156,13 +106,13 @@ const input = @import("input.zig");
 const theme = @import("theme.zig");
 const turtle = @import("turtle.zig");
 
-/// Shader mix toward white at animator value 1. Matches the step 5 weight.
+/// Shader mix toward white at animator value 1.
 pub const hover_lighten: f32 = 0.18;
 
 /// Shader mix toward black at animator value 1. Applied after the lighten.
 pub const down_darken: f32 = 0.30;
 
-/// Wall time for hover to travel the unit range. Makepad's button hover is 0.1 s.
+/// Wall time for hover to travel the unit range.
 pub const hover_duration_ms: f32 = 100;
 
 /// Wall time for the press darken to travel the unit range.
@@ -174,8 +124,8 @@ pub const hover_rate_per_ms: f32 = 1.0 / hover_duration_ms;
 /// Fraction of the unit range covered in one millisecond of press.
 pub const down_rate_per_ms: f32 = 1.0 / down_duration_ms;
 
-/// Slider knob radius in logical pixels. The demo slider is 24 px tall, so the
-/// knob is a disc that fills that height.
+/// Slider knob radius in logical pixels. The knob is a disc of diameter `2 * knob_radius`
+/// and the track is inset by this radius at both ends.
 pub const knob_radius: f32 = 12;
 
 /// Slider track thickness in logical pixels, centered in the widget rect.
@@ -432,8 +382,7 @@ pub const Slider = struct {
     }
 
     /// Track, then fill (omitted at value 0), then the knob on top. A slider has no
-    /// text, so `glyphs` is only checked. It is here so every standalone widget draws
-    /// with the same signature.
+    /// text, so `glyphs` is only checked; it keeps the signature uniform across widgets.
     pub fn draw(
         self: Slider,
         list: *quads.DrawList,
@@ -452,8 +401,8 @@ pub const Slider = struct {
             return;
         }
         const track = track_rect(self.rect);
-        // The rate is unused. This animator is never stepped. Value and target
-        // stay 0 so the shader's darken mix does not run on a held slider.
+        // A never-stepped resting animator keeps the darken mix off, so a held slider
+        // stays lightened but never darkens. The rate is irrelevant because it never steps.
         const rest = animator.Animator.init(down_rate_per_ms);
         assert(rest.value == 0);
         assert(rest.target == 0);
@@ -639,13 +588,13 @@ fn positive_span(span: f32) f32 {
     return 0;
 }
 
-/// Children one scroll may own. The demo uses 11.
+/// Children one scroll may own.
 pub const scroll_child_cap: u32 = 16;
 
 /// Gutter reserved for the thumb, in logical pixels.
 pub const gutter_px: f32 = 16;
 
-/// Drag and wheel travel that covers the unit range.
+/// Knob drag and wheel distance, in logical pixels, that covers the unit range.
 pub const drag_span_px: f32 = 120;
 
 /// Knob ring edge. The hit disc uses half of this so the hole still drags.
@@ -657,6 +606,9 @@ pub const ring_thickness: f32 = 4;
 /// Inset of the ring and the pill from the row's left edge.
 pub const ring_inset: f32 = 8;
 
+// Fixed row heights and face metrics, in logical pixels. `ring_of`, `meter_track`, and
+// `pill_of` place the faces inside a row of the matching height; `label_line_px` is the
+// height of one text line beside the ring, and `thumb_min_px` floors the scrollbar thumb.
 pub const knob_height: f32 = 72;
 pub const meter_height: f32 = 160;
 pub const toggle_height: f32 = 40;
@@ -672,7 +624,8 @@ pub const thumb_min_px: f32 = 24;
 pub const label_line_px: f32 = 36;
 pub const accent_count: u32 = 4;
 
-/// Purple, green, orange, yellow. Cycled by knob index. Not theme slots.
+/// Per-knob accent fills, cycled by knob index modulo `accent_count`. Not theme slots: each
+/// knob's value arc carries its own fill.
 pub const accents: [accent_count]Paint = .{
     .{ .r = 0.62, .g = 0.45, .b = 0.86, .a = 1, .radius = ring_thickness },
     .{ .r = 0.40, .g = 0.78, .b = 0.48, .a = 1, .radius = ring_thickness },
@@ -931,7 +884,7 @@ pub const Meter = struct {
     }
 };
 
-/// Pill with a sliding thumb. Click on the pill flips the bool. The thumb aims over 100 ms.
+/// Pill with a sliding thumb. A release on the pill flips `on` and re-aims the thumb animator.
 pub const Toggle = struct {
     id: u32,
     rect: turtle.Rect,
@@ -1479,8 +1432,8 @@ fn value_box(row: turtle.Rect) turtle.Rect {
 }
 
 fn side_box(row: turtle.Rect) turtle.Rect {
-    // Toggle rows are shorter than the knob ring. The label column is still
-    // `ring_inset + 64` from the row, which is `ring.x + 64` on a knob row.
+    // Toggle rows are shorter than the ring, so the label column is derived from the row
+    // edge. It must land at the same x as `name_box`; the comptime block asserts that.
     const x = row.x + ring_inset + 64;
     const box: turtle.Rect = .{
         .x = x,
@@ -1882,22 +1835,33 @@ comptime {
     assert(meter_height == 160);
     assert(toggle_height == 40);
     assert(accent_count == 4);
+    // The literal 64 in `name_box` and `side_box` is the label column offset: the ring plus
+    // its inset. `toggle_thumb` hardcodes the thumb travel as 20.
+    assert(ring_inset + ring_size == 64);
+    assert(pill_w - thumb_side - 2 * thumb_inset == 20);
+    // Capsules: the corner radius is half the short side.
+    assert(track_radius * 2 == track_height);
+    assert(pill_radius * 2 == pill_h);
+    assert(meter_radius * 2 == meter_track_w);
+    // Panel, thumb, and two faces per child must fit one draw list.
+    assert(1 + 1 + scroll_child_cap * 2 <= quads.instance_cap);
 }
 
-// Locks slider analytical geometry and worked values at 1280x720:
-// Bounding rect (16, 616, 1248, 24), knob_radius 12, travel 1224.
-// Verifies exact track dimensions (28, 625, 1224, 6), knob disc (628, 616, 24, 24) at value 0.5,
-// and boundary mapping for pointer samples at 640 (0.5), 28 (0.0), and 2000 (clamped to 1.0).
+// Locks the slider's pointer-to-value map, its clamping, and the track and knob placement.
 test "slider value at the worked pointer" {
+    // Rect x = 16, width = 1248, so travel = width - 2 * knob_radius = 1224.
     const rect: turtle.Rect = .{ .x = 16, .y = 616, .width = 1248, .height = 24 };
+    // (640 - 16 - 12) / 1224 = 0.5; x = 28 is the left stop; x = 2000 clamps to the right.
     try std.testing.expectEqual(@as(f32, 0.5), value_at(rect, 640));
     try std.testing.expectEqual(@as(f32, 0), value_at(rect, 28));
     try std.testing.expectEqual(@as(f32, 1), value_at(rect, 2000));
+    // Track: x = 16 + 12, y = 616 + (24 - 6) / 2, width = travel.
     const track = track_rect(rect);
     try std.testing.expectEqual(@as(f32, 28), track.x);
     try std.testing.expectEqual(@as(f32, 625), track.y);
     try std.testing.expectEqual(@as(f32, 1224), track.width);
     try std.testing.expectEqual(@as(f32, 6), track.height);
+    // Knob at value 0.5: x = 16 + 0.5 * 1224, a 24 px disc filling the row height.
     const knob = knob_rect(rect, 0.5);
     try std.testing.expectEqual(@as(f32, 628), knob.x);
     try std.testing.expectEqual(@as(f32, 616), knob.y);
@@ -2000,4 +1964,143 @@ test "slider drag sets an absolute value" {
     try std.testing.expectEqual(@as(u32, 2), list.count);
     try std.testing.expect(slider.handle(.{ .drag = .{ .x = 2000, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 1), slider.value);
+}
+
+const sample_walk: turtle.Walk = .{
+    .margin = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    .width = .fill,
+    .height = .{ .fixed = 0 },
+    .align_x = 0,
+};
+
+const sample_rect: turtle.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+
+// Locks the relative drag rule: upward motion adds `delta / drag_span_px`, the wheel uses the
+// same scale with the opposite sign of `dy`, results clamp to `[0, 1]`, and the formatted
+// text follows the value.
+test "knob drag is relative and clamped" {
+    var knob: Knob = .{
+        .id = 1,
+        .rect = sample_rect,
+        .walk = sample_walk,
+        .name = "k",
+        .value_text = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .value = 0,
+        .accent = accents[0],
+        .hover = animator.Animator.init(hover_rate_per_ms),
+        .drag_y = 0,
+    };
+    knob.set_value(0.25);
+    try std.testing.expectEqualStrings("0.25", knob.value_text[0..4]);
+    // Press at y = 100, then move up 30 px: 30 / drag_span_px = 0.25 added.
+    try std.testing.expect(knob.handle(.{ .down = .{ .x = 0, .y = 100 } }));
+    try std.testing.expect(knob.handle(.{ .drag = .{ .x = 0, .y = 70 } }));
+    try std.testing.expectEqual(@as(f32, 0.5), knob.value);
+    try std.testing.expectEqualStrings("0.50", knob.value_text[0..4]);
+    // A move of exactly drag_span_px down from y = 70 removes the whole range.
+    try std.testing.expect(knob.handle(.{ .drag = .{ .x = 0, .y = 190 } }));
+    try std.testing.expectEqual(@as(f32, 0), knob.value);
+    try std.testing.expect(!knob.handle(.{ .drag = .{ .x = 0, .y = 4000 } }));
+    // Wheel dy = -60 adds 60 / drag_span_px; a further push up clamps at 1.
+    try std.testing.expect(knob.handle(.{ .wheel = .{ .x = 0, .y = 0, .dy = -60 } }));
+    try std.testing.expectEqual(@as(f32, 0.5), knob.value);
+    try std.testing.expect(knob.handle(.{ .wheel = .{ .x = 0, .y = 0, .dy = -4000 } }));
+    try std.testing.expectEqual(@as(f32, 1), knob.value);
+    try std.testing.expectEqualStrings("1.00", knob.value_text[0..4]);
+}
+
+// Locks the toggle thumb travel to the pill interior and the release-inside flip rule.
+test "toggle thumb spans the pill and flips only on an inside release" {
+    var toggle: Toggle = .{
+        .id = 1,
+        .rect = sample_rect,
+        .walk = sample_walk,
+        .name = "t",
+        .on = false,
+        .hover = animator.Animator.init(hover_rate_per_ms),
+        .thumb = settled(hover_rate_per_ms, false),
+    };
+    // Row y = 0 and height = 40, so the pill is centered: y = (40 - 24) / 2 = 8.
+    const row: turtle.Rect = .{ .x = 0, .y = 0, .width = 200, .height = toggle_height };
+    const pill = pill_of(row);
+    const off = toggle_thumb(pill, 0);
+    const on = toggle_thumb(pill, 1);
+    // Off: the thumb sits thumb_inset from the left edge. On: thumb_inset from the right edge.
+    try std.testing.expectEqual(pill.x + thumb_inset, off.x);
+    try std.testing.expectEqual(pill.x + pill.width - thumb_inset, on.x + on.width);
+    try std.testing.expectEqual(pill.y + thumb_inset, off.y);
+    try std.testing.expect(!toggle.handle(.{ .up = .{ .x = 0, .y = 0, .inside = false } }));
+    try std.testing.expect(!toggle.on);
+    try std.testing.expect(toggle.handle(.{ .up = .{ .x = 20, .y = 20, .inside = true } }));
+    try std.testing.expect(toggle.on);
+    try std.testing.expectEqual(@as(f32, 1), toggle.thumb.target);
+    try std.testing.expect(toggle.handle(.{ .up = .{ .x = 20, .y = 20, .inside = true } }));
+    try std.testing.expect(!toggle.on);
+    try std.testing.expectEqual(@as(f32, 0), toggle.thumb.target);
+}
+
+// Locks the meter fill anchoring (bottom edge fixed, grows upward) and the omitted fill at 0.
+test "meter fill grows upward from the track bottom" {
+    var meter: Meter = .{
+        .id = 1,
+        .rect = sample_rect,
+        .walk = sample_walk,
+        .name = "",
+        .value = 0.25,
+    };
+    const row: turtle.Rect = .{ .x = 0, .y = 0, .width = 100, .height = meter_height };
+    const track = meter_track(row);
+    var list = quads.DrawList.init();
+    var glyphs = font.GlyphList.init();
+    meter.draw_row(&list, &glyphs, row, sample_clip);
+    try std.testing.expectEqual(@as(u32, 2), list.count);
+    // Quarter value: fill height = 0.25 * meter_track_h (exact in binary floating point).
+    const fill = list.items[1];
+    try std.testing.expectEqual(@as(f32, 0.25) * meter_track_h, fill.height);
+    try std.testing.expectEqual(track.y + track.height, fill.y + fill.height);
+    try std.testing.expectEqual(track.x, fill.x);
+    var empty = quads.DrawList.init();
+    meter.value = 0;
+    meter.draw_row(&empty, &glyphs, row, sample_clip);
+    try std.testing.expectEqual(@as(u32, 1), empty.count);
+}
+
+// Locks the scrollbar formulas: thumb height, thumb position from the offset, the inverse
+// pointer map, the minimum thumb height, and wheel clamping.
+test "scroll thumb follows the offset and the pointer" {
+    const pad: turtle.Inset = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 };
+    var scroll: Scroll = .{
+        .id = 1,
+        .rect = .{ .x = 0, .y = 0, .width = 320, .height = 200 },
+        .walk = sample_walk,
+        .padding = pad,
+        .children = undefined,
+        .child_count = 0,
+        .scroll_y = 0,
+        .content_h = 368,
+        .press = .none,
+        .hot = null,
+    };
+    // Viewport is 184 tall (200 - 2 * 8) and 304 wide, so max_scroll = 368 - 184 = 184,
+    // thumb_h = 184 * 184 / 368 = 92, and travel = 184 - 92 = 92.
+    try std.testing.expectEqual(@as(f32, 184), scroll.max_scroll());
+    scroll.scroll_y = 92;
+    const thumb = scroll.thumb_rect();
+    try std.testing.expectEqual(@as(f32, 92), thumb.height);
+    // Half the range puts the thumb half the travel below the viewport top: 8 + 46.
+    try std.testing.expectEqual(@as(f32, 54), thumb.y);
+    // The thumb occupies the gutter on the right of the viewport: 8 + 304 - gutter_px.
+    try std.testing.expectEqual(@as(f32, 296), thumb.x);
+    try std.testing.expectEqual(gutter_px, thumb.width);
+    // Inverse map: a pointer at the thumb center (54 + 46 = 100) yields the same offset.
+    try std.testing.expectEqual(@as(f32, 92), scroll.scroll_at_pointer(100));
+    // A tall content makes the raw thumb smaller than the floor: 184 * 184 / 2000 < 24.
+    scroll.content_h = 2000;
+    try std.testing.expectEqual(thumb_min_px, scroll.thumb_rect().height);
+    // A wheel inside the viewport scrolls and clamps at max_scroll; outside is ignored.
+    scroll.content_h = 368;
+    try std.testing.expect(scroll.handle(.{ .wheel = .{ .x = 100, .y = 100, .dy = 500 } }));
+    try std.testing.expectEqual(@as(f32, 184), scroll.scroll_y);
+    try std.testing.expect(!scroll.handle(.{ .wheel = .{ .x = 0, .y = 100, .dy = -500 } }));
+    try std.testing.expectEqual(@as(f32, 184), scroll.scroll_y);
 }

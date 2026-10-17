@@ -2,126 +2,53 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. The `wasm32-freestanding` Execution Model
-//! When targeting the browser, Zig compiles to `wasm32-freestanding`:
-//! - `wasm32`: A 32-bit WebAssembly virtual machine architecture where pointers are 32-bit
-//!   unsigned integers representing byte offsets into a single contiguous linear memory array.
-//! - `freestanding`: Indicates that there is NO underlying operating system, NO standard C
-//!   runtime library (libc), NO POSIX threads, and NO direct access to platform system calls.
-//! - The resulting `.wasm` binary is completely self-contained, deterministic, and contains
-//!   only application code without runtime bloat.
+//! ## 1. Sandbox Boundary and Zero-Copy Memory Sharing
+//! A `wasm32-freestanding` module has no OS, libc, or threads and cannot touch the DOM or
+//! WebGPU. All communication with `web/shell.js` crosses three channels:
+//! - **Exports:** `export_app` publishes every symbol through `@export`; `rdynamic` in
+//!   `build.zig` keeps them in the module and `shell.js` looks each one up by name.
+//! - **Imports:** `present_js` is the only host import (see `gpu.present`).
+//! - **Linear memory:** Pointers are `u32` byte offsets into `wasm.memory.buffer`. JavaScript
+//!   builds typed views over them, so no data is serialized or copied on the Zig side.
 //!
-//! ## 2. The Browser-Wasm Sandbox Boundary
-//! WebAssembly code executes in a memory-isolated sandbox. It cannot directly touch the DOM,
-//! receive browser window events, or invoke WebGPU JavaScript APIs.
-//! All communication is bridged through three explicit channels:
-//! - **Exports (`@export`):** Functions exported dynamically via `export_app(App)` using `@export`
-//!   so JavaScript can call them from the Wasm exports table (`wasm.start()`, `wasm.tick()`,
-//!   `wasm.timer()`, etc.).
-//! - **Imports (`extern "env"`):** JavaScript functions exposed to WebAssembly via the import
-//!   object passed to `WebAssembly.instantiateStreaming` (`present_js()`).
-//! - **Linear Memory (`WebAssembly.Memory`):** A contiguous byte buffer shared between the Wasm
-//!   instance and JavaScript. When `export_memory = true` is set in `build.zig`, JavaScript gains
-//!   direct access to `wasm.memory.buffer` (an `ArrayBuffer`).
+//! ## 2. Zig as the Single Source of Truth for Graphics Layouts
+//! `shell.js` queries the exports below instead of duplicating shader text, strides, theme
+//! bytes, or atlas dimensions. Where `shell.js` still has to hard-code a layout fact (the
+//! `PresentHeader` field offsets, the instance and glyph attribute offsets, the flag bits),
+//! the `comptime` block at the end of this file enforces that fact on the Zig side so a
+//! layout change fails the build instead of silently corrupting the browser decode.
 //!
-//! ## 3. Single Source of Truth for Graphics Layouts
-//! A classic anti-pattern in WebAssembly graphics applications is duplicating buffer sizes,
-//! attribute strides, and shader strings between the backend language and JavaScript.
+//! ## 3. Synchronous Stack-Frame Memory Sharing
+//! `present_frame` builds `draw.PresentHeader` on its own stack and passes three pointers
+//! (header, instances, glyphs) to `present_js`. This is memory safe because host calls are
+//! synchronous on one thread: the engine suspends Zig inside the call, the stack frame stays
+//! intact, and JavaScript must finish reading before control returns. JavaScript must not
+//! retain any of the three pointers or views after `present_js` returns. The upload flags
+//! and counts in the header decide which buffers JavaScript copies (see `draw.UploadCursor`).
 //!
-//! In Patchwork, Zig is the single authoritative source of truth:
-//! - `shader_ptr()` and `shader_len()` expose the embedded `quad.wgsl` source code.
-//! - `glyph_shader_ptr()` and `glyph_shader_len()` expose the embedded `glyph.wgsl` source code.
-//! - `quad_ptr()` and `quad_bytes()` expose the static unit quad vertex coordinates.
-//! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (64 bytes).
-//! - `glyph_stride()` exposes the byte stride of the `Glyph` struct (64 bytes).
-//! - `theme_ptr()` and `theme_len()` expose the 192-byte `Theme` uniform tail.
-//! - `pointer_wheel()` forwards DOM wheel deltas in logical pixels to the event queue.
-//! - `atlas_ptr()` and `atlas_len()` expose the pre-baked 131,072-byte `r8unorm` font atlas buffer.
-//! - `atlas_width()` (512) and `atlas_height()` (256) expose atlas dimensions.
+//! ## 4. Frame Pacing: Dirty Flags, Optional Timer, and rAF Chaining
+//! The browser host does not run an unconditional `requestAnimationFrame` loop, because that
+//! burns power while the UI is idle.
+//! - `start`, `resize`, and every `pointer_*` export return a `u32` dirty flag: 1 when a
+//!   frame is owed (`dirty_flag`), 0 otherwise. `shell.js` schedules one rAF only on 1.
+//! - `timer_period_ms` of 0 means the app has no timer and `shell.js` arms no interval.
+//!   Otherwise `timer` runs the app's timer, requests a redraw if it reports a change, and
+//!   never steps animators or chains rAF.
+//! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
+//!   `.frame`, presents if dirty, and returns 1 only while `app.live()`. Returning 0 ends
+//!   the rAF chain, and `clock.reset` makes the next sample after idle report a zero delta.
+//! - `start` leaves the draw list empty and `relayout` set; the first layout walk happens in
+//!   `present_frame` after `resize` has supplied real canvas dimensions.
+//! - Pointer coordinates are device pixels (canvas backing store), the same unit `resize`
+//!   receives, so layout and hit testing share one frame of reference.
+//! - Timing is host-driven: no Web Workers, no `SharedArrayBuffer`, and no cross-origin
+//!   isolation headers are required.
 //!
-//! When `web/shell.js` bootstraps, it queries these export functions to allocate its GPU buffers,
-//! compile both fixed-function pipelines, and upload the atlas texture. If the shaders or struct
-//! layouts change in Zig, JavaScript adapts automatically without code duplication.
-//!
-//! The 64-byte stride is the instance: rectangle, fill, shape `vec4` (radius, hover, down, kind),
-//! and clip bounds `(clip_x0, clip_y0, clip_x1, clip_y1)`. `instance_stride` asserts 64 here,
-//! and `shell.js` asserts 64 again before it builds the pipeline and before it uploads.
-//! Vertex attribute location 4 at offset 48 carries the clip bounds.
-//! Similarly, `glyph_stride` asserts 64 bytes for `(dest_rect, uv_rect, color, clip)`.
-//!
-//! ## 4. Synchronous Stack-Frame Memory Sharing (Zero-Copy & Zero-Heap)
-//! In `present_frame()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
-//! Zig passes three linear memory pointers across the FFI boundary:
-//! `present_js(header_ptr, instance_ptr, glyph_ptr)`.
-//!
-//! ### Why is this 100% memory safe?
-//! - WebAssembly host calls are **strictly synchronous** and execute on the same thread.
-//! - When Zig invokes `present_js(header_ptr, instance_ptr, glyph_ptr)`, the WebAssembly engine
-//!   halts Zig execution at that instruction while preserving its stack frame in linear memory.
-//! - JavaScript receives `headerPtr`, wraps it in a typed `DataView` over `wasm.memory.buffer`,
-//!   and reads the 104-byte header directly (dimensions, flags, clear, matrix, glyph count).
-//! - If `flags & flag_instances` is set and `count > 0`, JavaScript uploads `count * 64` bytes
-//!   directly from `instance_ptr`.
-//! - If `flags & flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 64`
-//!   bytes directly from `glyph_ptr`.
-//! - When JavaScript returns, control resumes in Zig. Zig marks the cursor and updates the frame.
-//! - Only then is the stack frame popped.
-//! - This achieves zero heap allocation, zero serialization, and zero garbage collection overhead.
-//!
-//! ## 5. Frame Pacing: Optional App Timer, `tick`, and Animation Chaining
-//! Traditional WebGL/WebGPU applications run an unconditional continuous loop with
-//! `requestAnimationFrame`. This burns CPU and GPU power even when displaying static documents
-//! or idle user interfaces.
-//!
-//! In Patchwork:
-//! - `start()` initializes state (`frame`, `list`, `glyphs`, `cursor`, `clock`) and leaves
-//!   the draw list empty (`state.list.count == 0`), setting `relayout = true`.
-//! - When the canvas attaches to the DOM, `web/shell.js` calls `resize(width_px, height_px)` with
-//!   actual physical dimensions, configuring the logical coordinate space and setting `redraw`.
-//! - `resize()` and `start()` return a `u32` dirty flag (1 if dirty, 0 if clean).
-//! - `web/shell.js` schedules a `requestAnimationFrame` **only** when the dirty flag is 1.
-//!
-//! ### `timer(now_ms)` vs `tick(now_ms)`:
-//! - **`timer_period_ms()` and `timer(now_ms)` (Optional App Timer):**
-//!   `web/shell.js` invokes `arm_timer()`, querying `wasm.timer_period_ms()`. When the period is 0
-//!   (such as in the scroll column example), no interval is created and the page idles between
-//!   events. When non-zero (such as 33 ms in the rack example), `arm_timer` sets a permanent
-//!   `setInterval`. On every interval tick, it invokes `wasm.timer(Math.floor(performance.now()))`.
-//!   `timer` calls `app.timer(now_ms)`. If any dynamic value changes, it calls
-//!   `state.frame.request_redraw()` and returns 1. If it returns 1, `shell.js` calls `schedule()`
-//!   to request one `requestAnimationFrame`. Crucially, `timer` does NOT advance widget animators
-//!   and does not chain rAF.
-//! - **`tick(now_ms)` (Animator Step & Presentation):**
-//!   When rAF runs, it calls `wasm.tick(Math.floor(now))`. `tick` advances `animator.Clock`,
-//!   feeds the delta to `app.event(.{ .frame = dt_ms })`, presents if dirty, and returns 1
-//!   **only** while an interactive animator is still moving (`app.live()`):
-//!   ```javascript
-//!   if (wasm.tick(Math.floor(now)) === 1) {
-//!       schedule();
-//!   }
-//!   ```
-//! - **Why rAF Stops When Animators Settle:**
-//!   Once hover and press transitions settle, `tick()` returns 0 and the animation frame
-//!   callback loop terminates. A resting pointer does not chain continuous rAF frames. Instead,
-//!   subsequent frame renders are triggered on demand by user input or by `wasm.timer()` when an
-//!   app timer is active.
-//! - **Zero Workers and No Shared Memory:**
-//!   This host-driven timing requires no background Web Workers, no `SharedArrayBuffer`, and no
-//!   cross-origin isolation headers (`COOP`/`COEP`); `serve.zig` is unchanged.
-//! - `pointer_move`, `pointer_down`, `pointer_up`, `pointer_wheel`, and `pointer_leave` call
-//!   `app.event(...)` directly and return the dirty flag. Press and release carry
-//!   device-pixel coordinates (`offsetX * devicePixelRatio`).
-//! - Layout runs only when `frame.relayout` is set. `app.layout` recalculates widget geometry,
-//!   so a resize keeps hover on the widget that still contains it.
-//! - A scale-only present leaves `app.dirty()` false and does not rebuild instances.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Static Allocation:** `State` is statically allocated in Wasm BSS linear memory.
-//!   Zero dynamic memory allocations at runtime.
-//! - **Comptime Consistency:** Hardware buffer byte counts (`quad_bytes`, `uniform_bytes`,
-//!   `instance_stride = 64`) are asserted at compile time.
-//! - **Bounded Operations:** `tick`, `start`, `resize`, and pointer entry points execute in
-//!   bounded O(1) time without unbounded recursion or dynamic reallocation.
+//! ## 5. TigerStyle Invariants
+//! - `State` and the app live in static (BSS) linear memory; there is no runtime allocation.
+//! - Buffer sizes and strides shared with the browser are checked at compile time (see the
+//!   `comptime` block at the end of this file and "export ABI scalars match source constants").
+//! - Every export runs in bounded time with no recursion.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -134,93 +61,91 @@ const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const theme = @import("../theme.zig");
 
-/// Returns the memory address of the embedded WGSL shader source code.
-/// JavaScript uses this pointer to decode the WGSL string and compile the pipeline.
+/// Linear-memory address of the embedded quad WGSL source (`draw.shader_file`).
 fn shader_ptr() callconv(.c) [*]const u8 {
     assert(draw.shader_file.len >= 1);
     assert(draw.instance_stride == 64);
     return draw.shader_file.ptr;
 }
 
-/// Returns the byte length of the embedded WGSL shader source code.
+/// Byte length of the quad WGSL source.
 fn shader_len() callconv(.c) u32 {
     assert(draw.shader_file.len >= 1);
     return @intCast(draw.shader_file.len);
 }
 
-/// Returns the memory address of the static unit quad vertex coordinates.
-/// JavaScript reads 48 bytes from this address to populate the GPU vertex buffer.
+/// Linear-memory address of `draw.unit_quad`. JavaScript reads `quad_bytes()` bytes from it.
 fn quad_ptr() callconv(.c) [*]const f32 {
     assert(draw.quad_bytes == 48);
     return &draw.unit_quad;
 }
 
-/// Returns the byte size of the unit quad vertex buffer (48 bytes).
+/// Byte size of the unit quad vertex buffer (`draw.quad_bytes`).
 fn quad_bytes() callconv(.c) u32 {
     assert(draw.unit_quad.len == 12);
     return draw.quad_bytes;
 }
 
-/// Returns the byte stride between instances (64 bytes).
-///
-/// JavaScript asserts the same 64 before creating the pipeline and again before
-/// `writeBuffer`. Four `vec4` attributes: rect, fill, shape, and clip.
+/// Byte stride of `draw.Instance` (`draw.instance_stride`). `shell.js` checks it against its
+/// own hard-coded attribute layout; the offsets it assumes are enforced by the `comptime`
+/// block at the end of this file.
 fn instance_stride() callconv(.c) u32 {
     assert(draw.instance_stride == 64);
     return draw.instance_stride;
 }
 
-/// Glyph shader source. `shell.js` compiles this as the second module.
+/// Linear-memory address of the glyph WGSL source (`font.shader_file`).
 fn glyph_shader_ptr() callconv(.c) [*]const u8 {
     assert(font.shader_file.len >= 1);
     assert(font.glyph_stride == 64);
     return font.shader_file.ptr;
 }
 
-/// Returns the byte length of the embedded `src/glyph.wgsl` shader source.
+/// Byte length of the glyph WGSL source.
 fn glyph_shader_len() callconv(.c) u32 {
     assert(font.shader_file.len >= 1);
     return @intCast(font.shader_file.len);
 }
 
-/// Byte stride of one glyph quad (64 bytes). The browser asserts 64 before upload.
+/// Byte stride of `font.Glyph` (`font.glyph_stride`).
 fn glyph_stride() callconv(.c) u32 {
     assert(font.glyph_stride == 64);
     return font.glyph_stride;
 }
 
-/// Address of the 192-byte theme. `shell.js` writes it at uniform offset 64.
+/// Linear-memory address of `theme.chrome`. `shell.js` writes it right after the matrix,
+/// at uniform offset `draw.matrix_bytes`.
 fn theme_ptr() callconv(.c) [*]const u8 {
     assert(@sizeOf(theme.Theme) == 192);
     return @ptrCast(&theme.chrome);
 }
 
-/// Byte length of the theme uniform tail.
+/// Byte length of the theme record (`theme.bytes`).
 fn theme_len() callconv(.c) u32 {
     assert(theme.bytes == 192);
     return theme.bytes;
 }
 
-/// Returns the memory address of the pre-baked 512 x 256 `r8unorm` font coverage atlas.
-/// JavaScript reads 131,072 bytes from this pointer to upload the WebGPU texture once at startup.
+/// Linear-memory address of the pre-baked `r8unorm` coverage atlas (`font.atlas_bytes`).
+/// JavaScript uploads it once at startup; rows are `atlas_width()` bytes with no padding.
 fn atlas_ptr() callconv(.c) [*]const u8 {
     assert(font.atlas_bytes.len == 131072);
     return font.atlas_bytes.ptr;
 }
 
-/// Returns the exact byte size of the font coverage atlas (131,072 bytes).
+/// Byte size of the atlas, equal to `atlas_width() * atlas_height()` for one byte per texel.
 fn atlas_len() callconv(.c) u32 {
     assert(font.atlas_bytes.len == 131072);
     return 131072;
 }
 
-/// Returns the horizontal pixel width of the font coverage atlas (512 texels).
+/// Atlas width in texels (`font.atlas_width`).
 fn atlas_width() callconv(.c) u32 {
     assert(font.atlas_width == 512);
     return font.atlas_width;
 }
 
-/// Returns the vertical pixel height of the font coverage atlas (256 texels).
+/// Atlas height in texels (`font.atlas_height`).
 fn atlas_height() callconv(.c) u32 {
     assert(font.atlas_height == 256);
     return font.atlas_height;
@@ -228,8 +153,7 @@ fn atlas_height() callconv(.c) u32 {
 
 /// Exports the whole browser surface for one app type. Called once, in a `comptime` block,
 /// from `src/host/web_main.zig`. `export fn` cannot live inside a generic struct, so every
-/// symbol goes through `@export`. `rdynamic` in `build.zig` keeps them in the module and
-/// `web/shell.js` looks each one up by the names below.
+/// symbol goes through `@export`; the names are the contract with `web/shell.js`.
 pub fn export_app(comptime App: type) void {
     comptime app_contract.check(App);
     const Web = WebApp(App);
@@ -259,8 +183,7 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.tick, .{ .name = "tick" });
 }
 
-/// The app-facing half of the browser host. `state` and `app` are statically allocated in
-/// Wasm linear memory (BSS). There is no dynamic allocation.
+/// The app-facing half of the browser host. `state` and `app` are static (BSS) storage.
 fn WebApp(comptime App: type) type {
     return struct {
         const State = struct {
@@ -281,14 +204,10 @@ fn WebApp(comptime App: type) type {
 
         var app: App = undefined;
 
-        /// Initializes the application state and leaves the draw list empty.
-        ///
-        /// Called once by JavaScript after the WebGPU pipeline is compiled.
-        /// This does not populate instances during startup; `state.list.count` remains 0
-        /// and `state.frame.relayout` is initialized to true. The initial layout walk is
-        /// deferred to `tick`, after `resize` has configured the true canvas dimensions.
-        ///
-        /// Returns 1 if a frame should be scheduled via `requestAnimationFrame`, or 0 if clean.
+        /// Resets host state and initializes the app. Called once by JavaScript after the
+        /// pipeline is compiled. The draw list stays empty and `relayout` stays set because
+        /// the first layout needs the canvas size that only `resize` supplies.
+        /// Returns the dirty flag (see `dirty_flag`).
         fn start() callconv(.c) u32 {
             state.frame = frame.Frame.init();
             state.list = draw.DrawList.init();
@@ -303,9 +222,8 @@ fn WebApp(comptime App: type) type {
             return dirty_flag();
         }
 
-        /// Informs the Zig runtime of a canvas resize event in physical pixels.
-        /// Updates logical and physical dimensions and sets the dirty redraw flag.
-        /// Returns 1 if a frame should be scheduled via `requestAnimationFrame`, or 0 if clean.
+        /// Applies a canvas size in physical pixels; both must be nonzero. Layout then runs in
+        /// logical pixels derived by `frame.Frame.apply_configure`. Returns the dirty flag.
         fn resize(width_px: u32, height_px: u32) callconv(.c) u32 {
             assert(state.frame.running);
             state.frame.apply_configure(width_px, height_px);
@@ -314,7 +232,7 @@ fn WebApp(comptime App: type) type {
         }
 
         /// Pointer moved. `(x, y)` are device pixels, matching the canvas backing store.
-        /// `shell.js` passes `offsetX * devicePixelRatio`. Returns 1 when a frame is owed.
+        /// Returns the dirty flag.
         fn pointer_move(x: f32, y: f32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
@@ -335,8 +253,8 @@ fn WebApp(comptime App: type) type {
             return note_event(.{ .pointer_up = .{ .x = x, .y = y } });
         }
 
-        /// Wheel at device-pixel `(x, y)`. `dy` is in the same pixel unit as the pointer.
-        /// Positive `dy` scrolls the column downward.
+        /// Wheel at device-pixel `(x, y)`. `dy` is in the same unit as the pointer coordinates;
+        /// positive `dy` scrolls content downward.
         fn pointer_wheel(x: f32, y: f32, dy: f32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
@@ -351,15 +269,15 @@ fn WebApp(comptime App: type) type {
             return note_event(.pointer_leave);
         }
 
-        /// Host timer period in milliseconds. 0 means the app has no timer, and `shell.js`
-        /// arms no `setInterval`.
+        /// Host timer period in milliseconds, bounded by `app_contract.timer_period_ms_max`.
+        /// Zero means the app has no timer.
         fn timer_period_ms() callconv(.c) u32 {
             assert(App.config.timer_period_ms <= app_contract.timer_period_ms_max);
             return App.config.timer_period_ms;
         }
 
-        /// Calls the app's `timer`. Returns 1 when a frame is owed. Does not step
-        /// animators. The interval in `shell.js` requests the next frame.
+        /// Calls the app's `timer`. Only valid when the app declared a timer period. Returns
+        /// the dirty flag. Does not step animators; the host interval owns the cadence.
         fn timer(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(App.config.timer_period_ms != 0);
@@ -370,9 +288,9 @@ fn WebApp(comptime App: type) type {
             return dirty_flag();
         }
 
-        /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1
-        /// while any animator is still live so `shell.js` chains `requestAnimationFrame`.
-        /// The first sample after idle has dt 0. A settled app returns 0 and the chain stops.
+        /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1 only
+        /// while an animator is live so `shell.js` chains another rAF. The first sample after
+        /// idle has dt 0 (see `animator.Clock.advance`).
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             const dt_ms = state.clock.advance(now_ms);
@@ -416,7 +334,8 @@ fn WebApp(comptime App: type) type {
                 app.draw(&state.list, &state.glyphs);
             }
             assert(!app.dirty());
-            // The header lives on this stack until present_js returns, so JS can read it safely.
+            // The header must outlive the host call; module guide section 3 explains why the
+            // stack is safe.
             var header: draw.PresentHeader = undefined;
             draw.fill_header(&header, .{
                 .list = &state.list,
@@ -444,7 +363,8 @@ fn WebApp(comptime App: type) type {
             assert(!app.dirty());
         }
 
-        /// Helper that checks if a redraw is owed and the window has valid dimensions.
+        /// 1 when a redraw is owed and the canvas has a nonzero size, else 0. A zero-size
+        /// canvas cannot be presented, so no frame is requested for it.
         fn dirty_flag() u32 {
             if (state.frame.redraw) {
                 if (state.frame.width_px != 0) {
@@ -454,4 +374,54 @@ fn WebApp(comptime App: type) type {
             return 0;
         }
     };
+}
+
+comptime {
+    // `web/shell.js` decodes `PresentHeader` with hard-coded offsets and configures vertex
+    // attributes with hard-coded offsets. JavaScript cannot be checked at compile time, so
+    // every offset it assumes is pinned here; changing a layout fails the build and forces
+    // the matching edit in `web/shell.js`.
+    assert(@offsetOf(draw.PresentHeader, "width_px") == 0);
+    assert(@offsetOf(draw.PresentHeader, "height_px") == 4);
+    assert(@offsetOf(draw.PresentHeader, "instance_count") == 8);
+    assert(@offsetOf(draw.PresentHeader, "flags") == 12);
+    assert(@offsetOf(draw.PresentHeader, "clear_r") == 16);
+    assert(@offsetOf(draw.PresentHeader, "clear_a") == 28);
+    assert(@offsetOf(draw.PresentHeader, "ortho") == 32);
+    assert(@offsetOf(draw.PresentHeader, "glyph_count") == 96);
+    assert(@sizeOf(draw.PresentHeader) == 104);
+    assert(draw.flag_instances == 1);
+    assert(draw.flag_uniform == 2);
+    assert(draw.flag_glyphs == 4);
+    assert(draw.matrix_bytes == @sizeOf([16]f32));
+
+    // Both pipelines share one four-attribute vertex layout, so Instance and Glyph must agree
+    // on where each vec4 group starts.
+    assert(@offsetOf(draw.Instance, "x") == 0);
+    assert(@offsetOf(draw.Instance, "r") == 16);
+    assert(@offsetOf(draw.Instance, "radius") == 32);
+    assert(@offsetOf(draw.Instance, "clip_x0") == 48);
+    assert(@offsetOf(font.Glyph, "x") == 0);
+    assert(@offsetOf(font.Glyph, "u0") == 16);
+    assert(@offsetOf(font.Glyph, "r") == 32);
+    assert(@offsetOf(font.Glyph, "clip_x0") == 48);
+    assert(draw.instance_stride == font.glyph_stride);
+
+    // `shell.js` sizes both vertex buffers with one shared capacity constant.
+    assert(draw.instance_cap == font.glyph_cap);
+    assert(font.atlas_bytes.len == font.atlas_width * font.atlas_height);
+}
+
+// Locks the invariant that each exported scalar reports the Zig constant it is documented
+// to mirror, so `shell.js` validation against these exports cannot drift from the source.
+test "export ABI scalars match source constants" {
+    try std.testing.expectEqual(draw.instance_stride, instance_stride());
+    try std.testing.expectEqual(draw.quad_bytes, quad_bytes());
+    try std.testing.expectEqual(font.glyph_stride, glyph_stride());
+    try std.testing.expectEqual(theme.bytes, theme_len());
+    try std.testing.expectEqual(font.atlas_width, atlas_width());
+    try std.testing.expectEqual(font.atlas_height, atlas_height());
+    try std.testing.expectEqual(atlas_width() * atlas_height(), atlas_len());
+    try std.testing.expectEqual(@as(u32, @intCast(draw.shader_file.len)), shader_len());
+    try std.testing.expectEqual(@as(u32, @intCast(font.shader_file.len)), glyph_shader_len());
 }

@@ -1,46 +1,48 @@
-//! Hand-Written Wayland xdg-shell v1 Protocol Dispatch Tables.
+//! Hand-written `xdg-shell` (version 1) interface tables and request wrappers.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Why Hand-Written Protocol Tables Instead of `wayland-scanner`?
-//! In conventional C/C++ Wayland applications, protocol bindings are produced by running
-//! `wayland-scanner client-header` and `wayland-scanner private-code` on `xdg-shell.xml`.
-//! This introduces external toolchain dependencies and generates verbose C glue code that must
-//! either be committed to the repository or produced by complex build-system hooks.
+//! ## 1. Why Hand-Written Tables Instead of `wayland-scanner`
+//! `wayland-scanner` generates C glue from `xdg-shell.xml`, which would add a tool to the
+//! build and generated code to either commit or produce through build hooks. The repository
+//! allows no dependency beyond the Zig toolchain, so the subset of `xdg_wm_base`,
+//! `xdg_surface`, and `xdg_toplevel` that a plain window needs is written out as
+//! `WlInterface` and `WlMessage` tables. `xdg_positioner` and `xdg_popup` are present only
+//! as empty interfaces because other messages name them in their type lists.
 //!
-//! In Patchwork:
-//! - We avoid `wayland-scanner` completely by specifying the minimal subset of `xdg-shell`
-//!   v1 interfaces (`WlInterface`, `WlMessage`, opcode indices, and listener function pointer
-//!   tables) directly in Zig according to the Wayland wire protocol specification.
-//! - Only the essential desktop surface lifecycle methods are bound: `xdg_wm_base` (ping/pong,
-//!   surface creation), `xdg_surface` (configure, ack_configure), and `xdg_toplevel` (title,
-//!   app_id, close events).
+//! ## 2. Wire Signatures
+//! `WlMessage.signature` uses the Wayland type letters: `u` unsigned, `i` signed, `s`
+//! string, `o` object, `n` new object, `a` array, and a `?` prefix for a nullable argument.
+//! `types` is indexed by argument position and consulted only for object and new-object
+//! arguments, so a table may stop after the last such argument. libwayland reads these tables
+//! at runtime, so a wrong count or order corrupts the wire format instead of failing to
+//! compile.
 //!
-//! ## 2. Wayland Wire Protocol & Type Signatures
-//! Wayland's IPC mechanism passes binary event/request structures over a Unix domain socket.
-//! In `WlMessage`:
-//! - `signature` encodes the serialized parameter types using Wayland type specifiers:
-//!   - `u`: 32-bit unsigned integer (e.g. configure serial, ping serial).
-//!   - `i`: 32-bit signed integer (e.g. width, height).
-//!   - `s`: Null-terminated string (e.g. window title, app ID).
-//!   - `o`: Object ID / proxy handle (`*WlProxy`).
-//!   - `n`: New object ID created by the request.
-//!   - `a`: Byte array (`WlArray`).
-//!   - `?`: Indicates that an object argument is nullable.
-//! - `types` points to an array of interface pointers validating the object types in the signature.
+//! ## 3. Opcodes and Marshalling
+//! Requests go through the variadic `wl_proxy_marshal_flags`. A request's opcode is its
+//! 0-based index in the interface's request table. The wrappers pass opcodes as literals, so
+//! `assert_interface_tables` derives each opcode from the table by name and asserts they
+//! agree. It also checks that every declared count equals its table length and that listener
+//! slot counts equal event counts, because libwayland indexes listeners by event opcode.
+//! `linux_window.zig` evaluates it at compile time.
 //!
-//! ## 3. The Proxy Marshaling Mechanism (`wl_proxy_marshal_flags`)
-//! Rather than compiling a separate C dispatch stub for every request, `libwayland-client`
-//! provides `wl_proxy_marshal_flags`.
-//! - Requests are issued by passing the proxy pointer, the 0-based opcode index in the interface's
-//!   method table, the target interface, and variable arguments.
-//! - The compositor processes these requests asynchronously. Incoming events are dispatched by
-//!   `wl_display_dispatch_pending()` through the listener callbacks registered via
-//!   `wl_proxy_add_listener()`.
+//! ## 4. Configure / Ack Protocol
+//! The compositor sends `xdg_toplevel.configure` (suggested size, 0 meaning no preference)
+//! and then `xdg_surface.configure(serial)`. The client must answer the latter with
+//! `ack_configure(serial)` before committing content for that configure. `linux_window.zig`
+//! records both events and acknowledges once per loop iteration. A `xdg_wm_base.ping` must be
+//! answered with `pong(serial)` or the compositor may mark the client unresponsive.
+//!
+//! ## 5. Ownership
+//! `WlProxy` and the typed proxy handles are opaque pointers owned by libwayland. A listener
+//! table passed to `add_*_listener` must outlive its proxy. Listener registration fails (and
+//! is asserted) if the proxy already has a listener.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// C layout of libwayland's `struct wl_interface`. Field order and the `i32` counts are ABI,
+/// so this must stay an `extern struct`; see the `comptime` block for the table checks.
 pub const WlInterface = extern struct {
     name: [*:0]const u8,
     version: i32,
@@ -50,6 +52,8 @@ pub const WlInterface = extern struct {
     events: ?[*]const WlMessage,
 };
 
+/// C layout of libwayland's `struct wl_message`. `signature` and `types` are described in the
+/// module guide.
 pub const WlMessage = extern struct {
     name: [*:0]const u8,
     signature: [*:0]const u8,
@@ -61,12 +65,14 @@ pub const WlSurface = opaque {};
 pub const XdgWmBase = opaque {};
 pub const XdgSurface = opaque {};
 pub const XdgToplevel = opaque {};
+/// C layout of libwayland's `struct wl_array`. Borrowed from libwayland; never freed here.
 pub const WlArray = extern struct {
     size: usize,
     alloc: usize,
     data: ?*anyopaque,
 };
 
+/// Core interfaces exported by `libwayland-client.so.0`, named here for type lists.
 pub extern const wl_surface_interface: WlInterface;
 pub extern const wl_seat_interface: WlInterface;
 pub extern const wl_output_interface: WlInterface;
@@ -215,6 +221,8 @@ pub const XdgToplevelListener = extern struct {
     close: *const fn (data: ?*anyopaque, toplevel: ?*XdgToplevel) callconv(.c) void,
 };
 
+/// `xdg_wm_base.get_xdg_surface`: gives `surface` the xdg role object. Assigning a role is
+/// permanent for the `wl_surface`.
 pub fn get_xdg_surface(base: *XdgWmBase, surface: *WlSurface) *XdgSurface {
     const proxy: *WlProxy = @ptrCast(base);
     const version = wl_proxy_get_version(proxy);
@@ -231,6 +239,7 @@ pub fn get_xdg_surface(base: *XdgWmBase, surface: *WlSurface) *XdgSurface {
     return @ptrCast(result.?);
 }
 
+/// `xdg_wm_base.pong`: answers a `ping` with the same `serial`.
 pub fn pong(base: *XdgWmBase, serial: u32) void {
     const proxy: *WlProxy = @ptrCast(base);
     const version = wl_proxy_get_version(proxy);
@@ -238,6 +247,7 @@ pub fn pong(base: *XdgWmBase, serial: u32) void {
     assert(serial != 0 or serial == 0);
 }
 
+/// `xdg_surface.get_toplevel`: makes the xdg surface a top-level window.
 pub fn get_toplevel(surface: *XdgSurface) *XdgToplevel {
     const proxy: *WlProxy = @ptrCast(surface);
     const version = wl_proxy_get_version(proxy);
@@ -253,6 +263,7 @@ pub fn get_toplevel(surface: *XdgSurface) *XdgToplevel {
     return @ptrCast(result.?);
 }
 
+/// `xdg_surface.ack_configure`: acknowledges the `serial` of a received configure.
 pub fn ack_configure(surface: *XdgSurface, serial: u32) void {
     const proxy: *WlProxy = @ptrCast(surface);
     const version = wl_proxy_get_version(proxy);
@@ -260,6 +271,7 @@ pub fn ack_configure(surface: *XdgSurface, serial: u32) void {
     assert(version >= 1);
 }
 
+/// `xdg_toplevel.set_title`: UTF-8 window title; `title` must be NUL-terminated.
 pub fn set_title(toplevel: *XdgToplevel, title: [*:0]const u8) void {
     const proxy: *WlProxy = @ptrCast(toplevel);
     const version = wl_proxy_get_version(proxy);
@@ -267,6 +279,7 @@ pub fn set_title(toplevel: *XdgToplevel, title: [*:0]const u8) void {
     assert(version >= 1);
 }
 
+/// `xdg_toplevel.set_app_id`: application identifier the compositor uses to group windows.
 pub fn set_app_id(toplevel: *XdgToplevel, app_id: [*:0]const u8) void {
     const proxy: *WlProxy = @ptrCast(toplevel);
     const version = wl_proxy_get_version(proxy);
@@ -299,4 +312,44 @@ pub fn add_toplevel_listener(
 ) void {
     const rc = wl_proxy_add_listener(@ptrCast(toplevel), listener, data);
     assert(rc == 0);
+}
+
+/// Index of the message called `name` in `messages`. Evaluated at compile time to tie the
+/// literal opcodes in the request wrappers to the interface tables.
+fn opcode_of(comptime messages: []const WlMessage, comptime name: []const u8) u32 {
+    comptime {
+        for (messages, 0..) |message, index| {
+            if (std.mem.eql(u8, std.mem.span(message.name), name)) return @intCast(index);
+        }
+        @compileError("no message named " ++ name);
+    }
+}
+
+/// Compile-time consistency checks between the tables, listeners, and request opcodes.
+/// They live in a function, called from a `comptime` block in `linux_window.zig`, because
+/// reading the interface tables makes the compiler reference the extern libwayland interface
+/// symbols, and unit-test builds link no `wayland-client`.
+pub fn assert_interface_tables() void {
+    comptime {
+        // libwayland trusts the declared counts, so they must equal the table lengths.
+        assert(xdg_wm_base_interface.method_count == wm_base_requests.len);
+        assert(xdg_wm_base_interface.event_count == wm_base_events.len);
+        assert(xdg_surface_interface.method_count == surface_requests.len);
+        assert(xdg_surface_interface.event_count == surface_events.len);
+        assert(xdg_toplevel_interface.method_count == toplevel_requests.len);
+        assert(xdg_toplevel_interface.event_count == toplevel_events.len);
+
+        // Listeners are indexed by event opcode, so slot counts must equal event counts.
+        assert(@typeInfo(XdgWmBaseListener).@"struct".fields.len == wm_base_events.len);
+        assert(@typeInfo(XdgSurfaceListener).@"struct".fields.len == surface_events.len);
+        assert(@typeInfo(XdgToplevelListener).@"struct".fields.len == toplevel_events.len);
+
+        // The wrappers pass opcodes as literals; these asserts tie them to the tables.
+        assert(opcode_of(&wm_base_requests, "get_xdg_surface") == 2);
+        assert(opcode_of(&wm_base_requests, "pong") == 3);
+        assert(opcode_of(&surface_requests, "get_toplevel") == 1);
+        assert(opcode_of(&surface_requests, "ack_configure") == 4);
+        assert(opcode_of(&toplevel_requests, "set_title") == 2);
+        assert(opcode_of(&toplevel_requests, "set_app_id") == 3);
+    }
 }

@@ -1,0 +1,138 @@
+---
+description: >-
+  Standards for writing and maintaining contract-focused code documentation and architectural
+  reviewer guides; worked numbers live in tests, not prose
+alwaysApply: true
+---
+
+# Contract-Focused Code Documentation Standards
+
+## Model Preference
+- **Preferred model**: Use Claude Sonnet 5.5 (`claude-sonnet-5-5-high`) when writing, auditing,
+  or updating documentation, whenever a model choice is available.
+- **Not a hard requirement**: No specific model is mandated. Any model may author or update docs,
+  and the standards below apply regardless of who writes them.
+- **Workflow Role**: Whenever features, shaders, data structures, or platform bindings are
+  added, modified, or refactored, update the affected guides and docstrings in the same change.
+
+## Guiding Principle: Document Contracts, Test Numbers
+
+Documentation drift is the main risk to a heavily commented codebase. When roughly a third or
+more of the lines are comments, every demo tweak or constant change can silently falsify prose.
+To keep docs trustworthy at library scale:
+
+- **Docs describe contracts.** A contract is something callers, reviewers, or the other side of
+  an FFI boundary can rely on: invariants, preconditions, postconditions, units, coordinate
+  spaces, ownership, lifetimes, error behavior, and layout rules.
+- **Tests hold worked numbers.** Concrete values, worked examples, golden outputs, and
+  numeric walk-throughs belong in tests, where a regression fails the build instead of
+  rotting quietly.
+- **Prefer enforcement over prose.** If a fact can be a `comptime` assert, a test, or a
+  type-system constraint, encode it there and make the comment point at it. A comment that
+  restates an enforced fact must reference the enforcing assert or test by name.
+- **Rationale ages slowly; values age fast.** Spend words on *why*, and avoid restating *what*
+  the code already says.
+
+### What must NOT appear in module guides or item docs
+- Demo-specific or scene-specific numbers (instance counts, window sizes, example colors,
+  sample positions, frame timings, tuned constants from a particular demo).
+- Values duplicated from a constant defined elsewhere. Name the constant instead
+  (for example, "see `instance_stride_bytes`") rather than copying its value.
+- Narration of what the next line does, changelog-style history, or "currently" / "for now"
+  statements that describe the present state of an example app.
+- Hand-computed numeric results that no test checks.
+
+### What SHOULD appear
+- Layout and ABI facts that are part of a stable interface (field order, alignment rules,
+  padding rationale, endianness, ownership at the Wasm/C boundary). Back each with a
+  `comptime` assert on `@sizeOf`, `@alignOf`, or `@offsetOf` so a change fails the build.
+- Spec-mandated limits (for example WebGPU's uniform offset alignment requirement), cited
+  by spec name and section, stated as a rule and referenced by a named constant.
+- Vendor or upstream workarounds, with the affected version, root cause, and the condition
+  under which the workaround can be deleted.
+- Derivations stated symbolically (variables and formulas), never with demo values.
+
+## Documentation Structure & Requirements
+
+### 1. Module-Level Architectural Guides (`//!` in Zig, top of WGSL/JS)
+Every core file begins with a structured `# Deep Architectural Guide for Reviewers:`.
+Include only the sections that apply to the module, and keep each one to contracts and
+rationale:
+
+1. **Core Problem & Rationale ("Why")**: Why the chosen approach exists over naive or
+   legacy alternatives (for example hardware instancing vs immediate geometry, blocking poll
+   vs timer ticks, zero-copy linear memory vs serialization).
+2. **Coordinate Spaces & Derivations**:
+   - Define coordinate frames explicitly (for example UI logical pixels, top-left origin,
+     Y-down, clip space, NDC).
+   - State transformations and matrix formulations symbolically, with the convention
+     (row/column-major, handedness) spelled out.
+   - For shaders and distance fields, give the analytical equations (for example SDF form,
+     `fwidth` screen derivatives, coverage calculation) in terms of variables.
+   - Use standard Markdown, code blocks, or clean ASCII/Unicode notation rather than raw
+     LaTeX (avoid `$`, `$$`, `\text{}`, `\times`, `\frac{}`), so it renders crisply in
+     IDE hover tooltips.
+   - Worked numeric examples go in the matching test, referenced by test name.
+3. **Hardware, Spec Limits, and C ABI Layouts**:
+   - Document specification rules and the hardware reason behind them.
+   - Describe struct and vertex buffer layout as rules (order, alignment, padding purpose).
+     Byte offsets and strides are allowed only when enforced by `comptime` asserts.
+4. **State Machines & Data Flow**:
+   - Lifecycle steps (for example dirty tracking, configure/ack cycles, upload flags).
+   - ASCII or Mermaid diagrams where they clarify ordering or ownership.
+5. **Cross-Platform Seams & FFI**:
+   - Wasm linear memory ownership, zero-copy pointer exchange rules, and C ABI conventions.
+   - Upstream bugs or vendor workarounds, with versions and root causes.
+6. **TigerStyle Invariants**:
+   - Static memory bounds, zero runtime allocation, split assertions, and bounded execution,
+     stated as properties the module guarantees.
+
+Guides must remain valid if demo content, tuned constants, or example apps change. If a
+sentence would become false after such a change, rewrite it as a contract or move it to a test.
+
+### 2. Item-Level Documentation (`///` in Zig, JSDoc in JS)
+- **Functions**: Document coordinate spaces, units (for example logical vs device pixels),
+  preconditions, error cases, and what is clamped vs rejected. For CPU/shader twins
+  (for example `sdf_box`), cross-reference the counterpart implementation and the test
+  that locks their agreement, by name, without copying its values.
+- **Structs & Constants**: Document meaning, units, padding rationale, and alignment
+  rules. Do not restate a constant's value in its doc comment.
+- **Tests**: Each test is preceded by a short plain `//` comment (Zig rejects `///` on
+  `test` declarations) stating the invariant or regression it locks. The worked numbers themselves live in the test body, with enough inline context
+  for a reviewer to verify them by hand.
+
+## Comment Hygiene
+- Explain *why* in full sentences. Do not narrate *what* the code obviously does.
+- Treat comment volume as a cost: every line must be maintained. Delete a comment that is
+  no longer true instead of leaving it, and delete a comment that adds nothing over the code.
+- When changing behavior, search for prose that mentions it (names, constants, test names)
+  and update or remove it in the same change.
+- Reviewers should reject documentation that cannot be falsified by a test, assert, or type
+  unless it is pure rationale.
+
+## Example: Top-Level Module Guide Structure
+
+```zig
+//! 2D Instanced Quad Rendering, Orthographic Projections, and SDF Boxes.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. Why Instanced Unit Quads Instead of Immediate Geometry?
+//! [Rationale: CPU-GPU bandwidth, allocation churn, single draw call. No scene numbers.]
+//!
+//! ## 2. Y-Down Orthographic Projection
+//! [Define pixel and NDC frames, state the linear map symbolically, name the matrix
+//! convention. Worked values: see test "projection maps corners to NDC corners".]
+//!
+//! ## 3. WebGPU Uniform Offset Alignment
+//! [Cite spec name and section, state the rule, point at the named constant and the
+//! comptime assert that enforces the padding.]
+//!
+//! ## 4. Dirty Tracking (UploadCursor)
+//! [Contract: when a revision bump forces an upload, what the primed flag guarantees,
+//! which dimension changes invalidate GPU state.]
+//!
+//! ## 5. Rounded-Box Distance Field and Instance Layout
+//! [Analytic SDF in variables, radius clamping rule, attribute padding purpose. Layout
+//! sizes are enforced by comptime asserts on the instance struct, not restated here.]
+```

@@ -1,111 +1,59 @@
-//! Retained demo: synthesizer rack of three panels, twelve knobs, and three meters.
+//! Retained demo: a synthesizer rack of panels, each holding a row of knobs and a level meter.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! Production audio workstation and modular synthesizer interfaces present dense groupings of
-//! parameters organized into hardware-style equipment racks.
+//! ## 1. Why a Flat Widget List
+//! The rack is one flat array of sibling widgets in `ui.Scene(Widget, widget_cap)` rather than
+//! a tree of container widgets. A tree would duplicate the pointer and gesture arbitration
+//! that `Scene` and `Scroll` already own. `Scene` hit-tests from the last slot to the first,
+//! so a knob or meter, stored after its panel, wins over the panel behind it. Only layout
+//! knows which widgets belong to which panel.
 //!
-//! Patchwork implements this running example as a modular synthesizer rack:
-//! - **Three Equipment Panels:** Oscillator (`osc`), Filter (`filter`), and Amplifier (`amp`)
-//!   stacked vertically across the window.
-//! - **Why the Rack is a Flat Widget List:** Rather than introducing a hierarchical tree of
-//!   nested container widgets (which would duplicate the pointer and gesture arbitration logic
-//!   of `Scroll`), the rack is stored as a flat array of sibling widgets (`widget_cap = 32`,
-//!   `demo_count = 18`) inside `ui.Scene(Widget, widget_cap)`. The scene array performs
-//!   back-to-front hit testing; because later slots win over earlier slots, a knob ring or meter
-//!   cell automatically wins over its backing panel. Layout is the only subsystem that knows
-//!   about panel grouping.
-//! - **Retained Column Example:** The Step 8 single-scroll column architecture lives in
-//!   `examples/column/app.zig`, preserving existing scroll regression tests and locks.
-//! - **Scissor-Free Hierarchical Clipping:** Panel faces use the window clip. Knob faces clip
-//!   to the parent panel. Meter faces clip to the meter cell, because the track is 144 px tall
-//!   and would cover the title on a short panel. `clip_for` writes that rectangle into
-//!   attribute location 4. The shader masks fragments outside it, with no GPU scissor.
+//! ### Scissor-Free Clipping
+//! Panel faces use the window clip, knob faces clip to their parent panel, and meter faces
+//! clip to the meter cell. The meter needs its own clip because its track has a fixed height
+//! (`widgets.meter_track_h`) and would otherwise cover the panel title on a short panel.
+//! `clip_for` writes the clip rectangle into each instance and the shader masks fragments
+//! outside it, so no GPU scissor state is involved.
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
+//! ## 2. Coordinate Spaces and Layout
+//! All measurements are UI logical pixels, top-left origin, `+Y` down. `turtle.place_column`
+//! stacks the panels, each with `width = fill`, `height = fill`, and a top margin of
+//! `panel_gap_px` except the first, inside a column inset by `column_padding`.
 //!
-//! ### Coordinate Spaces:
-//! All measurements are in UI logical pixels, top-left origin `(0, 0)`, `+X` right, and `+Y` down.
+//! Per panel, with `inner = panel.rect inset by panel.padding`:
+//! ```text
+//! band   = clamp(inner.height, 0, title_band_px)       title label height
+//! body   = inner below the band
+//! row    = body.x, body.y, knob_row_width(inner.width) knob cells via turtle.place_row
+//! meter  = (body.x + body.width - meter_column_px, body.y, meter_column_px, body.height)
+//! ```
+//! Space that cannot hold a control omits it instead of overlapping: a knob cell survives only
+//! if its whole fixed box lies inside the row beside the meter and the body height, and the
+//! meter survives only if the body is at least `meter_column_px` wide and has positive height.
+//! An omitted widget gets an empty rect, and `draw` skips any rect with a non-positive size.
+//! Worked layouts: tests "rack layout at 1280 by 720", "rack layout at 800 by 600",
+//! "a narrow window keeps only knobs that clear the meter", and "a short window hides knobs
+//! that would leave the panel".
 //!
-//! ### Rack Column & Panel Geometry:
-//! Root container column has outer padding 16 px on all sides.
-//! Panels specify: `width = .fill`, `height = .fill`, `align_x = 0`.
-//! The first panel has `margin.top = 0`; the subsequent two panels have `margin.top = 8`.
-//! Leftover vertical space is distributed equally among all three panels.
+//! ## 3. Slot Layout and Capacity
+//! Slots are grouped per panel: the panel, then `knobs_per_panel` knobs, then the meter, so
+//! `panel_stride = knobs_per_panel + 2` and `demo_count = panel_count * panel_stride`. The
+//! comptime block asserts the stride, the table sizes, and that the worst case fits
+//! `quads.instance_cap`, `font.glyph_cap`, and `widget_cap`.
 //!
-//! ### Panel Interior: Title Band, Knob Row, and Meter:
-//! Each panel has internal padding 8 px on all sides:
-//! - `inner_x = panel.rect.x + 8`, `inner_y = panel.rect.y + 8`.
-//! - `inner_w = panel.rect.width - 16`, `inner_h = panel.rect.height - 16`.
-//! - **Title Band:** Occupies 24 px at the top of the inner rect. `place_label` centers the
-//!   title within the panel; layout then explicitly clamps label height to 24 px.
-//! - **Body Rect:** Starts below the title band:
-//!   `body_y = inner_y + 24`, `body_h = inner_h - 24`.
-//! - **Knob Row:** Packed left-to-right via `turtle.place_row`:
-//!   - Width: `inner_w - 80` while the meter column fits, otherwise the whole `inner_w`.
-//!   - Height: fixed 72 px (`widgets.knob_height`).
-//!   - Walk per knob cell: `margin.left = 8`, `width = .fixed(144)`, `height = .fixed(72)`,
-//!     `align_x = 0`. Four knob cells cost 608 px main axis (`4 * (144 + 8)`).
-//! - **Meter Column:** Placed at right edge: `x = inner_x + inner_w - 80`, `y = body_y`,
-//!   `width = 80`, `height = body_h`.
-//! - **What does not fit is omitted:** A knob cell is kept only when its whole 144 by 72 box
-//!   lies in the row beside the meter, and the meter is kept only when its column lies in the
-//!   body. The meter face is clipped to its cell: the track is always 144 px tall and would
-//!   otherwise cover the title on a short panel.
+//! ## 4. Meter Data Flow
+//! The host calls `App.timer(now_ms)` every `config.timer_period_ms`:
+//! ```text
+//! levels.sample(now_ms) -> Meter.set_value per meter -> scene.dirty only if a value changed
+//! ```
+//! `draw` reads only the stored `meter.value`, and knob gestures never write meter values; test
+//! "apply_meters writes the sample and a knob drag does not" locks both. Pointer routing, hover,
+//! and capture are owned by `ui.Scene`; see the `ui.zig` guide.
 //!
-//! ### Relative Drag & Wheel Derivations:
-//! - **Vertical Pointer Drag:** Pointer travel `dy = y - drag_y` adjusts knob value by
-//!   `-dy / 120.0` (dragging up increases value). Drag span is 120 px across `[0.0, 1.0]`.
-//! - **Mouse Wheel Nudge:** Wheel delta `wheel.dy` over a knob ring nudges value by `-dy / 120.0`.
-//! - **Meter Passthrough:** Meters hit-test for containment to occlude underlying panel surfaces,
-//!   but ignore gestures.
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### Static Memory Budgets & Slot Layout:
-//! - `widget_cap = 32`: Root scene capacity in `ui.Scene(Widget, widget_cap)`.
-//! - `panel_count = 3`, `knobs_per_panel = 4`, `panel_stride = 6`.
-//! - `demo_count = 18` (3 panels * 6 slots):
-//!   - Slot `p * 6 + 0`: Panel container.
-//!   - Slots `p * 6 + 1 .. p * 6 + 4`: Four knobs.
-//!   - Slot `p * 6 + 5`: Vertical level meter.
-//! - Concrete worked coordinates, controls roster, and first-frame quad/glyph budgets belong in
-//!   tests and `README.md`. Worst-case allocations strictly respect `draw.instance_cap = 256` and
-//!   `font.glyph_cap = 256`.
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### Retained Pointer Routing (Back-to-Front Hit Testing):
-//! `App` wraps `ui.Scene(Widget, widget_cap)`:
-//! 1. `pointer_move`: Scans `widgets` array in reverse order (`count - 1` down to 0).
-//!    The first widget returning `contains(x, y) == true` becomes `hovered`.
-//! 2. `pointer_down`: Hit-tests back-to-front. If a knob ring is pressed, sets `capture` to that
-//!    slot and initializes `drag_y`.
-//! 3. `pointer_up`: Clears `capture` and releases active drag.
-//!
-//! ### Host-Driven Meter Synchronization:
-//! Host event loops call `App.timer(now_ms)` at approximately 30 Hz (`timer_period_ms = 33`):
-//! - Samples procedural triangle waves from `levels.sample(now_ms)`.
-//! - Calls `Meter.set_value()` on slots 5, 11, and 17.
-//! - `Meter.set_value()` returns `true` only when the value actually changes.
-//! - Returns `true` only when at least one meter value changes, dirtying `app.scene`.
-//! - Drawing reads stored `meter.value` only; dragging a knob does not alter meter levels.
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **Native (Linux Wayland):** Main loop in `src/host/linux_window.zig` sleeps in `ppoll` with a
-//!   nonblocking `timerfd` (33 ms). On wake, `drain_timer` calls `app.timer(now_ms)`.
-//! - **Web (WebAssembly):** `web/shell.js` invokes `setInterval` at `timer_period_ms()` (33 ms),
-//!   calling `wasm.timer(now_ms)`. If dirty, schedules one `requestAnimationFrame`.
-//! - **Wheel Normalization:** Wayland pointer axis and DOM wheel events normalize to logical pixel
-//!   deltas forwarded to `app.event(.{ .wheel = ... })`.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Static Allocation:** Fixed 32-element widget array (`widget_cap = 32`).
-//!   Zero runtime heap allocation.
-//! - **Bounded Operations:** All iterations bounded by `widget_cap`, `panel_count`, or
-//!   `knobs_per_panel`.
-//! - **Split Assertions:** Boundary conditions and non-zero dimensions asserted individually.
+//! ## 5. TigerStyle Invariants
+//! - The widget array is fixed at `widget_cap` slots; there is no runtime allocation.
+//! - Every loop is bounded by `widget_cap`, `panel_count`, or `knobs_per_panel`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -120,16 +68,16 @@ const ui = patchwork.ui;
 const widgets = patchwork.widgets;
 const levels = @import("levels.zig");
 
-/// Maximum widgets in the rack scene. The rack uses 18.
+/// Maximum widgets in the rack scene; `demo_count` of them are in use.
 pub const widget_cap: u32 = 32;
 
-/// Panels in the rack. Each one is followed by four knobs and one meter.
+/// Panels in the rack. Each one is followed by its knobs and one meter.
 pub const panel_count: u32 = 3;
 
 /// Knobs in one panel row.
 pub const knobs_per_panel: u32 = 4;
 
-/// Slots from one panel to the next: panel, four knobs, meter.
+/// Slots from one panel to the next: the panel, its knobs, and its meter.
 pub const panel_stride: u32 = 6;
 
 /// Widgets in the running rack.
@@ -173,8 +121,8 @@ pub const Widget = union(enum) {
 
 const Scene = ui.Scene(Widget, widget_cap);
 
-/// The rack app: one flat scene of three panels, twelve knobs, and three meters.
-/// `timer` writes the procedural meter levels at the period in `config`.
+/// The rack app: one flat scene of panels, knobs, and meters. `timer` writes the procedural
+/// meter levels at the period in `config`.
 pub const App = struct {
     scene: Scene,
 
@@ -183,7 +131,7 @@ pub const App = struct {
         .timer_period_ms = levels.meter_period_ms,
     };
 
-    /// One rack: three panels, four knobs each, one meter each. Rects are empty until `layout`.
+    /// Fills every slot. Rects are empty until `layout`.
     pub fn init(app: *App) void {
         app.scene = Scene.init(demo_count);
         var panel_index: u32 = 0;
@@ -194,7 +142,7 @@ pub const App = struct {
         assert(!app.scene.pointer.inside);
     }
 
-    /// Places the three panels, then each panel's knob row and meter.
+    /// Places the panels, then each panel's knob row and meter.
     pub fn layout(app: *App, width_logical: u32, height_logical: u32) void {
         assert(width_logical != 0);
         assert(height_logical != 0);
@@ -209,7 +157,7 @@ pub const App = struct {
         return app.scene.handle_event(event_value);
     }
 
-    /// Writes the latest samples onto the three meters. Dirty only when one changes.
+    /// Writes the latest samples onto the meters. Dirty only when one changes.
     pub fn timer(app: *App, now_ms: u64) bool {
         assert(app.scene.count == demo_count);
         const sampled = levels.sample(now_ms);
@@ -258,7 +206,7 @@ pub const App = struct {
             widget_draw(&app.scene.widgets[index], list, glyphs, face_clip);
         }
         app.scene.finish_draw();
-        // A window smaller than one panel has no positive face. That frame is empty.
+        // A window smaller than one panel has no positive face, so that frame is empty.
         assert(list.count <= quads.instance_cap);
         assert(glyphs.count <= font.glyph_cap);
     }
@@ -381,8 +329,8 @@ fn place_panel_body(scene: *Scene, panel_index: u32) void {
     assert(span == knob_row_width(inner_w));
 }
 
-/// Width left of the meter. Below an 80 px body the meter is dropped and the
-/// knobs may use the whole inner width.
+/// Width left of the meter. Below `meter_column_px` the meter is dropped and the knobs may
+/// use the whole inner width.
 fn knob_row_width(inner_w: f32) f32 {
     assert(inner_w == inner_w);
     if (inner_w >= meter_column_px) {
@@ -578,7 +526,7 @@ fn meter_slot(panel_index: u32) u32 {
     return slot;
 }
 
-/// A short window keeps the 24 px title when it fits, and uses the inner height
+/// A short window keeps the `title_band_px` title when it fits, and uses the inner height
 /// when it does not. A non-positive inner rect contributes no band.
 fn band_height(inner_h: f32) f32 {
     assert(inner_h == inner_h);
@@ -642,8 +590,8 @@ fn rect_clip(rect: turtle.Rect) font.Clip {
     return clip;
 }
 
-/// The meter track is 144 px tall even when the cell is shorter. Clipping to the
-/// cell keeps that bar off the title and off the knobs beside it.
+/// The meter track has a fixed height even when the cell is shorter. Clipping to the cell
+/// keeps that bar off the title and off the knobs beside it.
 fn meter_face_clip(rect: turtle.Rect, panel: font.Clip) font.Clip {
     assert(panel.x1 > panel.x0);
     assert(panel.y1 > panel.y0);
@@ -665,8 +613,15 @@ comptime {
     assert(panel_stride == 6);
     assert(demo_count == 18);
     assert(panel_count * panel_stride == demo_count);
-    assert(3 + 12 * 2 + 3 * 2 <= quads.instance_cap);
-    assert(3 * 8 + 12 * 8 + 12 * 4 <= font.glyph_cap);
+    assert(demo_count <= widget_cap);
+    assert(levels.meter_count == panel_count);
+    assert(panel_stride == 1 + knobs_per_panel + 1);
+    // Worst-case faces: one per panel, two per knob (track and value arc), two per meter.
+    assert(panel_count + panel_count * knobs_per_panel * 2 + panel_count * 2 <=
+        quads.instance_cap);
+    // Worst-case glyphs: a label of up to 8 per panel, up to 8 for each knob name and 4 for
+    // each value text.
+    assert(panel_count * 8 + panel_count * knobs_per_panel * (8 + 4) <= font.glyph_cap);
     assert(widget_cap <= turtle.child_cap);
     assert(column_padding.left == 16);
     assert(knob_table.len == panel_count * knobs_per_panel);
@@ -682,6 +637,7 @@ fn new_app() App {
     return app;
 }
 
+// Pulls the levels module's tests into this app's test run.
 test {
     _ = levels;
 }
@@ -708,19 +664,26 @@ fn meter_at(app: *App, panel_index: u32) *widgets.Meter {
     return &app.scene.widgets[meter_slot(panel_index)].meter;
 }
 
+// Locks panel, knob, ring, and meter rects, the knob and meter clips, and the omitted value
+// arc of a zero-valued knob.
 test "rack layout at 1280 by 720" {
     var app = new_app();
     app.layout(1280, 720);
+    // Panel height = (720 - 2 * 16 padding - 2 * 8 gap) / 3; the panels start 8 below each other.
     try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 16, 1248, 224);
     try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 248, 1248, 224);
     try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 480, 1248, 224);
+    // First knob: x = 16 panel + 8 padding + 8 cell margin, y = 16 + 8 + 24 title band.
     try expect_rect(knob_at(&app, 0, 0).rect, 32, 48, 144, 72);
     try expect_rect(widgets.ring_of(knob_at(&app, 0, 0).rect), 40, 56, 56, 56);
+    // Meter: right edge of the inner rect, 80 wide, body height 224 - 16 - 24.
     try expect_rect(meter_at(&app, 0).rect, 1176, 48, 80, 184);
-    try std.testing.expectEqual(@as(f32, 24), app.scene.widgets[panel_slot(0)].panel.label.rect.height);
+    const title = app.scene.widgets[panel_slot(0)].panel.label.rect;
+    try std.testing.expectEqual(@as(f32, 24), title.height);
     var list = quads.DrawList.init();
     var glyphs = font.GlyphList.init();
     app.draw(&list, &glyphs);
+    // 3 panels + 12 knobs * 2 arcs + 3 meters * 2 faces, minus the zero-valued knob's arc.
     try std.testing.expectEqual(@as(u32, 32), list.count);
     try std.testing.expectEqual(@as(u32, 100), glyphs.count);
     const ring = widgets.ring_of(knob_at(&app, 0, 3).rect);
@@ -728,6 +691,7 @@ test "rack layout at 1280 by 720" {
     var index: u32 = 0;
     while (index < list.count) : (index += 1) {
         const face = list.items[index];
+        // The first ring clips to its panel rect.
         if (face.x == 40 and face.y == 56) {
             try std.testing.expectEqual(@as(f32, 16), face.clip_x0);
             try std.testing.expectEqual(@as(f32, 16), face.clip_y0);
@@ -749,6 +713,7 @@ test "rack layout at 1280 by 720" {
     try std.testing.expect(!app.dirty());
 }
 
+// Locks that a smaller window shrinks panel heights and the meter cell, not the knob cells.
 test "rack layout at 800 by 600" {
     var app = new_app();
     app.layout(800, 600);
@@ -759,6 +724,7 @@ test "rack layout at 800 by 600" {
     try expect_rect(meter_at(&app, 0).rect, 696, 48, 80, 144);
 }
 
+// Locks that `timer` writes meters only when a sample changes and knob drags never do.
 test "apply_meters writes the sample and a knob drag does not" {
     var app = new_app();
     app.layout(1280, 720);
@@ -786,6 +752,7 @@ test "apply_meters writes the sample and a knob drag does not" {
     try std.testing.expectEqual(amp, meter_at(&app, 2).value);
 }
 
+// Locks ring drag and ring wheel through the scene, and that a wheel off the ring is ignored.
 test "a ring drag and a ring wheel change the knob" {
     var app = new_app();
     app.layout(1280, 720);
@@ -803,6 +770,7 @@ test "a ring drag and a ring wheel change the knob" {
     try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 0, 0).value);
 }
 
+// Locks that raising a zero-valued knob adds exactly one face.
 test "dragging mix off zero adds the value arc" {
     var app = new_app();
     app.layout(1280, 720);
@@ -819,6 +787,7 @@ test "dragging mix off zero adds the value arc" {
     try std.testing.expectEqual(@as(u32, 100), glyphs.count);
 }
 
+// Locks hover easing and that a settled scene stays clean across frames.
 test "hover on rate eases and a later frame stays clean" {
     var app = new_app();
     app.layout(1280, 720);
@@ -871,8 +840,7 @@ fn rects_overlap(a: turtle.Rect, b: turtle.Rect) bool {
     return true;
 }
 
-// 400 px leaves room for the meter and one 152 px knob cell. The other three
-// used to keep their fixed boxes and paint across the bar.
+// Locks that knob cells crossing the meter column are dropped, not painted over the bar.
 test "a narrow window keeps only knobs that clear the meter" {
     var app = new_app();
     app.layout(400, 720);
@@ -888,7 +856,8 @@ test "a narrow window keeps only knobs that clear the meter" {
     try std.testing.expect(list.count >= 3);
 }
 
-// Below the 72 px body, a placed knob would stick out of its panel into the next.
+// Locks that a body shorter than a knob row drops the knob instead of leaking into the
+// next panel.
 test "a short window hides knobs that would leave the panel" {
     var app = new_app();
     app.layout(1280, 200);
@@ -902,6 +871,7 @@ test "a short window hides knobs that would leave the panel" {
     try std.testing.expect(list.count >= 3);
 }
 
+// Locks that degenerate windows draw without aborting and never overlap a knob and a meter.
 test "a tiny window still draws" {
     var app = new_app();
     app.layout(32, 32);

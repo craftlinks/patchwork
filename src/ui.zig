@@ -9,12 +9,9 @@
 //! `Scene(Widget, widget_cap)` implements that once. The app supplies a tagged union of
 //! the widget kinds it uses, so adding a widget kind never edits the library.
 //!
-//! The union payloads are called through `switch (widget.*) { inline else => ... }`. That
-//! is one line per operation instead of one arm per widget kind, and it stays static
-//! dispatch: there is no vtable and no function pointer.
-//!
-//! This dispatcher is transitional. Hit areas recorded while drawing replace it in a later
-//! step, so it deliberately stays small and does no layout and no drawing.
+//! Payloads are called through `switch (widget.*) { inline else => ... }`, which keeps
+//! dispatch static (no vtable, no function pointer) with one line per operation instead of
+//! one arm per widget kind. The dispatcher does no layout and no drawing.
 //!
 //! ## 2. The Widget Contract
 //! `Widget` must be a tagged union. Every payload type `P` declares:
@@ -27,7 +24,9 @@
 //! contains(self: P, x: f32, y: f32) bool     hit test in logical pixels
 //! ```
 //!
-//! A missing member is a compile error from the first call that needs it.
+//! A missing member is a compile error from the first call that needs it. The wrappers
+//! `widget_handle`, `widget_animate`, `widget_live`, and `widget_contains` assert `id != 0`,
+//! and `widget_handle` also asserts the id is unchanged by the call.
 //!
 //! ## 3. Coordinate Space and Hit Order
 //! All points are UI logical pixels: origin top-left, `+X` right, `+Y` down. The widget
@@ -60,7 +59,8 @@ const input = @import("input.zig");
 const widgets = @import("widgets.zig");
 
 /// Dispatcher over `widget_cap` slots of the tagged union `Widget`.
-/// `capture` and `hovered` are slots in `widgets`, or null.
+/// `capture` and `hovered` are slot indices below `count`, or null. `pointer` and `was_down`
+/// mirror the last pointer event so `finish_layout` can re-hit it.
 pub fn Scene(comptime Widget: type, comptime widget_cap: u32) type {
     comptime {
         assert(widget_cap != 0);
@@ -80,11 +80,11 @@ pub fn Scene(comptime Widget: type, comptime widget_cap: u32) type {
         width_logical: u32,
         height_logical: u32,
 
-        /// Capacity of this scene, for apps that size their own tables against it.
+        /// Slot capacity, for apps that size their own tables against it.
         pub const capacity: u32 = widget_cap;
 
-        /// An empty scene with `count` slots the app fills before the first layout.
-        /// Slots are undefined until then, so no event may arrive first.
+        /// A scene of `count` slots, `0 < count <= widget_cap`. The app must fill every slot
+        /// before the first layout, because slots start undefined.
         pub fn init(count: u32) Self {
             assert(count != 0);
             assert(count <= widget_cap);
@@ -420,7 +420,7 @@ fn same_hover(hovered: ?u32, next: ?u32) bool {
     return false;
 }
 
-/// Minimal widget kinds for the dispatcher tests: one panel and one slider.
+/// Smallest widget union that satisfies the widget contract, for the tests below.
 const TestWidget = union(enum) {
     panel: widgets.Panel,
     slider: widgets.Slider,
@@ -428,6 +428,7 @@ const TestWidget = union(enum) {
 
 const TestScene = Scene(TestWidget, 4);
 
+// Locks the `init` postconditions: no capture, no hover, clean, and `capacity` is the cap.
 test "an empty scene starts idle and clean" {
     const scene = TestScene.init(2);
     try std.testing.expectEqual(@as(u32, 2), scene.count);
@@ -437,6 +438,7 @@ test "an empty scene starts idle and clean" {
     try std.testing.expectEqual(@as(u32, 4), TestScene.capacity);
 }
 
+// Locks `same_hover` over both positive and negative spaces of (null, some) pairs.
 test "same_hover covers all four combinations" {
     try std.testing.expect(same_hover(null, null));
     try std.testing.expect(!same_hover(null, 3));
@@ -445,6 +447,7 @@ test "same_hover covers all four combinations" {
     try std.testing.expect(!same_hover(3, 4));
 }
 
+// Locks the dirty contract: `finish_layout` sets it, `finish_draw` clears it.
 test "finish_layout marks dirty and finish_draw clears it" {
     var scene = TestScene.init(1);
     try std.testing.expect(!scene.dirty);

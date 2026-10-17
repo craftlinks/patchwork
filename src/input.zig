@@ -2,132 +2,55 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! In an event-driven graphical architecture, input delivery mechanisms from the operating
-//! system or display server must not be coupled directly to rendering and layout operations.
+//! ## 1. Why a Queue Instead of a Latest-State Snapshot?
+//! Wayland delivers socket messages in batches. If the loop only kept the latest pointer state,
+//! a press followed by a release inside one batch would overwrite itself to `down == false`
+//! before the app ran, and the click edge would be lost. `EventQueue` keeps events in the order
+//! the platform observed them, and the loop drains it once per wake.
 //!
-//! ### The Dispatch Batching Hazard:
-//! Wayland delivers incoming socket messages in large batches during
-//! `wl_display_dispatch_pending()`. If the application only recorded the latest pointer state
-//! into a single global variable, a rapid mouse click (a `pointer_button(pressed)` immediately
-//! followed by `pointer_button(released)` in the same read batch) would overwrite itself into
-//! `down == false` before the main application loop could execute a single tick.
-//! The button click edge would be completely lost.
+//! ### Ordering and Coalescing Rules
+//! - Presses, releases, leaves, and frames are never merged or reordered, so click transitions
+//!   survive.
+//! - A `pointer_move` pushed directly after a `pointer_move` replaces it. Only the newest
+//!   position matters, and this keeps high-rate mice from filling the queue.
+//! - A `wheel` pushed directly after a `wheel` is merged: `dy` is summed and the anchor point
+//!   `(x, y)` becomes the newest one.
+//! - Merging is only ever with the last queued event, so an intervening event of another kind
+//!   splits the run (tests "a wheel between moves does not merge" and "move down move up keeps
+//!   four events").
+//! - A push into a full queue is counted in `dropped` and discarded; queued history is never
+//!   modified and nothing is allocated (test "overflow drops the newest event").
 //!
-//! ### Ordered Event Queue with Motion and Wheel Coalescing:
-//! `EventQueue` preserves the chronological sequence of events across socket batches:
-//! - Presses (`.pointer_down`), releases (`.pointer_up`), and surface leaves (`.pointer_leave`)
-//!   are strictly preserved in FIFO order so click transitions are never missed.
-//! - Consecutive motion events (`.pointer_move`) are automatically coalesced into the newest
-//!   sample. High-frequency gaming mice (1000 Hz+) can flood the socket with dozens of motion
-//!   reports in a single compositor frame; coalescing preserves the current pointer location
-//!   while preventing queue exhaustion.
-//! - Consecutive wheel events (`.wheel`) are automatically coalesced: consecutive deltas sum
-//!   their vertical travel `dy` while updating the pointer anchor `(x, y)` to the latest sample.
-//! - The queue capacity is fixed at `queue_cap = 32`. Pushing past the capacity increments the
-//!   `dropped` counter and safely drops the excess event without corrupting queued history or
-//!   allocating dynamic heap memory.
+//! ### Native vs. Web
+//! Native Wayland callbacks only push to the queue; the window loop pops events in order
+//! (`sync_input` in `linux_window.zig`). Browser pointer events arrive one at a time, so the
+//! web exports call into the app directly and bypass the queue. Both paths hand the app the
+//! same `Event` values.
 //!
-//! ### Native vs. Web Execution:
-//! - On native Linux, `src/host/linux_window.zig` drains the `EventQueue` once per loop wake in
-//!   `sync_input()`, passing events sequentially to `app.event()`.
-//! - In the browser, DOM pointer events are delivered individually and asynchronously to
-//!   JavaScript; `web/shell.js` calls the Wasm exports (`pointer_move`, `pointer_down`, etc.)
-//!   directly, which invoke `app.event()` immediately without queuing.
+//! ## 2. Coordinate Spaces
+//! Points are in the surface's layout space: top-left origin, `+X` right, `+Y` down. This
+//! module applies no scaling; each host converts into that space before pushing.
+//! - **Wayland:** `wl_pointer.enter` and `motion` carry `wl_fixed_t`, a signed 24.8 fixed-point
+//!   number. `logical = fixed / 256` (`fixed_to_logical`, test "fixed_to_logical converts
+//!   24.8"). Surface-local coordinates are independent of the buffer scale, so they are already
+//!   layout pixels.
+//! - **Browser:** `web/shell.js` converts DOM CSS pixels into canvas pixels before calling the
+//!   exports (see its pointer and DPI section).
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
+//! ## 3. Ownership
+//! `input.zig` only records and buffers input. Hit testing, widget dispatch, and pointer capture
+//! belong to `ui.Scene` and the apps.
 //!
-//! ### Coordinate Spaces:
-//! All point coordinates are in UI logical pixels, top-left origin `(0, 0)`, `+X` right, and
-//! `+Y` down.
-//!
-//! ### Wayland Signed 24.8 Fixed-Point Conversion:
-//! Wayland's `wl_pointer.enter` and `wl_pointer.motion` deliver coordinates as `wl_fixed_t`:
-//! - High 24 bits: Signed integer pixel coordinate.
-//! - Low 8 bits: Subpixel fractional part in 1/256 increments.
-//! - Analytical conversion:
-//!   ```text
-//!   logical = @as(f32, @floatFromInt(fixed)) / 256.0
-//!   ```
-//! - By Wayland protocol specification, surface coordinates delivered in pointer events are
-//!   invariant to the window buffer scale factor (`wl_surface.set_buffer_scale`), aligning
-//!   directly with UI logical layout pixels.
-//!
-//! ### Browser Coordinate Mapping:
-//! In `web/shell.js`, DOM PointerEvent `offsetX` and `offsetY` (in CSS pixels) are multiplied by
-//! `window.devicePixelRatio` before invoking Zig exports:
-//! ```text
-//! x_device = event.offsetX * devicePixelRatio
-//! y_device = event.offsetY * devicePixelRatio
-//! ```
-//! This matches the physical pixel backing store of the HTML5 canvas.
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### Memory Layouts:
-//! - `Point`: 8 bytes total (`x: f32, y: f32`), 4-byte aligned.
-//! - `Wheel`: 12 bytes total (`x: f32, y: f32, dy: f32`), 4-byte aligned.
-//! - `Pointer`: 16 bytes total:
-//!   - Offset 0: `x: f32` (4 bytes)
-//!   - Offset 4: `y: f32` (4 bytes)
-//!   - Offset 8: `inside: bool` (1 byte)
-//!   - Offset 9: `down: bool` (1 byte)
-//!   - Offset 10..15: Padding (6 bytes)
-//!   - Alignment: 4 bytes.
-//! - `Event`: Tagged union representation of input facts (`pointer_move`, `pointer_down`,
-//!   `pointer_up`, `pointer_leave`, `frame`, `wheel`).
-//! - `EventQueue`: Ring buffer containing:
-//!   - `items: [queue_cap]Event` (fixed storage)
-//!   - `head: u32` (read index)
-//!   - `count: u32` (active items in queue)
-//!   - `dropped: u32` (count of discarded events due to overflow)
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### Queue Ingestion and Coalescing Logic:
-//! ```text
-//!                          push(event)
-//!                               |
-//!                   +-----------+-----------+
-//!                   | Can coalesce with     |
-//!                   | last item in queue?   |
-//!                   | (move+move, whl+whl)  |
-//!                   +-----------------------+
-//!                          /         \
-//!                    YES  /           \  NO
-//!                        v             v
-//!                 +-------------+  +-------------------+
-//!                 | Overwrite / |  | Is queue full?    |
-//!                 | sum into    |  | (count == cap 32) |
-//!                 | last item   |  +-------------------+
-//!                 +-------------+         /     \
-//!                                   YES  /       \  NO
-//!                                       v         v
-//!                               +-------------+  +-------------------+
-//!                               | dropped += 1|  | Append at count,  |
-//!                               | (drop event)|  | count += 1        |
-//!                               +-------------+  +-------------------+
-//! ```
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **Separation of Input from Dispatch:**
-//!   `input.zig` is strictly responsible for capturing raw device coordinates and buffering
-//!   input events. Dispatchers like `ui.Scene` (`src/ui.zig`) or applications own hit testing,
-//!   widget dispatch, and pointer capture. `draw.contains_box` remains the low-level analytic
-//!   signed distance test for rounded quads.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Static Memory Bounds:** `queue_cap = 32`. No dynamic memory allocations.
-//! - **Strict Bounded Execution:** All queue operations (`push`, `pop`, `index_at`) are O(1).
-//! - **Defensive Assertions:** Preconditions and postconditions asserted on every function.
-//! - **Explicit Error Tracking:** Drops are counted and reported via `dropped`, never
-//!   silently lost.
+//! ## 4. TigerStyle Invariants
+//! - Capacity is fixed by `queue_cap`; there is no allocation.
+//! - `push`, `pop`, and `index_at` are O(1).
+//! - Dropped events are counted, never silent.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Maximum events retained between loop wakes. Moves coalesce, so the cap fills
-/// with presses, releases, and leave events rather than with motion samples.
+/// Maximum events retained between loop wakes. Moves and wheels coalesce, so the cap fills with
+/// presses, releases, and leave events rather than with motion samples.
 pub const queue_cap: u32 = 32;
 
 /// A point in UI logical pixels. Origin is the top-left. Y grows downward.
@@ -136,16 +59,17 @@ pub const Point = struct {
     y: f32,
 };
 
-/// One input fact, in the order the platform observed it.
-/// `frame` carries the clock delta in milliseconds. The native loop pushes pointer
-/// events from Wayland callbacks and injects `frame` from `sync_clock`.
-/// One wheel sample in UI logical pixels. Positive `dy` scrolls content downward.
+/// One wheel sample: the pointer anchor `(x, y)` in UI logical pixels and the scroll delta `dy`.
+/// Positive `dy` scrolls content downward.
 pub const Wheel = struct {
     x: f32,
     y: f32,
     dy: f32,
 };
 
+/// One input fact, in the order the platform observed it. `frame` carries the clock delta in
+/// milliseconds; the native loop injects it from `sync_clock`, and pointer events come from
+/// Wayland callbacks.
 pub const Event = union(enum) {
     pointer_move: Point,
     pointer_down: Point,
@@ -156,9 +80,8 @@ pub const Event = union(enum) {
 };
 
 /// Latest pointer sample. `ui.Scene` stores this so a relayout can re-hit the same point.
-/// Button callbacks on Wayland carry no coordinates, so the window also keeps
-/// `last_x` / `last_y` and copies them into the down and up events.
-/// Memory: 16 bytes (two f32, two bools, 6 bytes of padding).
+/// Wayland button callbacks carry no coordinates, so the window keeps the last position
+/// separately and copies it into the down and up events.
 pub const Pointer = struct {
     x: f32,
     y: f32,
@@ -204,8 +127,8 @@ pub const Pointer = struct {
     }
 };
 
-/// Ring of events. `head` is the next pop. `count` is the live population.
-/// `dropped` counts pushes rejected because the ring was full.
+/// Ring of events. `head` is the next pop, `count` the live population, and `dropped` the
+/// pushes rejected because the ring was full.
 pub const EventQueue = struct {
     items: [queue_cap]Event,
     head: u32,
@@ -224,9 +147,8 @@ pub const EventQueue = struct {
         return queue;
     }
 
-    /// Appends `event`. A move that follows a move replaces that move.
-    /// Consecutive wheels sum `dy` and keep the latest point.
-    /// A push while `count == queue_cap` increments `dropped` and returns.
+    /// Appends `event`, applying the coalescing rules in the module guide. A push that cannot
+    /// coalesce while `count == queue_cap` increments `dropped` and leaves the queue unchanged.
     pub fn push(self: *EventQueue, event: Event) void {
         assert(self.count <= queue_cap);
         assert(self.head < queue_cap);
@@ -279,7 +201,7 @@ pub const EventQueue = struct {
     }
 };
 
-/// Converts a Wayland `wl_fixed_t` (signed 24.8) sample to UI logical pixels.
+/// Converts a Wayland `wl_fixed_t` (signed 24.8, so 1/256 units) sample to UI logical pixels.
 pub fn fixed_to_logical(fixed: i32) f32 {
     const logical: f32 = @as(f32, @floatFromInt(fixed)) / 256.0;
     if (fixed == 0) {
@@ -304,8 +226,8 @@ fn is_wheel(event: Event) bool {
     }
 }
 
-/// Replaces a trailing move, or sums a trailing wheel. Returns true when the
-/// new event did not need its own slot.
+/// Replaces a trailing move or sums a trailing wheel. Returns true when `event` did not need
+/// its own slot.
 fn coalesce(self: *EventQueue, event: Event) bool {
     assert(self.count <= queue_cap);
     if (self.count == 0) {
@@ -425,7 +347,7 @@ test "move down move up keeps four events" {
     try std.testing.expect(queue.pop() == null);
 }
 
-// The 33rd press is counted and discarded. The first 32 stay queued.
+// The press after `queue_cap` queued presses is counted and discarded; earlier ones stay.
 test "overflow drops the newest event" {
     var queue = EventQueue.init();
     var index: u32 = 0;

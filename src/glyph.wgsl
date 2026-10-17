@@ -1,142 +1,55 @@
-// Instanced Alpha-Coverage Glyph Text Rendering and Bilinear Texture Sampling.
+// Instanced glyph quads sampled from a prebaked coverage atlas.
 //
 // # Deep Architectural Guide for Reviewers:
 //
-// ## 1. Core Problem & Rationale ("Why")
-// In 2D graphical user interfaces, rendering text directly alongside geometric shapes poses
-// a fundamental architectural dilemma:
-// - **Monolithic Shader / Branched Pipeline:**
-//   Attempting to handle both rounded-box SDF geometry and glyph text inside a single shader
-//   requires adding conditional branches (`if (kind == GLYPH)`) or expanding the per-instance
-//   vertex record to 64 bytes (adding texture IDs, UV bounds, and clip rectangles). This wastes
-//   memory bandwidth for every non-text quad and introduces branch divergence in GPU warps.
-// - **Immediate Vertex Generation:**
-//   Decomposing text into independent textured triangles on the CPU requires generating 4 vertices
-//   and 6 indices per glyph, allocating temporary geometry buffers every frame, and thrashing PCIe
-//   bandwidth.
+// ## 1. Why a Separate Glyph Pipeline
+// Glyph instances need a texture rectangle and carry no corner radius or shape kind, while
+// face instances need the opposite. Folding both into `quad.wgsl` would add a kind branch
+// to every fragment and a record with fields most quads never use. Two pipelines share the
+// unit quad, the frame uniform, the render pass, and the blend state instead, and are drawn
+// in order within one pass: faces first, then glyphs on top. The CPU bakes ASCII glyphs into
+// an `r8unorm` atlas of `font.atlas_width` by `font.atlas_height` texels, so this shader does
+// no curve evaluation, hinting, or rasterization.
 //
-// **Patchwork's Dual-Pipeline Architecture:**
-// - **Shared Hardware Unit Quad:** The exact same static 48-byte unit quad vertex buffer
-//   (6 vertices spanning `(0, 0)` to `(1, 1)`) is bound to both the face quad pipeline and the
-//   glyph text pipeline.
-// - **Separate 64-Byte Instance Records:** Face instance buffer packs
-//   `(rect, fill, shape, bounds)`, while glyph buffer packs `(dest_rect, uv_rect, color, bounds)`.
-//   Both strides are 64 bytes, matching WebGPU 16-byte attribute alignment rules (`float32x4`).
-// - **Two Draws in One Pass:** The active pass executes `draw_quads(6, quad_count)` then
-//   `draw_glyphs(6, glyph_count)`. Sharing color target, depth, and blend avoids pass teardown.
-// - **Pre-Baked Coverage:** The CPU pre-bakes ASCII glyphs into a 512 x 256 `r8unorm` atlas.
-//   This shader performs zero curve evaluation, zero font hinting, and zero rasterization.
+// ## 2. Coordinate Spaces
+// - Unit quad: `unit` in `[0, 1]^2`, `(0, 0)` at the top-left vertex.
+// - UI logical pixels: top-left origin, `+X` right, `+Y` down.
+// - NDC: WebGPU clip volume, `Y` up; `frame.ortho` performs the Y flip (derivation in
+//   `draw.zig`).
+// - Atlas UV: `[0, 1]^2` with `(0, 0)` at the top-left texel.
 //
-// ## 2. Mathematical Derivations & Coordinate Spaces
+// Per vertex, with `rect = (x, y, w, h)` and `uv_rect = (u0, v0, u1, v1)`:
+//   local = unit * rect.zw
+//   pos   = rect.xy + local
+//   clip  = ortho * (pos, 0, 1)
+//   uv    = mix(uv_rect.xy, uv_rect.zw, unit)
+// The baker insets `uv_rect` by half a texel on each side (see `font.zig`), so bilinear
+// filtering never reads texels belonging to a neighboring glyph.
 //
-// ### Coordinate Spaces:
-// - **Unit Quad Space:** `unit in [0.0, 1.0] x [0.0, 1.0]`. `(0, 0)` is the top-left vertex,
-//   and `(1, 1)` is the bottom-right vertex.
-// - **UI Logical Screen Space:** Measured in logical pixels. Origin `(0, 0)` is at the top-left
-//   of the window. `+X` increases rightwards, and `+Y` increases downwards.
-// - **Normalized Device Coordinates (NDC):** WebGPU visible clip volume:
-//   `X in [-1.0, +1.0]` (left to right), `Y in [-1.0, +1.0]` (bottom to top, Y-up), and
-//   `Z in [0.0, 1.0]` (depth).
-// - **Atlas UV Texture Space:** Continuous range `[0.0, 1.0] x [0.0, 1.0]`. `(0, 0)` is top-left
-//   texel of the 512 x 256 atlas.
+// ## 3. Fragment Output
+// `coverage` is the red channel of the bilinearly filtered atlas sample and
+// `alpha = color.a * coverage * inside`, where `inside` is the same hard clip mask as in
+// `quad.wgsl` (exclusive-max rectangle, evaluated per fragment, no scissor state). RGB stays
+// straight, so the host's source-over blend leaves the destination untouched where coverage
+// or the mask is zero.
 //
-// ### Vertex Transformation Algebra:
-// Given unit quad vertex `unit = (u_x, u_y)`, destination rectangle `rect = (x, y, w, h)`,
-// and normalized UV bounding box `uv_rect = (u0, v0, u1, v1)`:
+// ## 4. Bindings and Vertex Layout
+// - Group 0, binding 0: the shared `Frame` uniform. Only `ortho` is read here; the `Theme`
+//   declaration keeps the struct identical to `quad.wgsl` so one bind group serves both.
+// - Group 1, binding 0: filterable-float `texture_2d` atlas (`r8unorm`), fragment stage.
+// - Group 1, binding 1: filtering sampler, fragment stage, linear min/mag filters and
+//   clamp-to-edge addressing on both axes. Both hosts configure this (`host/gpu_wgpu.zig`,
+//   `web/shell.js`); clamping stops wrap-around at the atlas border.
+// - Vertex inputs: location 0 is the unit quad (per-vertex); locations 1 to 4 are rect,
+//   uv_rect, color, and clip from `font.Glyph` (per-instance). Their offsets and the shared
+//   stride with `draw.Instance` are enforced by `comptime` asserts in `draw.zig`, and the
+//   location numbers by the test "wgsl declarations match the Zig layouts".
 //
-// 1. **Local Screen-Space Position:**
-//    ```text
-//    local_pos = unit * rect.zw             // local_x = u_x * w,  local_y = u_y * h
-//    world_pos = rect.xy + local_pos        // pos_x = x + local_x, pos_y = y + local_y
-//    ```
-//
-// 2. **Orthographic Projection Matrix Multiplication:**
-//    Matrix `ortho` is the 4x4 column-major matrix defined in `draw.zig`:
-//    ```text
-//    clip = ortho * vec4<f32>(world_pos.x, world_pos.y, 0.0, 1.0)
-//    ```
-//    Expanding the linear system:
-//    ```text
-//    clip.x = (2.0 / window_width) * world_pos.x - 1.0
-//    clip.y = -(2.0 / window_height) * world_pos.y + 1.0
-//    clip.z = 0.0
-//    clip.w = 1.0
-//    ```
-//
-// 3. **Bilinear Texture Coordinate Interpolation:**
-//    The UV bounding box is linearly interpolated across the unit quad:
-//    ```text
-//    uv = mix(uv_rect.xy, uv_rect.zw, unit)
-//       = ( (1.0 - unit.x) * u0 + unit.x * u1,  (1.0 - unit.y) * v0 + unit.y * v1 )
-//    ```
-//    Because the baker pre-inset `(u0, v0, u1, v1)` by half a texel (`0.5 / 512.0`, `0.5 / 256.0`),
-//    `uv` never samples outside the texel centers of the glyph's atlas region.
-//
-// ### Analytical Coverage and Alpha Compositing:
-// In the fragment shader:
-// 1. **Texture Sampling:**
-//    `coverage = textureSample(atlas, samp, in.uv).r`
-//    The atlas is single-channel `r8unorm`. The hardware texture unit samples the red channel,
-//    performing bilinear filtering between neighboring texels, returning a scalar in `[0.0, 1.0]`.
-// 2. **Alpha Modulation:**
-//    `alpha = in.color.a * coverage`
-//    Base text opacity `color.a` is scaled directly by the antialiased glyph coverage.
-// 3. **Fixed-Function Blend Equation:**
-//    The pipeline is configured with standard premultiplied-equivalent straight alpha blending:
-//    ```text
-//    Color_out = Color_src * Alpha_src + Color_dst * (1.0 - Alpha_src)
-//    Alpha_out = Alpha_src * 1.0       + Alpha_dst * (1.0 - Alpha_src)
-//    ```
-//    Where `Color_src = in.color.rgb` and `Alpha_src = alpha`.
-//    Texels with zero coverage (`coverage == 0.0`) produce `Alpha_src == 0.0`, resulting in:
-//    `Color_out = Color_dst` (the underlying widget quad is preserved with zero alteration).
-//
-// ## 3. Hardware, Spec Limits, and C ABI Layouts
-//
-// ### Bind Group Layouts:
-// - **Group 0 (Uniform Buffer):**
-//   - Binding 0: `var<uniform> frame: Frame` (256 bytes total: 64 bytes matrix + 192 bytes
-//     `Theme` to satisfy the WebGPU `minUniformBufferOffsetAlignment` specification rule).
-//   - Stage Visibility: `GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT`.
-// - **Group 1 (Glyph Atlas & Sampler):**
-//   - Binding 0: `var atlas: texture_2d<f32>` (texture format `r8unorm`, view dimension `2d`).
-//     Stage Visibility: `GPUShaderStage.FRAGMENT`.
-//   - Binding 1: `var samp: sampler` (filtering sampler, clamp-to-edge, linear min/mag).
-//     Stage Visibility: `GPUShaderStage.FRAGMENT`.
-//
-// ### Vertex Attribute Locations (Stride: 64 Bytes):
-// - `location(0)`: `unit: vec2<f32>` (Buffer 0, arrayStride 8, stepMode `vertex`).
-// - `location(1)`: `rect: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 0).
-// - `location(2)`: `uv_rect: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 16).
-// - `location(3)`: `color: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 32).
-// - `location(4)`: `bounds: vec4<f32>` (Buffer 1, arrayStride 64, stepMode `instance`, offset 48).
-//
-// ## 4. State Machines & Data Flow
-// 1. Host records face instances into `DrawList` and glyph instances into `GlyphList`.
-// 2. If `flag_glyphs` and `glyph_count > 0`, host writes `glyph_count * 64` B into `glyph_buffer`.
-// 3. Command encoder opens render pass with background clear color.
-// 4. `draw_quads` executes with `quadPipeline`, binding `quadBuffer` (0) and `instanceBuffer` (1).
-// 5. If `glyph_count > 0`, host sets `glyphPipeline`, binds group 0 (`uniform`),
-//    group 1 (`atlas + sampler`), binds buffers 0 and 1, and issues `draw(6, glyph_count)`.
-// 6. Hard clip mask is applied in fragment shader:
-//    `inside = step(bounds.x, pos.x) * step(bounds.y, pos.y)`
-//            `* step(pos.x, bounds.z) * step(pos.y, bounds.w)`
-//    `alpha = color.a * coverage * inside`
-//    Glyphs straddling container viewports are cleanly clipped with zero scissor state changes.
-// 7. Render pass closes and commands submit to hardware queue.
-//
-// ## 5. Cross-Platform Seams & FFI
-// - **Shader Compilation:** Native targets compile this source via `wgpuDeviceCreateShaderModule`
-//   with `WGPUSType_ShaderSourceWGSL`. Browser targets compile via `device.createShaderModule`.
-// - **Bilinear Clamp:** Both backends enforce `clamp-to-edge` on address mode U and V to eliminate
-//   texture coordinate wrapping artifacts.
-//
-// ## 6. TigerStyle Invariants
-// - **Bounded Execution:** Zero loops, zero recursion, zero dynamic branch conditions.
-// - **Deterministic Output:** No screen-space derivative functions (`fwidth`) or non-uniform flow.
+// ## 5. Shader Invariants
+// There are no loops or recursion. `textureSample` runs in uniform control flow because the
+// fragment function has no branches before it.
 
-// Same uniform as `quad.wgsl` so both pipelines share one 256-byte bind group.
-// This shader reads `frame.ortho`. The theme slots keep the struct the same size.
+// Must match `theme.Theme` field for field.
 struct Theme {
     panel: vec4<f32>,
     text: vec4<f32>,

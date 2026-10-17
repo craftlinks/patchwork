@@ -1,162 +1,86 @@
-//! Offline TrueType Font Baker: Quadratic Bézier Decomposition, Supersampled Coverage,
-//! 2D Shelf Packing, and Pre-Scaled Binary Serialization.
+//! Offline TrueType font baker: outline flattening, supersampled coverage, shelf packing, and
+//! serialization of the atlas and metrics that `src/font.zig` embeds.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! Real-time GPU rendering engines cannot afford to parse TrueType vector outlines on the critical
-//! animation frame path. A traditional runtime font pipeline (such as FreeType, DirectWrite, or
-//! CoreText) incurs severe drawbacks:
-//! - **Unbounded CPU Latency & Micro-Stutter:** Parsing complex binary font tables (`cmap`, `loca`,
-//!   `glyf`), performing quadratic Bézier curve flattening, and computing fractional pixel coverage
-//!   burns milliseconds of CPU time per frame when new characters appear.
-//! - **Memory Churn & Dynamic Allocation:** Dynamic glyph atlas allocators fragment the heap and
-//!   require complex cache invalidation, atlas repackaging, and dynamic texture uploads.
-//! - **Target Portability:** On freestanding targets (such as `wasm32-freestanding`), shipping
-//!   a full font rendering engine increases binary size by hundreds of kilobytes and introduces
-//!   OS font dependencies.
+//! ## 1. Why Bake Offline?
+//! Parsing `glyf` outlines, flattening Béziers, and rasterizing on the frame path costs
+//! latency spikes and heap churn, and ships a font engine to `wasm32-freestanding`. This tool
+//! runs only when the font asset changes. It reads `font_path`, covers `codepoint_first`
+//! through 126, and writes `atlas_path` and `metrics_path` (consumed by `src/font.zig`) plus
+//! the font's license text to `license_path`. Run it from the repository root.
 //!
-//! **Patchwork's Ahead-of-Time Pre-Baking Solution:**
-//! - This script executes **offline** during development (or when updating the font asset).
-//! - It reads `assets/NotoSans-Regular.ttf` once, extracts ASCII (U+0020..U+007E, 95 glyphs),
-//!   rasterizes each glyph into a 512 x 256 alpha coverage atlas (`font_atlas.bin`),
-//!   and emits pre-scaled metrics in UI logical pixels (`font_metrics.bin`).
-//! - The frame path consumes these static binaries via `@embedFile`, achieving 100% deterministic
-//!   layout, zero runtime allocation, and zero frame-time rasterization overhead.
+//! Scope limits are rejected loudly rather than handled: only `cmap` format 4, only the long
+//! `loca` format, and only simple glyphs (composites return `error.CompositeGlyph`).
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
-//!
-//! ### Coordinate Spaces:
-//! - **Font Design Space (FUnits):** Integer Cartesian coordinate system specified in the TrueType
-//!   `head` table (`unitsPerEm = 1000`). Origin `(0, 0)` is on baseline, and `+Y` points upwards.
-//! - **Bake Pixel Space:** Rasterizer pixel grid at 32 px per em.
-//!   Scale factor:
+//! ## 2. Coordinate Spaces & Algorithms
+//! - **Font units (FUnits):** `+Y` up, origin on the baseline, `units_per_em` from `head`.
+//! - **Bake pixel space:** Y-down. With `scale = ppem / units_per_em` and a per-glyph origin
+//!   at the floor of the ink's left edge and the ceiling of its top edge:
 //!   ```text
-//!   scale = ppem / units_per_em = 32.0 / 1000.0 = 0.032
+//!   px = x * scale - origin_x
+//!   py = top_y - y * scale          (`font_to_pixel`)
 //!   ```
-//!   Flipped to Y-down to align directly with screen and texture coordinates:
-//!   ```text
-//!   top_y = ceil(yMax * scale)
-//!   py = top_y - y * scale
-//!   ```
-//! - **UI Logical Screen Space:** Target display coordinate system at 16 px logical size.
-//!   Because bake space is 32 px, logical values are exactly half the baked pixel values:
-//!   ```text
-//!   logical_value = bake_pixel_value / 2.0
-//!   ```
+//! - **UI logical space:** `logical = bake_pixel / 2` (`fu_to_logical`, `ink_record`). The
+//!   runtime relies on this factor; test "ink quads are half their texel size" in
+//!   `src/font.zig` locks it against the written records.
 //!
-//! ### TrueType Quadratic Bézier Decomposition:
-//! TrueType contours consist of straight line segments and 2nd-degree quadratic Bézier curves.
-//! A quadratic Bézier curve is parameterized by control points `P0` (on-curve), `P1` (off-curve),
-//! and `P2` (on-curve) for parameter `t in [0.0, 1.0]`:
+//! ### Quadratic Bézier Flattening
+//! A TrueType curve is `P0` (on), `P1` (off), `P2` (on):
 //! ```text
-//! B(t) = (1 - t)^2 * P0 + 2 * (1 - t) * t * P1 + t^2 * P2
+//! B(t) = (1 - t)^2 * P0 + 2 * (1 - t) * t * P1 + t^2 * P2,   t in [0, 1]
 //! ```
-//! In `flatten_contour`, curves are subdivided into 8 linear chord segments (`t = step / 8.0`
-//! for `step = 1..8`).
+//! `add_quad` replaces each curve with a fixed number of chords at evenly spaced `t`; the edge
+//! budget `segment_cap` is sized for that count. Two consecutive off-curve points imply an
+//! on-curve point at their midpoint (TrueType `glyf` rule); `expand_contour` inserts it so
+//! every off-curve point is followed by an on-curve one.
 //!
-//! **Consecutive Off-Curve Midpoint Rule:**
-//! TrueType specifications permit consecutive off-curve points `P_a` and `P_b`. The specification
-//! mandates an implicit on-curve midpoint `P_mid` positioned exactly halfway between them:
+//! ### Supersampled Coverage
+//! `coverage_at` casts a 4 x 4 grid of samples per pixel, at sub-pixel centers
+//! `px + (sx + 0.5) / 4` and `py + (sy + 0.5) / 4`. A sample is inside when the non-zero
+//! winding number of the edge list around it is non-zero. `edge_wind` casts a ray toward `+X`
+//! and counts an edge as `+1` when `y` increases along it (Y-down bake space) and `-1` when it
+//! decreases. With `hits` inside samples, `coverage = hits * 255 / 16` (integer division).
+//! Test "edge_wind signs follow the edge direction" locks the winding convention.
+//!
+//! ### Shelf Packing
+//! Glyph bitmaps are placed left to right on a shelf of the tallest glyph so far; when a glyph
+//! does not fit in `atlas_width`, a new shelf opens below. Every placement is followed by a
+//! one-texel gutter, horizontally and vertically, so bilinear filtering at a glyph edge reads
+//! zero coverage instead of a neighbor's ink. Glyphs narrower or shorter than two texels are
+//! rejected (`error.InsetCollapsed`) because the half-texel inset below would invert them.
+//!
+//! ### Half-Texel UV Inset
+//! WebGPU samples texel `(x, y)` at `(x + 0.5, y + 0.5)`. For a glyph at atlas texel
+//! `(ax, ay)` with size `(gw, gh)`:
 //! ```text
-//! P_mid = (P_a + P_b) * 0.5
+//! u0 = (ax + 0.5) / atlas_width        v0 = (ay + 0.5) / atlas_height
+//! u1 = (ax + gw - 0.5) / atlas_width   v1 = (ay + gh - 0.5) / atlas_height
 //! ```
-//! `expand_contour` detects consecutive off-curve points and inserts explicit on-curve midpoints,
-//! transforming the outline into a canonical alternating sequence of on and off-curve vertices.
+//! `src/font.zig` consumes these as-is; its test "ink UVs sit on half-texel centers" locks the
+//! derivation against the written records.
 //!
-//! ### 4x4 Sub-Pixel Supersampled Coverage Rasterization:
-//! To produce crisp, antialiased alpha coverage without analytical ray-marching or distance fields,
-//! `rasterize` evaluates fractional pixel occupancy using a uniform 4x4 sub-pixel grid:
-//! - For each integer pixel `(px, py)` within the glyph bounding box:
-//!   - 16 sample rays are cast horizontally from sub-pixel coordinates:
-//!     ```text
-//!     sample_x = px + (sx + 0.5) / 4.0   for sx = 0..3
-//!     sample_y = py + (sy + 0.5) / 4.0   for sy = 0..3
-//!     ```
-//!   - For each sample, the **Non-Zero Winding Rule** is evaluated against all contour edges:
-//!     ```text
-//!     winding = sum( edge_wind(edge, sample_x, sample_y) )
-//!     inside = (winding != 0)
-//!     ```
-//!   - An edge crossing upwards contributes `+1`; an edge crossing downwards contributes `-1`.
-//!   - Total sub-pixel hits `hits in [0, 16]` are quantized to an 8-bit unsigned integer:
-//!     ```text
-//!     coverage = (hits * 255) / 16
-//!     ```
+//! ## 3. Output Formats
+//! The formats are defined by their reader, `src/font.zig` (module guide, "Layouts"); this
+//! tool must stay byte-identical to it. The comptime block below asserts the shared sizes and
+//! counts, and `font.zig` asserts the header fields it reads back. Records for glyphs with no
+//! outline (space) carry a positive advance and zero ink and UVs. Multi-byte fields are
+//! written little-endian, while the input font is read big-endian (`read_u16`, `read_i16`,
+//! `read_u32`).
 //!
-//! ### 2D Shelf Packing Algorithm:
-//! 94 ink glyphs are packed into the 512 x 256 atlas using a shelf-first bin packing heuristic:
-//! - Shelf state: `(shelf_x, shelf_y, shelf_h)`.
-//! - A 1-texel gutter separates glyphs horizontally and vertically to prevent bilinear bleed.
-//! - When a glyph of dimension `(gw, gh)` fits horizontally (`shelf_x + gw <= 512`):
-//!   It is placed at `(shelf_x, shelf_y)`, `shelf_x += gw + 1`, and `shelf_h = max(shelf_h, gh)`.
-//! - When it exceeds 512, a new shelf is opened:
-//!   `shelf_x = 0`, `shelf_y += shelf_h + 1`, `shelf_h = 0`.
-//!
-//! ### Half-Texel UV Inset Derivation:
-//! To guarantee that bilinear texture filtering never samples outside the dedicated texel bounds:
+//! ## 4. Pipeline
 //! ```text
-//! u0 = (atlas_x + 0.5) / 512.0
-//! v0 = (atlas_y + 0.5) / 256.0
-//! u1 = (atlas_x + glyph_w - 0.5) / 512.0
-//! v1 = (atlas_y + glyph_h - 0.5) / 256.0
+//! read_font -> bake_ascii (load_font_tables, then bake_codepoint per codepoint)
+//!   bake_codepoint -> bake_outline: load_simple -> flatten -> rasterize -> pack_shelf -> blit
+//! write_outputs (atlas and metrics) -> write_license (name IDs 0 and 13, UTF-16BE to UTF-8)
 //! ```
 //!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### `src/font_atlas.bin` Layout:
-//! - Dimensions: 512 x 256 texels.
-//! - Format: Single-channel `r8unorm` (1 byte per texel).
-//! - Total size: `512 * 256 = 131,072` bytes.
-//! - Row Stride: 512 bytes (`bytesPerRow = 512`), which is an exact multiple of the WebGPU
-//!   256-byte alignment requirement (`512 = 2 * 256`).
-//!
-//! ### `src/font_metrics.bin` Binary ABI (3,832 Bytes):
-//! Formatted as little-endian binary data:
-//! - **Header (32 Bytes):**
-//!   `atlas_width` (u32), `atlas_height` (u32), `glyph_count` (95), `codepoint_first` (32),
-//!   `ascent` (f32), `descent` (f32), `line_height` (f32), `pad` (u32 = 0).
-//! - **95 Records (40 Bytes Each):**
-//!   `advance` (f32), `left` (f32), `top` (f32), `width` (f32), `height` (f32),
-//!   `u0` (f32), `v0` (f32), `u1` (f32), `v1` (f32), `pad` (u32 = 0).
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ```text
-//! [assets/NotoSans-Regular.ttf]
-//!       │
-//!       ▼
-//! [load_font_tables()] ──► cmap (format 4), head, hhea, hmtx, maxp, loca, glyf
-//!       │
-//!       ▼
-//! [bake_codepoint(32..126)]
-//!       ├─► [read_points()]     (Parses TrueType simple glyph contours and flags)
-//!       ├─► [expand_contour()]  (Inserts implicit on-curve midpoints)
-//!       ├─► [flatten_contour()] (Decomposes quadratic Béziers into 8 linear chords)
-//!       ├─► [rasterize()]       (Evaluates 4x4 supersampled non-zero winding coverage)
-//!       ├─► [pack_shelf()]      (Allocates 2D slot in 512x256 atlas with 1px gutter)
-//!       └─► [blit()]            (Copies 8-bit coverage into global atlas buffer)
-//!       │
-//!       ▼
-//! [write_outputs()]
-//!       ├─► src/font_atlas.bin   (131,072 bytes)
-//!       ├─► src/font_metrics.bin (3,832 bytes)
-//!       └─► assets/OFL.txt       (SIL Open Font License text from name table)
-//! ```
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **TrueType Big-Endian Parsing:** TrueType fonts use big-endian integer encoding.
-//!   Helpers `read_u16`, `read_i16`, and `read_u32` decode network-order integers to host integers.
-//! - **OFL Extraction:** Decodes platform 3 (Windows) UTF-16BE name table entries (IDs 0 and 13)
-//!   and transcodes them to standard UTF-8 text for `assets/OFL.txt`.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Static Memory Bounds:**
-//!   `file_cap = 1048576` (1 MB max TTF file size).
-//!   `point_cap = 256`, `contour_cap = 32`, `segment_cap = 2048`, `bitmap_cap = 64`.
-//! - **Zero Runtime Allocation:** All scratch arrays (`file_bytes`, `points`, `edges`, `bitmap`)
-//!   are statically allocated global arrays in BSS memory. Zero heap allocation.
-//! - **Defensive Bounds Verification:** All loops bound to fixed caps; all buffer bounds asserted.
+//! ## 5. TigerStyle Invariants
+//! - No heap: every scratch buffer is a fixed-size global sized by a `*_cap` constant, and
+//!   each loop is bounded by one of them or by a table count asserted against its cap.
+//! - A glyph or table that exceeds a cap either returns an error (`error.PointCap`,
+//!   `error.ContourCap`, `error.EdgeCap`, `error.BitmapCap`, `error.AtlasFull`,
+//!   `error.FileTooLarge`) or trips an assert; nothing is truncated silently.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -266,6 +190,13 @@ comptime {
     assert(codepoint_first == 32);
     assert(metrics_bytes == 32 + 95 * 40);
     assert(ppem == 32);
+    // Layout facts shared with `src/font.zig`: `bake_ascii` hard-codes 126 as the last
+    // codepoint, a record is the `Record` fields plus one pad word, and the atlas byte length
+    // is exactly one byte per texel, with rows a multiple of the 256-byte copy alignment.
+    assert(codepoint_first + glyph_count - 1 == 126);
+    assert(@typeInfo(Record).@"struct".fields.len + 1 == 10);
+    assert(@sizeOf(@TypeOf(atlas)) == atlas_width * atlas_height);
+    assert(atlas_width % 256 == 0);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -1149,4 +1080,69 @@ fn ceil_px(value: f32) i32 {
     const rounded: i32 = @intFromFloat(@ceil(value));
     assert(@as(f32, @floatFromInt(rounded)) >= value);
     return rounded;
+}
+
+// Tests here are not part of `zig build test`; run them with `zig test scripts/bake_font.zig`
+// after changing the baker. They hold the worked numbers that the module guide leaves out.
+
+// Locks the winding convention from the module guide: a sample left of an edge that increases
+// in `y` gets `+1`, a decreasing edge gets `-1`, the `y` range is half-open at `y1`, a sample
+// right of the edge is not crossed by the +X ray, and horizontal edges never contribute.
+test "edge_wind signs follow the edge direction" {
+    const rising: Edge = .{ .x0 = 5, .y0 = 0, .x1 = 5, .y1 = 10 };
+    const falling: Edge = .{ .x0 = 5, .y0 = 10, .x1 = 5, .y1 = 0 };
+    const flat: Edge = .{ .x0 = 0, .y0 = 5, .x1 = 10, .y1 = 5 };
+    try std.testing.expectEqual(@as(i32, 1), edge_wind(rising, 4, 5));
+    try std.testing.expectEqual(@as(i32, -1), edge_wind(falling, 4, 5));
+    try std.testing.expectEqual(@as(i32, 1), edge_wind(rising, 4, 0));
+    try std.testing.expectEqual(@as(i32, 0), edge_wind(rising, 4, 10));
+    try std.testing.expectEqual(@as(i32, 0), edge_wind(rising, 6, 5));
+    try std.testing.expectEqual(@as(i32, 0), edge_wind(flat, 4, 5));
+}
+
+// Locks the shelf rules from the module guide: a placement advances the pen by the glyph width
+// plus the one-texel gutter, the shelf height is the tallest glyph on it, and a glyph that does
+// not fit opens a new shelf one gutter below the old one.
+test "pack_shelf advances with a gutter and opens a new shelf on overflow" {
+    shelf_x = 0;
+    shelf_y = 0;
+    shelf_h = 0;
+    defer {
+        shelf_x = 0;
+        shelf_y = 0;
+        shelf_h = 0;
+    }
+    const first = try pack_shelf(100, 20);
+    try std.testing.expectEqual(@as(u32, 0), first.x);
+    try std.testing.expectEqual(@as(u32, 0), first.y);
+    try std.testing.expectEqual(@as(u32, 101), shelf_x);
+    const second = try pack_shelf(50, 30);
+    try std.testing.expectEqual(@as(u32, 101), second.x);
+    try std.testing.expectEqual(@as(u32, 0), second.y);
+    try std.testing.expectEqual(@as(u32, 30), shelf_h);
+    shelf_x = atlas_width - 10;
+    const wrapped = try pack_shelf(20, 8);
+    try std.testing.expectEqual(@as(u32, 0), wrapped.x);
+    try std.testing.expectEqual(@as(u32, 31), wrapped.y);
+    try std.testing.expectEqual(@as(u32, 8), shelf_h);
+}
+
+// Locks the cmap id-delta arithmetic: it is modulo 2^16, so a negative delta and a sum past
+// the top of the range both wrap, as the TrueType `cmap` format 4 specification requires.
+test "delta_id wraps modulo 65536" {
+    try std.testing.expectEqual(@as(u32, 35), delta_id(-30, 65));
+    try std.testing.expectEqual(@as(u32, 0xFFFF), delta_id(-1, 0));
+    try std.testing.expectEqual(@as(u32, 64), delta_id(100, 65500));
+}
+
+// Locks the UTF-16 to UTF-8 transcoding used for the license text at each encoded length:
+// one byte below U+0080, two below U+0800, otherwise three.
+test "push_utf8 encodes one, two, and three byte units" {
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 1), try push_utf8(&buffer, 0, 'A'));
+    try std.testing.expectEqual(@as(u8, 'A'), buffer[0]);
+    try std.testing.expectEqual(@as(u32, 2), try push_utf8(&buffer, 0, 0x00E9));
+    try std.testing.expectEqualSlices(u8, &.{ 0xC3, 0xA9 }, buffer[0..2]);
+    try std.testing.expectEqual(@as(u32, 3), try push_utf8(&buffer, 0, 0x20AC));
+    try std.testing.expectEqualSlices(u8, &.{ 0xE2, 0x82, 0xAC }, buffer[0..3]);
 }

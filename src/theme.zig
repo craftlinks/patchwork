@@ -2,126 +2,58 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! In modern GPU APIs (WebGPU, Vulkan, Metal), uniform buffer allocations and dynamic bind group
-//! offsets are subject to strict minimum hardware alignment constraints:
-//! - WebGPU Table 23 (`minUniformBufferOffsetAlignment`) mandates at least 256-byte alignment.
-//! - A 4x4 float32 orthographic projection matrix requires only 64 bytes (16 floats * 4 bytes).
-//! - Allocating an isolated 64-byte buffer either violates hardware alignment requirements or
-//!   wastes 192 bytes as unmapped zero padding.
+//! ## 1. Why the Theme Rides in the Frame Uniform
+//! Both pipelines (`quad.wgsl`, `glyph.wgsl`) bind one uniform at `@group(0) @binding(0)`
+//! whose WGSL type is `Frame { ortho: mat4x4<f32>, theme: Theme }`. Placing `Theme` directly
+//! after the projection matrix lets both pipelines share one bind group layout and one bind
+//! group, and keeps color and arc-angle literals out of WGSL: widgets read `chrome` on the CPU
+//! to fill per-instance colors, while the fragment shader reads `lighten`, `darken`, and `arc`
+//! from the uniform.
 //!
-//! Rather than stranding that space or creating an additional uniform buffer with its own
-//! bind group allocation and descriptor tracking, Patchwork packs `Theme` (exactly 192 bytes)
-//! into the spare tail of the 256-byte uniform buffer at byte offset 64:
-//! - Offset  0..63  (64 bytes):  `mat4x4<f32>` orthographic projection matrix (`ortho`).
-//! - Offset 64..255 (192 bytes): `Theme` uniform record (12 `vec4<f32>` slots).
-//! Total allocation: exactly 256 bytes, satisfying the hardware alignment rule with zero waste.
+//! The frame record is `draw.matrix_bytes + bytes` long and must equal `draw.uniform_bytes`;
+//! see the `comptime` block in `draw.zig` and the alignment rationale on `draw.uniform_bytes`.
 //!
-//! Both pipelines (`quad.wgsl` and `glyph.wgsl`) bind this exact 256-byte uniform buffer at
-//! `@group(0) @binding(0)`, allowing both pipelines to share one bind group layout and one bind
-//! group instance without pipeline rebinding penalties.
+//! ## 2. Angle Convention
+//! Angles come from `atan2(y, x)` in Y-down pixel space: 0 points along +X, and increasing
+//! angles turn clockwise as seen on screen. The open ring starts at `arc_start`, sweeps
+//! clockwise by `arc_sweep`, and leaves a gap of `tau - arc_sweep` that closes back at
+//! `arc_start`. Test "open ring gap is a quarter turn that closes at the start angle" locks
+//! this, and test "sdf arc locks the open ring" in `draw.zig` locks the distance field.
 //!
-//! Furthermore, storing theme colors and ring angles in the uniform decouples shader logic from
-//! hardcoded magic literals:
-//! - The CPU widgets read chrome colors to populate per-instance fills.
-//! - The fragment shader reads `lighten`, `darken`, and `arc` angles from the uniform buffer.
-//! - No color literals or arc angle constants exist in WGSL source code.
+//! ## 3. Layout Contract
+//! `Theme` is an `extern struct` of `vec4<f32>` slots in the exact order of the `Theme` struct
+//! declared in both `.wgsl` files. WGSL packs each `vec4<f32>` at 16 bytes, so slot `i` lives
+//! at byte `16 * i` of the record. The `comptime` block below enforces the slot size, the
+//! per-field offsets, `bytes`, and `slot_count`; test "wgsl declarations match the Zig
+//! layouts" in `draw.zig` locks the shader side. The `pad*` slots stay zero so the record has
+//! no uninitialized bytes when copied to the GPU.
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
-//!
-//! ### Coordinate Space & Clockwise Angles:
-//! - Screen pixel coordinates use top-left origin `(0, 0)` with `+X` right and `+Y` down.
-//! - In this Y-down Cartesian system, `atan2(y, x)` is 0 radians at 3 o'clock (positive X axis),
-//!   `+pi/2` at 6 o'clock (positive Y axis), `pi` at 9 o'clock (negative X axis), and `-pi/2`
-//!   (or `+3pi/2` wrapped) at 12 o'clock (negative Y axis). Positive rotation is clockwise.
-//!
-//! ### Open-Ring Arc Angles:
-//! - **Start Angle (`arc_start`):** `2.0 * pi / 3.0` radians (120 degrees, 7 o'clock).
-//! - **Full Sweep Angle (`arc_sweep`):** `3.0 * pi / 2.0` radians (270 degrees clockwise).
-//! - **End Angle:** `arc_start + arc_sweep = 2pi/3 + 3pi/2 = 13pi/6 = 2pi + pi/6` (30 degrees,
-//!   5 o'clock).
-//! - **Open Gap:** The remaining `pi / 2` radians (90 degrees, or bottom quarter of the circle)
-//!   forms the open throat between 5 o'clock and 7 o'clock centered around 6 o'clock.
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### 192-Byte `Theme` Memory Layout:
-//! WebGPU uniform struct alignment packs each `vec4<f32>` at 16 bytes:
-//!
-//! ```text
-//! +---------------+-------------------+-----------------------------------------------+
-//! | Uniform Offs  | Theme Offs (Slot) | Field & Value RGBA / Radians                  |
-//! +---------------+-------------------+-----------------------------------------------+
-//! |  64..79       |   0..15   (Slot 0)| panel:   (0.16, 0.17, 0.20, 1.0)              |
-//! |  80..95       |  16..31   (Slot 1)| text:    (0.86, 0.87, 0.84, 1.0)              |
-//! |  96..111      |  32..47   (Slot 2)| track:   (0.27, 0.29, 0.33, 1.0)              |
-//! | 112..127      |  48..63   (Slot 3)| value:   (0.55, 0.85, 0.45, 1.0)              |
-//! | 128..143      |  64..79   (Slot 4)| control: (0.78, 0.79, 0.82, 1.0)              |
-//! | 144..159      |  80..95   (Slot 5)| meter:   (0.45, 0.80, 0.42, 1.0)              |
-//! | 160..175      |  96..111  (Slot 6)| lighten: (1.00, 1.00, 1.00, 1.0) [White]      |
-//! | 176..191      | 112..127  (Slot 7)| darken:  (0.00, 0.00, 0.00, 1.0) [Black]      |
-//! | 192..207      | 128..143  (Slot 8)| arc:     (arc_start, arc_sweep, 0.0, 0.0)     |
-//! | 208..223      | 144..159  (Slot 9)| pad0:    (0.00, 0.00, 0.00, 0.0)              |
-//! | 224..239      | 160..175 (Slot 10)| pad1:    (0.00, 0.00, 0.00, 0.0)              |
-//! | 240..255      | 176..191 (Slot 11)| pad2:    (0.00, 0.00, 0.00, 0.0)              |
-//! +---------------+-------------------+-----------------------------------------------+
-//! ```
-//! Total size: exactly 192 bytes (`slot_count * 16 = 12 * 16 = 192`).
-//!
-//! ### Chrome Colors vs. Per-Instance Knob Accents:
-//! - Background clear color remains dark slate `(0.11, 0.12, 0.16, 1.0)`.
-//! - Chrome colors are straight RGBA (unmultiplied alpha 1.0).
-//! - Knob active arcs do NOT take their fill from theme slots. Instead, knob accents are
-//!   per-instance fills passed in `Instance.fill`.
-//! - As an intentional demo visual choice, the scene cycles through four distinct accents:
-//!   - Purple: (0.62, 0.45, 0.86, 1.0)
-//!   - Green:  (0.40, 0.78, 0.48, 1.0)
-//!   - Orange: (0.93, 0.55, 0.24, 1.0)
-//!   - Yellow: (0.93, 0.80, 0.32, 1.0)
-//!
-//! ## 4. State Machines & Data Flow
-//! - **CPU Initialization:** `chrome` is declared as a compile-time constant.
-//! - **GPU Upload:** Whenever `flag_uniform` is set (e.g. on startup or window resize), the host
-//!   writes 64 bytes of matrix data at uniform buffer offset 0, followed immediately by 192 bytes
-//!   of `Theme` data at offset 64.
-//! - **Fragment Sampling:** `quad.wgsl` mixes toward `frame.theme.lighten` and `frame.theme.darken`
-//!   and evaluates ring geometry using `frame.theme.arc`.
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **Wasm Exports:** `theme_ptr()` and `theme_len()` expose the memory address and 192-byte
-//!   length to JavaScript in `web/shell.js`.
-//! - **Native & Web Parity:** Both `src/host/gpu_wgpu.zig` and `web/shell.js` upload the
-//!   64-byte matrix then the 192-byte theme at uniform offset 64, binding minBindingSize 256.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Comptime Layout Locking:** Compile-time assertions lock `@sizeOf(Theme) == 192`,
-//!   `bytes == 192`, `slot_count == 12`, and slot contents.
-//! - **Static Allocation:** Zero runtime heap allocations. Zero dynamic theme mutation.
+//! ## 4. Upload Flow
+//! When `draw.flag_uniform` is set, the host writes the projection matrix at uniform offset 0
+//! and then `Theme` at offset `draw.matrix_bytes`. Wasm hosts read it through the
+//! `theme_ptr()` / `theme_len()` exports; native hosts copy the same bytes. `chrome` is a
+//! `comptime`-known constant, so the theme never changes at runtime and needs no allocation.
+//! Knob accents are per-instance fills in `draw.Instance`, not theme slots.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Twelve `vec4` slots. WebGPU uniform layout packs each at 16 bytes.
+/// Number of `vec4` slots in `Theme`. Asserted equal to the field count.
 pub const slot_count: u32 = 12;
 
-/// Byte size of `Theme`. Uploaded at uniform offset 64.
+/// Byte size of `Theme`. Asserted equal to `@sizeOf(Theme)`.
 pub const bytes: u32 = 192;
 
-/// Arc start at 7 o'clock. `atan2` is 0 at 3 o'clock and positive clockwise in Y-down pixels.
+/// Start angle of the open ring, in the angle convention of the module guide.
 pub const arc_start: f32 = 2.0 * std.math.pi / 3.0;
 
-/// Full ring sweep, 270 degrees. The gap is the bottom quarter.
+/// Clockwise sweep of the full open ring. The remainder of the turn is the gap.
 pub const arc_sweep: f32 = 3.0 * std.math.pi / 2.0;
 
-/// One uniform theme. Field order is the GPU layout.
+/// One uniform theme. Field order is the GPU layout, so it must match the WGSL `Theme`.
 ///
-/// ```text
-/// 0 panel   1 text    2 track   3 value
-/// 4 control 5 meter   6 lighten 7 darken
-/// 8 arc     9 pad     10 pad    11 pad
-/// ```
-///
-/// `arc.x` is `arc_start`. `arc.y` is `arc_sweep`. Pads stay zero.
+/// `arc.x` is `arc_start` and `arc.y` is `arc_sweep`; `arc.z` and `arc.w` stay zero, as do
+/// all `pad*` slots.
 pub const Theme = extern struct {
     panel: [4]f32,
     text: [4]f32,
@@ -137,7 +69,7 @@ pub const Theme = extern struct {
     pad2: [4]f32,
 };
 
-/// Straight RGBA chrome. Knob accents are per-instance fills, not slots here.
+/// Straight (non-premultiplied) RGBA chrome. Knob accents are per-instance fills, not slots.
 pub const chrome: Theme = .{
     .panel = .{ 0.16, 0.17, 0.20, 1 },
     .text = .{ 0.86, 0.87, 0.84, 1 },
@@ -158,6 +90,14 @@ comptime {
     assert(@alignOf(Theme) >= 4);
     assert(bytes == @sizeOf(Theme));
     assert(slot_count == 12);
+    // WGSL lays each vec4<f32> out at 16 bytes, so slot i must start at byte 16 * i. Checking
+    // every field catches a reordered or retyped field that the total size alone would miss.
+    const fields = @typeInfo(Theme).@"struct".fields;
+    assert(fields.len == slot_count);
+    for (fields, 0..) |field, slot| {
+        assert(field.type == [4]f32);
+        assert(@offsetOf(Theme, field.name) == 16 * slot);
+    }
     assert(chrome.arc[0] == arc_start);
     assert(chrome.arc[1] == arc_sweep);
     assert(chrome.arc[2] == 0);
@@ -169,6 +109,7 @@ comptime {
     assert(chrome.darken[0] == 0);
 }
 
+// Locks the `Theme` size, the arc constants, and zeroed pad and arc tail slots.
 test "theme is 192 bytes and the arc is the open ring" {
     try std.testing.expectEqual(@as(usize, 192), @sizeOf(Theme));
     try std.testing.expectApproxEqAbs(2.0 * std.math.pi / 3.0, chrome.arc[0], 0.0001);
@@ -179,4 +120,16 @@ test "theme is 192 bytes and the arc is the open ring" {
     try std.testing.expectEqual(@as(f32, 0), chrome.pad0[3]);
     try std.testing.expectEqual(@as(f32, 0), chrome.pad1[1]);
     try std.testing.expectEqual(@as(f32, 0), chrome.pad2[2]);
+}
+
+// Locks the open-ring geometry: a three-quarter sweep leaves a quarter-turn gap, and the
+// swept end plus the gap returns exactly to `arc_start`, so the ring has no overlap.
+test "open ring gap is a quarter turn that closes at the start angle" {
+    const gap: f32 = std.math.tau - arc_sweep;
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, gap, 0.00001);
+    // The unwrapped end angle is arc_start + arc_sweep. Wrapped into [0, tau) it is pi/6,
+    // that is 30 degrees clockwise of the +X axis.
+    const end: f32 = arc_start + arc_sweep - std.math.tau;
+    try std.testing.expectApproxEqAbs(std.math.pi / 6.0, end, 0.00001);
+    try std.testing.expectApproxEqAbs(arc_start, end + gap, 0.00001);
 }

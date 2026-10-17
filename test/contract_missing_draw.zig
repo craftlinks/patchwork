@@ -1,12 +1,14 @@
 //! Negative build test for the app contract. This file must NOT compile.
 //!
 //! `zig build test-contract` compiles it and passes only when the compiler reports
-//! "App is missing `pub fn draw`". It guards the first half of the contract: a hand-written
-//! app that forgets a declaration fails at build time with a message naming it, instead of
-//! failing later inside a host. The second half, the `@hasDecl` checks, is in `src/app.zig`.
+//! "App is missing `pub fn draw`" (the `expect_errors` string in `build.zig`). It locks the
+//! compile-error path of `patchwork.app.check`: an app that forgets a declaration fails at
+//! build time with a message naming it, instead of failing later inside a host. The pure
+//! `conformance` checks are tested in `src/app.zig`.
 
 const patchwork = @import("patchwork");
 
+/// Satisfies every declaration of the contract except `draw`.
 const MissingDraw = struct {
     pub const config: patchwork.app.Config = .{ .title = "missing draw", .timer_period_ms = 0 };
 

@@ -2,125 +2,58 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! Real-time audio and synthesizer interfaces rely on responsive level meter visualization to
-//! convey signal presence and output dynamic range.
+//! ## 1. Why Host-Driven Metering
+//! A meter needs a value that changes over time. Feeding it from a worker thread would bring
+//! locks or atomics and memory-ordering hazards into a UI that otherwise has none. Here the
+//! host's own timer drives everything: each wake calls `sample(now_ms)` once, so there are no
+//! threads, no locks, and no atomics.
 //!
-//! Naive implementations often spawn high-frequency background worker threads or simulate audio
-//! DSP pipelines, introducing thread synchronization overhead, mutex contention, atomic memory
-//! ordering hazards, or platform-specific audio driver dependencies.
+//! `sample` is a pure function of time. Metering never reads widget state, so dragging a knob
+//! cannot perturb a bar, and the same `now_ms` always yields the same levels, which is what
+//! lets `Meter.set_value` suppress redundant redraws (test "the same time returns the same
+//! three numbers").
 //!
-//! Patchwork avoids multi-threaded complexity by making level metering completely host-driven:
-//! - **Single-Threaded Host Clock:** Meters are driven strictly by the host environment's main
-//!   event loop. One sample is generated per timer wake, requiring zero background threads,
-//!   zero locks, and zero atomics.
-//! - **Pure Integer Arithmetic:** The wave calculation avoids trigonometric functions (`sin`,
-//!   `cos`) and double-precision floating-point (`f64`). It evaluates periodic triangle waves
-//!   using integer millisecond remainder arithmetic, performing a single division into `f32`
-//!   so locked milestone timestamps hit exact fractional coordinates without floating drift.
-//! - **Knob Decoupling:** `sample(now_ms)` is a pure function of time. Metering does not read
-//!   widget knob states, and dragging a knob never perturbs the procedural bar animation.
-//!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
-//!
-//! ### Time Domain:
-//! The input domain is integer milliseconds (`now_ms: u64`) sourced from platform monotonic clocks
-//! (`CLOCK_MONOTONIC` on Linux, `performance.now()` in the browser).
-//!
-//! ### Analytical Triangle Wave Derivation:
-//! Each meter `i` is defined by a `Wave` struct containing `period_ms` and `phase_ms`.
-//! The wave cycles through rising `[0.0, 1.0]` and falling `[1.0, 0.0]` slopes:
+//! ## 2. Waveform Derivation
+//! `now_ms` is integer milliseconds from a monotonic clock supplied by the host. Each meter
+//! has a `Wave` with an even `period_ms` and a `phase_ms`, evaluated as a triangle wave:
 //! ```text
-//! shifted  = now_ms + phase_ms
-//! along    = shifted % period_ms
-//! half     = period_ms / 2
+//! along = (now_ms + phase_ms) % period_ms
+//! half  = period_ms / 2
 //!
-//! rising  (along <= half): level = along / half
-//! falling (along >  half): level = (period_ms - along) / half
+//! along <= half:  level = along / half                 (rising)
+//! along >  half:  level = (period_ms - along) / half   (falling)
 //! ```
+//! The reduction is integer arithmetic and the only floating-point step is the final division
+//! in `f32`, so there are no trigonometric functions, no `f64`, and no accumulated drift.
+//! Periods differ per meter so the bars do not move in lockstep.
 //!
-//! ### Locked Waveform Parameters:
-//! The rack defines 3 waves with distinct periods to prevent visual lockstep:
-//! 1. `osc`:   `period_ms = 2000`, `phase_ms = 500`
-//! 2. `filter`: `period_ms = 3000`, `phase_ms = 750`
-//! 3. `amp`:    `period_ms = 4000`, `phase_ms = 1000`
+//! Each `phase_ms` is `period_ms / 4`, which puts every bar at the midpoint when `now_ms` is 0
+//! so it matches the initial meter value in `rack_meter`. The comptime block asserts that
+//! relation; test "sample at zero is the midpoint of every bar" locks the result, and test
+//! "the locked timestamps hit empty and full" locks the peaks, the troughs, and the falling
+//! slope.
 //!
-//! ### Locked Coordinate Milestones:
-//! Because each wave's `phase_ms` is set to exactly `period_ms / 4`:
-//! - **At `now_ms = 0`:** `along = period_ms / 4 = half / 2`.
-//!   All three bars evaluate to exactly `0.5`:
-//!   `levels[0] = 0.5`, `levels[1] = 0.5`, `levels[2] = 0.5`.
-//!   This matches the initial value configured in `rack_meter`.
-//! - **At `now_ms = 500`:**
-//!   `osc` reaches `(500 + 500) % 2000 = 1000 = half` -> `level = 1.0` (peak).
-//!   `amp` reaches `(500 + 1000) % 4000 = 1500 <= 2000` -> `1500 / 2000 = 0.75`.
-//! - **At `now_ms = 750`:**
-//!   `filter` reaches `(750 + 750) % 3000 = 1500 = half` -> `level = 1.0` (peak).
-//!   `osc` reaches `(750 + 500) % 2000 = 1250 > 1000` -> `(2000 - 1250) / 1000 = 0.75`.
-//! - **At `now_ms = 1500`:**
-//!   `osc` reaches `(1500 + 500) % 2000 = 0` -> `level = 0.0` (empty).
+//! ## 3. Host Seam
+//! `meter_period_ms` is the wake period the app puts in `config.timer_period_ms`, and
+//! `period_ns` is the same interval for hosts that arm a nanosecond timer; the comptime block
+//! asserts they agree. This file imports no platform code, so native hosts, the browser host,
+//! and unit tests all run it unchanged.
 //!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### Static Constants & Limits:
-//! - `meter_count: u32 = 3`: Exactly matches the 3 panels (`osc`, `filter`, `amp`).
-//! - `meter_period_ms: u32 = 33`: Host wake period (approx. 30.3 Hz update frequency).
-//! - `period_ns: u64 = 33_000_000`: Exact nanosecond equivalent for Linux `timerfd`.
-//!
-//! ### Stack Memory Layout:
-//! `sample()` returns `[meter_count]f32` (12 bytes) by value on the stack. No heap allocation,
-//! no pointer indirection, and no dynamic slices.
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### Host-Driven Execution Pipeline:
-//! ```text
-//! [Platform Wake (~33 ms)]
-//!          |
-//!          v
-//! now_ms = monotonic_clock()
-//!          |
-//!          v
-//! sampled = levels.sample(now_ms)
-//!          |
-//!          v
-//! app.timer(now_ms)
-//!          |---> writes slots 5, 11, 17
-//!          |---> Meter.set_value(new_val) (returns true if changed)
-//!          +---> if changed: app.scene.dirty = true
-//! ```
-//!
-//! ### Idempotent Evaluation:
-//! Passing the same `now_ms` returns identical values. `Meter.set_value` compares incoming
-//! values and returns `false` when unchanged, preventing unnecessary frame invalidation.
-//!
-//! ## 5. Cross-Platform Seams & FFI
-//! - **Linux (Wayland):** The event loop initializes a nonblocking `timerfd` armed at `period_ns`
-//!   when `config.timer_period_ms != 0`. On wake, `drain_timer` reads the current timestamp and
-//!   calls `app.timer(now_ms)`.
-//! - **Browser (WebAssembly):** `web/shell.js` arms a `setInterval` at `timer_period_ms()` (33 ms),
-//!   calling the exported `wasm.timer(Math.floor(performance.now()))`. If `timer` returns 1,
-//!   `shell.js` schedules a single `requestAnimationFrame`.
-//! - **Platform Neutrality:** `levels.zig` contains zero platform-specific imports, running
-//!   identically under native Linux, WebAssembly, and unit test harnesses.
-//!
-//! ## 6. TigerStyle Invariants
-//! - **Pure Function Invariance:** `sample` and `level_at` are pure and free of side effects.
-//! - **Bounded Loop Bounds:** Iteration bounded by compile-time `meter_count`.
-//! - **Split Assertions:** Period positivity, even period division, half positivity, and normalized
-//!   output ranges are asserted separately.
-//! - **Zero Runtime Allocation:** BSS/stack-only execution with zero dynamic allocation.
+//! ## 4. TigerStyle Invariants
+//! - `sample` and `level_at` are pure, allocation-free, and loop only over `meter_count`.
+//! - Preconditions (positive even period) and the postcondition (`level` in `[0, 1]`) are
+//!   asserted separately.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Bars on the rack. One per panel.
+/// Bars on the rack, one per panel; the rack asserts the two counts match.
 pub const meter_count: u32 = 3;
 
 /// Host wake period. Native `period_ns` is this many milliseconds.
 pub const meter_period_ms: u32 = 33;
 
-/// `timerfd` interval. 33 ms, matching `meter_period_ms`.
+/// `timerfd` interval equal to `meter_period_ms`; the comptime block enforces the relation.
 pub const period_ns: u64 = 33_000_000;
 
 const Wave = struct {
@@ -128,7 +61,7 @@ const Wave = struct {
     phase_ms: u32,
 };
 
-/// Osc, filter, amp. Periods differ so the bars do not stay locked together.
+/// One wave per meter, in panel order. Periods differ so the bars do not stay locked together.
 const waves = [meter_count]Wave{
     .{ .period_ms = 2000, .phase_ms = 500 },
     .{ .period_ms = 3000, .phase_ms = 750 },
@@ -140,6 +73,11 @@ comptime {
     assert(meter_period_ms == 33);
     assert(period_ns == @as(u64, meter_period_ms) * 1_000_000);
     assert(waves.len == meter_count);
+    // A quarter-period phase puts every bar at its midpoint at time zero.
+    for (waves) |wave| {
+        assert(wave.period_ms % 4 == 0);
+        assert(wave.phase_ms * 4 == wave.period_ms);
+    }
 }
 
 /// Three levels in `[0, 1]` at `now_ms`. The same time returns the same numbers.
@@ -177,6 +115,7 @@ fn level_at(now_ms: u64, wave: Wave) f32 {
     return falling;
 }
 
+// Locks the quarter-period phase: every bar starts at its midpoint, matching `rack_meter`.
 test "sample at zero is the midpoint of every bar" {
     const levels = sample(0);
     try std.testing.expectEqual(@as(f32, 0.5), levels[0]);
@@ -184,6 +123,13 @@ test "sample at zero is the midpoint of every bar" {
     try std.testing.expectEqual(@as(f32, 0.5), levels[2]);
 }
 
+// Locks the triangle wave at hand-checked times. With wave = (period_ms, phase_ms):
+// t = 500: osc (2000, 500) has along = 1000 = half, so it peaks at 1; amp (4000, 1000) has
+// along = 1500 of half = 2000, so it rises to 0.75.
+// t = 750: filter (3000, 750) has along = 1500 = half, so it peaks at 1; osc has along = 1250
+// past half = 1000, so it falls to (2000 - 1250) / 1000 = 0.75; amp has along = 1750 of
+// half = 2000, so it rises to 0.875.
+// t = 1500: osc has along = 0, so it is empty.
 test "the locked timestamps hit empty and full" {
     const at_500 = sample(500);
     try std.testing.expectEqual(@as(f32, 1), at_500[0]);
@@ -196,6 +142,7 @@ test "the locked timestamps hit empty and full" {
     try std.testing.expectEqual(@as(f32, 0.875), at_750[2]);
 }
 
+// Locks that `sample` is a pure function of time and stays within `[0, 1]`.
 test "the same time returns the same three numbers" {
     const first = sample(500);
     const second = sample(500);

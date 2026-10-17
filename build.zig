@@ -16,15 +16,15 @@
 //!   module "app" ------------> test runner                              (tests)
 //! ```
 //!
-//! The host roots are plain files in this repo. They contain no app code, only
-//! `linux_window.run(app.App)` and `export_app(app.App)`.
+//! The host roots are plain files in this repo. They contain no app code, only the call that
+//! instantiates the matching host for `app.App`.
 //!
 //! ## 2. Why Every Path Comes From the Patchwork Builder
-//! `addApp(b, patchwork_builder, options)` takes two builders. `b` is the consumer's. The
-//! consumer's `build.zig.zon` lists only `patchwork`. `patchwork_builder` is that
-//! dependency's builder, so `src/host/*`, `web/*`, and the `wgpu_native` package resolve
-//! against Patchwork's own tree. A `b.path` call here would look for `src/host` in the
-//! consumer's tree. Inside this repo the two builders are the same object.
+//! `addApp(b, patchwork_builder, options)` takes two builders. `b` is the consumer's and
+//! `patchwork_builder` is the Patchwork dependency's. Host roots, web assets, and the
+//! `wgpu_native` package must resolve in Patchwork's tree, so they go through
+//! `patchwork_builder`. A `b.path` call for them would search the consumer's tree. Inside
+//! this repo the two builders are the same object.
 //!
 //! ## 3. One Library Module Per Target
 //! The app module and the host root must import the same `patchwork` module instance for a
@@ -33,18 +33,19 @@
 //!
 //! ## 4. Steps
 //! - `run` builds and runs the native executable (Wayland and wgpu-native).
-//! - `wasm` installs `<name>.wasm` (no libc, no OS, `export_memory`, `rdynamic`).
-//! - `serve` serves `index.html`, `shell.js`, and the wasm on `http://127.0.0.1:8080/`.
+//! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
+//! - `serve` serves the page, `shell.js`, and the wasm through `src/serve.zig`, which owns
+//!   the address and port.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests. `zig build test-contract`
 //!   compiles an app with no `draw` and passes only if the compiler rejects it.
-//! - Examples: `run`, `serve`, `wasm` use the rack. `run-column`, `serve-column`, and
-//!   `wasm-column` use the column.
+//! - Each example in this repo gets `run`, `serve`, and `wasm` steps through
+//!   `add_example_steps`, with a name suffix for every example but the first.
 
 const std = @import("std");
 
-/// Options for `addApp`. `target` and `optimize` apply to the native executable and the
-/// tests. The wasm module always targets `wasm32-freestanding` at `optimize`.
+/// Options for `addApp`. `target` applies to the native executable and the tests, and
+/// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
 pub const AppOptions = struct {
     /// Executable and wasm base name.
     name: []const u8,
@@ -248,7 +249,7 @@ pub fn build(b: *std.Build) void {
         "Override directory containing libwgpu_native.so (defaults to the wgpu_native package)",
     );
 
-    // The library module for projects that import it directly.
+    // Exposed so other projects can import the library without `addApp`.
     const library = b.addModule("patchwork", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

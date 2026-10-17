@@ -1,96 +1,70 @@
-//! Wayland `wp_presentation` (presentation-time) client binding.
+//! Wayland `wp_presentation` (presentation-time protocol) client binding.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! `wl_callback.done` indicates only that a committed surface buffer was accepted into a
-//! compositor rendering cycle. It does not indicate when that buffer physically reached the
-//! display scanout hardware, and when it is sent is a compositor policy, not a protocol
-//! guarantee: some compositors send it after their render pass, Hyprland 0.56 sends it about
-//! 0.35 ms after the pageflip, and the driver's own present path can hold it back (Mesa's FIFO
-//! on `wp_fifo_v1` delayed every other `done` by a refresh). A client that schedules its next
-//! commit strictly from `done` inherits whichever of those applies and spends its latch margin
-//! on it.
+//! ## 1. Why Presentation Feedback Instead of `wl_callback.done`
+//! `wl_callback.done` says the commit was taken into a compositor presentation cycle, not
+//! when it reached scanout, and when it is sent is compositor and driver policy. It can
+//! carry the compositor's render time, and a driver's present path can hold it back: with
+//! Mesa 26.2.2 in FIFO mode (`wp_fifo_v1`), each present issues a barrier-held second commit
+//! that carries the client's `wl_surface.frame`, which delays every other `done` by a
+//! refresh period. A client that schedules from `done` inherits that jitter and spends its
+//! latch margin on it. The workaround is to anchor on `wp_presentation_feedback.presented`
+//! and keep `done` as the fallback; it can be dropped if `done` becomes a reliable scanout
+//! signal across the compositors and drivers in use.
 //!
-//! The `wp_presentation` extension solves this by providing explicit per-commit hardware timing
-//! via `wp_presentation_feedback`. For each commit, the compositor emits exactly one completion
-//! event:
-//! - `presented`: The buffer was displayed on screen at an exact hardware vertical blanking
-//!   timestamp, reporting the output refresh period and hardware synchronization flags.
-//! - `discarded`: The buffer was superseded, occluded, or dropped before reaching the display.
+//! For each requested feedback the compositor sends exactly one terminal event:
+//! `presented` (hardware pageflip time, refresh period, flags) or `discarded` (the content
+//! never reached the screen). When `wp_presentation.clock_id` names `CLOCK_MONOTONIC`
+//! (`clock_monotonic`), the timestamp is comparable to `clock_gettime(.MONOTONIC)` and the
+//! host can project the next vblank from it. Any other clock disables the anchor.
 //!
-//! The `presented` timestamp corresponds to the hardware pageflip. When the compositor uses
-//! `CLOCK_MONOTONIC`, this timestamp is directly comparable to `std.os.linux.clock_gettime`,
-//! enabling the client to phase-lock its render submission directly to the upcoming display
-//! vertical blank rather than reacting to variable compositor render completion.
-//!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
-//! The Wayland wire protocol defines only 32-bit integer primitives (`u`, `i`) and lacks native
-//! 64-bit integer types. Consequently, the 64-bit seconds counter (`tv_sec`) and vertical refresh
-//! sequence counter (`seq`) are transmitted as split 32-bit unsigned integers:
+//! ## 2. Timestamp Assembly
+//! The wire format has no 64-bit integer, so `presented` splits the seconds and the vblank
+//! sequence counter into high and low 32-bit words:
 //! ```text
-//! tv_sec      = (tv_sec_hi << 32) | tv_sec_lo            (seconds)
-//! presented   = tv_sec * 1_000_000_000 + tv_nsec        (nanoseconds)
-//! seq         = (seq_hi << 32) | seq_lo                 (vblank count, 0 if unsupported)
-//! refresh     = nanoseconds between refreshes           (0 for variable refresh rate)
+//! tv_sec    = (tv_sec_hi << 32) | tv_sec_lo
+//! presented = tv_sec * 1_000_000_000 + tv_nsec       (nanoseconds, tv_nsec < 1_000_000_000)
+//! refresh   = nanoseconds per output refresh, 0 when the output has no fixed rate
 //! ```
-//! The pure helper `presented_ns` performs this 64-bit assembly. The protocol guarantees that
-//! `tv_nsec` is strictly within `0 <= tv_nsec < 1_000_000_000`.
+//! `presented_ns` performs the assembly; the test "presented_ns assembles the split
+//! timestamp" and the carry test next to it lock it.
 //!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//! - `wp_presentation` interface (version 2):
-//!   - Request 0: `destroy` (signature `""`) - Destroys the presentation global proxy.
-//!   - Request 1: `feedback` (signature `"on"`) - Requests feedback for a `wl_surface`.
-//!   - Event 0: `clock_id` (signature `"u"`) - Informs client of `clockid_t` (e.g. 1).
-//! - `wp_presentation_feedback` interface (version 2):
-//!   - Method count: 0 (no client-to-server requests).
-//!   - Event 0: `sync_output` (signature `"o"`) - Output proxy (`wl_output`) of presentation.
-//!   - Event 1: `presented` (signature `"uuuuuuu"`) - Timing parameters and flags.
-//!   - Event 2: `discarded` (signature `""`) - Buffer dropped without presentation.
-//! - Destructor Semantics: Both `presented` and `discarded` are protocol destructors. The server
-//!   deletes its state immediately upon emission. The client MUST call `wl_proxy_destroy` from
-//!   within the callback listener to release the client-side `WlProxy` tracking structure.
-//! - C ABI Struct Layouts:
-//!   - `PresentationListener`: 8 bytes, alignment 8 (single function pointer for `clock_id`).
-//!   - `FeedbackListener`: 24 bytes, alignment 8 (three function pointers at offsets 0, 8, 16).
-//! - Flags Bitmask (`wp_presentation_feedback.kind`):
-//!   - `vsync = 0x1`: Synchronized with vertical blanking interval.
-//!   - `hw_clock = 0x2`: Timestamp sampled directly by display hardware/kernel clock.
-//!   - `hw_completion = 0x4`: Completion confirmed by hardware execution signal.
-//!   - `zero_copy = 0x8`: Presentation occurred via direct zero-copy scanout.
-//!   - Measured on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz): Observed `flags = 0x5`
-//!     (`vsync | hw_completion`, without `hw_clock`), refresh reported `16666666 ns`, and
-//!     `clock_id = CLOCK_MONOTONIC` (1).
+//! ## 3. Protocol Rules and C ABI
+//! - Both interfaces are hand-written tables (`wp_presentation_interface`,
+//!   `wp_presentation_feedback_interface`) because the protocol is an extension that
+//!   `libwayland-client` does not export. `assert_interface_tables`, evaluated at compile
+//!   time by `linux_window.zig`, checks their counts and versions against the tables.
+//! - `presented` and `discarded` are both terminal. The server forgets the object after
+//!   either, and the client MUST call `destroy_feedback` from inside that listener to
+//!   release the client-side proxy.
+//! - `flag_*` constants name the `wp_presentation_feedback.kind` bits; the `comptime` block
+//!   pins them to the protocol values.
+//! - Listener structs hold one function pointer per event in opcode order. Slot counts and
+//!   sizes are enforced by `comptime` asserts.
 //!
-//! ## 4. State Machines & Data Flow
+//! ## 4. State Machine
 //! ```text
-//!   commit N  --request feedback-->  wp_presentation_feedback (one-shot proxy)
-//!                                         |
-//!                       +-----------------+------------------+
-//!                       v                                    v
-//!             presented(t, refresh, seq, flags)           discarded
-//!                       |                                    |
-//!             store t, refresh to State                  no timestamps stored
-//!                       |                                    |
-//!                       +-------- wl_proxy_destroy ----------+
+//!   commit N --request_feedback--> one-shot feedback proxy
+//!                                      |
+//!                    +-----------------+-----------------+
+//!                    v                                   v
+//!             presented(t, refresh, ...)             discarded
+//!             store t and refresh                    store nothing
+//!                    +--------- destroy_feedback ---------+
 //! ```
-//! Exactly two feedback proxies are active in steady state: the feedback for the frame currently
-//! scanning out arrives after the subsequent commit has already been dispatched. The client bounds
-//! active proxies via `feedback_in_flight_max = 4`. If the bound is reached, further feedback
-//! requests are skipped to guarantee bounded memory even if the compositor stalls.
+//! Feedback for the frame on screen arrives after the next commit was already dispatched, so
+//! more than one proxy is normally live. The host bounds them with
+//! `feedback_in_flight_max` in `linux_window.zig` and skips a request at the bound, so a
+//! stalled compositor cannot grow memory.
 //!
-//! ## 5. Cross-Platform Seams & FFI
-//! Hand-written protocol interface tables match the `libwayland-client.so.0` C ABI without
-//! generating code or linking external tools. Upstream interfaces `wl_surface_interface` and
-//! `wl_output_interface` are imported from `xdg_shell.zig`. WebAssembly browsers do not offer
-//! equivalent hardware pageflip feedback; the browser harness relies on `requestAnimationFrame`.
+//! ## 5. Cross-Platform Seam
+//! Browsers expose no pageflip feedback; the web host paces with `requestAnimationFrame`.
 //!
 //! ## 6. TigerStyle Invariants
-//! - Strict comptime assertions locking listener struct sizes and alignment.
-//! - Zero runtime allocations: proxies are managed by `libwayland-client` and destroyed
-//!   deterministically upon receiving terminal destructor events.
-//! - Bounded proxy count (`feedback_in_flight_max = 4`).
-//! - Leaf listeners perform minimal data recording into `State`, keeping event handlers pure.
+//! - No runtime allocation; proxies are libwayland-owned and destroyed on the terminal event.
+//! - The extern libwayland functions are referenced only by runtime helpers, so the interface
+//!   tables, asserts, and `presented_ns` are testable without linking `wayland-client`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -105,12 +79,12 @@ pub const WpPresentation = opaque {};
 /// either the `presented` or `discarded` event callback.
 pub const WpPresentationFeedback = opaque {};
 
-/// Highest `wp_presentation` interface version supported by these protocol definitions.
+/// Highest `wp_presentation` version these interface tables describe. The host binds
+/// `min(advertised, presentation_version)`.
 pub const presentation_version: u32 = 2;
 
-/// POSIX `clockid_t` for `CLOCK_MONOTONIC` (value 1 on Linux).
-/// Feedback events stamped with any other clock ID cannot be compared to system time and
-/// must be ignored by the pacing loop.
+/// Linux `clockid_t` for `CLOCK_MONOTONIC`. Feedback stamped with any other clock cannot be
+/// compared to `clock_gettime(.MONOTONIC)` and must be ignored by the pacing loop.
 pub const clock_monotonic: u32 = 1;
 
 /// Presentation was synchronized with the display vertical blanking interval.
@@ -185,11 +159,8 @@ pub const wp_presentation_feedback_interface: WlInterface = .{
     .events = &feedback_events,
 };
 
-/// C ABI function table for `wp_presentation` events.
-///
-/// Contains one callback (`clock_id` at opcode 0):
-/// - Offset 0..7: `clock_id` function pointer (8 bytes).
-/// - Size: 8 bytes. Alignment: 8 bytes.
+/// C ABI listener for `wp_presentation` events: one slot, `clock_id` (opcode 0).
+/// Size is enforced by the `comptime` block.
 pub const PresentationListener = extern struct {
     clock_id: *const fn (
         data: ?*anyopaque,
@@ -198,13 +169,8 @@ pub const PresentationListener = extern struct {
     ) callconv(.c) void,
 };
 
-/// C ABI function table for `wp_presentation_feedback` events.
-///
-/// Contains three event callbacks:
-/// - Offset 0..7: `sync_output` function pointer (opcode 0, 8 bytes).
-/// - Offset 8..15: `presented` function pointer (opcode 1, 8 bytes).
-/// - Offset 16..23: `discarded` function pointer (opcode 2, 8 bytes).
-/// - Size: 24 bytes. Alignment: 8 bytes.
+/// C ABI listener for `wp_presentation_feedback` events, slots in opcode order:
+/// `sync_output`, `presented`, `discarded`. Size is enforced by the `comptime` block.
 pub const FeedbackListener = extern struct {
     sync_output: *const fn (
         data: ?*anyopaque,
@@ -242,10 +208,10 @@ pub fn add_presentation_listener(
     assert(@intFromPtr(presentation) != 0);
 }
 
-/// Issues request opcode 1 (`feedback`) on `wp_presentation` for the target `surface`.
+/// Issues `wp_presentation.feedback` (request opcode 1) for `surface`.
 ///
-/// Allocates and returns a one-shot `WpPresentationFeedback` proxy. The compositor will
-/// report the presentation outcome of the surface's next `wl_surface.commit`.
+/// Returns a one-shot `WpPresentationFeedback` proxy. The compositor reports the outcome of
+/// the surface's next `wl_surface.commit`, so call this before that commit.
 ///
 /// Preconditions: `presentation` and `surface` must be valid, non-null proxy pointers.
 /// Interface version must satisfy `1 <= version <= presentation_version`.
@@ -270,7 +236,7 @@ pub fn request_feedback(
     return @ptrCast(result.?);
 }
 
-/// Registers the three-callback listener on a newly created `WpPresentationFeedback` proxy.
+/// Registers the listener on a newly created `WpPresentationFeedback` proxy.
 ///
 /// Preconditions: `feedback` must be non-null. `listener` must remain valid until the
 /// proxy is destroyed.
@@ -286,9 +252,8 @@ pub fn add_feedback_listener(
 
 /// Destroys a one-shot `WpPresentationFeedback` proxy via `wl_proxy_destroy`.
 ///
-/// Must be called from within either `presented` or `discarded` event handlers.
-/// Both events are server-side destructors; destroying the client-side proxy releases its
-/// local tracking ID without sending further wire messages.
+/// Must be called from within the `presented` or `discarded` handler. Both are terminal on
+/// the server, so destroying the client proxy sends no further wire message.
 pub fn destroy_feedback(feedback: *WpPresentationFeedback) void {
     const proxy: *WlProxy = @ptrCast(feedback);
     assert(@intFromPtr(proxy) != 0);
@@ -296,13 +261,15 @@ pub fn destroy_feedback(feedback: *WpPresentationFeedback) void {
     assert(@intFromPtr(feedback) != 0);
 }
 
-/// Assembles split 64-bit seconds and 32-bit nanoseconds from `presented` into total nanoseconds.
+/// Assembles the split `presented` timestamp into total nanoseconds.
 ///
 /// Preconditions: `tv_nsec` must be strictly less than 1_000_000_000 (asserted).
 ///
-/// Coordinate Frame & Units: Monotonic nanoseconds (`u64`) on the compositor presentation clock
-/// (`CLOCK_MONOTONIC`). Directly comparable to `std.os.linux.clock_gettime(.MONOTONIC, ...)`.
-/// Verified by test case "presented_ns assembles the split timestamp".
+/// Units: nanoseconds on the compositor presentation clock. Only comparable to
+/// `clock_gettime(.MONOTONIC)` when `clock_monotonic` was reported. The seconds word
+/// must be small enough that the product fits `u64`, which any real clock satisfies.
+/// Locked by the tests "presented_ns assembles the split timestamp" and
+/// "presented_ns carries the low seconds word without sign extension".
 pub fn presented_ns(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) u64 {
     assert(tv_nsec < 1_000_000_000);
     const seconds: u64 = (@as(u64, tv_sec_hi) << 32) | @as(u64, tv_sec_lo);
@@ -312,7 +279,31 @@ pub fn presented_ns(tv_sec_hi: u32, tv_sec_lo: u32, tv_nsec: u32) u64 {
     return total;
 }
 
+/// Compile-time consistency checks between the hand-written interface tables and their
+/// declared counts and version. They live in a function, called from a `comptime` block in
+/// `linux_window.zig`, because reading the interface structs makes the compiler reference the
+/// extern libwayland interface symbols, and unit-test builds link no `wayland-client`.
+pub fn assert_interface_tables() void {
+    comptime {
+        // libwayland trusts the declared counts, so a mismatch reads past the message array.
+        assert(wp_presentation_interface.method_count == presentation_requests.len);
+        assert(wp_presentation_interface.event_count == presentation_events.len);
+        assert(wp_presentation_feedback_interface.event_count == feedback_events.len);
+        assert(wp_presentation_feedback_interface.method_count == 0);
+        assert(wp_presentation_interface.version == presentation_version);
+        assert(wp_presentation_feedback_interface.version == presentation_version);
+        // Listener slots must equal the event counts of the interface they serve.
+        assert(@typeInfo(PresentationListener).@"struct".fields.len == presentation_events.len);
+        assert(@typeInfo(FeedbackListener).@"struct".fields.len == feedback_events.len);
+    }
+}
+
 comptime {
+    // `wp_presentation_feedback.kind` bit values as defined by the protocol.
+    assert(flag_vsync == 0x1);
+    assert(flag_hw_clock == 0x2);
+    assert(flag_hw_completion == 0x4);
+    assert(flag_zero_copy == 0x8);
     assert(@typeInfo(PresentationListener).@"struct".fields.len == 1);
     assert(@sizeOf(PresentationListener) == 8);
     assert(@typeInfo(FeedbackListener).@"struct".fields.len == 3);
@@ -327,4 +318,12 @@ test "presented_ns assembles the split timestamp" {
     try std.testing.expectEqual(@as(u64, 1_000_000_005), presented_ns(0, 1, 5));
     const high = presented_ns(1, 0, 0);
     try std.testing.expectEqual(@as(u64, 4_294_967_296) * 1_000_000_000, high);
+}
+
+// Locks that the low seconds word is zero-extended: a sign-extending shift would corrupt the
+// high bits of the result. The values are the largest low word and the largest legal tv_nsec.
+test "presented_ns carries the low seconds word without sign extension" {
+    // 4_294_967_295 s * 1e9 ns/s + 999_999_999 ns.
+    const expected: u64 = 4_294_967_295_999_999_999;
+    try std.testing.expectEqual(expected, presented_ns(0, 0xFFFF_FFFF, 999_999_999));
 }

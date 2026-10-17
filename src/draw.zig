@@ -1,258 +1,135 @@
-//! 2D Instanced Quad Rendering, Orthographic Projections, Draw Lists, and SDF Boxes.
+//! 2D instanced quads, Y-down orthographic projection, draw lists, and SDF boxes.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Why Instanced Unit Quads Instead of Immediate Geometry?
-//! In a graphical user interface (buttons, panels, borders, badges, scrollbars, text backgrounds),
-//! virtually every rendered visual element is a 2D axis-aligned rectangle (quad).
+//! ## 1. Why Instanced Unit Quads Instead of Immediate Geometry
+//! Nearly every UI element is an axis-aligned rectangle. Rebuilding four to six vertices per
+//! rectangle on the CPU each frame costs CPU time, allocator churn, and upload bandwidth that
+//! grows with the rectangle count. Instead, one static unit quad (`unit_quad`, uploaded once)
+//! is expanded in the vertex shader by per-instance data held in `Instance`. The vertex fetch
+//! unit advances the quad attributes per vertex and the instance attributes per instance, so a
+//! whole frame of rectangles is one draw call of `vertex_count` vertices times `count`
+//! instances, and only `DrawList.count` instances are ever uploaded.
 //!
-//! In traditional or legacy graphics approaches (such as OpenGL 1.x immediate mode or naive 2D
-//! canvas drawing):
-//! - The CPU recalculates four 2D vertex positions `(x, y)` and UV coordinates for each quad.
-//! - The CPU builds a temporary vertex buffer with 4 to 6 vertices per quad.
-//! - For 256 quads, this requires copying 256 * 6 = 1,536 vertices (~49 KB)
-//!   across the PCIe bus to GPU VRAM every single frame.
-//! - This burns CPU cycles, causes memory allocator churn, and congests PCIe bandwidth.
+//! ## 2. Y-Down Orthographic Projection
+//! Coordinate spaces:
+//! - **UI logical pixels:** origin at the top-left of the window, `+X` right in `[0, w]`,
+//!   `+Y` down in `[0, h]`.
+//! - **WebGPU NDC:** `X` in `[-1, +1]` left to right, `Y` in `[-1, +1]` bottom to top (Y-up),
+//!   `Z` in `[0, 1]` near to far.
 //!
-//! Modern GPU engines (such as Makepad, Flutter Impeller, and modern game UI engines) leverage
-//! **Hardware Instancing**:
-//! - A single canonical "unit quad" of 6 vertices representing a 1 x 1 square spanning
-//!   from `(0, 0)` to `(1, 1)` is uploaded to GPU memory **once** at startup (48 bytes total).
-//! - Per-quad parameters (position `x, y`, dimension `width, height`, color `r, g, b, a`,
-//!   corner `radius` or arc stroke thickness, `hover` lighten, `down` darken or arc sweep,
-//!   `kind`, and `clip` bounds) are packed into a compact array called **instances**
-//!   (64 bytes per instance, four `vec4` groups). Section 6 derives the distance fields
-//!   and clip masks those extra floats drive.
-//! - Drawing all 256 quads requires just **one single draw call**: `draw(6, instance_count)`.
-//! - The GPU hardware vertex fetch unit advances unit quad attributes once per vertex,
-//!   and advances instance attributes once per instance. The vertex shader expands each
-//!   unit quad into its world-space pixel rectangle directly inside GPU registers.
-//!
-//! ## 2. Mathematical Derivation of the Y-Down Orthographic Projection Matrix
-//!
-//! ### Coordinate Spaces:
-//! - **UI Pixel Coordinates:**
-//!   User interfaces are defined in 2D screen coordinates with origin `(0, 0)` at the top-left
-//!   corner of the window. `+X` increases rightwards (`[0, width]`), and `+Y` increases downwards
-//!   (`[0, height]`).
-//! - **Normalized Device Coordinates (NDC) in WebGPU:**
-//!   WebGPU (and Vulkan / Metal) defines the visible clip space as a 3D volume:
-//!   - `X in [-1.0, +1.0]`: -1.0 is the left edge, +1.0 is the right edge.
-//!   - `Y in [-1.0, +1.0]`: -1.0 is the bottom edge, +1.0 is the top edge (Y-up!).
-//!   - `Z in [0.0, 1.0]`: 0.0 is the near plane, 1.0 is the far plane (not OpenGL `[-1, 1]`).
-//!
-//! ### Algebraic Derivation:
-//! We seek linear transformations `f(x)` and `g(y)` mapping pixel ranges to NDC ranges:
-//!
-//! 1. **Horizontal Mapping (X):**
-//!    ```text
-//!    f(0) = -1.0,  f(w) = +1.0
-//!    f(x) = m_x * x + c_x
-//!    m_x * 0 + c_x = -1.0  =>  c_x = -1.0
-//!    m_x * w - 1.0 = +1.0  =>  m_x = 2 / w
-//!    X_ndc = (2 / w) * x - 1
-//!    ```
-//!
-//! 2. **Vertical Mapping (Y, Inverting Top-Down to Bottom-Up):**
-//!    ```text
-//!    g(0) = +1.0 (top),  g(h) = -1.0 (bottom)
-//!    g(y) = m_y * y + c_y
-//!    m_y * 0 + c_y = +1.0  =>  c_y = +1.0
-//!    m_y * h + 1.0 = -1.0  =>  m_y = -2 / h
-//!    Y_ndc = -(2 / h) * y + 1
-//!    ```
-//!
-//! 3. **Depth Mapping (Z):**
-//!    For 2D orthographic UI rendering, depth is unused.
-//!    We set `z = 0`, mapping directly to `Z_ndc = 0.0`.
-//!
-//! 4. **Matrix Formulation (Column-Major 4x4):**
-//!    Multiplying matrix `M` by column vector `[x, y, 0, 1]`:
-//!    ```text
-//!    | 2/w   0    0  -1 |   | x |   | (2*x)/w - 1 | -> NDC X in [-1, +1]
-//!    |  0  -2/h   0   1 | * | y | = | 1 - (2*y)/h | -> NDC Y in [+1, -1]
-//!    |  0    0    1   0 |   | 0 |   |      0      | -> NDC Z in [0, 1]
-//!    |  0    0    0   1 |   | 1 |   |      1      | -> W
-//!    ```
-//!    Because WebGPU and WGSL represent matrices in **column-major memory order**,
-//!    the 16 consecutive floats in memory are stored column by column:
-//!    - Column 0 (indices 0..3):   `[ 2.0 / w,      0.0, 0.0, 0.0 ]`
-//!    - Column 1 (indices 4..7):   `[     0.0, -2.0 / h, 0.0, 0.0 ]`
-//!    - Column 2 (indices 8..11):  `[     0.0,      0.0, 1.0, 0.0 ]`
-//!    - Column 3 (indices 12..15): `[    -1.0,      1.0, 0.0, 1.0 ]`
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### WebGPU Specification Limit: 256-Byte Uniform Buffer Alignment Rule
-//! The WebGPU standard specification (Section 24.1, Table 23 "Limits") specifies:
-//! - `minUniformBufferOffsetAlignment`: Minimum byte alignment for dynamic uniform buffer
-//!   offsets and bind group ranges. Compliant hardware requires at least **256 bytes**.
-//! - Even though our 4x4 matrix is exactly 64 bytes (16 * 4 bytes), allocating 64 bytes
-//!   violates the minimum binding size on certain Vulkan and Metal backends.
-//! - Therefore, we set `uniform_bytes = 256` for the GPU allocation: bytes 0..63 store the
-//!   64-byte 4x4 orthographic matrix (`ortho`), and bytes 64..255 store the 192-byte
-//!   `Theme` record (see `src/theme.zig`). The uniform buffer is bound once to both pipelines
-//!   with visibility `VERTEX | FRAGMENT`.
-//!
-//! ### `PresentHeader` C ABI Binary Memory Layout (104 Bytes):
-//! `PresentHeader` communicates frame dimensions, clear colors, upload dirty flags, the projection
-//! matrix, and draw counts across the platform boundary (FFI / WebAssembly linear memory).
-//!
+//! The linear maps are fixed by the corner constraints `f(0) = -1, f(w) = +1` for X and
+//! `g(0) = +1, g(h) = -1` for Y (the flip), with depth pinned at `z = 0`:
 //! ```text
-//! +---------------+-----------------------+-----------------------------------------------+
-//! | Byte Offset   | Field                 | Description                                   |
-//! +---------------+-----------------------+-----------------------------------------------+
-//! |   0..3        | width_px: u32         | Physical framebuffer width in device pixels   |
-//! |   4..7        | height_px: u32        | Physical framebuffer height in device pixels  |
-//! |   8..11       | instance_count: u32   | Number of quad instances to draw [0..256]     |
-//! |  12..15       | flags: u32            | Bitmask: 1=instances, 2=uniform, 4=glyphs     |
-//! |  16..31       | clear: [4]f32         | Clear color (r, g, b, a)                      |
-//! |  32..95       | ortho: [16]f32        | 4x4 column-major orthographic matrix (64 B)   |
-//! |  96..99       | glyph_count: u32      | Number of glyph quads to draw [0..256]        |
-//! | 100..103      | pad: u32              | Alignment pad, written 0                      |
-//! +---------------+-----------------------+-----------------------------------------------+
+//! X_ndc = (2 / w) * x - 1
+//! Y_ndc = -(2 / h) * y + 1
 //! ```
-//! Total size: exactly 104 bytes (`@sizeOf(PresentHeader) == 104`).
+//! As a column-major 4x4 `M` applied to the column vector `[x, y, 0, 1]`, matching WGSL
+//! `mat4x4<f32>` memory order, the 16 floats are written column by column:
+//! ```text
+//! col 0: [ 2/w,   0, 0, 0 ]      col 2: [  0, 0, 1, 0 ]
+//! col 1: [   0, -2/h, 0, 0 ]     col 3: [ -1, 1, 0, 1 ]
+//! ```
+//! Worked values: see test "ortho maps the four corners and the center".
 //!
-//! ## 4. The Dirty Tracking Architecture (`UploadCursor`)
-//! Transferring data from CPU to GPU via `writeBuffer` incurs driver synchronization overhead.
-//! `UploadCursor` implements a state machine that tracks:
-//! - `primed`: Has the GPU received the initial data yet? (First frame uploads all buffers).
-//! - `revision`: An incrementing counter bumped on `DrawList.append()` or `DrawList.clear()`.
-//! - `width_logical`, `height_logical`: Window dimensions from which matrix was built.
+//! ## 3. Uniform Size and the Present Header
+//! The frame uniform holds the projection matrix followed by `theme.Theme`; `uniform_bytes`
+//! is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
+//! offsets to be multiples of the `minUniformBufferOffsetAlignment` limit (WebGPU "Limits"
+//! table, default 256). The buffer size is kept a multiple of that limit
+//! (`min_uniform_offset_alignment`) so the record stays valid if it is ever bound at an offset.
 //!
-//! This enables four distinct upload scenarios:
-//! 1. **Initial Frame:** `flag_instances | flag_uniform | flag_glyphs`.
-//! 2. **Face change only:** `flag_instances`. A glyph revision mismatch sets `flag_glyphs`.
-//! 3. **Window Resize Only:** `flag_uniform` (re-uploads the 64-byte matrix; leaves both
-//!    instance buffers intact).
-//! 4. **Identical Re-present:** `0`, including a scale-only present. Neither instance
-//!    buffer is uploaded.
+//! `PresentHeader` is an `extern struct` that the host reads in place across the platform
+//! boundary: native code as a Zig struct and `web/shell.js` through a `DataView` over Wasm
+//! linear memory. Its size and every field offset are the ABI, enforced by `comptime` asserts
+//! on `@sizeOf` and `@offsetOf`; there is no padding except the explicit `pad` field, which
+//! `fill_header` writes as zero so no uninitialized bytes cross the boundary.
 //!
-//! ## 5. TigerStyle Safety and Determinism
-//! - **Static Allocation:** Fixed capacity of 256 instances (`items: [instance_cap]Instance`).
-//!   Zero heap allocation, zero pointer chasing, zero risk of `OutOfMemory` after startup.
-//! - **Defensive Pre/Postconditions:** Every public function asserts valid bounds, positive edges,
-//!   and correct state transitions.
-//! - **Binary Layout Verification:** Comptime assertions enforce exact struct sizes, alignments,
-//!   and layout compatibility with WGSL shader declarations.
+//! ## 4. Dirty Tracking (`UploadCursor`)
+//! Each GPU `writeBuffer` has driver synchronization cost, so `UploadCursor` remembers what
+//! the GPU last received and `flags` reports only what changed:
+//! - Unprimed cursor: upload everything (`flag_instances | flag_uniform | flag_glyphs`).
+//! - `DrawList.revision` differs: `flag_instances`. `GlyphList.revision` differs: `flag_glyphs`.
+//! - Logical width or height differs: `flag_uniform`, because the projection depends only on
+//!   the logical size.
+//! - Nothing differs, including a present that changes only the physical pixel scale: zero,
+//!   so neither instance buffer is rewritten.
+//! Revision counters only increase and are compared for inequality, never reset. Each
+//! scenario above is locked by one of the `UploadCursor` tests at the end of this file.
 //!
-//! ## 6. Rounded-Box Distance Field
-//! Step 2 filled each instance with a flat color. Step 3 keeps the same unit quad, the same
-//! draw call, and the same straight-alpha blend, and evaluates a signed distance in the
-//! fragment shader. A panel, a pill, and a button face are one instance type.
+//! ## 5. Rounded-Box and Open-Ring Distance Fields
+//! The same unit quad, draw call, and straight-alpha blend serve boxes and rings: the fragment
+//! shader evaluates a signed distance (negative inside, zero on the outline, positive outside)
+//! and turns it into coverage. A distance field replaces a fan of corner triangles, which
+//! would need a mesh rebuild when the radius changes and would alias unless finer than a
+//! pixel. The unit quad is the shape's bounding box.
 //!
-//! ### Why a distance instead of more triangles
-//! A rounded corner can be a fan of extra vertices. That would rebuild the mesh whenever the
-//! radius changed, and it would alias on a scaled surface unless the fan was finer than a
-//! pixel. A signed distance is a scalar at every local point: negative inside the shape, zero
-//! on the boundary, positive outside. The unit quad stays the rectangle's bounding box. The
-//! fragment shader asks the field whether that pixel is inside the rounded outline, then turns
-//! the distance into coverage. Radius 0 reproduces the sharp rectangle from step 2.
+//! ### Instance Layout
+//! `Instance` is four `float32x4` vertex attributes, in struct order, one per shader
+//! location. Offsets are enforced by the `comptime` block below.
+//! - Location 1, `(x, y, width, height)`: rectangle in logical pixels, top-left origin.
+//! - Location 2, `(r, g, b, a)`: straight-alpha fill.
+//! - Location 3, `(radius, hover, down, kind)`: `kind` is `kind_box` or `kind_arc`.
+//!   For a box, `radius` is the geometric corner radius and `down` is the darken weight.
+//!   For an arc, `radius` is the stroke thickness and `down` is the sweep fraction.
+//!   `hover` is the lighten weight for both.
+//! - Location 4, `(clip_x0, clip_y0, clip_x1, clip_y1)`: exclusive-max clip rectangle in
+//!   logical pixels.
 //!
-//! ### The 64-byte instance
-//! `Instance` is sixteen `f32`s in four groups the GPU fetches as `float32x4`:
-//! - Location 1 (Offset  0): rectangle `(x, y, width, height)` in logical pixels, origin top-left.
-//! - Location 2 (Offset 16): straight-alpha fill `(r, g, b, a)`.
-//! - Location 3 (Offset 32): `(radius, hover, down, kind)`.
-//!   `kind` selects the primitive: `kind_box` (0.0) or `kind_arc` (1.0).
-//!   - For a box: `radius` is the geometric corner radius; `hover` is lighten weight; `down` is
-//!     darken weight.
-//!   - For an arc: `radius` is the stroke thickness; `hover` is lighten weight; `down` is the
-//!     sweep fraction in `[0.0, 1.0]`. The shader does not darken an arc.
-//! - Location 4 (Offset 48): exclusive-max clip
-//!   `(clip_x0, clip_y0, clip_x1, clip_y1)` in logical pixels.
+//! ### Radius, Hover, and Down
+//! A box radius is clamped to half the shorter edge by both `sdf_box` and the shader, so a
+//! wide box becomes a capsule and a square becomes a disc. `append` rejects a negative radius
+//! and stores an oversized one unchanged. `hover` and `down` are mix weights in `[0, 1]`
+//! toward the theme's `lighten` and `darken` colors; for an arc, `down` instead scales
+//! `theme.arc_sweep` and the shader never darkens an arc. Widgets scale their animator values
+//! by `widgets.hover_lighten` and `widgets.down_darken` before writing them; this module only
+//! validates the range.
 //!
-//! Note the critical architectural distinction between the unit quad and the instance buffer:
-//! - The static unit quad vertex buffer remains **48 bytes** (6 vertices * 2 floats * 4 bytes).
-//! - The instance buffer is `instance_cap * instance_stride` = 256 * 64 = **16,384 bytes**.
-//! Only `count` instances are uploaded per dirty frame.
-//!
-//! ### Radius and Arc Stroke Thickness
-//! For a box (`kind = 0`), `radius` is the geometric corner radius in logical pixels. `append`
-//! rejects a negative radius. `sdf_box` and the shader both clamp it to half the shorter edge, so
-//! a wide box becomes a capsule and a square becomes a disc.
-//! For an open ring (`kind = 1`), `radius` is the stroke thickness (e.g. knob thickness 4 px).
-//!
-//! ### Hover, Down, and Sweep Shader Blend Weights
-//! `hover` is a mix weight in `[0.0, 1.0]` toward theme lighten (white).
-//! For boxes (`kind = 0`), `down` is a mix weight in `[0.0, 1.0]` toward theme darken (black).
-//! For arcs (`kind = 1`), `down` is the sweep fraction in `[0.0, 1.0]` scaling the theme's
-//! full 270-degree arc sweep (`3pi/2`), and the shader does not darken the arc.
-//!
-//! #### Widget Ownership and Weight Scaling:
-//! Continuous `Animator` instances travel across `[0.0, 1.0]`. When populating instance records:
-//! - Hover weight: `instance.hover = animator.value * hover_lighten` (`0.18`).
-//! - Down weight: `instance.down = animator.value * down_darken` (`0.30`).
-//! The shader receives standard 64-byte instance records and evaluates lighting
-//! entirely in registers.
-//!
-//! ### CPU Twins: `sdf_box` and `sdf_arc`
-//! - `sdf_box` is the exact CPU mathematical twin of the WGSL box function.
-//! - `sdf_arc` is the CPU twin of `sdf_arc` in `quad.wgsl`.
-//!   - Uses Y-down `atan2`, where 0 is 3 o'clock and positive angles rotate clockwise.
-//!   - Arc starts at 7 o'clock (`2pi/3`) and sweeps across 270 degrees (`3pi/2`), leaving an open
-//!     gap at the bottom quarter.
-//!   - Round caps are evaluated as distance to the swept centerline minus half the stroke
-//!     thickness.
-//!   - Locked test verification (56x56 ring, thickness 4, sweep fraction 1.0):
-//!     - start-cap local about (15, 50.51666) yields distance -2.0;
-//!     - rect center (28, 28) yields distance 24.0;
-//!     - 6 o'clock on the mid-radius is outside the sweep (positive distance);
-//!     - down 0 is `-thickness / 2` (-2.0) only at the start point.
+//! ### CPU Twins
+//! `sdf_box` and `sdf_arc` are the CPU twins of the functions of the same names in
+//! `quad.wgsl`, so layout and hit testing can be verified without a GPU. Tests "sdf center is
+//! inside", "sdf sharp edge midpoint is on the boundary", "sdf point outside a sharp corner
+//! is positive", "sdf grown radius puts a former inner corner outside", "sdf oversized radius
+//! saturates into a disc", and "sdf arc locks the open ring" hold the worked values.
 //!
 //! ### Hard Clip Masking
-//! Rather than issuing driver scissor calls or breaking render passes, clipping is evaluated
-//! per-fragment in shaders:
+//! Clipping is evaluated per fragment instead of through scissor state, so one pass and one
+//! draw call survive any number of clip regions:
 //! ```text
-//! pos = rect.xy + local
+//! pos    = rect.xy + local
 //! inside = step(clip.x, pos.x) * step(clip.y, pos.y) * step(pos.x, clip.z) * step(pos.y, clip.w)
-//! alpha = fill.a * coverage * inside
+//! alpha  = fill.a * coverage * inside
 //! ```
-//! The stored clip is exclusive-max, but WGSL `step` makes the max edge inclusive.
-//! There is no unclipped sentinel: chrome elements use the window rectangle, while scrollable
-//! content uses the scroll viewport clip rectangle.
+//! `append` requires an exclusive-max clip (`clip_x1 > clip_x0`, `clip_y1 > clip_y0`, all
+//! finite), although WGSL `step` makes the max edge inclusive. There is no unclipped sentinel:
+//! unclipped content passes the window rectangle.
 //!
-//! ### Who Writes the Rectangles
-//! This module (`draw.zig`) provides graphics primitives, buffer layouts, and distance fields; it
-//! does NOT place scene geometry or widgets.
-//! Widgets write rectangles to `DrawList` and glyphs to `GlyphList` via their own `draw` methods,
-//! calling append helpers such as `DrawList.append`. Applications own the overall draw order: an
-//! app's `draw(list, glyphs)` clears both lists and iterates through its retained controls in
-//! back-to-front painter order.
+//! ### Ownership
+//! This module owns primitives, buffer layouts, and distance fields, not scene geometry.
+//! Widgets append to `DrawList` and `font.GlyphList`; the application owns draw order and
+//! rebuilds both lists back to front. `contains_box` is the single rounded-box point test and
+//! `contains` delegates to it, so instance hit testing and widget bounds checks cannot drift.
 //!
-//! That rebuild executes ONLY when `app.dirty()` is set:
-//! 1. Window layout changes (`Frame.relayout` is true),
-//! 2. User input updates widget state (mouse enter/leave, knob drag, toggle click, wheel),
-//! 3. An in-flight animator steps by `dt_ms` and alters an animated weight, or
-//! 4. The host timer fires and updates dynamic application values (such as level meters).
-//!
-//! A scale-only present (same logical size, new physical pixels) leaves `app.dirty()` false.
-//! `UploadCursor.flags` returns 0, so neither instance buffer is uploaded.
-//!
-//! Capacity invariant: all quad instances emitted during a frame must fit within `instance_cap`
-//! (256 instances), guaranteeing that drawing never exceeds static GPU buffer capacity.
-//!
-//! `contains_box` is the low-level analytic rounded-box point test used across the codebase;
-//! `contains` delegates directly to it so instance hit testing and widget bounds checking
-//! can never drift.
+//! ## 6. TigerStyle Invariants
+//! - `DrawList` is a fixed array bounded by `instance_cap`: no heap allocation, no
+//!   `OutOfMemory` after startup, and `error.ListFull` instead of growth.
+//! - Public functions assert their preconditions and postconditions, and layout facts are
+//!   `comptime` asserts so an ABI mismatch with WGSL or the web shell fails the build.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const font = @import("font.zig");
 const theme = @import("theme.zig");
 
-/// The WebGPU Shading Language source embedded directly into the binary at compile time.
-/// Both native Linux (via wgpu-native) and the browser (via WebAssembly) compile this same source.
+/// WGSL source for the quad pipeline, embedded so the native and web hosts compile the same text.
 pub const shader_file: []const u8 = @embedFile("quad.wgsl");
 
-/// Hard upper bound on how many rectangle instances can be queued in one draw call.
-/// In TigerStyle, all buffer sizes are statically bounded at compile time.
+/// Hard upper bound on instances queued per frame. It bounds `DrawList.items` and the GPU
+/// instance buffer, so nothing grows after startup.
 pub const instance_cap: u32 = 256;
 
-/// Byte size of one instance (16 floats * 4 bytes = 64 bytes).
-/// Four `float32x4` attributes at offsets 0, 16, 32, and 48. `kind` selects the
-/// box or the arc. The fourth attribute is the clip rect. There is no unclipped sentinel.
+/// Byte size of one `Instance`: four `float32x4` vertex attributes. Asserted equal to
+/// `@sizeOf(Instance)` and a multiple of 16 in the `comptime` block below.
 pub const instance_stride: u32 = 64;
 
 /// Box face. The fragment shader evaluates `sdf_box` and may darken by `down`.
@@ -262,56 +139,50 @@ pub const kind_box: f32 = 0;
 /// The shader does not darken an arc.
 pub const kind_arc: f32 = 1;
 
-/// Number of vertices in a quad drawn as a triangle list (2 triangles * 3 vertices = 6).
+/// Vertices in the unit quad drawn as a triangle list. Asserted equal to `unit_quad.len / 2`.
 pub const vertex_count: u32 = 6;
 
-/// Byte size of the unit quad vertex buffer (12 floats * 4 bytes = 48 bytes).
+/// Byte size of the unit quad vertex buffer. Asserted equal to `@sizeOf` of `unit_quad`.
 pub const quad_bytes: u32 = 48;
 
-/// Byte size of a 4x4 float32 matrix (16 floats * 4 bytes = 64 bytes).
+/// Byte size of one `mat4x4<f32>`. Asserted equal to `@sizeOf([16]f32)`.
 pub const matrix_bytes: u32 = 64;
 
-/// WebGPU specification rule: Uniform buffer bindings must be aligned to at least 256 bytes.
-/// Even though our 4x4 matrix is only 64 bytes, its GPU buffer must be at least 256 bytes.
+/// WebGPU `minUniformBufferOffsetAlignment` default (WebGPU "Limits" table).
+const min_uniform_offset_alignment: u32 = 256;
+
+/// Byte size of the frame uniform: the projection matrix followed by `theme.Theme`. Asserted to
+/// equal `matrix_bytes + theme.bytes` and to be a multiple of `min_uniform_offset_alignment`.
 pub const uniform_bytes: u32 = 256;
 
-/// Upload flag indicating that the instance vertex buffer needs to be written to GPU memory.
+/// Upload flag: the face instance buffer must be rewritten.
 pub const flag_instances: u32 = 1;
 
-/// Upload flag indicating that the orthographic matrix uniform buffer needs to be written to GPU.
+/// Upload flag: the frame uniform (projection matrix and theme) must be rewritten.
 pub const flag_uniform: u32 = 2;
 
-/// Upload flag indicating that the glyph instance buffer needs to be written.
-/// A scale-only present leaves this clear.
+/// Upload flag: the glyph instance buffer must be rewritten.
 pub const flag_glyphs: u32 = 4;
 
-/// Two triangles that make up the unit square `(0,0)` to `(1,1)` in counter-clockwise order.
-/// Laid out as flat 2D points: `[x0, y0, x1, y1, ...]`.
-/// No index buffer is required because the 6 vertices are drawn as a triangle list.
+/// Two triangles covering the unit square, as flat `[x, y]` pairs drawn as a triangle list
+/// without an index buffer. The winding is clockwise on screen after the projection's Y flip,
+/// which is harmless because both pipelines disable face culling.
 pub const unit_quad: [12]f32 = .{
-    0.0, 0.0, // Triangle 1: top-left
-    1.0, 0.0, // Triangle 1: top-right
-    1.0, 1.0, // Triangle 1: bottom-right
-    0.0, 0.0, // Triangle 2: top-left
-    1.0, 1.0, // Triangle 2: bottom-right
-    0.0, 1.0, // Triangle 2: bottom-left
+    0.0, 0.0,
+    1.0, 0.0,
+    1.0, 1.0,
+    0.0, 0.0,
+    1.0, 1.0,
+    0.0, 1.0,
 };
 
-/// Per-instance parameters sent to the GPU in Vertex Buffer 1.
-/// Marked as `extern struct` to guarantee exact C ABI memory layout with no compiler reordering.
-/// Memory Layout:
-/// - Offset  0: `x` (f32) - Left edge in logical UI pixels.
-/// - Offset  4: `y` (f32) - Top edge in logical UI pixels.
-/// - Offset  8: `width` (f32) - Width in logical UI pixels.
-/// - Offset 12: `height` (f32) - Height in logical UI pixels.
-/// - Offset 16: `r`, `g`, `b`, `a` (4 f32) - Fill color.
-/// - Offset 32: `radius` (f32) - Corner radius for a box, stroke thickness for an arc.
-/// - Offset 36: `hover` (f32) - Mix weight toward the theme lighten color, range [0, 1].
-/// - Offset 40: `down` (f32) - Box darken weight, or arc sweep fraction, range [0, 1].
-/// - Offset 44: `kind` (f32) - `kind_box` (0) or `kind_arc` (1). Stored as given.
-/// - Offset 48: `clip_x0`, `clip_y0`, `clip_x1`, `clip_y1` - Exclusive-max clip in
-///   logical pixels. `clip_x1 > clip_x0` and `clip_y1 > clip_y0`, all finite.
-/// Total size: 64 bytes.
+/// Per-instance parameters sent to the GPU in vertex buffer 1.
+///
+/// An `extern struct` so field order is the byte order, with no compiler reordering. Fields are
+/// grouped as four `float32x4` attributes; see the module guide for their meaning, and the
+/// `comptime` block below for the enforced offsets. Rectangle and clip are in logical pixels
+/// and the fill is straight alpha. `hover` and `down` are in `[0, 1]`, and `kind` is stored
+/// as a float and is `kind_box` or `kind_arc`.
 pub const Instance = extern struct {
     x: f32,
     y: f32,
@@ -331,22 +202,14 @@ pub const Instance = extern struct {
     clip_y1: f32,
 };
 
-/// The binary header passed to the graphics backend before rendering a frame.
-/// In WebAssembly, this exact struct is constructed on the Zig call stack and read by
-/// JavaScript via a typed `DataView` over Wasm linear memory.
-/// Memory Layout:
-/// - Offset  0: `width_px` (u32, 4 bytes) - Physical swapchain width in device pixels.
-/// - Offset  4: `height_px` (u32, 4 bytes) - Physical swapchain height in device pixels.
-/// - Offset  8: `instance_count` (u32, 4 bytes) - Number of instances to draw [0..256].
-/// - Offset 12: `flags` (u32, 4 bytes) - Bitmask of buffers to upload (flags_instances / uniform).
-/// - Offset 16: `clear_r` (f32, 4 bytes) - Framebuffer background clear color red.
-/// - Offset 20: `clear_g` (f32, 4 bytes) - Framebuffer background clear color green.
-/// - Offset 24: `clear_b` (f32, 4 bytes) - Framebuffer background clear color blue.
-/// - Offset 28: `clear_a` (f32, 4 bytes) - Framebuffer background clear color alpha.
-/// - Offset 32: `ortho` ([16]f32, 64 bytes) - 4x4 column-major orthographic projection matrix.
-/// - Offset 96: `glyph_count` (u32) - Glyph quads to draw. Zero skips that draw.
-/// - Offset 100: `pad` (u32) - Written as 0 so the header is 104 bytes.
-/// Total size: 104 bytes.
+/// The frame description handed to the graphics backend, read in place by the host. See the
+/// module guide for the ABI rules; field offsets are enforced by the `comptime` block below.
+///
+/// `width_px` and `height_px` are physical swapchain pixels. `instance_count` and
+/// `glyph_count` are the number of live records, bounded by `instance_cap` and
+/// `font.glyph_cap`. `flags` is a bitmask of `flag_instances`, `flag_uniform`, and
+/// `flag_glyphs`. `clear_*` is the straight RGBA clear color and `ortho` is the column-major
+/// projection from `ortho_y_down`. `pad` is always written as zero.
 pub const PresentHeader = extern struct {
     width_px: u32,
     height_px: u32,
@@ -361,14 +224,14 @@ pub const PresentHeader = extern struct {
     pad: u32,
 };
 
-/// A fixed-capacity list of rectangle instances to be drawn in a frame.
-/// Follows TigerStyle: zero dynamic heap allocation, bounded by `instance_cap`.
+/// A fixed-capacity list of face instances for one frame. `revision` increases on every
+/// mutation, which is what `UploadCursor` compares to decide whether to upload.
 pub const DrawList = struct {
     items: [instance_cap]Instance,
     count: u32,
     revision: u32,
 
-    /// Initializes an empty draw list with zeroed memory.
+    /// Returns an empty list with zeroed storage.
     pub fn init() DrawList {
         const list: DrawList = .{
             .items = std.mem.zeroes([instance_cap]Instance),
@@ -390,27 +253,19 @@ pub const DrawList = struct {
         ClipUnordered,
     };
 
-    /// Appends one rectangle instance to the draw list.
+    /// Appends one instance, or returns the first violated precondition. Nothing is stored and
+    /// `revision` is unchanged on error.
     ///
-    /// Preconditions and Error Handling:
-    /// - `error.EdgeNotPositive`: Returned if either `instance.width <= 0` or
-    ///   `instance.height <= 0`. Layout calculations can produce zero edges (e.g. collapsed
-    ///   flex bounds or zero-dimension viewports) or negative edges (e.g. when container
-    ///   padding or child margins exceed available bounds). Both zero and negative dimensions
-    ///   are explicitly rejected so degenerate geometry is never submitted to the GPU.
-    /// - `error.NegativeRadius`: Returned if `instance.radius < 0`. An oversized radius is
-    ///   stored unchanged because both `sdf_box` and `quad.wgsl` clamp it to half the shorter
-    ///   edge. A negative radius would survive `min(radius, half)` and invert the field.
-    /// - `error.HoverOutOfRange`: Returned if `instance.hover < 0` or `instance.hover > 1`.
-    ///   Weights outside `[0.0, 1.0]` would extrapolate the shader `mix` beyond the fill or white.
-    /// - `error.DownOutOfRange`: Returned if `instance.down < 0` or `instance.down > 1`.
-    ///   The darken mix would extrapolate past black the same way an out-of-range hover
-    ///   extrapolates past white.
-    /// - `error.ListFull`: Returned if `self.count == instance_cap` (256).
-    ///
-    /// `kind` and the clip are stored as given. A kind other than box or arc is
-    /// `error.KindUnknown`. A clip that is non-finite or not exclusive-max is
-    /// `error.ClipUnordered`. There is no unclipped sentinel.
+    /// - `error.EdgeNotPositive`: `width <= 0` or `height <= 0`. Layout can produce collapsed or
+    ///   negative edges, and degenerate geometry must never reach the GPU.
+    /// - `error.NegativeRadius`: `radius < 0`. An oversized radius is stored unchanged because
+    ///   `sdf_box` and `quad.wgsl` clamp it, but a negative one would survive the clamp and
+    ///   invert the field.
+    /// - `error.HoverOutOfRange`, `error.DownOutOfRange`: weight outside `[0, 1]`, which would
+    ///   extrapolate the shader `mix` past the lighten or darken color.
+    /// - `error.KindUnknown`: `kind` is neither `kind_box` nor `kind_arc`.
+    /// - `error.ClipUnordered`: the clip is non-finite or not exclusive-max.
+    /// - `error.ListFull`: `count == instance_cap`.
     pub fn append(self: *DrawList, instance: Instance) AppendError!void {
         assert(self.count <= instance_cap);
         if (instance.width <= 0) {
@@ -452,20 +307,12 @@ pub const DrawList = struct {
         assert(self.items[self.count - 1].clip_x1 > self.items[self.count - 1].clip_x0);
     }
 
-    /// Writes `hover` and `down` on one live slot.
+    /// Writes `hover` and `down` on the live slot `index` (`index < count`). Both weights
+    /// must already be in `[0, 1]`; they are asserted, not clamped.
     ///
-    /// Parameters & Invariants:
-    /// - `index`: Must be a valid live slot (`index < self.count`). Slot 0 is reserved for column
-    ///   background and should not be modified by caller.
-    /// - `hover`: Mix weight toward white, clamped to `[0.0, 1.0]`.
-    /// - `down`: Mix weight toward black, clamped to `[0.0, 1.0]`.
-    ///
-    /// Revision & Dirty Tracking Interplay:
-    /// - Returns false when both stored weights already match existing values, leaving `revision`
-    ///   unchanged. This allows resting pointers to hit-test every poll wake with 0% CPU and zero
-    ///   GPU buffer uploads (`UploadCursor.flags() == 0`).
-    /// - Returns true when either weight differs, updating `items[index]` and incrementing
-    ///   `self.revision` so `UploadCursor.flags()` emits `flag_instances`.
+    /// Returns false and leaves `revision` unchanged when both weights already match, so a
+    /// resting pointer that hit-tests on every wake causes no upload. Returns true after
+    /// storing a change and bumping `revision`.
     pub fn set_state(self: *DrawList, index: u32, hover: f32, down: f32) bool {
         assert(index < self.count);
         assert(hover >= 0);
@@ -487,7 +334,7 @@ pub const DrawList = struct {
         return true;
     }
 
-    /// Clears the draw list for the next frame, bumping the revision counter.
+    /// Empties the list. `revision` is bumped even if the list was already empty.
     pub fn clear(self: *DrawList) void {
         assert(self.count <= instance_cap);
         self.count = 0;
@@ -497,9 +344,8 @@ pub const DrawList = struct {
     }
 };
 
-/// Remembers the last uploaded revision and logical window dimensions.
-/// This prevents redundant GPU queue writes: if neither the draw list contents nor
-/// the window dimensions changed, the present call skips writing to the GPU buffers.
+/// Remembers the revisions and logical size last uploaded, so an unchanged present skips every
+/// GPU buffer write. See the module guide for the flag rules.
 pub const UploadCursor = struct {
     primed: bool,
     revision: u32,
@@ -520,10 +366,8 @@ pub const UploadCursor = struct {
         return cursor;
     }
 
-    /// Computes the bitmask of buffers that need to be uploaded to the GPU.
-    /// Unprimed uploads faces, glyphs, and the uniform. A face revision mismatch
-    /// sets `flag_instances`. A glyph revision mismatch sets `flag_glyphs`.
-    /// A logical size change sets only `flag_uniform` when the lists match.
+    /// Returns the `flag_*` bitmask of buffers to upload for this frame. Pure: the cursor is
+    /// only updated by `mark`, after the upload actually happened.
     pub fn flags(
         self: UploadCursor,
         list: *const DrawList,
@@ -572,6 +416,8 @@ pub const UploadCursor = struct {
     }
 };
 
+/// Inputs to `fill_header`. `width_logical` and `height_logical` size the projection, while
+/// `width_px` and `height_px` are the physical framebuffer size; both must be nonzero.
 pub const HeaderOptions = struct {
     list: *const DrawList,
     glyphs: *const font.GlyphList,
@@ -586,8 +432,8 @@ pub const HeaderOptions = struct {
     clear_a: f32,
 };
 
-/// Populates a `PresentHeader` for presentation.
-/// Computes upload flags, stores pixel/instance counts, and generates the projection matrix.
+/// Fills every field of `header` from `options`, including the upload flags and a projection
+/// built from the logical size. Does not call `UploadCursor.mark`.
 pub fn fill_header(header: *PresentHeader, options: HeaderOptions) void {
     assert(options.width_px != 0);
     assert(options.height_px != 0);
@@ -613,19 +459,8 @@ pub fn fill_header(header: *PresentHeader, options: HeaderOptions) void {
     assert(header.ortho[0] > 0);
 }
 
-/// Generates a 4x4 column-major orthographic projection matrix for a top-left origin, Y-down UI.
-///
-/// Matrix Layout (column-major):
-/// ```
-/// | 2/w   0     0  -1 |   [x]   [ (2*x)/w - 1 ] -> NDC X in [-1, +1]
-/// |  0  -2/h    0   1 | * [y] = [ 1 - (2*y)/h ] -> NDC Y in [+1, -1] (flipped!)
-/// |  0    0     1   0 |   [0]   [      0      ] -> NDC Z in [0, 1]
-/// |  0    0     0   1 |   [1]   [      1      ] -> W
-/// ```
-/// - When x = 0:       (2*0)/w - 1 = -1 (left edge)
-/// - When x = w:       (2*w)/w - 1 = +1 (right edge)
-/// - When y = 0:       1 - (2*0)/h = +1 (top edge in NDC)
-/// - When y = h:       1 - (2*h)/h = -1 (bottom edge in NDC)
+/// Writes the column-major projection from top-left, Y-down logical pixels to WebGPU NDC.
+/// The derivation is in the module guide; `width` and `height` are nonzero logical pixels.
 pub fn ortho_y_down(out: *[16]f32, width: u32, height: u32) void {
     assert(width != 0);
     assert(height != 0);
@@ -641,77 +476,48 @@ pub fn ortho_y_down(out: *[16]f32, width: u32, height: u32) void {
     assert(out[5] < 0);
 }
 
-/// Signed distance of a rounded rectangle. This is the CPU twin of `sdf_box` in `quad.wgsl`.
+/// Signed distance of a rounded rectangle, negative inside and positive outside. CPU twin of
+/// `sdf_box` in `quad.wgsl`; the tests named in the module guide lock the field without a GPU.
 ///
-/// `(px, py)` is in local logical pixels. The origin is the rectangle's top-left, the same
-/// space the vertex shader interpolates as `unit * size`. The return is negative inside, zero
-/// on the boundary, and positive outside. Tests lock this field without a GPU. The shader
-/// turns the same field into coverage and applies hover. This function does not.
+/// `(px, py)` is in local logical pixels with the origin at the rectangle's top-left, the space
+/// the vertex shader interpolates as `unit * size`. `radius` is the geometric corner radius,
+/// clamped to half the shorter edge, so oversized values give a capsule or a disc. The shader
+/// derives coverage and hover from this field; this function does neither.
 ///
-/// `radius` is the geometric corner radius in logical pixels. It is clamped to half the
-/// shorter edge. A larger value becomes a capsule, and a square becomes a disc whose diameter
-/// is the side. Radius 0 is the sharp rectangle from step 2. `append` stores an oversized
-/// radius unchanged and rejects a negative one. This function and the shader both clamp, so
-/// the pictures cannot drift. Makepad's older button shader multiplied the radius by 2 as a
-/// compatibility clamp. The value here is the geometric radius.
-///
-/// The outline is an inner sharp box shrunk by the clamped radius `k`, then expanded by `k`.
-/// The expansion turns the inner corners into quarter-circles. With `half = (width/2, height/2)`
-/// and `k = min(radius, min(half.x, half.y))`:
-///
-/// ```
-/// q = abs(point - half) - (half - k)
+/// With `half = (width / 2, height / 2)` and `k = min(radius, min(half.x, half.y))`:
+/// ```text
+/// q        = abs(point - half) - (half - k)
 /// distance = min(max(q.x, q.y), 0) + length(max(q, 0)) - k
 /// ```
-///
-/// `q` is the first-quadrant offset from the inner box. `abs` folds the other three quadrants.
-/// `min(max(q.x, q.y), 0)` is the inside distance to the nearest inner face. `length(max(q, 0))`
-/// is the outside Euclidean distance. At a corner, that length is the distance to the inner
-/// corner point. Subtracting `k` moves the boundary out to the rounded outline.
-///
-/// Values locked by the tests:
-/// - Center of a 20 by 10 sharp box: -5, which is half the shorter side.
-/// - Midpoint of that box's top edge: 0.
-/// - The point (-1, -1), one pixel left and one pixel above the top-left corner: sqrt(2).
-/// - The point (0.5, 0.5) on a 20 by 20 box is inside at radius 0 and outside at radius 8.
-/// - A 20 by 20 box with radius 100 clamps to `k = 10`. The center is -10, an edge midpoint
-///   is 0, and a geometric corner is outside. That is a disc.
+/// `q` is the offset from an inner sharp box shrunk by `k`, folded into one quadrant. The
+/// first term is the inside distance to the nearest inner face, the second is the outside
+/// Euclidean distance, and subtracting `k` grows the inner box back into the rounded outline.
 pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
     assert(width > 0);
     assert(height > 0);
     assert(radius >= 0);
-    // Origin is the top-left, so the center sits at (half_w, half_h). Those same
-    // numbers are the half-extents of the box. The field is measured from there.
     const half_w: f32 = 0.5 * width;
     const half_h: f32 = 0.5 * height;
-    // A radius past half the shorter edge would make the inner box negative and the
-    // corner circles overlap. The clamp saturates a wide box into a capsule and a
-    // square into a disc.
+    // Past half the shorter edge the inner box would invert and the corner circles overlap.
     const shorter: f32 = @min(half_w, half_h);
     const k: f32 = @min(radius, shorter);
     assert(k >= 0);
     assert(k <= shorter);
-    // First-quadrant offset from the inner box, whose half-extent is (half - k).
     const qx: f32 = @abs(px - half_w) - (half_w - k);
     const qy: f32 = @abs(py - half_h) - (half_h - k);
-    // The outside term ignores inward components. At a corner it is the distance
-    // to the inner corner point.
     const outside_x: f32 = @max(qx, 0.0);
     const outside_y: f32 = @max(qy, 0.0);
     const outside: f32 = @sqrt(outside_x * outside_x + outside_y * outside_y);
-    // The inside term is the nearest face, and only while the point is inside both axes.
     const inside: f32 = @min(@max(qx, qy), 0.0);
-    // Expand the inner box by k. The boundary lands on the quarter-circle.
     return inside + outside - k;
 }
 
 /// Signed distance of an open ring. CPU twin of `sdf_arc` in `quad.wgsl`.
 ///
-/// `(px, py)` is local logical pixels, origin at the face top-left, Y down.
-/// `thickness` is the stroke width. `sweep_fraction` in `[0, 1]` scales the theme
-/// sweep (`3π/2`). Angle 0 is 3 o'clock. Positive is clockwise because Y grows down.
-/// The start angle is the theme's 7 o'clock (`2π/3`). The gap is the bottom quarter.
-/// Round caps are the distance to the swept centerline, minus half the thickness.
+/// `(px, py)` is in local logical pixels, origin at the face top-left, Y down. `thickness` is
+/// the stroke width and `sweep_fraction` in `[0, 1]` scales `theme.arc_sweep`. Angles follow
+/// the convention in `theme.zig`. Round caps fall out of measuring the distance to the swept
+/// centerline, clamped at the sweep end, and subtracting half the thickness.
 ///
 /// ```text
 /// center = size * 0.5
@@ -755,7 +561,8 @@ pub fn sdf_arc(
     return dist;
 }
 
-/// Wraps one turn into `[0, tau)`. `atan2` minus the start angle stays within one turn.
+/// Wraps an angle into `[0, tau)`. Valid because `atan2` minus the start angle is less than
+/// one turn away from that range.
 fn wrap_tau(angle: f32) f32 {
     assert(angle == angle);
     const span = std.math.tau;
@@ -771,12 +578,10 @@ fn wrap_tau(angle: f32) f32 {
     return value;
 }
 
-/// True when `(px, py)` lies inside the rounded rectangle, inclusive of the boundary.
+/// True when `(px, py)` lies inside the rounded rectangle, boundary included.
 ///
-/// Coordinate space: UI logical pixels, top-left origin, Y down. `(x, y)` is the
-/// rectangle's top-left. The test rejects the axis-aligned box first, then requires
-/// `sdf_box <= 0`, which matches fragment coverage of at least 0.5 on the boundary.
-/// A corner inside the box but outside the quarter-circle returns false.
+/// All values are logical pixels, top-left origin, Y down, and `(x, y)` is the rectangle's
+/// top-left. `sdf_box <= 0` matches the shader's coverage of at least one half on the outline.
 pub fn contains_box(
     x: f32,
     y: f32,
@@ -917,23 +722,60 @@ fn face(spec: Face) Instance {
 }
 
 comptime {
-    // Assert struct sizes and alignments to prevent C ABI mismatches across compilers.
+    // The `extern struct` layouts below are an ABI shared with WGSL vertex attributes and with
+    // the web shell's `DataView`, so a field reorder must fail the build, not the GPU.
     assert(@sizeOf(Instance) == 64);
     assert(@alignOf(Instance) >= 4);
-    assert(instance_stride == 64);
+    assert(instance_stride == @sizeOf(Instance));
+    // One float32x4 attribute per 16 bytes: rect, fill, shape, clip.
+    assert(instance_stride % 16 == 0);
+    assert(@offsetOf(Instance, "x") == 0);
+    assert(@offsetOf(Instance, "r") == 16);
+    assert(@offsetOf(Instance, "radius") == 32);
+    assert(@offsetOf(Instance, "kind") == 44);
+    assert(@offsetOf(Instance, "clip_x0") == 48);
     assert(kind_box == 0);
     assert(kind_arc == 1);
-    assert(theme.bytes + matrix_bytes == uniform_bytes);
-    // 64 is four vec4 groups. The spec only requires a stride multiple of 4.
-    assert(instance_stride % 16 == 0);
+
     assert(@sizeOf(PresentHeader) == 104);
+    assert(@offsetOf(PresentHeader, "width_px") == 0);
+    assert(@offsetOf(PresentHeader, "height_px") == 4);
+    assert(@offsetOf(PresentHeader, "instance_count") == 8);
+    assert(@offsetOf(PresentHeader, "flags") == 12);
+    assert(@offsetOf(PresentHeader, "clear_r") == 16);
+    assert(@offsetOf(PresentHeader, "ortho") == 32);
+    assert(@offsetOf(PresentHeader, "glyph_count") == 96);
+    assert(@offsetOf(PresentHeader, "pad") == 100);
+
+    // Flags are disjoint bits so they can be OR-ed and tested independently.
+    assert(flag_instances == 1);
+    assert(flag_uniform == 2);
     assert(flag_glyphs == 4);
-    assert(quad_bytes == 48);
-    assert(unit_quad.len == 12);
-    assert(vertex_count == 6);
+
+    assert(quad_bytes == @sizeOf(@TypeOf(unit_quad)));
+    assert(unit_quad.len == 2 * vertex_count);
+    assert(matrix_bytes == @sizeOf([16]f32));
+    assert(theme.bytes + matrix_bytes == uniform_bytes);
+    assert(uniform_bytes % min_uniform_offset_alignment == 0);
     assert(shader_file.len >= 1);
-    assert(uniform_bytes == 256);
+
+    // The relations above hold for any consistent change; these pin the values the web shell
+    // and the hosts hard-code, so changing one without the others fails the build.
+    assert(quad_bytes == 48);
+    assert(vertex_count == 6);
     assert(matrix_bytes == 64);
+    assert(uniform_bytes == 256);
+}
+
+comptime {
+    // `glyph.wgsl` reads `font.Glyph` through the same attribute locations and 64-byte stride
+    // as `quad.wgsl` reads `Instance`: rect at 0, uv rect at 16, color at 32, clip at 48. The
+    // clip offset is also shared with `Instance` so both shaders mask identically.
+    assert(font.glyph_stride == instance_stride);
+    assert(@offsetOf(font.Glyph, "x") == 0);
+    assert(@offsetOf(font.Glyph, "u0") == 16);
+    assert(@offsetOf(font.Glyph, "r") == 32);
+    assert(@offsetOf(font.Glyph, "clip_x0") == @offsetOf(Instance, "clip_x0"));
 }
 
 fn project(matrix: [16]f32, x: f32, y: f32) [2]f32 {
@@ -961,6 +803,8 @@ fn rect(width: f32, height: f32) Instance {
     return instance;
 }
 
+// Locks the projection: the four logical corners map to the NDC corners with Y flipped, and the
+// center maps to the origin.
 test "ortho maps the four corners and the center" {
     var matrix: [16]f32 = undefined;
     ortho_y_down(&matrix, 200, 100);
@@ -981,6 +825,7 @@ test "ortho maps the four corners and the center" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), center[1], 0.0001);
 }
 
+// Locks that `append` preserves insertion order and counts each instance.
 test "append keeps order" {
     var list = DrawList.init();
     try list.append(face(.{
@@ -1014,6 +859,7 @@ test "append keeps order" {
     try std.testing.expectEqual(@as(f32, 5), list.items[1].x);
 }
 
+// Locks that a zero width or height is rejected without storing anything.
 test "a zero edge is rejected" {
     var list = DrawList.init();
     try std.testing.expectError(error.EdgeNotPositive, list.append(rect(0, 10)));
@@ -1021,6 +867,7 @@ test "a zero edge is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
+// Locks that a negative width or height is rejected without storing anything.
 test "a negative edge is rejected" {
     var list = DrawList.init();
     try std.testing.expectError(error.EdgeNotPositive, list.append(rect(-1, 10)));
@@ -1028,6 +875,7 @@ test "a negative edge is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
+// Locks that a negative radius is rejected without storing anything.
 test "negative radius is rejected" {
     var list = DrawList.init();
     var instance = rect(10, 10);
@@ -1036,6 +884,7 @@ test "negative radius is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
+// Locks that a `hover` weight outside [0, 1] returns `HoverOutOfRange` and stores nothing.
 test "hover outside 0 to 1 is rejected" {
     var list = DrawList.init();
     var low = rect(10, 10);
@@ -1047,7 +896,7 @@ test "hover outside 0 to 1 is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
-// Kind 0 and kind 1 round-trip. Kind is no longer forced to 0.
+// Locks that `append` stores both known kinds and their `down` meaning unchanged.
 test "append stores box and arc kinds" {
     var list = DrawList.init();
     var box = rect(10, 10);
@@ -1064,6 +913,7 @@ test "append stores box and arc kinds" {
     try std.testing.expectEqual(@as(f32, 1), list.items[1].down);
 }
 
+// Locks that a kind other than `kind_box` or `kind_arc` returns `KindUnknown`.
 test "an unknown kind is rejected" {
     var list = DrawList.init();
     var instance = rect(10, 10);
@@ -1072,6 +922,7 @@ test "an unknown kind is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
+// Locks that an empty or reversed clip on either axis returns `ClipUnordered`.
 test "a reversed clip is rejected" {
     var list = DrawList.init();
     var instance = rect(10, 10);
@@ -1084,7 +935,7 @@ test "a reversed clip is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
-// Locks defensive bounds validation: down weights outside [0, 1] return DownOutOfRange.
+// Locks that a `down` weight outside [0, 1] returns `DownOutOfRange` and stores nothing.
 test "down outside 0 to 1 is rejected" {
     var list = DrawList.init();
     var low = rect(10, 10);
@@ -1096,7 +947,7 @@ test "down outside 0 to 1 is rejected" {
     try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
-// Locks dirty tracking optimization: matching weights return false without bumping revision.
+// Locks that matching weights return false and leave `revision` alone, so no upload follows.
 test "set_state leaves the revision when the weights match" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1107,7 +958,7 @@ test "set_state leaves the revision when the weights match" {
     try std.testing.expectEqual(@as(f32, 0), list.items[0].down);
 }
 
-// Locks revision bumping: changed hover or down weights return true and increment revision.
+// Locks that a changed weight returns true and bumps `revision` by exactly one.
 test "set_state bumps the revision when a weight changes" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1118,12 +969,15 @@ test "set_state bumps the revision when a weight changes" {
     try std.testing.expectEqual(@as(f32, 0.30), list.items[0].down);
 }
 
-// Locks analytic boundary testing: sharp corners hit edges, rounded corners reject outside curve.
+// Locks that a sharp box includes its edges and a rounded box rejects the pixel just inside
+// its corner, where the box covers the point but the quarter circle does not.
 test "contains accepts the sharp edge and rejects a rounded corner" {
     const sharp = rect(20, 10);
     try std.testing.expect(contains(sharp, 10, 0));
     try std.testing.expect(contains(sharp, 0, 5));
     try std.testing.expect(!contains(sharp, -1, 5));
+    // A pill: the radius is half the height, so the (x + 1, y + 1) pixel is outside the cap and
+    // (1144, 680) is the rectangle center.
     const footer = face(.{
         .x = 1024,
         .y = 656,
@@ -1143,6 +997,7 @@ test "contains accepts the sharp edge and rejects a rounded corner" {
     try std.testing.expect(!contains_box(1024, 656, 240, 48, 24, 1025, 657));
 }
 
+// Locks the capacity bound: the append after `instance_cap` returns `ListFull`.
 test "a full list rejects the next append" {
     var list = DrawList.init();
     var index: u32 = 0;
@@ -1153,6 +1008,7 @@ test "a full list rejects the next append" {
     try std.testing.expectEqual(instance_cap, list.count);
 }
 
+// Locks that `clear` zeroes the count and bumps `revision` by exactly one.
 test "clear zeros the count and bumps the revision" {
     var list = DrawList.init();
     try list.append(rect(1, 1));
@@ -1162,25 +1018,27 @@ test "clear zeros the count and bumps the revision" {
     try std.testing.expectEqual(revision + 1, list.revision);
 }
 
-// The five distance tests mirror the worked values on `sdf_box`: interior, boundary,
-// exterior corner, a corner sample pushed outside by a grown radius, and disc saturation.
+// Locks the interior: the center of a sharp 20 by 10 box is half the shorter side inside.
 test "sdf center is inside" {
     const dist = sdf_box(10, 5, 20, 10, 0);
     try std.testing.expect(dist < 0);
     try std.testing.expectApproxEqAbs(@as(f32, -5), dist, 0.0001);
 }
 
+// Locks that the midpoint of a box edge is on the outline.
 test "sdf sharp edge midpoint is on the boundary" {
     const dist = sdf_box(10, 0, 20, 10, 0);
     try std.testing.expectApproxEqAbs(@as(f32, 0), dist, 0.0001);
 }
 
+// Locks the exterior corner: one pixel out on both axes is sqrt(2) away from the corner.
 test "sdf point outside a sharp corner is positive" {
     const dist = sdf_box(-1, -1, 20, 10, 0);
     try std.testing.expect(dist > 0);
     try std.testing.expectApproxEqAbs(@sqrt(@as(f32, 2)), dist, 0.0001);
 }
 
+// Locks that growing the radius moves a pixel next to the corner from inside to outside.
 test "sdf grown radius puts a former inner corner outside" {
     const sharp = sdf_box(0.5, 0.5, 20, 20, 0);
     const rounded = sdf_box(0.5, 0.5, 20, 20, 8);
@@ -1188,8 +1046,9 @@ test "sdf grown radius puts a former inner corner outside" {
     try std.testing.expect(rounded > 0);
 }
 
-// 56×56 ring, thickness 4, full sweep. The start-cap center is inside by half the stroke.
-// The rect center is 24 px outside that stroke. 6 o'clock on the mid-radius sits in the gap.
+// Locks the ring: on a 56 by 56 face with thickness 4, the start-cap center is half the stroke
+// inside, the face center is `mid - thickness / 2` outside, a point on the mid radius at 6
+// o'clock lies in the gap, and a zero sweep leaves only the cap at the start.
 test "sdf arc locks the open ring" {
     const size: f32 = 56;
     const thickness: f32 = 4;
@@ -1210,6 +1069,7 @@ test "sdf arc locks the open ring" {
     try std.testing.expect(away > 0);
 }
 
+// Locks the radius clamp: a 20 by 20 box with an oversized radius is a disc of diameter 20.
 test "sdf oversized radius saturates into a disc" {
     const center = sdf_box(10, 10, 20, 20, 100);
     const edge = sdf_box(10, 0, 20, 20, 100);
@@ -1219,6 +1079,7 @@ test "sdf oversized radius saturates into a disc" {
     try std.testing.expect(corner > 0);
 }
 
+// Locks that an unprimed cursor requests every upload, so the first frame is complete.
 test "the first present uploads instances and the uniform" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1228,6 +1089,7 @@ test "the first present uploads instances and the uniform" {
     try std.testing.expectEqual(flag_instances | flag_uniform | flag_glyphs, flags);
 }
 
+// Locks that a primed cursor with a changed face revision requests only `flag_instances`.
 test "a revision change uploads instances" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1252,6 +1114,7 @@ test "a revision change uploads instances" {
     try std.testing.expectEqual(flag_instances, flags);
 }
 
+// Locks that a primed cursor with a changed logical width requests only `flag_uniform`.
 test "a logical size change uploads the uniform" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1262,6 +1125,8 @@ test "a logical size change uploads the uniform" {
     try std.testing.expectEqual(flag_uniform, flags);
 }
 
+// Locks that identical revisions and logical size request no upload, even if the physical
+// pixel scale changed.
 test "a scale-style present with the same logical size uploads nothing" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1272,6 +1137,7 @@ test "a scale-style present with the same logical size uploads nothing" {
     try std.testing.expectEqual(@as(u32, 0), flags);
 }
 
+// Locks that a primed cursor with a changed glyph revision requests only `flag_glyphs`.
 test "a glyph revision change uploads glyphs" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
@@ -1281,4 +1147,47 @@ test "a glyph revision change uploads glyphs" {
     glyphs.clear();
     const flags = cursor.flags(&list, &glyphs, 1280, 720);
     try std.testing.expectEqual(flag_glyphs, flags);
+}
+
+// Locks the Zig-to-WGSL contract that `comptime` cannot see: both shaders declare `Theme` with
+// the fields of `theme.Theme` in order, and the vertex inputs use the locations the layouts
+// in this module and `font.Glyph` assume.
+test "wgsl declarations match the Zig layouts" {
+    const sources = [_][]const u8{ shader_file, font.shader_file };
+    for (sources) |source| {
+        const start = std.mem.indexOf(u8, source, "struct Theme {").?;
+        const end = std.mem.indexOfPos(u8, source, start, "}").?;
+        const block = source[start..end];
+        var cursor: usize = 0;
+        inline for (@typeInfo(theme.Theme).@"struct".fields) |field| {
+            const needle = field.name ++ ": vec4<f32>";
+            const at = std.mem.indexOfPos(u8, block, cursor, needle).?;
+            cursor = at + needle.len;
+        }
+        try std.testing.expectEqual(
+            @as(usize, theme.slot_count),
+            std.mem.count(u8, block, ": vec4<f32>"),
+        );
+        const ortho_at = std.mem.indexOfPos(u8, source, end, "ortho: mat4x4<f32>").?;
+        const theme_at = std.mem.indexOfPos(u8, source, end, "theme: Theme,").?;
+        try std.testing.expect(ortho_at < theme_at);
+    }
+    const quad_inputs = [_][]const u8{
+        "@location(1) rect: vec4<f32>",
+        "@location(2) fill: vec4<f32>",
+        "@location(3) shape: vec4<f32>",
+        "@location(4) bounds: vec4<f32>",
+    };
+    for (quad_inputs) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, shader_file, needle) != null);
+    }
+    const glyph_inputs = [_][]const u8{
+        "@location(1) rect: vec4<f32>",
+        "@location(2) uv_rect: vec4<f32>",
+        "@location(3) color: vec4<f32>",
+        "@location(4) bounds: vec4<f32>",
+    };
+    for (glyph_inputs) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, font.shader_file, needle) != null);
+    }
 }

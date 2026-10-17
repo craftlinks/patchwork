@@ -1,29 +1,38 @@
-//! Zero-Dependency Development HTTP Server for Browser WebGPU/Wasm Host Testing.
+//! Zero-dependency development HTTP server for the browser host.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Why an Internal HTTP Server Instead of `file://` or External Tools?
-//! WebGPU is strictly disabled by all modern browsers on local `file://` URIs due to the
-//! W3C cross-origin security specification and origin-isolation rules.
-//! - Running browser builds typically requires external dependencies like Python (`python -m
-//!   http.server`), Node.js (`npx serve`), or Go.
-//! - In Patchwork, `zig build serve` provides a completely self-contained, zero-dependency
-//!   static HTTP server compiled using only Zig's standard library.
+//! ## 1. Why an Internal Server
+//! The browser host needs an HTTP origin: `web/shell.js` is an ES module and fetches the
+//! wasm with `WebAssembly.instantiateStreaming`, and neither works from a `file://` page.
+//! `instantiateStreaming` also requires the response `Content-Type` to be `application/wasm`
+//! (WebAssembly Web API specification, "compile a potential WebAssembly response"), and
+//! WebGPU is exposed only in secure contexts, which `http://127.0.0.1` is. Serving from this
+//! file keeps the toolchain at Zig alone, with no Python, Node, or Go server needed.
 //!
-//! ## 2. TigerStyle Memory and Concurrency Guarantees
-//! - **Bounded Buffers:** Fixed 4 KB request/response header buffers (`header_cap = 4096`)
-//!   and a 4 MB maximum file size limit (`file_cap = 4 * 1024 * 1024`).
-//! - **Zero Runtime Allocation:** Serves directly from preallocated stack/file buffers without
-//!   dynamic heap allocation.
-//! - **Deterministic MIME Handling:** Explicitly sets correct `Content-Type` headers for
-//!   `text/html`, `application/javascript`, and `application/wasm` (which is required by browsers
-//!   for streaming instantiation via `WebAssembly.instantiateStreaming`).
+//! ## 2. Contract
+//! - Command line: three file paths, in order, for the page, `shell.js`, and the wasm.
+//!   `build.zig` (`add_serve`) passes them. Relative paths resolve against the working
+//!   directory.
+//! - Routes are exact path matches after the query string is dropped. Anything else gets 404.
+//! - The server binds loopback only on `listen_port`, handles one connection at a time, and
+//!   closes each connection after one response. That is sufficient for a single developer
+//!   browser and keeps the control flow bounded.
+//!
+//! ## 3. TigerStyle Invariants
+//! - Header buffers are `header_cap` bytes and a served file may be at most `file_cap` bytes.
+//!   A larger file returns `error.FileTooLarge` instead of truncating.
+//! - No heap allocation: the Io runtime is built with a failing allocator, and the request
+//!   and file buffers live on the stack.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// Size of each of the receive and send buffers, which bounds the request head.
 const header_cap: u32 = 4096;
+/// Largest file the server will read into its stack buffer.
 const file_cap: u32 = 4 * 1024 * 1024;
+/// Loopback TCP port. A fixed port keeps the URL stable between runs.
 const listen_port: u16 = 8080;
 
 const Paths = struct {
@@ -47,6 +56,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try serve_forever(io, paths);
 }
 
+/// Reads the three required file paths from the command line, in the order the module guide
+/// states.
 fn parse_paths(args: std.process.Args) !Paths {
     var it = std.process.Args.Iterator.init(args);
     const argv0 = it.next();
@@ -75,6 +86,8 @@ fn serve_forever(io: std.Io, paths: Paths) !void {
     }
 }
 
+/// Accepts one connection and answers its first request. A malformed request head drops the
+/// connection silently, since the only client is a local browser that will retry.
 fn serve_one(io: std.Io, server: *std.Io.net.Server, paths: Paths) !void {
     var stream = try server.accept(io);
     defer stream.close(io);
@@ -149,6 +162,9 @@ fn respond_file(
     });
 }
 
+/// Reads the whole file into `dest[0..length]` and returns `length`. Fails with
+/// `error.FileTooLarge` above `file_cap` and `error.FileShortRead` if the file shrinks
+/// between `stat` and read.
 fn read_file(io: std.Io, path: []const u8, dest: []u8) !u32 {
     assert(path.len != 0);
     assert(dest.len == file_cap);

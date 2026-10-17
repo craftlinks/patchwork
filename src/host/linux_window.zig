@@ -1,205 +1,96 @@
-//! Linux Wayland Windowing, Event Loop, and Graphics Integration.
+//! Linux Wayland window host: event loop, frame pacing, and GPU surface hookup.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Core Problem & Rationale ("Why")
-//! On modern Linux desktop environments, display serving and window management are governed by
-//! the **Wayland** protocol (superseding legacy X11).
+//! ## 1. Why a Blocking Dual-Source Loop
+//! The compositor, not the client, owns the display, sizes the window through asynchronous
+//! configure events, and receives complete pixel buffers; Wayland has no server-side drawing.
+//! A client that spins or polls on an interval wastes power while the UI is static, so the
+//! loop sleeps in `ppoll` until something can change the picture:
+//! 1. `wl_display_prepare_read` claims the socket read. A non-zero return means events are
+//!    already queued: dispatch them, drain the timer so a busy socket cannot starve app
+//!    timers, and skip the sleep.
+//! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on the Wayland fd and the
+//!    optional timer fd. A negative descriptor is ignored by `poll`, so an app without a
+//!    timer passes `no_timer_fd` and never wakes on ticks.
+//! 3. The timeout is null (sleep until the compositor writes) unless a commit is latched in
+//!    `State.present_at_ns`, in which case it is the time remaining until that deadline.
+//! 4. Cancel-read rule: every successful `prepare_read` must end in `wl_display_read_events`
+//!    or `wl_display_cancel_read`. A timer-only wake or timeout cancels; only a readable
+//!    socket reads. Skipping the cancel leaves libwayland's read lock held.
+//! 5. Timer expirations collapse: `drain_timer` reads one expiration count and calls
+//!    `app.timer` once at the current monotonic time, however many periods were missed.
 //!
-//! ### Architectural Principles of Wayland:
-//! - **The Compositor as Authority:** The compositor (e.g. Hyprland, Sway, GNOME Mutter, KDE KWin)
-//!   acts as the display server, directly controlling video outputs, graphics page-flipping,
-//!   and kernel input devices (libinput mice, keyboards, touchpads).
-//! - **Client Pixel Ownership:** The client connects to the compositor via a Unix domain socket
-//!   (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, typically `/run/user/1000/wayland-0`). Unlike X11,
-//!   Wayland provides no server-side drawing primitives; clients render complete pixel buffers
-//!   (via WebGPU or shared memory) and attach them to a `wl_surface`.
-//! - **Compositor-Dictated Sizing:** The compositor—not the client—dictates window sizes through
-//!   asynchronous configure transactions.
+//! Hover animators do not chain wakes: a present is followed by one frame callback, and a
+//! `done` that finds nothing dirty arms nothing, which returns the loop to a null timeout.
 //!
-//! ### The Dual-Source Blocking Event Loop & Timerfd Clock:
-//! Many UI toolkits run continuous rendering loops or spin threads, wasting battery and warming
-//! devices. Patchwork implements the libwayland multi-thread reader protocol integrated with an
-//! optional Linux `timerfd` managed through `Host(App)`:
-//! 1. When `App.config.timer_period_ms != 0`, `timerfd_create(CLOCK_MONOTONIC, CLOEXEC|NONBLOCK)`
-//!    opens a timer file descriptor armed relatively with `period_ns` for both interval and
-//!    initial value, closed on scope exit with `defer`. When `timer_period_ms == 0`, `timer_fd`
-//!    is set to `no_timer_fd` (-1). Because `poll` ignores negative file descriptors, an app
-//!    without a timer passes -1 in `fds[1]` and sleeps in `ppoll` without waking on timer ticks.
-//! 2. `wl_display_prepare_read()`: Atomically registers intent to read socket events. If events
-//!    are already pending (`rc != 0`), it dispatches pending events and immediately drains the
-//!    timer (`drain_timer`) so a busy Wayland socket cannot starve procedural app timers.
-//! 3. `wl_display_flush()`: Flushes pending client requests across the Unix socket.
-//! 4. `ppoll` over two descriptors: `fds[0]` is the Wayland socket, and `fds[1]` is `timer_fd`
-//!    (or -1 when unused). The timeout is null unless a commit is latched (`present_at_ns != 0`),
-//!    sleeping until an event arrives or the present deadline is due.
-//! 5. **The Cancel-Read Rule:** A timer-only wake must NOT call `wl_display_read_events`.
-//!    If `fds[0]` is readable, `wl_display_read_events` reads incoming bytes into libwayland's
-//!    ring buffers and dispatches callbacks. If `fds[0]` is NOT readable (a timer-only wake or
-//!    timeout), the thread cancels the prepared read via `wl_display_cancel_read`.
-//! 6. When `fds[1]` is readable, `drain_timer` reads one `u64` expiration count and calls
-//!    `app.timer(now_ms)`. Multiple missed periods collapse into one sample at monotonic time,
-//!    requesting redraw when `app.timer` reports a change.
-//! 7. **CPU Profile & Idle Characterization:** When an app configures no timer (such as the
-//!    scroll column), `fds[1]` is -1 and the process sleeps indefinitely in `ppoll` with 0.0%
-//!    CPU while idle. When an app configures a timer (such as the rack at 33 ms), the thread
-//!    wakes at that frequency to sample values, plus Wayland events and the present latch. Hover
-//!    animators do not chain continuous loops; steady state is one present per wake, then sleep.
+//! ## 2. Coordinate Spaces
+//! - UI logical pixels: origin at the top-left, +X right, +Y down. Pointer coordinates and
+//!   layout use this frame. Wayland surface coordinates are independent of
+//!   `wl_surface.set_buffer_scale`, so no scale conversion is applied to input.
+//! - Physical device pixels: `width_px = width_logical * scale`, and likewise for height.
+//!   Only the swapchain and the present header use them.
+//! - `wl_pointer` coordinates arrive as signed 24.8 fixed point and are converted by
+//!   `input.fixed_to_logical` (test "fixed_to_logical converts 24.8" in `input.zig`).
 //!
-//! ## 2. Mathematical Derivations & Coordinate Spaces
+//! ## 3. Protocol Limits and Layout
+//! - Bounds are the named constants `global_cap`, `compositor_version_max`,
+//!   `wl_seat.seat_version`, `wp_presentation.presentation_version` (the host binds
+//!   `min(advertised, version)`), and `feedback_in_flight_max`.
+//! - `present_margin_ns` is how far before the projected vblank a commit is dispatched. It
+//!   must exceed the compositor's latch lead (the point before vblank after which new
+//!   content misses that vblank), which is compositor-specific, so the constant is tuned
+//!   per target and guarded by the `comptime` block below.
+//! - Listener tables are `extern struct`s with one slot per event in opcode order. This file
+//!   asserts the layout of `RegistryListener` and `SurfaceListener`; the seat, callback and
+//!   presentation listeners are asserted in their own files.
 //!
-//! ### Coordinate Spaces:
-//! - **UI Logical Pixels:** Screen-space coordinates with origin `(0, 0)` at the top-left, `+X`
-//!   right, and `+Y` down.
-//! - **Physical Device Pixels:** The actual pixel resolution of the GPU swapchain framebuffer
-//!   texture:
-//!   ```text
-//!   width_px  = width_logical  * scale
-//!   height_px = height_logical * scale
-//!   ```
-//!
-//! ### Wayland Signed 24.8 Fixed-Point (`wl_fixed_t`):
-//! - Pointer motion delivered by `wl_pointer` uses 24.8 signed fixed-point integers.
-//! - Conversion to logical pixels:
-//!   ```text
-//!   logical = @as(f32, @floatFromInt(fixed)) / 256.0
-//!   ```
-//! - By Wayland specification, surface coordinates are strictly invariant to `set_buffer_scale`,
-//!   matching the logical pixel frame of `turtle` and the app.
-//!
-//! ## 3. Hardware, Spec Limits, and C ABI Layouts
-//!
-//! ### C ABI Callbacks and Listeners:
-//! - `RegistryListener`: 2 function pointers (16 bytes, alignment 8).
-//! - `SurfaceListener`: 4 function pointers (32 bytes, alignment 8).
-//! - `SeatListener`: 1 function pointer (8 bytes, alignment 8). Bound to `wl_seat` version 1.
-//! - `PointerListener`: 5 function pointers (40 bytes, alignment 8). Bound to `wl_pointer` v1.
-//! - `CallbackListener`: 1 function pointer (8 bytes, alignment 8). For `wl_callback` opcode 0.
-//! - `PresentationListener`: 1 function pointer (8 bytes, alignment 8). `wp_presentation.clock_id`.
-//! - `FeedbackListener`: 3 function pointers (24 bytes, alignment 8). Opcodes 0..2 for
-//!   `sync_output`, `presented`, and `discarded`.
-//!
-//! ### Pinned Limits:
-//! - `global_cap = 256`: Maximum compositor globals scanned during registry roundtrip.
-//! - `compositor_version_max = 6`: Pinned maximum version of `wl_compositor`.
-//! - `seat_version = 1`: Guarantees compositor emits opcodes 0..4 only, preventing overrun.
-//! - `wp_presentation` is bound at `min(advertised, 2)`.
-//! - `feedback_in_flight_max = 4`: Most `wp_presentation_feedback` proxies awaiting an answer.
-//!   Steady state is two. A commit that would exceed the bound requests no feedback.
-//! - `present_margin_ns = 3 ms` (3_000_000 ns): Dispatch margin prior to projected display vblank.
-//!   Guarantees the commit completes before Hyprland's ~2 ms pre-vblank latch point.
-//!
-//! ## 4. State Machines & Data Flow
-//!
-//! ### The Strict Main Loop Order:
-//! In `loop()`, the execution order is strictly deterministic:
-//! ```text
-//! 1. ack_if_needed(state)
-//! 2. sync_input(state)
-//! 3. sync_clock(state)
-//! 4. present_if_dirty(state)
-//! 5. wait_for_events(state.display)
-//! ```
-//!
-//! ### Loop Stage Details:
-//! 1. **`ack_if_needed` (Configure-Acknowledge State Machine):**
-//!    If an `xdg_surface.configure(serial)` was received, sends `xdg_surface.ack_configure(serial)`
-//!    and updates window dimensions via `frame.apply_configure()`.
-//! 2. **`sync_input` (Pointer Event Draining):**
-//!    Wayland pointer callbacks (`pointer_motion`, `pointer_button`) are pure leaf writers that
-//!    push `input.Event` records into `state.queue: input.EventQueue`. Motion events are coalesced.
-//!    `sync_input` drains this queue once per wake, feeding `app.event(event)`. If widget
-//!    state changes, it flags `frame.request_redraw()`.
-//! 3. **`sync_clock` (Frame Timing Synchronization):**
-//!    When `wl_callback.done` fires, `frame_done_callback` records the timestamp and sets
-//!    `frame_done`.
-//!    `sync_clock` passes this timestamp to `clock.advance(now_ms)`. If animators move, or any
-//!    animator is still live, it requests a redraw. A `done` with `redraw` set schedules the
-//!    commit 3 ms before the next vblank (`schedule_present`). That vblank is projected from
-//!    the last `wp_presentation.presented` pageflip (`frame.present_deadline`):
-//!    ```text
-//!    earliest = now + margin
-//!    k        = ceil((earliest - anchor) / refresh)   (0 if anchor >= earliest)
-//!    vblank   = anchor + k * refresh
-//!    deadline = vblank - margin
-//!    ```
-//!    Because the anchor is the pageflip itself, whatever the compositor or the driver does
-//!    between pageflip and `done` cannot move the deadline. When no fresh pageflip is known
-//!    (no `wp_presentation`, a non-monotonic compositor clock, or older than `anchor_age_max_ns`
-//!    = 1 s), the `done` receipt is the anchor and the rule reduces to `done + refresh - 3 ms`.
-//!    The period is the one `presented` reports; without one, callback gaps are snapped to a
-//!    known rate and a doubled gap is ignored. The commit draws the pointer sample that has
-//!    arrived by the deadline. If all animators have settled, `clock.reset()` is called.
-//! 4. **`present_if_dirty` (Conditional Presentation & Frame Callback Request):**
-//!    - Early returns if clean (`!frame.redraw`) or unconfigured (`width_px == 0`).
-//!    - If a frame callback is in flight, or the late-latch deadline has not arrived, leaves
-//!      `redraw` set and returns. Layout and the instance rebuild wait for the commit.
-//!    - If `frame.relayout` is true, calls `app.layout()`, re-dispatching pointer hover.
-//!    - If `app.dirty()` is true, calls `app.draw()` to rebuild the 64-byte instance list.
-//!    - **Frame Callback Request:** Every commit requests `wl_surface.frame` immediately before
-//!      `gpu.present()`, and only while `state.frame_callback == null`. A `done` with nothing
-//!      dirty arms nothing.
-//!    - **Presentation Feedback Request:** Every commit also requests
-//!      `wp_presentation.feedback` (bounded by `feedback_in_flight_max`). Its `presented`
-//!      event is the pageflip timestamp the next schedule anchors on.
-//!    - Invokes `gpu.present()` and marks cursor and frame clean.
-//! 5. **`wait_for_events` (Sleep & Dual-Source Wake):**
-//!    Flushes the socket and blocks in `ppoll` across two file descriptors (`fds[0]` Wayland
-//!    socket, `fds[1]` timer descriptor or -1). The timeout is null unless a commit is latched.
-//!    - If a timeout occurs, cancels the prepared read and returns to present.
-//!    - If `fds[0]` is readable, calls `wl_display_read_events` and dispatches pending events.
-//!    - **Cancel-Read Rule:** If `fds[0]` is not readable, cancels the prepared read via
-//!      `wl_display_cancel_read` to avoid blocking on an unreadable socket.
-//!    - If `fds[1]` is readable, `drain_timer` reads the 8-byte expiration counter, calls
-//!      `app.timer(now_ms)`, and flags redraw if `app.timer` returns true.
-//!    - Early return path: if `prepare_read` fails because events are pending, dispatches them
-//!      and immediately drains the timer to prevent timer starvation.
-//!    - Steady state is one present per timer wake when dirty, then sleep in `ppoll`.
-//!
-//! ### Measured Cadence on Hyprland 0.56.2 / Mesa 26.2.2 (3840x2160@60 Hz, 6-8 s hover sweep):
-//! Hyprland latches client content about 2 ms before the vblank and pageflips at the vblank.
-//! Commits dispatched 3 ms before the projected vblank reach the screen in 2.6-2.7 ms (median),
-//! and `wl_callback.done` arrives ~0.35 ms after the pageflip (p95 0.55 ms).
-//!
-//! Pacing mode comparison:
-//! - FIFO (`wp_fifo_v1`): Mesa issues two commits per present (attach, set_barrier, wait_barrier,
-//!   commit, wait_barrier, commit). The held second commit causes every other `done` to arrive
-//!   one refresh late, yielding 105 one-period vs 89 two-period gaps in alternating pairs
-//!   and holes.
-//! - Mailbox (single attach and commit per present): In a 6 s hover sweep, yielded 267 one-period
-//!   vs 3 two-period gaps. In an 8 s hover sweep over 377 presents, yielded 348 one-period vs 7
-//!   two-period gaps, with zero scheduled commits shown later than their targeted vblank.
-//! - Presentation feedback: Observed flags = 0x5 (`vsync | hw_completion`, no `hw_clock`),
-//!   reported refresh = 16666666 ns, and `clock_id` = `CLOCK_MONOTONIC` (1). The 1 s anchor
-//!   freshness limit (`anchor_age_max_ns`) never engaged during continuous sweeps.
+//! ## 4. Loop State Machine
+//! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_clock`,
+//! `present_if_dirty`, `wait_for_events`. Callbacks only write `State`; all app calls happen
+//! in this order on the main thread.
+//! - `ack_if_needed`: answers a pending `xdg_surface.configure` with `ack_configure` and
+//!   applies the pending size through `frame.apply_configure`. A configure carries no size
+//!   guarantee, so a zero dimension is replaced by `Frame`.
+//! - `sync_input`: drains `State.queue` once per wake, bounded by `input.queue_cap`. Motion
+//!   is coalesced by the queue, and a press and release stay separate events.
+//! - `sync_clock`: runs only after a `wl_callback.done`. It steps animators from the callback
+//!   timestamp, requests a redraw while the app is live, resets the clock when settled, and
+//!   calls `schedule_present`.
+//! - `present_if_dirty`: presents only when a redraw is owed, the surface is configured, no
+//!   frame callback is in flight, and the latched deadline has passed. Otherwise it leaves
+//!   `redraw` set so pointer motion that arrives during the wait is drawn by the commit.
+//!   Layout and instance rebuild run only on that commit. Each commit requests
+//!   `wl_surface.frame` and (bounded) `wp_presentation.feedback` before `gpu.present`, because
+//!   both requests attach to the next `wl_surface.commit`.
+//! - `schedule_present`: the deadline is `frame.present_deadline` applied to an anchor, the
+//!   last `presented` pageflip while `frame.anchor_is_fresh`, else the receipt time of `done`.
+//!   Anchoring on the pageflip keeps compositor and driver delay between pageflip and `done`
+//!   out of the deadline (root cause in `wp_presentation.zig`). The refresh period comes
+//!   from `presented` when it reports one, else from callback gaps via `frame.refresh_after`.
+//!   Tests: the `present_deadline` and `anchor_is_fresh` tests in `frame.zig`.
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - **libwayland-client FFI:** Dynamically linked against `libwayland-client.so.0`. Direct
-//!   C calling convention callbacks (`callconv(.c)`) recover `*State` from user data pointers.
-//! - **wgpu-native Graphics:** Passes `display` and `wl_surface` pointers to `gpu.create()` to
-//!   instantiate an XDG-Wayland WebGPU surface, swapchain, and pipeline.
-//! - **Two clients on one socket:** Mesa's Wayland WSI binds its own `wp_presentation`,
-//!   `wp_fifo_v1`, and `linux-drm-syncobj` globals through a wrapped display on a private
-//!   event queue. Its requests interleave with ours on the wire, which is why the present
-//!   mode matters to our frame callback: under FIFO the driver's barrier-held second commit
-//!   carries our `wl_surface.frame` with it.
-//! - **Clock domain:** `presented` timestamps are compared to `clock_gettime(CLOCK_MONOTONIC)`
-//!   only after `wp_presentation.clock_id` has named that clock (`CLOCK_MONOTONIC` is 1 on Linux).
-//!   Any other clock disables the vblank anchor, causing the scheduler to fall back to `done`.
-//! - **Wayland Pointer Axis Seam:** Vertical wheel scrolling arrives via `wl_pointer.axis`
-//!   (opcode 4). Only vertical axis 0 is processed; horizontal axes are ignored. Values arrive
-//!   as `wl_fixed_t` (signed 24.8) and are converted to UI logical pixels via
-//!   `input.fixed_to_logical`. Non-zero deltas are paired with `state.last_x` / `state.last_y`
-//!   and pushed onto `EventQueue` as `Event.wheel`. Positive `dy` increases `scroll_y`
-//!   (scrolls content downward).
-//! - **Timerfd Wake Seam:** Linux drives app timers via `timerfd_create` and `ppoll` on the main
-//!   thread, passing `no_timer_fd` (-1) when `timer_period_ms == 0`. The browser host uses
-//!   `setInterval` calling `wasm.timer()`, arming nothing when the period is 0.
+//! - `libwayland-client.so.0` is linked dynamically. C callbacks recover `*State` from the
+//!   listener user-data pointer and never lay out, draw, or step animators.
+//! - `gpu.create` receives the `wl_display` and `wl_surface` pointers to make the WebGPU
+//!   surface.
+//! - Two clients share one socket: Mesa's Wayland WSI binds its own `wp_presentation`,
+//!   `wp_fifo_v1` and `linux-drm-syncobj` objects on a private event queue through a wrapped
+//!   display, and its requests interleave with ours. Under FIFO present mode the driver's
+//!   barrier-held second commit carries our `wl_surface.frame`, so `done` timing depends on
+//!   the driver's present mode (Mesa 26.2.2).
+//! - Presentation timestamps are compared to `CLOCK_MONOTONIC` only after
+//!   `wp_presentation.clock_id` has named it. Any other clock disables the vblank anchor and
+//!   the scheduler falls back to `done`.
+//! - Only the vertical `wl_pointer.axis` becomes `Event.wheel`; a positive `dy` is added to
+//!   the scroll offset by the widgets. The browser host drives app timers with
+//!   `setInterval` instead of a `timerfd`, arming nothing when the period is zero.
 //!
 //! ## 6. TigerStyle Invariants
-//! - **Static Allocation:** `State` is stack-allocated in `run()`; zero heap allocations in loop.
-//! - **Split Defensive Assertions:** Assertions check versions, return codes, and bounds.
-//! - **Leaf Callbacks:** Wayland C callbacks perform zero rendering, layout, or animator math.
+//! - `State` lives on the stack of `run`; the loop allocates nothing.
+//! - Every loop is bounded: input drain by `input.queue_cap`, `EINTR` retry by a fixed guard.
+//! - Wayland callbacks are leaf writers; all app and GPU work happens in the loop body.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -215,17 +106,18 @@ const wl_seat = @import("wl_seat.zig");
 const wp_presentation = @import("wp_presentation.zig");
 const xdg = @import("xdg_shell.zig");
 
-/// First refresh guess, re-exported for `main`. 60 Hz in nanoseconds.
+/// First refresh-period guess, re-exported from `frame` for `main`.
 pub const refresh_ns_initial: u64 = frame.refresh_ns_initial;
-/// Commit this many nanoseconds before the next callback is due, so the sample
-/// includes pointer motion from the rest of the frame. `ppoll` sleeps until that
-/// instant. A millisecond timeout was coarse enough to miss the latch.
+/// Lead time before the projected vblank at which a commit is dispatched. It must exceed the
+/// compositor's latch lead so the commit lands in that vblank, while staying early enough in
+/// the frame to include late pointer motion. The `ppoll` timeout is nanosecond-resolution
+/// because a millisecond timeout is too coarse to hit the latch.
 const present_margin_ns: u64 = 3_000_000;
 
-/// Maximum concurrent `wp_presentation_feedback` proxies allowed in flight.
-/// Two is the steady state: the feedback for the frame currently on screen arrives after the
-/// subsequent commit has already been dispatched. If a compositor stops responding, further
-/// feedback requests are suppressed once this bound is reached to guarantee bounded memory.
+/// Maximum concurrent `wp_presentation_feedback` proxies. The feedback for the frame on screen
+/// arrives after the next commit was dispatched, so at least two must be allowed (asserted
+/// below). At the bound, further requests are skipped so a stalled compositor cannot grow
+/// memory.
 const feedback_in_flight_max: u32 = 4;
 
 comptime {
@@ -275,8 +167,8 @@ pub const State = struct {
     frame_time_ms: u32,
     /// Monotonic nanoseconds when the coalesced commit should run. 0 means not waiting.
     present_at_ns: u64,
-    /// Refresh period in use. From `wp_presentation` when it reports one, otherwise
-    /// measured from frame-callback gaps. The first guess is 60 Hz.
+    /// Refresh period in use, in nanoseconds. From `wp_presentation` when it reports one,
+    /// otherwise estimated from frame-callback gaps starting at `refresh_ns_initial`.
     refresh_ns: u64,
     /// Monotonic nanoseconds of the previous `done`. 0 before the first callback.
     last_callback_ns: u64,
@@ -294,8 +186,8 @@ pub const State = struct {
     /// Fixed output refresh period in nanoseconds reported by `presented`. Value 0 if the
     /// output has no fixed rate (e.g. VRR). When valid, overrides heuristic callback gap tracking.
     vblank_refresh_ns: u64,
-    /// Number of active `WpPresentationFeedback` proxies currently awaiting an event.
-    /// Bounded by `feedback_in_flight_max` (4).
+    /// Number of `WpPresentationFeedback` proxies awaiting a terminal event. Never exceeds
+    /// `feedback_in_flight_max`.
     feedback_in_flight: u32,
     /// Bound Wayland seat proxy (`wl_seat` version 1) from the compositor registry.
     seat: ?*wl_seat.WlSeat,
@@ -473,6 +365,20 @@ const feedback_listener: wp_presentation.FeedbackListener = .{
     .presented = feedback_presented,
     .discarded = feedback_discarded,
 };
+
+comptime {
+    // libwayland indexes listener tables by event opcode, so a table must have exactly one
+    // pointer slot per event: `wl_registry` has 2 events and `wl_surface` has 4 at the
+    // versions bound here.
+    assert(@typeInfo(RegistryListener).@"struct".fields.len == 2);
+    assert(@sizeOf(RegistryListener) == 2 * @sizeOf(*const anyopaque));
+    assert(@typeInfo(SurfaceListener).@"struct".fields.len == 4);
+    assert(@sizeOf(SurfaceListener) == 4 * @sizeOf(*const anyopaque));
+    // These checks read the hand-written interface tables, so they run only in builds that
+    // link `wayland-client`.
+    xdg.assert_interface_tables();
+    wp_presentation.assert_interface_tables();
+}
 
 /// Orchestrates the entire Wayland application lifecycle for one app type:
 /// 1. Checks the app contract at compile time and initializes `App`.
@@ -844,8 +750,8 @@ fn ack_if_needed(state: *State) void {
     assert(!state.ack_pending);
 }
 
-/// Populates 104-byte `PresentHeader` and submits quad face and glyph lists to the GPU.
-/// Updates the upload cursor with newly presented revisions and marks the frame presented.
+/// Fills the `draw.PresentHeader` and submits the quad and glyph lists to the GPU. Marks the
+/// upload cursor with the presented revisions, then marks the frame presented.
 fn submit_frame(state: *State) !void {
     assert(state.frame.redraw);
     assert(state.frame.width_px != 0);
@@ -898,8 +804,8 @@ fn arm_frame(state: *State) void {
 /// Skipped when `state.presentation == null`, `state.surface == null`, or when
 /// `state.feedback_in_flight >= feedback_in_flight_max`. In the skipped case, `schedule_present`
 /// continues projecting from the most recent valid anchor.
-/// When armed, allocates a one-shot `WpPresentationFeedback` proxy, installs `feedback_listener`,
-/// and increments `state.feedback_in_flight` (steady state is 2, ceiling is 4).
+/// When armed, requests a one-shot `WpPresentationFeedback` proxy, installs `feedback_listener`,
+/// and increments `state.feedback_in_flight`.
 fn arm_feedback(state: *State) void {
     assert(state.frame.redraw);
     const presentation = state.presentation orelse {
@@ -987,8 +893,7 @@ fn arm_timer(period_ms: u32) !i32 {
         else => return error.TimerCreateFailed,
     };
     assert(fd >= 0);
-    // One second is the contract maximum, so the period is whole milliseconds below that
-    // and `tv_nsec` stays under 1_000_000_000. A full second goes in `tv_sec`.
+    // Whole seconds go in `tv_sec` so `tv_nsec` stays below one second for any period.
     const period: std.os.linux.timespec = .{
         .sec = @intCast(period_ms / 1000),
         .nsec = @intCast((period_ms % 1000) * 1_000_000),
@@ -1055,11 +960,10 @@ fn note_refresh(state: *State) void {
 /// can enter an unbounded sleep.
 /// If a redraw is owed, queries `monotonic_ns()` and checks
 /// `frame.anchor_is_fresh(state.vblank_ns, now_ns)`.
-/// If fresh (age <= `anchor_age_max_ns` = 1 s), projects forward from `state.vblank_ns`. Otherwise,
-/// falls back to anchoring on `now_ns` (the receipt time of `wl_callback.done`).
+/// If fresh (age within `frame.anchor_age_max_ns`), projects forward from `state.vblank_ns`.
+/// Otherwise anchors on `now_ns`, the receipt time of `wl_callback.done`.
 /// Calls `frame.present_deadline(anchor_ns, state.refresh_ns, now_ns, present_margin_ns)`
-/// to place the commit `present_margin_ns` (3 ms) before the next achievable vblank.
-/// Cross-references: `frame.present_deadline`.
+/// to place the commit `present_margin_ns` before the next achievable vblank.
 fn schedule_present(state: *State) void {
     assert(!state.frame_done);
     if (!state.frame.redraw) {
@@ -1369,7 +1273,8 @@ fn pointer_motion(
 }
 
 /// C ABI callback for `wl_pointer.button` (opcode 3).
-/// Tracks primary mouse button (`BTN_LEFT` = 0x110). Ignores secondary and middle clicks.
+/// Queues press and release of the primary button (`wl_seat.button_code_left`) at the last
+/// pointer position. Other buttons are ignored.
 fn pointer_button(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1466,7 +1371,7 @@ fn frame_done_callback(
 /// Preconditions: `data != null`.
 /// Emitted once by the compositor following the initial global binding.
 /// Records `clock_id` into `state.presentation_clock`. Presentation timestamps from
-/// `feedback_presented` are accepted only if `clock_id == wp_presentation.clock_monotonic` (1).
+/// `feedback_presented` are accepted only if `clock_id == wp_presentation.clock_monotonic`.
 fn presentation_clock_id(
     data: ?*anyopaque,
     presentation: ?*wp_presentation.WpPresentation,
@@ -1499,13 +1404,13 @@ fn feedback_sync_output(
 /// Preconditions: `data != null`, `feedback != null`.
 /// Protocol destructor: destroys the one-shot proxy via `wp_presentation.destroy_feedback` and
 /// decrements `state.feedback_in_flight`.
-/// Validates that `state.presentation_clock == wp_presentation.clock_monotonic` (1) and that
+/// Validates that `state.presentation_clock == wp_presentation.clock_monotonic` and that
 /// `tv_nsec < 1_000_000_000`. If valid, assembles the timestamp via `wp_presentation.presented_ns`
 /// and stores it in `state.vblank_ns`. Also records `state.vblank_refresh_ns = refresh`.
 /// Zero `refresh` indicates a variable refresh rate output and defers cadence tracking to the gap
 /// estimator.
-/// Observed flags on Hyprland 0.56.2 / Mesa 26.2.2: 0x5 (`vsync | hw_completion`, no `hw_clock`),
-/// refresh = 16666666 ns.
+/// The `flags` argument is not consulted: the anchor is used whether or not the timestamp
+/// came from the hardware clock.
 /// Cross-reference: `schedule_present` projects the next commit deadline from `state.vblank_ns`.
 fn feedback_presented(
     data: ?*anyopaque,
