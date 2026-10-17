@@ -4,6 +4,7 @@
 //! `zig build test` compiles this file and nothing else.
 
 pub const frame = @import("frame.zig");
+pub const font = @import("font.zig");
 pub const draw = @import("draw.zig");
 pub const turtle = @import("turtle.zig");
 pub const input = @import("input.zig");
@@ -18,6 +19,7 @@ pub const wp_presentation = @import("wp_presentation.zig");
 
 test {
     _ = frame;
+    _ = font;
     _ = draw;
     _ = turtle;
     _ = input;

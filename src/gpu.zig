@@ -23,11 +23,15 @@
 //! In Zig on `wasm32`:
 //! - Any pointer `*T` or `[*]T` is fundamentally a 32-bit unsigned integer offset into that
 //!   linear memory buffer.
-//! - By casting pointers with `@intCast(@intFromPtr(header))` and
-//!   `@intCast(@intFromPtr(instances))`, Zig passes the raw memory addresses across the FFI
-//!   boundary to the host import `present_js()`.
-//! - In the browser, JavaScript reads the `PresentHeader` struct directly out of Wasm memory
-//!   using a `DataView(wasm.memory.buffer, headerPtr, 96)`.
+//! - By casting pointers with `@intCast(@intFromPtr(header))`,
+//!   `@intCast(@intFromPtr(instances))`, and `@intCast(@intFromPtr(glyphs))`, Zig passes the
+//!   raw memory addresses across the FFI boundary to `present_js(header, instances, glyphs)`.
+//! - In the browser, JavaScript reads the 104-byte `PresentHeader` struct directly out of
+//!   Wasm linear memory using a `DataView(wasm.memory.buffer, headerPtr, 104)`.
+//! - If `flag_instances` is set and `instance_count > 0`, JavaScript uploads `instance_count * 48`
+//!   bytes directly from `instancePtr`.
+//! - If `flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 48` bytes
+//!   directly from `glyphPtr`.
 //! - Zero serialization, zero copying, zero JSON overhead, zero GC pressure.
 //!
 //! ## 3. Clear Color Rationale
@@ -42,6 +46,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("draw.zig");
+const font = @import("font.zig");
 
 /// Conditionally import native wgpu bindings only when compiling for non-Wasm targets.
 const gpu_wgpu = if (builtin.cpu.arch == .wasm32) void else @import("gpu_wgpu.zig");
@@ -78,19 +83,25 @@ pub fn present(
     gpu: *Gpu,
     header: *const draw.PresentHeader,
     instances: [*]const draw.Instance,
+    glyphs: [*]const font.Glyph,
 ) !void {
     assert(header.width_px != 0);
     assert(header.height_px != 0);
+    assert(header.glyph_count <= font.glyph_cap);
     if (builtin.cpu.arch == .wasm32) {
-        // In WebAssembly, call the imported JavaScript presentation function.
-        // Pointers are cast to 32-bit unsigned integer byte offsets into Wasm linear memory.
+        // Pointers are byte offsets into Wasm linear memory. The glyph pointer is
+        // valid for the call even when glyph_count is 0.
         const js = struct {
-            extern "env" fn present_js(header_ptr: u32, instance_ptr: u32) void;
+            extern "env" fn present_js(header_ptr: u32, instance_ptr: u32, glyph_ptr: u32) void;
         };
-        js.present_js(@intCast(@intFromPtr(header)), @intCast(@intFromPtr(instances)));
+        js.present_js(
+            @intCast(@intFromPtr(header)),
+            @intCast(@intFromPtr(instances)),
+            @intCast(@intFromPtr(glyphs)),
+        );
         return;
     }
-    try gpu_wgpu.present(gpu, header, instances);
+    try gpu_wgpu.present(gpu, header, instances, glyphs);
 }
 
 /// Initializes the GPU backend.

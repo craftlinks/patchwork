@@ -134,10 +134,47 @@
 //! refresh (tearing requires explicit `wp_tearing_control_v1`). Mesa allocates four images for
 //! mailbox instead of three; `desiredMaximumFrameLatency` is still requested as 1 and clamped
 //! to 2, and no longer controls pacing.
+//!
+//! ## 9. Glyph Atlas Architecture, Dual Bind Groups, and Second Draw Pass
+//! Text is rendered via a dedicated fixed-function pipeline (`glyph_pipeline`) within the exact
+//! same active render pass as the geometric quads (`pipeline`), eliminating framebuffer attachment
+//! thrashing and color target clears.
+//!
+//! ### Pipeline Layouts and Shared Group 0:
+//! - **Quad Pipeline Layout:** Holds one bind group: Group 0 (256-byte uniform buffer containing
+//!   the orthographic projection matrix, vertex stage visibility).
+//! - **Glyph Pipeline Layout:** Holds two bind groups: Group 0 (shared with the quad pipeline) plus
+//!   Group 1 (dedicated texture atlas and filtering sampler).
+//! - **Group 1 Bindings:**
+//!   - Binding 0: `texture_2d<f32>` (sample type `float`, view dimension `2d`, format `r8unorm`),
+//!     fragment stage visibility (`shader_fragment = 0x2`).
+//!   - Binding 1: `sampler` (filtering sampler, address mode `clamp-to-edge`, linear min/mag),
+//!     fragment stage visibility (`shader_fragment = 0x2`).
+//!
+//! ### WebGPU Texture Copy Rules and wgpu-native v29 ABI:
+//! - **Texture vs. Buffer Copy Usage Flags:** In WebGPU, texture usage bit `0x2` represents
+//!   `COPY_DST`. For buffers, `COPY_DST` is bit `0x8`. Passing `0x8` to a texture descriptor
+//!   specifies `STORAGE_BINDING`, which is disallowed on `r8unorm` textures and causes validation
+//!   panics in `wgpuDeviceCreateTexture`. We define `texture_usage_copy_dst: TextureUsage = 0x2`.
+//! - **Hardware Copy Alignment:** WebGPU specification Section 24.1 dictates that buffer-to-texture
+//!   and data-to-texture copies must have `bytesPerRow` aligned to a multiple of 256 bytes.
+//!   The atlas is 512 x 256 texels. `bytesPerRow = 512` is an exact multiple (`512 = 2 * 256`),
+//!   satisfying hardware alignment with zero padding.
+//! - **wgpu-native v29 Texel Copy Structs:** Texture writes use `WGPUTexelCopyTextureInfo` and
+//!   `WGPUTexelCopyBufferLayout` matching `wgpuQueueWriteTexture` field-for-field.
+//!
+//! ### Dual Draw Pass Execution:
+//! Both pipelines bind Vertex Buffer 0 to the unit quad (stride 8, stepMode `vertex`).
+//! The glyph pipeline binds Vertex Buffer 1 to `glyph_buffer` (`glyph_cap * 48 = 12,288` bytes).
+//! Within `encode_submit_present`:
+//! 1. `draw_quads(pass, instance_count)` draws rounded geometric quads.
+//! 2. `draw_glyphs(pass, glyph_count)` binds `glyph_pipeline`, Group 0, Group 1, and draws text.
+//! If `glyph_count == 0`, `draw_glyphs` returns immediately with zero GPU overhead.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("draw.zig");
+const font = @import("font.zig");
 
 /// Hardware GPU state context encapsulating all native WebGPU resources.
 pub const Gpu = struct {
@@ -153,10 +190,15 @@ pub const Gpu = struct {
     configured_width: u32,
     configured_height: u32,
     pipeline: RenderPipeline,
+    glyph_pipeline: RenderPipeline,
     quad_buffer: Buffer,
     instance_buffer: Buffer,
+    glyph_buffer: Buffer,
     uniform_buffer: Buffer,
     bind_group: BindGroup,
+    glyph_bind_group: BindGroup,
+    atlas: Texture,
+    glyph_sampler: Sampler,
 };
 
 const Instance = *opaque {};
@@ -175,6 +217,7 @@ const BindGroupLayout = *opaque {};
 const PipelineLayout = *opaque {};
 const BindGroup = *opaque {};
 const RenderPipeline = *opaque {};
+const Sampler = *opaque {};
 
 const Bool = u32;
 const Flags = u64;
@@ -245,6 +288,18 @@ const blend_src_alpha: BlendFactor = 0x00000005;
 const blend_one_minus_src_alpha: BlendFactor = 0x00000006;
 const buffer_uniform: BufferBindingType = 0x00000002;
 const shader_vertex: Flags = 0x0000000000000001;
+const shader_fragment: Flags = 0x0000000000000002;
+const format_r8_unorm: TextureFormat = 0x00000001;
+/// Texture `COPY_DST` is 0x2. Buffer `usage_copy_dst` is 0x8, which is texture `STORAGE_BINDING`.
+const texture_usage_copy_dst: TextureUsage = 0x0000000000000002;
+const usage_texture_binding: TextureUsage = 0x0000000000000004;
+const dimension_2d: u32 = 0x00000002;
+const sample_float: u32 = 0x00000002;
+const view_2d: u32 = 0x00000002;
+const address_clamp_to_edge: u32 = 0x00000001;
+const filter_linear: u32 = 0x00000002;
+const mip_nearest: u32 = 0x00000001;
+const sampler_filtering: u32 = 0x00000002;
 const color_write_all: Flags = 0x000000000000000F;
 const whole_size: u64 = 0xFFFFFFFFFFFFFFFF;
 
@@ -542,6 +597,68 @@ const RenderPipelineDescriptor = extern struct {
     fragment: ?*const FragmentState,
 };
 
+const Extent3D = extern struct {
+    width: u32,
+    height: u32,
+    depth_or_array_layers: u32,
+};
+
+const Origin3D = extern struct {
+    x: u32,
+    y: u32,
+    z: u32,
+};
+
+const TexelCopyBufferLayout = extern struct {
+    offset: u64,
+    bytes_per_row: u32,
+    rows_per_image: u32,
+};
+
+const TexelCopyTextureInfo = extern struct {
+    texture: Texture,
+    mip_level: u32,
+    origin: Origin3D,
+    aspect: u32,
+};
+
+const TextureDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    usage: TextureUsage,
+    dimension: u32,
+    size: Extent3D,
+    format: TextureFormat,
+    mip_level_count: u32,
+    sample_count: u32,
+    view_format_count: usize,
+    view_formats: ?[*]const TextureFormat,
+};
+
+const SamplerDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    address_mode_u: u32,
+    address_mode_v: u32,
+    address_mode_w: u32,
+    mag_filter: u32,
+    min_filter: u32,
+    mipmap_filter: u32,
+    lod_min_clamp: f32,
+    lod_max_clamp: f32,
+    compare: u32,
+    max_anisotropy: u16,
+};
+
+comptime {
+    assert(@sizeOf(Extent3D) == 12);
+    assert(@sizeOf(Origin3D) == 12);
+    assert(@sizeOf(TexelCopyBufferLayout) == 16);
+    assert(@sizeOf(TexelCopyTextureInfo) == 32);
+    assert(@sizeOf(TextureDescriptor) == 80);
+    assert(@sizeOf(SamplerDescriptor) == 64);
+}
+
 const AdapterSlot = struct {
     adapter: ?Adapter,
     ok: bool,
@@ -600,6 +717,22 @@ extern fn wgpuDeviceCreateRenderPipeline(
     device: Device,
     descriptor: *const RenderPipelineDescriptor,
 ) RenderPipeline;
+extern fn wgpuDeviceCreateTexture(
+    device: Device,
+    descriptor: *const TextureDescriptor,
+) ?Texture;
+extern fn wgpuDeviceCreateSampler(
+    device: Device,
+    descriptor: *const SamplerDescriptor,
+) Sampler;
+extern fn wgpuQueueWriteTexture(
+    queue: Queue,
+    destination: *const TexelCopyTextureInfo,
+    data: [*]const u8,
+    data_size: usize,
+    data_layout: *const TexelCopyBufferLayout,
+    write_size: *const Extent3D,
+) void;
 extern fn wgpuQueueWriteBuffer(
     queue: Queue,
     buffer: Buffer,
@@ -748,19 +881,29 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
         .configured_width = 0,
         .configured_height = 0,
         .pipeline = resources.pipeline,
+        .glyph_pipeline = resources.glyph_pipeline,
         .quad_buffer = resources.quad,
         .instance_buffer = resources.instances,
+        .glyph_buffer = resources.glyph_buffer,
         .uniform_buffer = resources.uniform,
         .bind_group = resources.bind_group,
+        .glyph_bind_group = resources.glyph_bind_group,
+        .atlas = resources.atlas,
+        .glyph_sampler = resources.glyph_sampler,
     };
 }
 
 const PipelineResources = struct {
     pipeline: RenderPipeline,
+    glyph_pipeline: RenderPipeline,
     quad: Buffer,
     instances: Buffer,
+    glyph_buffer: Buffer,
     uniform: Buffer,
     bind_group: BindGroup,
+    glyph_bind_group: BindGroup,
+    atlas: Texture,
+    glyph_sampler: Sampler,
 };
 
 /// Compiles the WGSL shader, allocates VRAM buffers, uploads the static unit quad,
@@ -779,12 +922,65 @@ fn create_resources(
     const pipeline_layout = create_pipeline_layout(device, layout);
     const bind_group = create_bind_group(device, layout, buffers.uniform);
     const pipeline = create_pipeline(device, shader, pipeline_layout, format);
+    const glyphs = try create_glyph_resources(device, queue, format, layout);
     return .{
         .pipeline = pipeline,
+        .glyph_pipeline = glyphs.pipeline,
         .quad = buffers.quad,
         .instances = buffers.instances,
+        .glyph_buffer = glyphs.buffer,
         .uniform = buffers.uniform,
         .bind_group = bind_group,
+        .glyph_bind_group = glyphs.bind_group,
+        .atlas = glyphs.atlas,
+        .glyph_sampler = glyphs.sampler,
+    };
+}
+
+/// Encapsulates all GPU resources dedicated to instanced glyph text rendering.
+const GlyphResources = struct {
+    pipeline: RenderPipeline,
+    buffer: Buffer,
+    bind_group: BindGroup,
+    atlas: Texture,
+    sampler: Sampler,
+};
+
+/// Orchestrates creation of all glyph text GPU pipelines, buffers, textures, and bind groups.
+///
+/// Preconditions and Allocations:
+/// - Allocates a 12,288-byte instance vertex buffer (`glyph_cap * 48 = 256 * 48`).
+/// - Creates and writes the static 512 x 256 `r8unorm` coverage atlas texture.
+/// - Configures a clamp-to-edge linear filtering sampler.
+/// - Builds Group 1 bind group layout (atlas texture at binding 0, sampler at binding 1).
+/// - Assembles a two-group pipeline layout combining shared uniform Group 0 and glyph Group 1.
+/// - Compiles `glyph.wgsl` into the second fixed-function render pipeline.
+fn create_glyph_resources(
+    device: Device,
+    queue: Queue,
+    format: TextureFormat,
+    uniform_layout: BindGroupLayout,
+) !GlyphResources {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(uniform_layout) != 0);
+    const shader = create_glyph_shader(device);
+    const byte_count: u32 = font.glyph_cap * font.glyph_stride;
+    const buffer = try create_buffer(device, byte_count, usage_vertex | usage_copy_dst);
+    const atlas = try create_atlas(device);
+    write_atlas(queue, atlas);
+    const sampler = create_glyph_sampler(device);
+    const glyph_layout = create_glyph_bind_group_layout(device);
+    const bind_group = create_glyph_bind_group(device, glyph_layout, atlas, sampler);
+    const pipeline_layout = create_glyph_pipeline_layout(device, uniform_layout, glyph_layout);
+    const pipeline = create_glyph_pipeline(device, shader, pipeline_layout, format);
+    assert(@intFromPtr(pipeline) != 0);
+    assert(font.atlas_bytes.len == 131072);
+    return .{
+        .pipeline = pipeline,
+        .buffer = buffer,
+        .bind_group = bind_group,
+        .atlas = atlas,
+        .sampler = sampler,
     };
 }
 
@@ -797,12 +993,14 @@ pub fn present(
     self: *Gpu,
     header: *const draw.PresentHeader,
     instances: [*]const draw.Instance,
+    glyphs: [*]const font.Glyph,
 ) !void {
     assert(header.width_px != 0);
     assert(header.height_px != 0);
     assert(header.instance_count <= draw.instance_cap);
+    assert(header.glyph_count <= font.glyph_cap);
     configure_surface(self, header.width_px, header.height_px);
-    write_uploads(self, header, instances);
+    write_uploads(self, header, instances, glyphs);
     const texture = try acquire_texture(self.surface);
     encode_submit_present(self, texture, header);
 }
@@ -1227,8 +1425,10 @@ fn write_uploads(
     self: *Gpu,
     header: *const draw.PresentHeader,
     instances: [*]const draw.Instance,
+    glyphs: [*]const font.Glyph,
 ) void {
     assert(header.instance_count <= draw.instance_cap);
+    assert(header.glyph_count <= font.glyph_cap);
     if ((header.flags & draw.flag_uniform) != 0) {
         wgpuQueueWriteBuffer(
             self.queue,
@@ -1248,6 +1448,19 @@ fn write_uploads(
                 self.instance_buffer,
                 0,
                 @ptrCast(instances),
+                @intCast(byte_count),
+            );
+        }
+    }
+    if ((header.flags & draw.flag_glyphs) != 0) {
+        if (header.glyph_count != 0) {
+            assert(font.glyph_stride == 48);
+            const byte_count: u32 = header.glyph_count * font.glyph_stride;
+            wgpuQueueWriteBuffer(
+                self.queue,
+                self.glyph_buffer,
+                0,
+                @ptrCast(glyphs),
                 @intCast(byte_count),
             );
         }
@@ -1327,6 +1540,7 @@ fn encode_submit_present(
     assert(@intFromPtr(encoder) != 0);
     const pass = begin_clear_pass(encoder, view, header);
     draw_quads(self, pass, header.instance_count);
+    draw_glyphs(self, pass, header.glyph_count);
     wgpuRenderPassEncoderEnd(pass);
     const commands = wgpuCommandEncoderFinish(encoder, null);
     wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands));
@@ -1381,6 +1595,303 @@ fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
     wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.quad_buffer, 0, whole_size);
     wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.instance_buffer, 0, whole_size);
     wgpuRenderPassEncoderDraw(pass, draw.vertex_count, instance_count, 0, 0);
+}
+
+/// Creates the static 512 x 256 `r8unorm` 2D texture for the baked font coverage atlas.
+///
+/// Hardware & WebGPU Invariants:
+/// - Uses `texture_usage_copy_dst` (`0x2`) combined with `usage_texture_binding` (`0x4`).
+///   Passing buffer `usage_copy_dst` (`0x8`) is forbidden because bit 0x8 represents
+///   `STORAGE_BINDING` on textures, triggering validation panics on `r8unorm`.
+fn create_atlas(device: Device) !Texture {
+    assert(@intFromPtr(device) != 0);
+    assert(texture_usage_copy_dst != usage_copy_dst);
+    assert(font.atlas_height == 256);
+    const descriptor: TextureDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = texture_usage_copy_dst | usage_texture_binding,
+        .dimension = dimension_2d,
+        .size = .{
+            .width = font.atlas_width,
+            .height = font.atlas_height,
+            .depth_or_array_layers = 1,
+        },
+        .format = format_r8_unorm,
+        .mip_level_count = 1,
+        .sample_count = 1,
+        .view_format_count = 0,
+        .view_formats = null,
+    };
+    const texture = wgpuDeviceCreateTexture(device, &descriptor) orelse return error.AtlasFailed;
+    assert(@intFromPtr(texture) != 0);
+    assert(descriptor.format == format_r8_unorm);
+    return texture;
+}
+
+/// Uploads the 131,072 bytes of `font.atlas_bytes` into the GPU texture atlas once at startup.
+///
+/// WebGPU Spec Alignment:
+/// - `bytes_per_row = font.atlas_width` (= 512).
+/// - 512 is an exact multiple of the required 256-byte row copy alignment (`512 = 2 * 256`).
+/// - Employs wgpu-native v29 `WGPUTexelCopyTextureInfo` and `WGPUTexelCopyBufferLayout` ABI.
+fn write_atlas(queue: Queue, texture: Texture) void {
+    assert(@intFromPtr(queue) != 0);
+    assert(@intFromPtr(texture) != 0);
+    assert(font.atlas_width % 256 == 0);
+    assert(font.atlas_bytes.len == 131072);
+    const destination: TexelCopyTextureInfo = .{
+        .texture = texture,
+        .mip_level = 0,
+        .origin = .{ .x = 0, .y = 0, .z = 0 },
+        .aspect = 0,
+    };
+    const layout: TexelCopyBufferLayout = .{
+        .offset = 0,
+        .bytes_per_row = font.atlas_width,
+        .rows_per_image = font.atlas_height,
+    };
+    const size: Extent3D = .{
+        .width = font.atlas_width,
+        .height = font.atlas_height,
+        .depth_or_array_layers = 1,
+    };
+    wgpuQueueWriteTexture(
+        queue,
+        &destination,
+        font.atlas_bytes.ptr,
+        font.atlas_bytes.len,
+        &layout,
+        &size,
+    );
+    assert(layout.bytes_per_row == 512);
+    assert(size.depth_or_array_layers == 1);
+}
+
+/// Creates a bilinear filtering sampler configured with clamp-to-edge addressing on U, V, and W.
+///
+/// Clamp-to-edge combined with half-texel UV insetting guarantees zero bleed along texture edges.
+fn create_glyph_sampler(device: Device) Sampler {
+    assert(@intFromPtr(device) != 0);
+    const descriptor: SamplerDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .address_mode_u = address_clamp_to_edge,
+        .address_mode_v = address_clamp_to_edge,
+        .address_mode_w = address_clamp_to_edge,
+        .mag_filter = filter_linear,
+        .min_filter = filter_linear,
+        .mipmap_filter = mip_nearest,
+        .lod_min_clamp = 0,
+        .lod_max_clamp = 32,
+        .compare = 0,
+        .max_anisotropy = 1,
+    };
+    const sampler = wgpuDeviceCreateSampler(device, &descriptor);
+    assert(@intFromPtr(sampler) != 0);
+    assert(descriptor.mag_filter == filter_linear);
+    return sampler;
+}
+
+/// Creates the Bind Group Layout for Group 1 (atlas texture and filtering sampler).
+///
+/// Layout Bindings:
+/// - Binding 0: `texture_2d<f32>` (sample type `float`, view dimension `2d`), fragment visibility.
+/// - Binding 1: `sampler` (filtering sampler), fragment visibility.
+fn create_glyph_bind_group_layout(device: Device) BindGroupLayout {
+    assert(@intFromPtr(device) != 0);
+    const entries = [2]BindGroupLayoutEntry{
+        .{
+            .next_in_chain = null,
+            .binding = 0,
+            .visibility = shader_fragment,
+            .binding_array_size = 0,
+            .buffer = std.mem.zeroes(BufferBindingLayout),
+            .sampler = std.mem.zeroes(SamplerBindingLayout),
+            .texture = .{
+                .next_in_chain = null,
+                .sample_type = sample_float,
+                .view_dimension = view_2d,
+                .multisampled = 0,
+            },
+            .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
+        },
+        .{
+            .next_in_chain = null,
+            .binding = 1,
+            .visibility = shader_fragment,
+            .binding_array_size = 0,
+            .buffer = std.mem.zeroes(BufferBindingLayout),
+            .sampler = .{
+                .next_in_chain = null,
+                .type = sampler_filtering,
+            },
+            .texture = std.mem.zeroes(TextureBindingLayout),
+            .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
+        },
+    };
+    const descriptor: BindGroupLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .entry_count = entries.len,
+        .entries = &entries,
+    };
+    const layout = wgpuDeviceCreateBindGroupLayout(device, &descriptor);
+    assert(@intFromPtr(layout) != 0);
+    assert(entries[0].binding == 0);
+    return layout;
+}
+
+/// Constructs Bind Group 1 attaching the atlas texture view to slot 0 and sampler to slot 1.
+fn create_glyph_bind_group(
+    device: Device,
+    layout: BindGroupLayout,
+    texture: Texture,
+    sampler: Sampler,
+) BindGroup {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(texture) != 0);
+    const view = wgpuTextureCreateView(texture, null);
+    assert(@intFromPtr(view) != 0);
+    const entries = [2]BindGroupEntry{
+        .{
+            .next_in_chain = null,
+            .binding = 0,
+            .buffer = null,
+            .offset = 0,
+            .size = 0,
+            .sampler = null,
+            .texture_view = view,
+        },
+        .{
+            .next_in_chain = null,
+            .binding = 1,
+            .buffer = null,
+            .offset = 0,
+            .size = 0,
+            .sampler = sampler,
+            .texture_view = null,
+        },
+    };
+    const descriptor: BindGroupDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .entry_count = entries.len,
+        .entries = &entries,
+    };
+    const group = wgpuDeviceCreateBindGroup(device, &descriptor);
+    assert(@intFromPtr(group) != 0);
+    assert(entries[1].sampler != null);
+    return group;
+}
+
+/// Constructs the two-group pipeline layout combining shared uniform Group 0 and glyph Group 1.
+fn create_glyph_pipeline_layout(
+    device: Device,
+    uniform_layout: BindGroupLayout,
+    glyph_layout: BindGroupLayout,
+) PipelineLayout {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(uniform_layout) != 0);
+    const groups = [2]BindGroupLayout{ uniform_layout, glyph_layout };
+    const descriptor: PipelineLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .bind_group_layout_count = groups.len,
+        .bind_group_layouts = &groups,
+        .immediate_size = 0,
+    };
+    const layout = wgpuDeviceCreatePipelineLayout(device, &descriptor);
+    assert(@intFromPtr(layout) != 0);
+    assert(descriptor.bind_group_layout_count == 2);
+    return layout;
+}
+
+/// Compiles `src/glyph.wgsl` into a WebGPU shader module for native execution.
+fn create_glyph_shader(device: Device) ShaderModule {
+    assert(@intFromPtr(device) != 0);
+    assert(font.shader_file.len >= 1);
+    var source: ShaderSourceWgsl = .{
+        .chain = .{ .next = null, .s_type = s_type_shader_source_wgsl },
+        .code = .{
+            .data = font.shader_file.ptr,
+            .length = font.shader_file.len,
+        },
+    };
+    const descriptor: ShaderModuleDescriptor = .{
+        .next_in_chain = @ptrCast(&source.chain),
+        .label = empty_label,
+    };
+    const shader = wgpuDeviceCreateShaderModule(device, &descriptor);
+    assert(@intFromPtr(shader) != 0);
+    assert(font.glyph_stride == 48);
+    return shader;
+}
+
+/// Builds the fixed-function render pipeline for instanced glyph text rendering.
+/// Reuses `fill_vertex_layouts` (48-byte instance stride) and `alpha_blend` compositing.
+fn create_glyph_pipeline(
+    device: Device,
+    shader: ShaderModule,
+    layout: PipelineLayout,
+    format: TextureFormat,
+) RenderPipeline {
+    assert(@intFromPtr(device) != 0);
+    assert(@intFromPtr(shader) != 0);
+    var buffers: [2]VertexBufferLayout = undefined;
+    fill_vertex_layouts(&buffers);
+    const vertex = vertex_state(shader, &buffers);
+    const target: ColorTargetState = .{
+        .next_in_chain = null,
+        .format = format,
+        .blend = &alpha_blend,
+        .write_mask = color_write_all,
+    };
+    const fragment = fragment_state(shader, &target);
+    const descriptor: RenderPipelineDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .vertex = vertex,
+        .primitive = .{
+            .next_in_chain = null,
+            .topology = topology_triangle_list,
+            .strip_index_format = index_undefined,
+            .front_face = front_ccw,
+            .cull_mode = cull_none,
+            .unclipped_depth = 0,
+        },
+        .depth_stencil = null,
+        .multisample = .{
+            .next_in_chain = null,
+            .count = 1,
+            .mask = 0xFFFFFFFF,
+            .alpha_to_coverage_enabled = 0,
+        },
+        .fragment = &fragment,
+    };
+    const pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
+    assert(@intFromPtr(pipeline) != 0);
+    assert(format == format_bgra8_unorm);
+    return pipeline;
+}
+
+/// Binds glyph pipeline, bind groups 0 and 1, vertex buffers 0 and 1, and draws 6 vertices.
+/// Returns immediately without issuing GPU commands if `glyph_count == 0`.
+fn draw_glyphs(self: *Gpu, pass: RenderPassEncoder, glyph_count: u32) void {
+    assert(@intFromPtr(pass) != 0);
+    assert(glyph_count <= font.glyph_cap);
+    if (glyph_count == 0) {
+        assert(glyph_count == 0);
+        return;
+    }
+    wgpuRenderPassEncoderSetPipeline(pass, self.glyph_pipeline);
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
+    wgpuRenderPassEncoderSetBindGroup(pass, 1, self.glyph_bind_group, 0, null);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.quad_buffer, 0, whole_size);
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.glyph_buffer, 0, whole_size);
+    wgpuRenderPassEncoderDraw(pass, draw.vertex_count, glyph_count, 0, 0);
 }
 
 /// C ABI callback for adapter request completion.

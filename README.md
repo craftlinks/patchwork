@@ -2,15 +2,18 @@
 
 A Zig 0.16.0 library that copies Makepad's drawing model: a retained widget
 tree that lays itself out with a turtle and paints with instanced signed-distance
-shaders. Step 6 puts a panel, a button, and a slider on that buffer. Each widget
-keeps its own state. Hover and press are animators: a float moving toward a
-target. The native loop arms `wl_surface.frame` on every commit. A `done` with
-nothing dirty arms nothing, so the process blocks in `poll` again. The browser
-still presents inside `requestAnimationFrame`. The idle invariant is 0% CPU once
-a `done` finds nothing dirty, including while the pointer rests on a widget.
+shaders. The demo draws a header labeled `Patchwork` and a button labeled `Cycle`.
+Each widget keeps its own state. Hover and press are animators: a float moving
+toward a target. Text is not an animator, so a label does not keep a frame
+callback alive. The native loop arms `wl_surface.frame` on every commit. A `done`
+with nothing dirty arms nothing, so the process blocks in `poll` again. The
+browser still presents inside `requestAnimationFrame`. The idle invariant is 0%
+CPU once a `done` finds nothing dirty, including while the pointer rests on a
+widget and while the labels are on screen.
 
-Flow is downward only. Sizing is either `fixed: f32` or `fill`; content-derived `fit`
-is deferred until text measurement and widgets exist. Padding lives on the `Column`
+Flow is downward only. Sizing is `fixed`, `fill`, or `fit`. `fit` is a pixel
+extent the scene measured before layout; the turtle treats it like `fixed` and
+does not clamp a value wider than the inner rect. Padding lives on the `Column`
 container, while `margin`, `width`, `height`, and `align_x` live on each child's `Walk`.
 Column padding insets the inner rectangle where children walk. The turtle advances a
 cursor along the main axis and writes border-box instance rectangles (margins excluded).
@@ -26,10 +29,15 @@ The demo scene lays out a full-window column with 16px padding on all sides:
   A button click cycles its fill through three colors.
 - Slider: width `fill`, height `fixed 24`, margin-top 16. The value is absolute
   along the track. It starts at 0.5.
-- Button: width `fixed 240`, height `fixed 48`, margin-top 16, `align_x = 1.0`,
-  corner radius 24.
+- Button: width `fit` = `measure("Cycle") + 32`, height `fixed 48`, margin-top 16,
+  `align_x = 1.0`, corner radius 24. The 32 is the 16 px padding on each side.
+  The label is centered in that padding box.
 At 1280 x 720 the header is (16, 16, 1248, 64), the body is (16, 96, 1248, 504),
-the slider is (16, 616, 1248, 24), and the button is (1024, 656, 240, 48).
+and the slider is (16, 616, 1248, 24). The button stays at y 656 and height 48.
+Its x is `16 + (1248 - width)` because `align_x` is 1. Header, body, and slider
+rectangles are unchanged from step 6. The header reads `Patchwork` (9 ink quads)
+and the button reads `Cycle` (5). Glyphs are a second 48-byte instance buffer
+and a second draw in the same pass. A scale-only present uploads neither buffer.
 Hover takes 100 ms and press takes 50 ms, independent of the display refresh.
 
 Layout executes in two bounded passes with zero heap allocation (`child_cap = instance_cap - 1`,

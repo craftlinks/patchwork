@@ -12,7 +12,7 @@
 //!   gestures, or multi-stage color palettes.
 //!
 //! `Scene` introduces a retained UI architecture:
-//! - **Retained State:** `Scene` maintains a fixed-capacity array of widgets (`[widget_cap]Widget`).
+//! - **Retained State:** Fixed-capacity array of widgets (`[widget_cap]Widget`).
 //! - **Separation of Layout and Drawing:** `Scene.layout()` queries the turtle to calculate
 //!   border-box rectangles for each widget's walk. `Scene.draw()` generates GPU instances from
 //!   widget state only when `dirty` is set.
@@ -43,8 +43,8 @@
 //! 1. Header: `fixed 64`, zero margin. Main-axis cost = `64`.
 //! 2. Body Panel: `margin.top = 16`, `height = .fill`. Main-axis margin cost = `16`.
 //! 3. Slider: `margin.top = 16`, `fixed 24`. Main-axis cost = `16 + 24 = 40`.
-//! 4. Button: `margin.top = 16`, `fixed 48`, `align_x = 1.0` (right-aligned, width `fixed 240`).
-//!    Main-axis cost = `16 + 48 = 64`.
+//! 4. Button: `margin.top = 16`, height `fixed 48`, width `fit = measure("Cycle") + 32`,
+//!    `align_x = 1.0`. Main-axis cost = `16 + 48 = 64`. The fit payload is not a fill share.
 //!
 //! Total fixed main-axis cost:
 //! ```text
@@ -64,10 +64,13 @@
 //! - Body rect: `(16, 96, 1248, 504)`, corner radius 16.
 //! - Slider rect: `(16, 616, 1248, 24)`. Track: `(28, 625, 1224, 6)`.
 //!   At default `value = 0.5`: Fill `(28, 625, 612, 6)`, Knob disc `(628, 616, 24, 24)`.
-//! - Button rect: `(1024, 656, 240, 48)` where `1024 = 16 + (1248 - 240)`, `656 = 616 + 24 + 16`.
+//! - Button rect: y 656, height 48.
+//!   `width = fit = measure("Cycle") + 32 = 39.104 + 32 = 71.104`.
+//!   `x = 16 + (1248 - 71.104) = 1192.896` because `align_x` is 1.0 (right-aligned).
 //!   Bottom boundary check: `656 + 48 + 16 = 720` (exact pixel match with window height).
-//! - Instance count: 1 column background + 1 header + 1 body + 3 slider faces + 1 button = 7 instances.
+//! - Face Instances: 1 root + 1 header + 1 body + 3 slider faces + 1 button = 7 instances.
 //!   (At `slider.value == 0`, fill is omitted, yielding 6 instances).
+//! - Glyph Instance count: 9 quads ("Patchwork") + 5 quads ("Cycle") = 14 quads.
 //!
 //! #### 2. Compact Size (800 x 600):
 //! - `inner_h = 600 - 32 = 568`
@@ -75,7 +78,7 @@
 //! - Header rect: `(16, 16, 768, 64)`
 //! - Body rect: `(16, 96, 768, 384)`
 //! - Slider rect: `(16, 496, 768, 24)`
-//! - Button rect: `(544, 536, 240, 48)` where `544 = 16 + (768 - 240)`.
+//! - Button rect: y 536, height 48, `width = 71.104`, `x = 16 + (768 - 71.104) = 712.896`.
 //!
 //! ## 3. Hardware, Spec Limits, and C ABI Layouts
 //!
@@ -151,6 +154,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("animator.zig");
+const font = @import("font.zig");
 const quads = @import("draw.zig");
 const input = @import("input.zig");
 const turtle = @import("turtle.zig");
@@ -176,6 +180,9 @@ const id_button: u32 = 4;
 const zero_margin: turtle.Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 const top_margin: turtle.Inset = .{ .left = 0, .top = 16, .right = 0, .bottom = 0 };
 const column_padding: turtle.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
+const header_padding: turtle.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
+const button_padding: turtle.Inset = .{ .left = 16, .top = 0, .right = 16, .bottom = 0 };
+const zero_padding: turtle.Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
 
 const column_paint: widgets.Paint = .{
     .r = 0.18,
@@ -308,6 +315,7 @@ pub const Scene = struct {
         index = 0;
         while (index < self.count) : (index += 1) {
             widget_set_rect(&self.widgets[index], rects[index]);
+            widget_place_label(&self.widgets[index]);
         }
         self.width_logical = width_logical;
         self.height_logical = height_logical;
@@ -345,21 +353,23 @@ pub const Scene = struct {
         return false;
     }
 
-    /// Clears `list` and appends the column plus every widget face. Clears `dirty`.
-    /// Call only when `dirty` is set; a scale-only present skips this and uploads
-    /// no instances.
-    pub fn draw(self: *Scene, list: *quads.DrawList) void {
+    /// Clears both lists, appends the column and faces, then the labels.
+    /// Clears `dirty`. Call only when `dirty` is set; a scale-only present
+    /// skips this and uploads neither instance buffer.
+    pub fn draw(self: *Scene, list: *quads.DrawList, glyphs: *font.GlyphList) void {
         assert(self.width_logical != 0);
         assert(self.height_logical != 0);
         list.clear();
+        glyphs.clear();
         append_column(list, self.width_logical, self.height_logical);
         var index: u32 = 0;
         while (index < self.count) : (index += 1) {
-            widget_draw(&self.widgets[index], list);
+            widget_draw(&self.widgets[index], list, glyphs);
         }
         self.dirty = false;
         assert(!self.dirty);
         assert(list.count >= 1);
+        assert(glyphs.count <= font.glyph_cap);
     }
 
     fn on_move(self: *Scene, point: input.Point) bool {
@@ -620,14 +630,25 @@ fn widget_contains(widget: *const Widget, x: f32, y: f32) bool {
     };
 }
 
-fn widget_draw(widget: *const Widget, list: *quads.DrawList) void {
+fn widget_draw(widget: *const Widget, list: *quads.DrawList, glyphs: *font.GlyphList) void {
     assert(list.count <= quads.instance_cap);
+    assert(glyphs.count <= font.glyph_cap);
     switch (widget.*) {
-        .panel => |*panel| panel.draw(list),
-        .button => |*button| button.draw(list),
+        .panel => |*panel| panel.draw(list, glyphs),
+        .button => |*button| button.draw(list, glyphs),
         .slider => |*slider| slider.draw(list),
     }
     assert(list.count <= quads.instance_cap);
+    assert(glyphs.count <= font.glyph_cap);
+}
+
+fn widget_place_label(widget: *Widget) void {
+    assert(widget_id(widget) != 0);
+    switch (widget.*) {
+        .panel => |*panel| widgets.place_label(&panel.label, panel.rect, panel.padding),
+        .button => |*button| widgets.place_label(&button.label, button.rect, button.padding),
+        .slider => assert(widget_id(widget) != 0),
+    }
 }
 
 fn widget_walk(widget: *const Widget) turtle.Walk {
@@ -708,6 +729,8 @@ fn header_panel() widgets.Panel {
             .height = .{ .fixed = 64 },
             .align_x = 0,
         },
+        .padding = header_padding,
+        .label = white_label("Patchwork"),
         .paint = header_paint,
         .hover = animator.Animator.init(widgets.hover_rate_per_ms),
         .down = animator.Animator.init(widgets.down_rate_per_ms),
@@ -727,6 +750,8 @@ fn body_panel() widgets.Panel {
             .height = .fill,
             .align_x = 0,
         },
+        .padding = zero_padding,
+        .label = white_label(""),
         .paint = body_palette[0],
         .hover = animator.Animator.init(widgets.hover_rate_per_ms),
         .down = animator.Animator.init(widgets.down_rate_per_ms),
@@ -763,10 +788,12 @@ fn demo_button() widgets.Button {
         .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
         .walk = .{
             .margin = top_margin,
-            .width = .{ .fixed = 240 },
+            .width = .{ .fit = font.measure("Cycle") + 32 },
             .height = .{ .fixed = 48 },
             .align_x = 1,
         },
+        .padding = button_padding,
+        .label = white_label("Cycle"),
         .paint = button_paint,
         .hover = animator.Animator.init(widgets.hover_rate_per_ms),
         .down = animator.Animator.init(widgets.down_rate_per_ms),
@@ -775,6 +802,21 @@ fn demo_button() widgets.Button {
     assert(button.clicks == 0);
     assert(button.walk.align_x == 1);
     return button;
+}
+
+fn white_label(text: []const u8) widgets.Label {
+    assert(text.len <= font.text_cap);
+    const label: widgets.Label = .{
+        .text = text,
+        .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+        .r = 1,
+        .g = 1,
+        .b = 1,
+        .a = 1,
+    };
+    assert(label.a == 1);
+    assert(label.text.len == text.len);
+    return label;
 }
 
 comptime {
@@ -787,6 +829,9 @@ comptime {
     assert(header_paint.radius == 8);
     assert(button_paint.radius == 24);
     assert(body_palette[0].radius == 16);
+    assert("Patchwork".len + "Cycle".len == 14);
+    assert(header_padding.left == 16);
+    assert(button_padding.top == 0);
 }
 
 fn expect_rect(rect: turtle.Rect, x: f32, y: f32, width: f32, height: f32) !void {
@@ -811,21 +856,25 @@ test "demo layout at 1280 by 720" {
     const body = scene.widgets[slot_body].panel.rect;
     const slider = scene.widgets[slot_slider].slider.rect;
     const button = scene.widgets[slot_button].button.rect;
+    const width = font.measure("Cycle") + 32;
+    const fitted_x = 16 + (1248 - width);
     try expect_rect(header, 16, 16, 1248, 64);
     try expect_rect(body, 16, 96, 1248, 504);
     try expect_rect(slider, 16, 616, 1248, 24);
-    try expect_rect(button, 1024, 656, 240, 48);
+    try expect_rect(button, fitted_x, 656, width, 48);
     try std.testing.expectEqual(@as(f32, 720), button.y + button.height + column_padding.bottom);
     var list = quads.DrawList.init();
-    scene.draw(&list);
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
     try std.testing.expectEqual(@as(u32, 7), list.count);
+    try std.testing.expectEqual(@as(u32, 14), glyphs.count);
     try expect_box(list.items[0], 0, 0, 1280, 720);
     try expect_box(list.items[1], 16, 16, 1248, 64);
     try expect_box(list.items[2], 16, 96, 1248, 504);
     try expect_box(list.items[3], 28, 625, 1224, 6);
     try expect_box(list.items[4], 28, 625, 612, 6);
     try expect_box(list.items[5], 628, 616, 24, 24);
-    try expect_box(list.items[6], 1024, 656, 240, 48);
+    try expect_box(list.items[6], fitted_x, 656, width, 48);
     try std.testing.expectEqual(@as(f32, 8), list.items[1].radius);
     try std.testing.expectEqual(@as(f32, 16), list.items[2].radius);
     try std.testing.expectEqual(@as(f32, 3), list.items[3].radius);
@@ -838,10 +887,11 @@ test "demo layout at 1280 by 720" {
 test "demo layout at 800 by 600" {
     var scene = Scene.init_demo();
     scene.layout(800, 600);
+    const width = font.measure("Cycle") + 32;
     try expect_rect(scene.widgets[slot_header].panel.rect, 16, 16, 768, 64);
     try expect_rect(scene.widgets[slot_body].panel.rect, 16, 96, 768, 384);
     try expect_rect(scene.widgets[slot_slider].slider.rect, 16, 496, 768, 24);
-    try expect_rect(scene.widgets[slot_button].button.rect, 544, 536, 240, 48);
+    try expect_rect(scene.widgets[slot_button].button.rect, 16 + (768 - width), 536, width, 48);
 }
 
 // Widening the window moves the right-aligned button, and the stored pointer
@@ -849,10 +899,17 @@ test "demo layout at 800 by 600" {
 test "relayout keeps hover on the moved button" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 1144, .y = 680 } }));
+    const first = scene.widgets[slot_button].button.rect;
+    const point: input.Point = .{
+        .x = first.x + first.width - 4,
+        .y = first.y + first.height * 0.5,
+    };
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = point }));
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
-    scene.layout(1360, 720);
-    try expect_rect(scene.widgets[slot_button].button.rect, 1104, 656, 240, 48);
+    scene.layout(1288, 720);
+    const width = font.measure("Cycle") + 32;
+    const expected_x = 16 + ((1288 - 32) - width);
+    try expect_rect(scene.widgets[slot_button].button.rect, expected_x, 656, width, 48);
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
     try std.testing.expectEqual(slot_button, scene.hovered.?);
 }
@@ -862,7 +919,8 @@ test "relayout keeps hover on the moved button" {
 test "hover eases and then rests" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 1144, .y = 680 } }));
+    const bc = button_center(&scene);
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = bc.x, .y = bc.y } }));
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.target);
     try std.testing.expect(scene.live());
     try std.testing.expect(scene.dirty);
@@ -877,7 +935,8 @@ test "hover eases and then rests" {
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_button].button.hover.value);
     try std.testing.expect(!scene.live());
     var list = quads.DrawList.init();
-    scene.draw(&list);
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
     try std.testing.expect(!scene.dirty);
     try std.testing.expectEqual(widgets.hover_lighten, list.items[6].hover);
     try std.testing.expect(!scene.handle_event(.{ .frame = 16 }));
@@ -889,8 +948,9 @@ test "hover eases and then rests" {
 test "a click cycles the body palette" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = 1144, .y = 680 } }));
-    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = 1144, .y = 680 } }));
+    const bc = button_center(&scene);
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
+    try std.testing.expect(scene.handle_event(.{ .pointer_up = .{ .x = bc.x, .y = bc.y } }));
     try std.testing.expectEqual(@as(u32, 1), scene.widgets[slot_button].button.clicks);
     try std.testing.expectEqual(@as(u32, 1), scene.palette_index);
     try std.testing.expectEqual(body_palette[1].r, scene.widgets[slot_body].panel.paint.r);
@@ -900,7 +960,8 @@ test "a click cycles the body palette" {
 test "a drag off the button does not click" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = 1144, .y = 680 } }));
+    const bc = button_center(&scene);
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
     // The drag is captured by the button and does not change its value. Hover
     // stays locked until release, so this move is not a state change.
     try std.testing.expect(!scene.handle_event(.{ .pointer_move = .{ .x = 640, .y = 368 } }));
@@ -916,7 +977,8 @@ test "a drag off the button does not click" {
 test "pointer leave during a press releases outside" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = 1144, .y = 680 } }));
+    const bc = button_center(&scene);
+    try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = bc.x, .y = bc.y } }));
     try std.testing.expect(scene.handle_event(.pointer_leave));
     try std.testing.expectEqual(@as(u32, 0), scene.widgets[slot_button].button.clicks);
     try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.down.target);
@@ -930,7 +992,8 @@ test "pointer leave during a press releases outside" {
 test "slider drag sets an absolute value" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
-    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 1144, .y = 680 } }));
+    const bc = button_center(&scene);
+    try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = bc.x, .y = bc.y } }));
     try std.testing.expect(scene.handle_event(.{ .pointer_down = .{ .x = 640, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_button].button.hover.target);
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.target);
@@ -938,7 +1001,8 @@ test "slider drag sets an absolute value" {
     try std.testing.expect(scene.handle_event(.{ .frame = widgets.hover_duration_ms }));
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.hover.value);
     var held = quads.DrawList.init();
-    scene.draw(&held);
+    var held_glyphs = font.GlyphList.init();
+    scene.draw(&held, &held_glyphs);
     // Column, header, body, then track, fill, and knob. Value is still 0.5.
     try std.testing.expectEqual(@as(u32, 7), held.count);
     var face: u32 = 3;
@@ -949,7 +1013,8 @@ test "slider drag sets an absolute value" {
     try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 28, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 0), scene.widgets[slot_slider].slider.value);
     var list = quads.DrawList.init();
-    scene.draw(&list);
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
     try std.testing.expectEqual(@as(u32, 6), list.count);
     try std.testing.expect(scene.handle_event(.{ .pointer_move = .{ .x = 2000, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 1), scene.widgets[slot_slider].slider.value);
@@ -960,11 +1025,23 @@ test "a settled scene does not rebuild on a scale-style present" {
     var scene = Scene.init_demo();
     scene.layout(1280, 720);
     var list = quads.DrawList.init();
-    scene.draw(&list);
+    var glyphs = font.GlyphList.init();
+    scene.draw(&list, &glyphs);
     const revision = list.revision;
     var cursor = quads.UploadCursor.init();
-    cursor.mark(&list, 1280, 720);
+    cursor.mark(&list, &glyphs, 1280, 720);
     try std.testing.expect(!scene.dirty);
-    try std.testing.expectEqual(@as(u32, 0), cursor.flags(&list, 1280, 720));
+    try std.testing.expectEqual(@as(u32, 0), cursor.flags(&list, &glyphs, 1280, 720));
     try std.testing.expectEqual(revision, list.revision);
+}
+
+fn button_center(scene: *const Scene) input.Point {
+    const rect = scene.widgets[slot_button].button.rect;
+    const point: input.Point = .{
+        .x = rect.x + rect.width * 0.5,
+        .y = rect.y + rect.height * 0.5,
+    };
+    assert(point.x > rect.x);
+    assert(point.y > rect.y);
+    return point;
 }

@@ -9,6 +9,7 @@
 //! - Runs the power-optimal blocking Wayland event loop to completion until the window is closed.
 
 const animator = @import("animator.zig");
+const font = @import("font.zig");
 const input = @import("input.zig");
 const linux_window = @import("linux_window.zig");
 const scene = @import("scene.zig");
@@ -24,6 +25,7 @@ pub fn main() !void {
         .toplevel = null,
         .gpu = undefined,
         .list = .init(),
+        .glyphs = font.GlyphList.init(),
         .cursor = .init(),
         .scene = scene.Scene.init_demo(),
         .clock = animator.Clock.init(),

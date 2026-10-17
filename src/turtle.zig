@@ -29,7 +29,9 @@
 //! - `fill`: Consumes remaining space. On width, fills available inner column width minus child
 //!   margins. On height, receives an equal share of leftover main-axis space after summing all
 //!   fixed heights and margins.
-//! - `fit`: Content-derived sizing; deferred until font rasterization and text measurement exist.
+//! - `fit`: A premeasured span in logical pixels. Layout treats the payload like
+//!   `fixed`: it is not a fill share, and a value wider than the inner rect is
+//!   not clamped. The scene measures the string once, before the walk is built.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
@@ -56,7 +58,7 @@
 //! Fixed main-axis cost is summed across all children `i = 0..N-1`:
 //! ```text
 //! fixed_sum = sum(walk[i].margin.top + walk[i].margin.bottom +
-//!                 (walk[i].height.fixed if fixed else 0))
+//!                 (walk[i].height payload when fixed or fit, else 0))
 //! fill_count = count of children where walk[i].height == .fill
 //! leftover = inner_h - fixed_sum
 //! fill_share = max(leftover, 0) / fill_count   (0 if fill_count == 0)
@@ -66,8 +68,8 @@
 //! For each child `i`:
 //! ```text
 //! avail_w = inner_w - walk[i].margin.left - walk[i].margin.right
-//! width   = walk[i].width.fixed if fixed else avail_w
-//! height  = walk[i].height.fixed if fixed else fill_share
+//! width   = walk[i].width payload when fixed or fit, else avail_w
+//! height  = walk[i].height payload when fixed or fit, else fill_share
 //!
 //! slack_x = max(avail_w - width, 0)
 //! x       = inner_x + walk[i].margin.left + walk[i].align_x * slack_x
@@ -162,9 +164,12 @@ pub const Inset = struct {
     bottom: f32,
 };
 
-/// Axis sizing. `fixed` is a span in logical pixels. `fill` consumes leftover space.
+/// Axis sizing. `fixed` and `fit` are spans in logical pixels. `fit` is a
+/// premeasured extent, not a fill share. `fill` consumes leftover space.
+/// A `fit` wider than the inner rect is not clamped.
 pub const Size = union(enum) {
     fixed: f32,
+    fit: f32,
     fill,
 };
 
@@ -219,7 +224,7 @@ fn assert_inset(inset: Inset) void {
 
 fn assert_size(size: Size) void {
     switch (size) {
-        .fixed => |value| {
+        .fixed, .fit => |value| {
             assert(value >= 0);
             assert(value == value);
         },
@@ -264,7 +269,7 @@ fn column_fixed_cost(walks: []const Walk) AxisCost {
         sum += walk.margin.bottom;
         switch (walk.height) {
             .fill => fill_count += 1,
-            .fixed => |height| sum += height,
+            .fixed, .fit => |height| sum += height,
         }
     }
     assert(index == count);
@@ -317,7 +322,7 @@ fn place_walks(inner: Rect, walks: []const Walk, share: f32, out: []Rect) void {
 fn resolved_width(size: Size, avail_w: f32) f32 {
     assert(avail_w == avail_w);
     switch (size) {
-        .fixed => |value| {
+        .fixed, .fit => |value| {
             assert(value >= 0);
             return value;
         },
@@ -331,7 +336,7 @@ fn resolved_width(size: Size, avail_w: f32) f32 {
 fn resolved_height(size: Size, share: f32) f32 {
     assert(share >= 0);
     switch (size) {
-        .fixed => |value| {
+        .fixed, .fit => |value| {
             assert(value >= 0);
             return value;
         },
@@ -450,4 +455,38 @@ test "margin advances the cursor outside the border box" {
     try std.testing.expectEqual(@as(f32, 10), out[0].y);
     try std.testing.expectEqual(@as(f32, 20), out[0].height);
     try std.testing.expectEqual(@as(f32, 34), out[1].y);
+}
+
+// Verifies that `Size.fit` resolves to the identical border-box geometry as `Size.fixed`
+// when provided with the same pixel dimensions, ensuring that content-fitted elements participate
+// in cross-axis alignment and fixed-cost accounting identically to explicit spans.
+test "fit matches fixed of the same span" {
+    const column: Column = .{
+        .rect = .{ .x = 0, .y = 0, .width = 300, .height = 80 },
+        .padding = zero_inset,
+    };
+    const fit_walks = [_]Walk{
+        .{
+            .margin = zero_inset,
+            .width = .{ .fit = 80 },
+            .height = .{ .fit = 24 },
+            .align_x = 1,
+        },
+    };
+    const fixed_walks = [_]Walk{
+        .{
+            .margin = zero_inset,
+            .width = .{ .fixed = 80 },
+            .height = .{ .fixed = 24 },
+            .align_x = 1,
+        },
+    };
+    var fit_out: [1]Rect = undefined;
+    var fixed_out: [1]Rect = undefined;
+    place_column(column, &fit_walks, &fit_out);
+    place_column(column, &fixed_walks, &fixed_out);
+    try std.testing.expectEqual(fixed_out[0].x, fit_out[0].x);
+    try std.testing.expectEqual(fixed_out[0].y, fit_out[0].y);
+    try std.testing.expectEqual(fixed_out[0].width, fit_out[0].width);
+    try std.testing.expectEqual(fixed_out[0].height, fit_out[0].height);
 }

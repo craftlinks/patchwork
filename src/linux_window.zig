@@ -174,6 +174,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("animator.zig");
 const draw = @import("draw.zig");
+const font = @import("font.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const input = @import("input.zig");
@@ -227,6 +228,7 @@ pub const State = struct {
     toplevel: ?*xdg.XdgToplevel,
     gpu: gpu.Gpu,
     list: draw.DrawList,
+    glyphs: font.GlyphList,
     cursor: draw.UploadCursor,
     /// Retained widgets. Hover and slider value live here, not on the draw list.
     scene: scene.Scene,
@@ -626,6 +628,8 @@ fn present_if_dirty(state: *State) !void {
     try submit_frame(state);
 }
 
+/// Prepares scene layout and draw lists before presentation.
+/// Runs layout if `relayout` is set, and repopulates `DrawList` and `GlyphList` if `dirty` is set.
 fn prepare_scene(state: *State) void {
     if (state.frame.relayout) {
         state.scene.layout(state.frame.width_logical, state.frame.height_logical);
@@ -633,17 +637,20 @@ fn prepare_scene(state: *State) void {
     }
     assert(!state.frame.relayout);
     if (state.scene.dirty) {
-        state.scene.draw(&state.list);
+        state.scene.draw(&state.list, &state.glyphs);
     }
     assert(!state.scene.dirty);
 }
 
+/// Populates 104-byte `PresentHeader` and submits quad face and glyph lists to the GPU.
+/// Updates the upload cursor with newly presented revisions and marks the frame presented.
 fn submit_frame(state: *State) !void {
     assert(state.frame.redraw);
     assert(state.frame.width_px != 0);
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{
         .list = &state.list,
+        .glyphs = &state.glyphs,
         .cursor = state.cursor,
         .width_logical = state.frame.width_logical,
         .height_logical = state.frame.height_logical,
@@ -654,8 +661,13 @@ fn submit_frame(state: *State) !void {
         .clear_b = gpu.clear_color.b,
         .clear_a = gpu.clear_color.a,
     });
-    try gpu.present(&state.gpu, &header, &state.list.items);
-    state.cursor.mark(&state.list, state.frame.width_logical, state.frame.height_logical);
+    try gpu.present(&state.gpu, &header, &state.list.items, &state.glyphs.items);
+    state.cursor.mark(
+        &state.list,
+        &state.glyphs,
+        state.frame.width_logical,
+        state.frame.height_logical,
+    );
     state.frame.mark_presented();
     assert(!state.frame.redraw);
     assert(!state.scene.dirty);

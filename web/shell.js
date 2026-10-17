@@ -31,7 +31,7 @@
 //
 // ## 3. Synchronous Call-Stack Longevity
 // In `web_exports.zig:tick()`, `PresentHeader` is allocated directly on Zig's call stack.
-// Zig calls the host import `present_js(headerPtr, instancePtr)` synchronously.
+// Zig calls the host import `present_js(headerPtr, instancePtr, glyphPtr)` synchronously.
 // Because WebAssembly and JavaScript run synchronously on the main UI thread:
 // - The Zig stack frame remains active and frozen while `present_js()` executes.
 // - JavaScript safely reads `PresentHeader` and instance records directly from Wasm stack memory.
@@ -43,8 +43,8 @@
 // or idling.
 //
 // In Patchwork:
-// - `requestAnimationFrame` is scheduled when Zig signals that a frame is dirty (`resize`, `pointer_*`).
-// - When the rAF callback fires, `wasm.tick(Math.floor(now))` steps animators and presents dirty frames.
+// - `requestAnimationFrame` is scheduled when Zig signals that a frame is dirty (`resize`).
+// - When rAF fires, `wasm.tick(Math.floor(now))` steps animators and presents dirty frames.
 // - `wasm.tick(now)` returns 1 while any widget animator is still moving (`scene.live()`), and
 //   `schedule()` chains another `requestAnimationFrame` only while `wasm.tick()` returns 1:
 //   ```javascript
@@ -53,7 +53,8 @@
 //   }
 //   ```
 // - When all animators settle, `tick()` returns 0, terminating the rAF chain.
-// - A resting hover does not keep the callback running.
+// - A resting hover does not keep the callback running. Labels are not animators,
+//   so text does not keep `requestAnimationFrame` alive either.
 // - The browser tab consumes 0.0% CPU and 0.0% GPU cycles once every animator has settled.
 //
 // ## 5. The 48-Byte Instance and the Shape Attribute
@@ -86,6 +87,41 @@
 //   Press and release pass `offsetX * devicePixelRatio` into `pointer_down` / `pointer_up`.
 //   `pointerleave` and `pointercancel` call `wasm.pointer_leave()`, which releases capture
 //   inside the scene so a drag off the canvas cannot stick.
+//
+// ## 7. Dual-Pipeline WebGPU Architecture: Shared Uniforms and Dedicated Glyph Atlas
+// In WebGPU, pipelines constructed with `layout: "auto"` generate driver-private bind group
+// layouts that cannot be bound across different pipeline objects.
+// To render both geometric quads and glyph text within the same pass:
+//
+// 1. **Explicit Shared Group 0 (Uniform Buffer):**
+//    An explicit bind group layout is created with a single dynamic uniform buffer binding
+//    at binding 0 (`GPUShaderStage.VERTEX`). Both `pipeline` (quads) and `glyphPipeline` (text)
+//    reference this exact bind group layout, allowing `bindGroup` (wrapping `uniformBuffer`)
+//    to be bound to slot 0 for both draw calls without pipeline rebinding penalties.
+//
+// 2. **Dedicated Group 1 (Atlas Texture & Sampler):**
+//    A second bind group layout is created holding:
+//    - Binding 0: `texture_2d<f32>` (sample type `float`, fragment visibility).
+//    - Binding 1: `sampler` (filtering sampler, fragment visibility).
+//    An `r8unorm` 2D texture (512 x 256 texels) is allocated with `TEXTURE_BINDING | COPY_DST`.
+//    The pre-baked atlas (131,072 bytes) is written directly from Wasm linear memory via
+//    `device.queue.writeTexture()` with `bytesPerRow = 512` (aligns with 256-byte requirement).
+//    A linear filtering sampler configured with `clamp-to-edge` is created.
+//
+// 3. **104-Byte PresentHeader and Conditional Uploads:**
+//    The header is read via `DataView(wasm.memory.buffer, headerPtr, 104)`.
+//    Offset 96 contains `glyphCount: u32`.
+//    - If `(flags & FLAG_INSTANCES) !== 0` and `count > 0`: uploads `count * 48` bytes.
+//    - If `(flags & FLAG_GLYPHS) !== 0` and `glyphCount > 0`: uploads `glyphCount * 48` bytes.
+//    - If `glyphCount === 0`: glyph buffer upload and glyph draw call are skipped.
+//
+// 4. **Sequential Draws in Single Render Pass:**
+//    Within the single `beginRenderPass` / `end` scope:
+//    - Quads draw: `setPipeline(pipeline)`, `setBindGroup(0, bindGroup)`,
+//      `setVertexBuffer(1, instanceBuffer)`, `draw(6, count)`.
+//    - Glyphs draw: `setPipeline(glyphPipeline)`, `setBindGroup(0, bindGroup)`,
+//      `setBindGroup(1, glyphBindGroup)`, `setVertexBuffer(1, glyphBuffer)`,
+//      `draw(6, glyphCount)`.
 
 const canvas = document.getElementById("surface");
 
@@ -95,17 +131,21 @@ let format = null;
 let wasm = null;
 let raf = 0;
 let pipeline = null;
+let glyphPipeline = null;
 let quadBuffer = null;
 let instanceBuffer = null;
+let glyphBuffer = null;
 let uniformBuffer = null;
 let bindGroup = null;
+let glyphBindGroup = null;
 let configuredWidth = 0;
 let configuredHeight = 0;
 
 // Binary layout constants matching `src/draw.zig`.
 const FLAG_INSTANCES = 1;
 const FLAG_UNIFORM = 2;
-const HEADER_BYTES = 96;
+const FLAG_GLYPHS = 4;
+const HEADER_BYTES = 104;
 const MATRIX_BYTES = 64;
 const INSTANCE_CAP = 256;
 
@@ -115,9 +155,10 @@ const INSTANCE_CAP = 256;
  * buffers to GPU VRAM, and executes the instanced draw render pass.
  *
  * @param {number} headerPtr Byte offset of `PresentHeader` in Wasm linear memory.
- * @param {number} instancePtr Byte offset of `Instance` array in Wasm linear memory.
+ * @param {number} instancePtr Byte offset of the face `Instance` array.
+ * @param {number} glyphPtr Byte offset of the glyph quad array.
  */
-function present_js(headerPtr, instancePtr) {
+function present_js(headerPtr, instancePtr, glyphPtr) {
     if (context === null || device === null || pipeline === null) {
         throw new Error("present called before the graphics pipeline is initialized");
     }
@@ -135,6 +176,7 @@ function present_js(headerPtr, instancePtr) {
     const g = view.getFloat32(20, true);
     const b = view.getFloat32(24, true);
     const a = view.getFloat32(28, true);
+    const glyphCount = view.getUint32(96, true);
 
     // If the window dimensions or projection changed, upload the 64-byte matrix (offset 32).
     if ((flags & FLAG_UNIFORM) !== 0) {
@@ -156,6 +198,21 @@ function present_js(headerPtr, instancePtr) {
                 instanceBuffer,
                 0,
                 new Uint8Array(memory, instancePtr, count * stride),
+            );
+        }
+    }
+
+    // Glyph quads are a second buffer. A zero count skips the upload.
+    if ((flags & FLAG_GLYPHS) !== 0) {
+        if (glyphCount !== 0) {
+            const glyphStride = wasm.glyph_stride();
+            if (glyphStride !== 48) {
+                throw new Error("glyph stride mismatch: expected 48 bytes");
+            }
+            device.queue.writeBuffer(
+                glyphBuffer,
+                0,
+                new Uint8Array(memory, glyphPtr, glyphCount * glyphStride),
             );
         }
     }
@@ -193,7 +250,15 @@ function present_js(headerPtr, instancePtr) {
     pass.setBindGroup(0, bindGroup);
     pass.setVertexBuffer(0, quadBuffer);
     pass.setVertexBuffer(1, instanceBuffer);
-    pass.draw(6, count); // 6 vertices of the unit quad, repeated `count` times
+    pass.draw(6, count);
+    if (glyphCount !== 0) {
+        pass.setPipeline(glyphPipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.setBindGroup(1, glyphBindGroup);
+        pass.setVertexBuffer(0, quadBuffer);
+        pass.setVertexBuffer(1, glyphBuffer);
+        pass.draw(6, glyphCount);
+    }
     pass.end();
 
     // Submit recorded command buffer to the GPU hardware execution queue.
@@ -220,19 +285,12 @@ async function create_pipeline() {
         throw new Error("shader source is empty");
     }
 
-    // Read WGSL shader text directly from Wasm linear memory.
-    const memory = wasm.memory.buffer;
-    const shaderText = new TextDecoder().decode(
-        new Uint8Array(memory, wasm.shader_ptr(), shaderLen),
+    const module = await compile_shader(wasm.shader_ptr(), shaderLen, "quad");
+    const glyphModule = await compile_shader(
+        wasm.glyph_shader_ptr(),
+        wasm.glyph_shader_len(),
+        "glyph",
     );
-
-    const module = device.createShaderModule({ code: shaderText });
-    const info = await module.getCompilationInfo();
-    for (const message of info.messages) {
-        if (message.type === "error") {
-            throw new Error(`WGSL Compilation Error: ${message.message}`);
-        }
-    }
 
     // Allocate GPU buffers:
     // 1. Static unit quad (48 bytes: 6 vertices of 2D points).
@@ -253,6 +311,7 @@ async function create_pipeline() {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    const memory = wasm.memory.buffer;
     // Upload static unit quad coordinates once at startup.
     device.queue.writeBuffer(
         quadBuffer,
@@ -260,28 +319,81 @@ async function create_pipeline() {
         new Uint8Array(memory, wasm.quad_ptr(), quadByteCount),
     );
 
-    // Build the fixed-function render pipeline with alpha blending.
+    const atlasWidth = wasm.atlas_width();
+    const atlasHeight = wasm.atlas_height();
+    const atlasLen = wasm.atlas_len();
+    if (atlasWidth !== 512) {
+        throw new Error("atlas width mismatch: expected 512");
+    }
+    if (atlasLen !== 131072) {
+        throw new Error("atlas length mismatch: expected 131072 bytes");
+    }
+    if (atlasWidth % 256 !== 0) {
+        throw new Error("atlas bytesPerRow is not a multiple of 256");
+    }
+
+    glyphBuffer = device.createBuffer({
+        size: INSTANCE_CAP * wasm.glyph_stride(),
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+
+    // Group 0 is the shared uniform. Group 1 is the atlas. Auto layouts are
+    // not compatible across pipelines, so both pipelines use these objects.
+    const group0 = device.createBindGroupLayout({
+        entries: [{
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" },
+        }],
+    });
+    const group1 = device.createBindGroupLayout({
+        entries: [
+            {
+                binding: 0,
+                visibility: GPUShaderStage.FRAGMENT,
+                texture: { sampleType: "float" },
+            },
+            {
+                binding: 1,
+                visibility: GPUShaderStage.FRAGMENT,
+                sampler: { type: "filtering" },
+            },
+        ],
+    });
+    const quadLayout = device.createPipelineLayout({ bindGroupLayouts: [group0] });
+    const glyphLayout = device.createPipelineLayout({ bindGroupLayouts: [group0, group1] });
+    const blend = {
+        color: {
+            srcFactor: "src-alpha",
+            dstFactor: "one-minus-src-alpha",
+            operation: "add",
+        },
+        alpha: {
+            srcFactor: "src-alpha",
+            dstFactor: "one-minus-src-alpha",
+            operation: "add",
+        },
+    };
+    const unitBuffer = {
+        arrayStride: 8,
+        stepMode: "vertex",
+        attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+    };
+
     pipeline = device.createRenderPipeline({
-        layout: "auto",
+        layout: quadLayout,
         vertex: {
             module,
             entryPoint: "vs_main",
             buffers: [
-                // Vertex Buffer 0: Unit Quad (stepMode: "vertex")
-                {
-                    arrayStride: 8,
-                    stepMode: "vertex",
-                    attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
-                },
-                // Vertex Buffer 1: Instances (stepMode: "instance").
-                // Location 3 is the shape vec4. The shader reads radius, hover, and down.
+                unitBuffer,
                 {
                     arrayStride: stride,
                     stepMode: "instance",
                     attributes: [
-                        { shaderLocation: 1, offset: 0, format: "float32x4" }, // rect
-                        { shaderLocation: 2, offset: 16, format: "float32x4" }, // fill
-                        { shaderLocation: 3, offset: 32, format: "float32x4" }, // shape
+                        { shaderLocation: 1, offset: 0, format: "float32x4" },
+                        { shaderLocation: 2, offset: 16, format: "float32x4" },
+                        { shaderLocation: 3, offset: 32, format: "float32x4" },
                     ],
                 },
             ],
@@ -289,34 +401,92 @@ async function create_pipeline() {
         fragment: {
             module,
             entryPoint: "fs_main",
-            targets: [{
-                format,
-                // Standard alpha compositing: (src * src_a) + (dst * (1 - src_a))
-                blend: {
-                    color: {
-                        srcFactor: "src-alpha",
-                        dstFactor: "one-minus-src-alpha",
-                        operation: "add",
-                    },
-                    alpha: {
-                        srcFactor: "src-alpha",
-                        dstFactor: "one-minus-src-alpha",
-                        operation: "add",
-                    },
-                },
-            }],
+            targets: [{ format, blend }],
         },
         primitive: { topology: "triangle-list" },
     });
 
-    // Create bind group connecting the uniform buffer to binding slot 0.
+    glyphPipeline = device.createRenderPipeline({
+        layout: glyphLayout,
+        vertex: {
+            module: glyphModule,
+            entryPoint: "vs_main",
+            buffers: [
+                unitBuffer,
+                {
+                    arrayStride: 48,
+                    stepMode: "instance",
+                    attributes: [
+                        { shaderLocation: 1, offset: 0, format: "float32x4" },
+                        { shaderLocation: 2, offset: 16, format: "float32x4" },
+                        { shaderLocation: 3, offset: 32, format: "float32x4" },
+                    ],
+                },
+            ],
+        },
+        fragment: {
+            module: glyphModule,
+            entryPoint: "fs_main",
+            targets: [{ format, blend }],
+        },
+        primitive: { topology: "triangle-list" },
+    });
+
     bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
+        layout: group0,
         entries: [{
             binding: 0,
             resource: { buffer: uniformBuffer },
         }],
     });
+
+    const atlas = device.createTexture({
+        size: { width: atlasWidth, height: atlasHeight },
+        format: "r8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    device.queue.writeTexture(
+        { texture: atlas },
+        new Uint8Array(memory, wasm.atlas_ptr(), atlasLen),
+        { bytesPerRow: atlasWidth, rowsPerImage: atlasHeight },
+        { width: atlasWidth, height: atlasHeight },
+    );
+    const glyphSampler = device.createSampler({
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge",
+        magFilter: "linear",
+        minFilter: "linear",
+    });
+    glyphBindGroup = device.createBindGroup({
+        layout: group1,
+        entries: [
+            { binding: 0, resource: atlas.createView() },
+            { binding: 1, resource: glyphSampler },
+        ],
+    });
+}
+
+/**
+ * Compiles a WGSL shader module from WebAssembly linear memory and validates compilation info.
+ *
+ * @param {number} ptr - Byte offset of shader source text in Wasm linear memory.
+ * @param {number} len - Byte length of shader source text.
+ * @param {string} label - Human-readable label for error reporting ("quad" or "glyph").
+ * @returns {Promise<GPUShaderModule>} Compiled WebGPU shader module.
+ */
+async function compile_shader(ptr, len, label) {
+    if (len === 0) {
+        throw new Error(`${label} shader source is empty`);
+    }
+    const text = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+    const module = device.createShaderModule({ code: text });
+    const info = await module.getCompilationInfo();
+    for (const message of info.messages) {
+        if (message.type === "error") {
+            throw new Error(`${label} WGSL: ${message.message}`);
+        }
+    }
+    return module;
 }
 
 /**

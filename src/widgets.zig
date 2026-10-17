@@ -22,8 +22,8 @@
 //!   and has no knowledge of widgets.
 //!
 //! ### Scaled Shader Blend Weights:
-//! An `Animator` travels across the unit range `[0.0, 1.0]`. If written directly to the GPU instance,
-//! a hover weight of 1.0 would mix the fill color 100% to pure white, and a down weight of 1.0
+//! An `Animator` travels across `[0.0, 1.0]`. If written directly to the GPU instance,
+//! a hover weight of 1.0 would mix the fill color 100% to pure white, and down 1.0
 //! would mix 100% to solid black.
 //! Instead, widgets scale the normalized animator values:
 //! - `hover_weight = animator.value * hover_lighten` (`0.18`, matching Step 5).
@@ -32,22 +32,53 @@
 //!   The hover lighten is the pressed color.
 //!
 //! ### Passive Occlusion vs. Interactive Response:
-//! - **Panel:** Passive container. It participates in the scene's reverse-order hit scan so that
-//!   clicks or pointer motions over the panel body occlude controls beneath it. Its `handle()`
-//!   method returns `false` for all events, ensuring it consumes hits without triggering dirty frames.
-//! - **Button:** Active trigger. Responds to `.hover_in` / `.hover_out` by aiming `hover` at 1 or 0,
-//!   and `.down` by aiming `down` at 1. On `.up`, it registers a click if and only if `up.inside` is
-//!   true (pointer was released within button bounds).
-//! - **Slider:** Continuous control. Dragging and pressing map the absolute pointer X coordinate
+//! - **Panel:** Passive container. Participates in reverse-order hit scan so pointer
+//!   events over the panel body occlude controls beneath. `handle()` returns `false`,
+//!   consuming hits without dirtying frames.
+//! - **Button:** Active trigger. Responds to `.hover_in` / `.hover_out` by aiming `hover`
+//!   at 1 or 0, and `.down` by aiming `down` at 1. On `.up`, registers click if inside.
+//! - **Slider:** Continuous control. Dragging and pressing map absolute pointer X
 //!   directly into `[0.0, 1.0]`. Absolute positioning eliminates relative delta accumulation drift
 //!   and guarantees idempotent state for any pointer position. The gesture keeps the hover
 //!   highlight. It does not mix toward black the way a button press does.
+//!
+//! ### Embedded Text Labels vs. Standalone Text Widgets:
+//! Rather than introducing an independent `Widget` union arm for text, static text is embedded
+//! as a lightweight `Label` struct directly inside container widgets (`Panel` and `Button`):
+//! - **Zero Hit Overhead:** Labels do not participate in spatial hit testing, pointer capture,
+//!   or hover detection; the enclosing container handles all pointer interactions.
+//! - **Zero Animation Overhead:** Labels do not own animators. A static text string never triggers
+//!   frame pacing callbacks or wakes the compositor (preserving the 0% idle CPU invariant).
+//! - **Zero Geometry Duplication:** The enclosing widget layout walk places the container's
+//!   border-box `Rect`. `place_label()` then derives the label's inner text bounds by insetting
+//!   the container border by the widget's `padding: turtle.Inset`.
+//! - **Dual Draw Emission:** On redraw, `Panel.draw` and `Button.draw` append their background
+//!   face quad to `DrawList`, and then immediately invoke `label.draw(glyphs)`, emitting
+//!   pre-measured glyph quads into the separate `GlyphList`.
 //!
 //! ## 2. Mathematical Derivations & Coordinate Spaces
 //!
 //! ### Coordinate Spaces:
 //! All widget geometries are expressed in UI logical pixels, top-left origin `(0, 0)`, `+X` right,
 //! and `+Y` down.
+//!
+//! ### Label Padding Box Insetting Derivation:
+//! Given container border box `border = (x, y, w, h)` and container padding `padding = Inset`:
+//! ```text
+//! label.rect.x = border.x + padding.left
+//! label.rect.y = border.y + padding.top
+//! label.rect.width = border.width - padding.left - padding.right
+//! label.rect.height = border.height - padding.top - padding.bottom
+//! ```
+//! In `font.place()`, the text is horizontally and vertically centered within `label.rect`:
+//! - **Header Label ("Patchwork"):**
+//!   `border = (16, 16, 1248, 64)`, `padding = 16` all sides.
+//!   `label.rect = (16 + 16, 16 + 16, 1248 - 32, 64 - 32) = (32, 32, 1216, 32)`.
+//! - **Button Label ("Cycle"):**
+//!   `width = fit = measure("Cycle") + 32 = 71.104`, height = 48.
+//!   `padding = (left = 16, right = 16, top = 0, bottom = 0)`.
+//!   `label.rect = (x + 16, y + 0, 71.104 - 32, 48 - 0) = (x + 16, 656, 39.104, 48)`.
+//!   The text width of "Cycle" is exactly 39.104, perfectly filling the horizontal padding box.
 //!
 //! ### Slider Track, Fill, and Knob Analytical Derivation:
 //! Let `rect = (x, y, width, height)` be the slider's bounding box assigned by the turtle.
@@ -75,7 +106,7 @@
 //!    fill.height = track.height
 //!    fill.radius = track.radius
 //!    ```
-//!    *Optimization:* When `value == 0`, the fill instance is completely omitted from the draw list.
+//!    *Optimization:* When `value == 0`, the fill instance is completely omitted.
 //!
 //! 3. **Knob Rectangle (Analytical Disc):**
 //!    ```text
@@ -85,8 +116,8 @@
 //!    knob.height = 2 * knob_radius (= 24)
 //!    knob.radius = knob_radius     (= 12)
 //!    ```
-//!    In `sdf_box`, corner radius is clamped to `min(radius, min(w/2, h/2))`. For a 24x24 box with
-//!    radius 12, `k = 12`, transforming the box into an exact analytical circle with zero vertex overhead.
+//!    In `sdf_box`, radius clamps to `min(radius, min(w/2, h/2))`. For a 24x24 box with
+//!    radius 12, `k = 12`, making the box an exact analytical circle with zero vertex overhead.
 //!
 //! 4. **Absolute Value Projection (`value_at`):**
 //!    Maps an arbitrary pointer coordinate `px` to the normalized interval `[0.0, 1.0]`:
@@ -115,8 +146,12 @@
 //! - `Paint` (20 bytes, 4-byte aligned): `r, g, b, a, radius: f32`.
 //! - `Up` (12 bytes, 4-byte aligned): `x: f32, y: f32, inside: bool, pad: 3 bytes`.
 //! - `Point` (8 bytes, 4-byte aligned): `x: f32, y: f32`.
-//! - `Panel` and `Button`: `Rect`, `Walk`, `Paint`, and an `Animator` pair (`hover`, `down`).
-//! - `Slider`: `Rect`, `Walk`, three `Paint`s, one hover `Animator`, and `value`. No down animator.
+//! - `Label` (48 bytes, 8-byte aligned on 64-bit):
+//!   `text: []const u8` (16 B), `rect: Rect` (16 B), `r, g, b, a: f32` (16 B).
+//! - `Panel` and `Button`: `id: u32`, `rect: Rect`, `walk: Walk`, `padding: Inset`, `label: Label`,
+//!   `paint: Paint`, and an `Animator` pair (`hover`, `down`).
+//! - `Slider`: `id: u32`, `rect: Rect`, `walk: Walk`, three `Paint`s, hover `Animator`,
+//!   `value: f32`. Contains no padding or label.
 //!
 //! ### GPU Instance Emission (`append_weighted`):
 //! Each quad appended to `DrawList` occupies 48 bytes matching WebGPU Vertex Buffer 1 stride:
@@ -187,6 +222,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("animator.zig");
+const font = @import("font.zig");
 const quads = @import("draw.zig");
 const input = @import("input.zig");
 const turtle = @import("turtle.zig");
@@ -247,11 +283,57 @@ pub const Paint = struct {
     radius: f32,
 };
 
+/// Text drawn into a padding box. Empty `text` appends no glyphs. The label
+/// does not hit-test, animate, or append a face quad. `text` points at a literal.
+pub const Label = struct {
+    text: []const u8,
+    rect: turtle.Rect,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+
+    /// Places one coverage quad per ink glyph inside `rect`.
+    pub fn draw(self: Label, glyphs: *font.GlyphList) void {
+        assert(self.text.len <= font.text_cap);
+        assert(self.a >= 0);
+        font.place(glyphs, self.text, .{
+            .x = self.rect.x,
+            .y = self.rect.y,
+            .width = self.rect.width,
+            .height = self.rect.height,
+        }, .{
+            .r = self.r,
+            .g = self.g,
+            .b = self.b,
+            .a = self.a,
+        });
+    }
+};
+
+/// Writes the border box inset by `padding` onto `label.rect`.
+pub fn place_label(label: *Label, border: turtle.Rect, padding: turtle.Inset) void {
+    assert(padding.left >= 0);
+    assert(padding.top >= 0);
+    assert(padding.right >= 0);
+    assert(padding.bottom >= 0);
+    label.rect = .{
+        .x = border.x + padding.left,
+        .y = border.y + padding.top,
+        .width = border.width - padding.left - padding.right,
+        .height = border.height - padding.top - padding.bottom,
+    };
+    assert(label.rect.x == border.x + padding.left);
+    assert(label.text.len <= font.text_cap);
+}
+
 /// Passive rounded rectangle. Hit-tested so it occludes, and then ignored.
 pub const Panel = struct {
     id: u32,
     rect: turtle.Rect,
     walk: turtle.Walk,
+    padding: turtle.Inset,
+    label: Label,
     paint: Paint,
     hover: animator.Animator,
     down: animator.Animator,
@@ -288,10 +370,11 @@ pub const Panel = struct {
         return face_contains(self.rect, self.paint.radius, x, y);
     }
 
-    pub fn draw(self: Panel, list: *quads.DrawList) void {
+    pub fn draw(self: Panel, list: *quads.DrawList, glyphs: *font.GlyphList) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
         append_weighted(list, self.rect, self.paint, self.hover, self.down);
+        self.label.draw(glyphs);
     }
 };
 
@@ -300,6 +383,8 @@ pub const Button = struct {
     id: u32,
     rect: turtle.Rect,
     walk: turtle.Walk,
+    padding: turtle.Inset,
+    label: Label,
     paint: Paint,
     hover: animator.Animator,
     down: animator.Animator,
@@ -344,10 +429,11 @@ pub const Button = struct {
         return face_contains(self.rect, self.paint.radius, x, y);
     }
 
-    pub fn draw(self: Button, list: *quads.DrawList) void {
+    pub fn draw(self: Button, list: *quads.DrawList, glyphs: *font.GlyphList) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
         append_weighted(list, self.rect, self.paint, self.hover, self.down);
+        self.label.draw(glyphs);
     }
 };
 

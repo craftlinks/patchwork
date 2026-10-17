@@ -28,33 +28,42 @@
 //! attribute strides, and shader strings between the backend language and JavaScript.
 //!
 //! In Patchwork, Zig is the single authoritative source of truth:
-//! - `shader_ptr()` and `shader_len()` expose the embedded WGSL shader source code.
+//! - `shader_ptr()` and `shader_len()` expose the embedded `quad.wgsl` source code.
+//! - `glyph_shader_ptr()` and `glyph_shader_len()` expose the embedded `glyph.wgsl` source code.
 //! - `quad_ptr()` and `quad_bytes()` expose the static unit quad vertex coordinates.
 //! - `instance_stride()` exposes the exact byte stride of the `Instance` struct (48 bytes).
+//! - `glyph_stride()` exposes the byte stride of the `Glyph` struct (48 bytes).
+//! - `atlas_ptr()` and `atlas_len()` expose the pre-baked 131,072-byte `r8unorm` font atlas buffer.
+//! - `atlas_width()` (512) and `atlas_height()` (256) expose atlas dimensions.
 //!
-//! When `web/shell.js` bootstraps, it queries these export functions to allocate its GPU buffers
-//! and compile its pipeline. If the shader or struct layouts change in Zig, JavaScript adapts
-//! automatically without code duplication.
+//! When `web/shell.js` bootstraps, it queries these export functions to allocate its GPU buffers,
+//! compile both fixed-function pipelines, and upload the atlas texture. If the shaders or struct
+//! layouts change in Zig, JavaScript adapts automatically without code duplication.
 //!
 //! The 48-byte stride is the instance: rectangle, fill, and a shape `vec4` of
 //! `(radius, hover, down, 0)`. `instance_stride` asserts 48 here, and `shell.js` asserts 48
 //! again before it builds the pipeline and before it uploads. The third vertex attribute
 //! (shader location 3, offset 32, `float32x4`) must stay in lockstep with `quad.wgsl` and
 //! with the native `instance_attrs` table. A stride mismatch would silently fetch hover
-//! from the wrong bytes. `down` occupies offset 40. The pipeline did not change.
+//! from the wrong bytes. `down` occupies offset 40.
+//! Similarly, `glyph_stride` asserts 48 bytes for `(dest_rect, uv_rect, color)`.
 //!
 //! ## 4. Synchronous Stack-Frame Memory Sharing (Zero-Copy & Zero-Heap)
-//! In `tick()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
-//! Zig passes the memory address `@intFromPtr(&header)` across the FFI boundary to `present_js`.
+//! In `present_frame()`, `var header: draw.PresentHeader` is allocated on Zig's call stack.
+//! Zig passes three linear memory pointers across the FFI boundary:
+//! `present_js(header_ptr, instance_ptr, glyph_ptr)`.
 //!
 //! ### Why is this 100% memory safe?
 //! - WebAssembly host calls are **strictly synchronous** and execute on the same thread.
-//! - When Zig invokes `present_js(header_ptr, ...)`, the WebAssembly engine halts Zig execution
-//!   at that instruction while preserving its stack frame in linear memory.
+//! - When Zig invokes `present_js(header_ptr, instance_ptr, glyph_ptr)`, the WebAssembly engine
+//!   halts Zig execution at that instruction while preserving its stack frame in linear memory.
 //! - JavaScript receives `headerPtr`, wraps it in a typed `DataView` over `wasm.memory.buffer`,
-//!   and reads the fields directly.
-//! - When JavaScript returns, control resumes in Zig. Zig updates the cursor, marks the frame
-//!   presented, and returns from `tick()`.
+//!   and reads the 104-byte header directly (dimensions, flags, clear, matrix, glyph count).
+//! - If `flags & flag_instances` is set and `count > 0`, JavaScript uploads `count * 48` bytes
+//!   directly from `instance_ptr`.
+//! - If `flags & flag_glyphs` is set and `glyph_count > 0`, JavaScript uploads `glyph_count * 48`
+//!   bytes directly from `glyph_ptr`.
+//! - When JavaScript returns, control resumes in Zig. Zig marks the cursor and updates the frame.
 //! - Only then is the stack frame popped.
 //! - This achieves zero heap allocation, zero serialization, and zero garbage collection overhead.
 //!
@@ -101,6 +110,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("animator.zig");
 const draw = @import("draw.zig");
+const font = @import("font.zig");
 const frame = @import("frame.zig");
 const gpu = @import("gpu.zig");
 const input = @import("input.zig");
@@ -112,6 +122,7 @@ const scene = @import("scene.zig");
 const State = struct {
     frame: frame.Frame,
     list: draw.DrawList,
+    glyphs: font.GlyphList,
     cursor: draw.UploadCursor,
     scene: scene.Scene,
     clock: animator.Clock,
@@ -120,6 +131,7 @@ const State = struct {
 var state: State = .{
     .frame = frame.Frame.init(),
     .list = draw.DrawList.init(),
+    .glyphs = font.GlyphList.init(),
     .cursor = draw.UploadCursor.init(),
     .scene = scene.Scene.init_demo(),
     .clock = animator.Clock.init(),
@@ -162,6 +174,50 @@ export fn instance_stride() u32 {
     return draw.instance_stride;
 }
 
+/// Glyph shader source. `shell.js` compiles this as the second module.
+export fn glyph_shader_ptr() [*]const u8 {
+    assert(font.shader_file.len >= 1);
+    assert(font.glyph_stride == 48);
+    return font.shader_file.ptr;
+}
+
+/// Returns the byte length of the embedded `src/glyph.wgsl` shader source.
+export fn glyph_shader_len() u32 {
+    assert(font.shader_file.len >= 1);
+    return @intCast(font.shader_file.len);
+}
+
+/// Byte stride of one glyph quad. The browser asserts 48 before upload.
+export fn glyph_stride() u32 {
+    assert(font.glyph_stride == 48);
+    return font.glyph_stride;
+}
+
+/// Returns the memory address of the pre-baked 512 x 256 `r8unorm` font coverage atlas.
+/// JavaScript reads 131,072 bytes from this pointer to upload the WebGPU texture once at startup.
+export fn atlas_ptr() [*]const u8 {
+    assert(font.atlas_bytes.len == 131072);
+    return font.atlas_bytes.ptr;
+}
+
+/// Returns the exact byte size of the font coverage atlas (131,072 bytes).
+export fn atlas_len() u32 {
+    assert(font.atlas_bytes.len == 131072);
+    return 131072;
+}
+
+/// Returns the horizontal pixel width of the font coverage atlas (512 texels).
+export fn atlas_width() u32 {
+    assert(font.atlas_width == 512);
+    return font.atlas_width;
+}
+
+/// Returns the vertical pixel height of the font coverage atlas (256 texels).
+export fn atlas_height() u32 {
+    assert(font.atlas_height == 256);
+    return font.atlas_height;
+}
+
 /// Initializes the application state and leaves the draw list empty.
 ///
 /// Called once by JavaScript after the WebGPU pipeline is compiled.
@@ -174,6 +230,7 @@ export fn instance_stride() u32 {
 export fn start() u32 {
     state.frame = frame.Frame.init();
     state.list = draw.DrawList.init();
+    state.glyphs = font.GlyphList.init();
     state.cursor = draw.UploadCursor.init();
     state.scene = scene.Scene.init_demo();
     state.clock = animator.Clock.init();
@@ -268,13 +325,14 @@ fn present_frame() void {
     }
     assert(!state.frame.relayout);
     if (state.scene.dirty) {
-        state.scene.draw(&state.list);
+        state.scene.draw(&state.list, &state.glyphs);
     }
     assert(!state.scene.dirty);
     // The header lives on this stack until present_js returns, so JS can read it safely.
     var header: draw.PresentHeader = undefined;
     draw.fill_header(&header, .{
         .list = &state.list,
+        .glyphs = &state.glyphs,
         .cursor = state.cursor,
         .width_logical = state.frame.width_logical,
         .height_logical = state.frame.height_logical,
@@ -286,8 +344,13 @@ fn present_frame() void {
         .clear_a = gpu.clear_color.a,
     });
     var unused: gpu.Gpu = .{};
-    gpu.present(&unused, &header, &state.list.items) catch unreachable;
-    state.cursor.mark(&state.list, state.frame.width_logical, state.frame.height_logical);
+    gpu.present(&unused, &header, &state.list.items, &state.glyphs.items) catch unreachable;
+    state.cursor.mark(
+        &state.list,
+        &state.glyphs,
+        state.frame.width_logical,
+        state.frame.height_logical,
+    );
     state.frame.mark_presented();
     assert(!state.frame.redraw);
     assert(!state.scene.dirty);

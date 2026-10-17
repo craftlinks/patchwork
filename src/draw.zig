@@ -80,7 +80,9 @@
 //!    - Column 2 (indices 8..11):  `[     0.0,      0.0, 1.0, 0.0 ]`
 //!    - Column 3 (indices 12..15): `[    -1.0,      1.0, 0.0, 1.0 ]`
 //!
-//! ## 3. WebGPU Specification Limit: The 256-Byte Uniform Buffer Alignment Rule
+//! ## 3. Hardware, Spec Limits, and C ABI Layouts
+//!
+//! ### WebGPU Specification Limit: 256-Byte Uniform Buffer Alignment Rule
 //! The WebGPU standard specification (Section 24.1, Table 23 "Limits") specifies:
 //! - `minUniformBufferOffsetAlignment`: Minimum byte alignment for dynamic uniform buffer
 //!   offsets and bind group ranges. Compliant hardware requires at least **256 bytes**.
@@ -88,6 +90,26 @@
 //!   violates the minimum binding size on certain Vulkan and Metal backends.
 //! - Therefore, we set `uniform_bytes = 256` for the GPU allocation, leaving bytes 64..255
 //!   zeroed as safe padding.
+//!
+//! ### `PresentHeader` C ABI Binary Memory Layout (104 Bytes):
+//! `PresentHeader` communicates frame dimensions, clear colors, upload dirty flags, the projection
+//! matrix, and draw counts across the platform boundary (FFI / WebAssembly linear memory).
+//!
+//! ```text
+//! +---------------+-----------------------+-----------------------------------------------+
+//! | Byte Offset   | Field                 | Description                                   |
+//! +---------------+-----------------------+-----------------------------------------------+
+//! |   0..3        | width_px: u32         | Physical framebuffer width in device pixels   |
+//! |   4..7        | height_px: u32        | Physical framebuffer height in device pixels  |
+//! |   8..11       | instance_count: u32   | Number of quad instances to draw [0..256]     |
+//! |  12..15       | flags: u32            | Bitmask: 1=instances, 2=uniform, 4=glyphs     |
+//! |  16..31       | clear: [4]f32         | Clear color (r, g, b, a)                      |
+//! |  32..95       | ortho: [16]f32        | 4x4 column-major orthographic matrix (64 B)   |
+//! |  96..99       | glyph_count: u32      | Number of glyph quads to draw [0..256]        |
+//! | 100..103      | pad: u32              | Alignment pad, written 0                      |
+//! +---------------+-----------------------+-----------------------------------------------+
+//! ```
+//! Total size: exactly 104 bytes (`@sizeOf(PresentHeader) == 104`).
 //!
 //! ## 4. The Dirty Tracking Architecture (`UploadCursor`)
 //! Transferring data from CPU to GPU via `writeBuffer` incurs driver synchronization overhead.
@@ -97,10 +119,12 @@
 //! - `width_logical`, `height_logical`: Window dimensions from which matrix was built.
 //!
 //! This enables four distinct upload scenarios:
-//! 1. **Initial Frame:** `flag_instances | flag_uniform` (uploads both buffers).
-//! 2. **Content Change Only:** `flag_instances` (re-uploads instance buffer; leaves matrix alone).
-//! 3. **Window Resize Only:** `flag_uniform` (re-uploads 64-byte matrix; leaves instances intact).
-//! 4. **Identical Re-present:** `0` (skips all buffer uploads; immediately begins render pass).
+//! 1. **Initial Frame:** `flag_instances | flag_uniform | flag_glyphs`.
+//! 2. **Face change only:** `flag_instances`. A glyph revision mismatch sets `flag_glyphs`.
+//! 3. **Window Resize Only:** `flag_uniform` (re-uploads the 64-byte matrix; leaves both
+//!    instance buffers intact).
+//! 4. **Identical Re-present:** `0`, including a scale-only present. Neither instance
+//!    buffer is uploaded.
 //!
 //! ## 5. TigerStyle Safety and Determinism
 //! - **Static Allocation:** Fixed capacity of 256 instances (`items: [instance_cap]Instance`).
@@ -188,9 +212,8 @@
 //! 2. User input updates widget state (mouse enter/leave, button press/release, slider drag), or
 //! 3. An in-flight animator steps by `dt_ms` and alters an animated weight.
 //!
-//! A scale-only present (e.g. moving between monitors) leaves `scene.dirty` false. As a result,
-//! `UploadCursor.flags` returns `flag_uniform` only, and the 256-instance GPU vertex buffer is NOT
-//! re-uploaded.
+//! A scale-only present (same logical size, new physical pixels) leaves `scene.dirty` false.
+//! `UploadCursor.flags` returns 0, so neither the face buffer nor the glyph buffer is uploaded.
 //!
 //! Capacity invariant: `1 + widget_cap * 3 <= instance_cap` (1 + 32 * 3 = 97 <= 256), guaranteeing
 //! that the full scene never exceeds the static instance capacity.
@@ -200,6 +223,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const font = @import("font.zig");
 
 /// The WebGPU Shading Language source embedded directly into the binary at compile time.
 /// Both native Linux (via wgpu-native) and the browser (via WebAssembly) compile this same source.
@@ -233,6 +257,10 @@ pub const flag_instances: u32 = 1;
 
 /// Upload flag indicating that the orthographic matrix uniform buffer needs to be written to GPU.
 pub const flag_uniform: u32 = 2;
+
+/// Upload flag indicating that the glyph instance buffer needs to be written.
+/// A scale-only present leaves this clear.
+pub const flag_glyphs: u32 = 4;
 
 /// Two triangles that make up the unit square `(0,0)` to `(1,1)` in counter-clockwise order.
 /// Laid out as flat 2D points: `[x0, y0, x1, y1, ...]`.
@@ -290,7 +318,9 @@ pub const Instance = extern struct {
 /// - Offset 24: `clear_b` (f32, 4 bytes) - Framebuffer background clear color blue.
 /// - Offset 28: `clear_a` (f32, 4 bytes) - Framebuffer background clear color alpha.
 /// - Offset 32: `ortho` ([16]f32, 64 bytes) - 4x4 column-major orthographic projection matrix.
-/// Total size: 96 bytes.
+/// - Offset 96: `glyph_count` (u32) - Glyph quads to draw. Zero skips that draw.
+/// - Offset 100: `pad` (u32) - Written as 0 so the header is 104 bytes.
+/// Total size: 104 bytes.
 pub const PresentHeader = extern struct {
     width_px: u32,
     height_px: u32,
@@ -301,6 +331,8 @@ pub const PresentHeader = extern struct {
     clear_b: f32,
     clear_a: f32,
     ortho: [16]f32,
+    glyph_count: u32,
+    pad: u32,
 };
 
 /// A fixed-capacity list of rectangle instances to be drawn in a frame.
@@ -441,6 +473,7 @@ pub const DrawList = struct {
 pub const UploadCursor = struct {
     primed: bool,
     revision: u32,
+    glyph_revision: u32,
     width_logical: u32,
     height_logical: u32,
 
@@ -448,29 +481,37 @@ pub const UploadCursor = struct {
         const cursor: UploadCursor = .{
             .primed = false,
             .revision = 0,
+            .glyph_revision = 0,
             .width_logical = 0,
             .height_logical = 0,
         };
         assert(!cursor.primed);
-        assert(cursor.revision == 0);
+        assert(cursor.glyph_revision == 0);
         return cursor;
     }
 
     /// Computes the bitmask of buffers that need to be uploaded to the GPU.
-    /// If unprimed (first frame), both instances and uniform matrix must be uploaded.
+    /// Unprimed uploads faces, glyphs, and the uniform. A face revision mismatch
+    /// sets `flag_instances`. A glyph revision mismatch sets `flag_glyphs`.
+    /// A logical size change sets only `flag_uniform` when the lists match.
     pub fn flags(
         self: UploadCursor,
         list: *const DrawList,
+        glyphs: *const font.GlyphList,
         width_logical: u32,
         height_logical: u32,
     ) u32 {
         assert(list.count <= instance_cap);
+        assert(glyphs.count <= font.glyph_cap);
         if (!self.primed) {
-            return flag_instances | flag_uniform;
+            return flag_instances | flag_uniform | flag_glyphs;
         }
         var result: u32 = 0;
         if (self.revision != list.revision) {
             result |= flag_instances;
+        }
+        if (self.glyph_revision != glyphs.revision) {
+            result |= flag_glyphs;
         }
         if (self.width_logical != width_logical) {
             result |= flag_uniform;
@@ -480,17 +521,20 @@ pub const UploadCursor = struct {
         return result;
     }
 
-    /// Records that the current revision and dimensions were successfully uploaded to the GPU.
+    /// Records that the current revisions and dimensions were uploaded.
     pub fn mark(
         self: *UploadCursor,
         list: *const DrawList,
+        glyphs: *const font.GlyphList,
         width_logical: u32,
         height_logical: u32,
     ) void {
         assert(list.count <= instance_cap);
+        assert(glyphs.count <= font.glyph_cap);
         assert(width_logical != 0);
         self.primed = true;
         self.revision = list.revision;
+        self.glyph_revision = glyphs.revision;
         self.width_logical = width_logical;
         self.height_logical = height_logical;
         assert(self.primed);
@@ -500,6 +544,7 @@ pub const UploadCursor = struct {
 
 pub const HeaderOptions = struct {
     list: *const DrawList,
+    glyphs: *const font.GlyphList,
     cursor: UploadCursor,
     width_logical: u32,
     height_logical: u32,
@@ -519,8 +564,11 @@ pub fn fill_header(header: *PresentHeader, options: HeaderOptions) void {
     header.width_px = options.width_px;
     header.height_px = options.height_px;
     header.instance_count = options.list.count;
+    header.glyph_count = options.glyphs.count;
+    header.pad = 0;
     header.flags = options.cursor.flags(
         options.list,
+        options.glyphs,
         options.width_logical,
         options.height_logical,
     );
@@ -530,6 +578,8 @@ pub fn fill_header(header: *PresentHeader, options: HeaderOptions) void {
     header.clear_a = options.clear_a;
     ortho_y_down(&header.ortho, options.width_logical, options.height_logical);
     assert(header.instance_count <= instance_cap);
+    assert(header.glyph_count <= font.glyph_cap);
+    assert(header.pad == 0);
     assert(header.ortho[0] > 0);
 }
 
@@ -722,7 +772,8 @@ comptime {
     assert(instance_stride == 48);
     // 48 is three vec4 groups, not a WebGPU minimum. The spec only requires a multiple of 4.
     assert(instance_stride % 16 == 0);
-    assert(@sizeOf(PresentHeader) == 96);
+    assert(@sizeOf(PresentHeader) == 104);
+    assert(flag_glyphs == 4);
     assert(quad_bytes == 48);
     assert(unit_quad.len == 12);
     assert(vertex_count == 6);
@@ -969,16 +1020,18 @@ test "sdf oversized radius saturates into a disc" {
 test "the first present uploads instances and the uniform" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
+    const glyphs = font.GlyphList.init();
     const cursor = UploadCursor.init();
-    const flags = cursor.flags(&list, 1280, 720);
-    try std.testing.expectEqual(flag_instances | flag_uniform, flags);
+    const flags = cursor.flags(&list, &glyphs, 1280, 720);
+    try std.testing.expectEqual(flag_instances | flag_uniform | flag_glyphs, flags);
 }
 
 test "a revision change uploads instances" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
+    const glyphs = font.GlyphList.init();
     var cursor = UploadCursor.init();
-    cursor.mark(&list, 1280, 720);
+    cursor.mark(&list, &glyphs, 1280, 720);
     list.clear();
     try list.append(face(.{
         .x = 8,
@@ -993,24 +1046,37 @@ test "a revision change uploads instances" {
         .hover = 0,
         .down = 0,
     }));
-    const flags = cursor.flags(&list, 1280, 720);
+    const flags = cursor.flags(&list, &glyphs, 1280, 720);
     try std.testing.expectEqual(flag_instances, flags);
 }
 
 test "a logical size change uploads the uniform" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
+    const glyphs = font.GlyphList.init();
     var cursor = UploadCursor.init();
-    cursor.mark(&list, 1280, 720);
-    const flags = cursor.flags(&list, 800, 720);
+    cursor.mark(&list, &glyphs, 1280, 720);
+    const flags = cursor.flags(&list, &glyphs, 800, 720);
     try std.testing.expectEqual(flag_uniform, flags);
 }
 
 test "a scale-style present with the same logical size uploads nothing" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
+    const glyphs = font.GlyphList.init();
     var cursor = UploadCursor.init();
-    cursor.mark(&list, 800, 600);
-    const flags = cursor.flags(&list, 800, 600);
+    cursor.mark(&list, &glyphs, 800, 600);
+    const flags = cursor.flags(&list, &glyphs, 800, 600);
     try std.testing.expectEqual(@as(u32, 0), flags);
+}
+
+test "a glyph revision change uploads glyphs" {
+    var list = DrawList.init();
+    try list.append(rect(10, 10));
+    var glyphs = font.GlyphList.init();
+    var cursor = UploadCursor.init();
+    cursor.mark(&list, &glyphs, 1280, 720);
+    glyphs.clear();
+    const flags = cursor.flags(&list, &glyphs, 1280, 720);
+    try std.testing.expectEqual(flag_glyphs, flags);
 }
