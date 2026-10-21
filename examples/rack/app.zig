@@ -39,8 +39,25 @@
 //! ## 3. Slot Layout and Capacity
 //! Slots are grouped per panel: the panel, then `knobs_per_panel` knobs, then the meter, so
 //! `panel_stride = knobs_per_panel + 2` and `demo_count = panel_count * panel_stride`. The
-//! comptime block asserts the stride, the table sizes, and that the worst case fits
-//! `quads.instance_cap`, `font.glyph_cap`, and `widget_cap`.
+//! comptime block asserts the stride, the table sizes, and that the worst case fits each
+//! draw pool in `config.draw` and `widget_cap`; tests assert `overflow_count == 0`.
+//!
+//! ## 3a. Draw Types, Layers, and the Title Band
+//! `config.draw` registers the library's `Box`, `Arc`, `Glyph`, and `Image` and the rack's
+//! own `Led` (`led.zig`). Each panel's title band carries the procedural badge
+//! (`badge.zig`, an `Image` of the texture `init` creates) at its left end and an LED centered
+//! over the meter track whose brightness is that panel's meter level; the title text is
+//! centered between them. Everything is on the base layer except the tooltip.
+//!
+//! ## 3b. Tooltip
+//! Hovering a knob for `tooltip_delay_ms` shows its name and value in a bordered box beside
+//! the ring. The box overlaps the neighbouring knob's name, so it goes on the overlay layer,
+//! which is drawn after every base batch; on the base layer the sticky glyph batch would draw
+//! the neighbour's text over it. The delay is a `dwell` animator local to the rack: hovering a
+//! knob aims it at 1 over `tooltip_delay_ms`, and a change of hovered knob restarts it.
+//! `event` reports a change only when the tooltip appears or disappears, so the dwell frames
+//! between redraw nothing. Test "the tooltip box covers the neighbour's text on the overlay
+//! layer" locks the rule.
 //!
 //! ## 4. Meter Data Flow
 //! The host calls `App.timer(now_ms)` every `config.timer_period_ms`:
@@ -67,6 +84,8 @@ const turtle = patchwork.turtle;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
 const levels = @import("levels.zig");
+const led = @import("led.zig");
+const badge = @import("badge.zig");
 
 /// Maximum widgets in the rack scene; `demo_count` of them are in use.
 pub const widget_cap: u32 = 32;
@@ -97,6 +116,39 @@ const panel_radius: f32 = 8;
 
 const panel_names = [_][]const u8{ "osc", "filter", "amp" };
 
+/// Hover time before a knob's tooltip appears.
+pub const tooltip_delay_ms: f32 = 500;
+
+/// Tooltip box relative to the knob cell. A cell's name column (`widgets.name_box`) spans
+/// 72 to 144 px into the cell and the next cell starts 152 px in, so a box from 128 to 304
+/// clears the rack's short names centered at 108 and covers the whole neighbouring name
+/// column (224 to 296).
+const tooltip_offset_x: f32 = 128;
+const tooltip_offset_y: f32 = 4;
+const tooltip_width: f32 = 176;
+const tooltip_height: f32 = 32;
+const tooltip_radius: f32 = 6;
+const tooltip_border_px: f32 = 1;
+const tooltip_fill: [4]f32 = .{ 0.08, 0.09, 0.11, 1 };
+
+/// Badge quad edge in the title band, in logical pixels, and its inset from the band's left.
+const badge_px: f32 = 20;
+const badge_inset_px: f32 = 2;
+
+/// LED color: the theme's meter green.
+const led_color = theme.chrome.meter;
+
+/// Pool capacities. The comptime block checks each against the rack's worst case.
+const box_cap: u32 = 16;
+const arc_cap: u32 = 32;
+const glyph_cap: u32 = 256;
+const image_cap: u32 = 4;
+const led_cap: u32 = 4;
+const batch_cap: u32 = 16;
+
+/// Bytes of the tooltip text: a name of up to 8, a space, and the 4-byte value.
+const tooltip_text_cap: u32 = 13;
+
 const knob_table = [_]struct { name: []const u8, value: f32 }{
     .{ .name = "rate", .value = 0.25 },
     .{ .name = "fine", .value = 0.50 },
@@ -125,14 +177,39 @@ const Scene = ui.Scene(Widget, widget_cap);
 /// meter levels at the period in `config`.
 pub const App = struct {
     scene: Scene,
+    /// Hover time toward the tooltip; see the module guide, section 3b.
+    dwell: animator.Animator,
+    /// The knob slot `dwell` is timing, or null when no knob is hovered.
+    dwell_slot: ?u32,
+    /// The badge texture and its pixels, which must outlive the stream that uploads them.
+    badge_texture: quads.TextureId,
+    badge_pixels: [badge.bytes]u8,
 
     pub const config: patchwork.app.Config = .{
         .title = "patchwork",
         .timer_period_ms = levels.meter_period_ms,
+        .draw = &.{
+            .{ .type = quads.Box, .cap = box_cap },
+            .{ .type = quads.Arc, .cap = arc_cap },
+            .{ .type = quads.Glyph, .cap = glyph_cap },
+            .{ .type = quads.Image, .cap = image_cap },
+            .{ .type = led.Led, .cap = led_cap },
+        },
+        .batch_cap = batch_cap,
     };
 
-    /// Fills every slot. Rects are empty until `layout`.
-    pub fn init(app: *App) void {
+    /// Fills every slot and generates the badge texture. Rects are empty until `layout`.
+    pub fn init(app: *App, textures: *quads.Textures) void {
+        badge.fill(&app.badge_pixels);
+        app.badge_texture = textures.create(.rgba8, badge.side, badge.side);
+        textures.write(app.badge_texture, .{
+            .x = 0,
+            .y = 0,
+            .width = badge.side,
+            .height = badge.side,
+        }, &app.badge_pixels);
+        app.dwell = animator.Animator.init(1.0 / tooltip_delay_ms);
+        app.dwell_slot = null;
         app.scene = Scene.init(demo_count);
         var panel_index: u32 = 0;
         while (panel_index < panel_count) : (panel_index += 1) {
@@ -152,9 +229,27 @@ pub const App = struct {
         assert(app.scene.dirty);
     }
 
+    /// Routes the event through the scene, then times the tooltip. Dirty when the scene
+    /// changed or the tooltip appeared or disappeared.
     pub fn event(app: *App, event_value: input.Event) bool {
         assert(app.scene.count == demo_count);
-        return app.scene.handle_event(event_value);
+        var changed = app.scene.handle_event(event_value);
+        if (app.retarget_dwell()) {
+            changed = true;
+        }
+        switch (event_value) {
+            .frame => |dt_ms| {
+                if (app.step_dwell(dt_ms)) {
+                    changed = true;
+                }
+            },
+            else => {},
+        }
+        if (changed) {
+            app.scene.dirty = true;
+        }
+        assert(app.dwell_slot == null or app.dwell.target == 1);
+        return changed;
     }
 
     /// Writes the latest samples onto the meters. Dirty only when one changes.
@@ -180,6 +275,9 @@ pub const App = struct {
 
     pub fn live(app: *const App) bool {
         assert(app.scene.count == demo_count);
+        if (app.dwell.live()) {
+            return true;
+        }
         return app.scene.live();
     }
 
@@ -188,12 +286,11 @@ pub const App = struct {
         return app.scene.dirty;
     }
 
-    /// Clears both lists and draws every widget. The window clip is the full frame.
-    pub fn draw(app: *App, list: *quads.DrawList, glyphs: *font.GlyphList) void {
+    /// Draws every widget into the freshly reset context, each panel's badge and LED after
+    /// the panel, then the tooltip on the overlay layer. The window clip is the full frame.
+    pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         assert(app.scene.width_logical != 0);
         assert(app.scene.height_logical != 0);
-        list.clear();
-        glyphs.clear();
         const clip: font.Clip = .{
             .x0 = 0,
             .y0 = 0,
@@ -203,28 +300,184 @@ pub const App = struct {
         var index: u32 = 0;
         while (index < app.scene.count) : (index += 1) {
             const face_clip = clip_for(&app.scene, index, clip);
-            widget_draw(&app.scene.widgets[index], list, glyphs, face_clip);
+            widget_draw(&app.scene.widgets[index], cx, face_clip);
+            if (index % panel_stride == 0) {
+                app.draw_title_marks(cx, index / panel_stride, face_clip);
+            }
         }
+        app.draw_tooltip(cx, clip);
         app.scene.finish_draw();
         // A window smaller than one panel has no positive face, so that frame is empty.
-        assert(list.count <= quads.instance_cap);
-        assert(glyphs.count <= font.glyph_cap);
+        assert(cx.overflow_count == 0);
+        assert(cx.layer_now == .base);
+    }
+
+    /// True while the tooltip of `dwell_slot` is showing.
+    pub fn tooltip_visible(app: *const App) bool {
+        if (app.dwell_slot == null) {
+            return false;
+        }
+        return app.dwell.value == 1;
+    }
+
+    /// Restarts the dwell when the hovered knob changed. True when that hid the tooltip.
+    fn retarget_dwell(app: *App) bool {
+        const next = hovered_knob(&app.scene);
+        if (same_slot(app.dwell_slot, next)) {
+            return false;
+        }
+        const was_visible = app.tooltip_visible();
+        app.dwell = animator.Animator.init(1.0 / tooltip_delay_ms);
+        app.dwell_slot = next;
+        if (next != null) {
+            const aimed = app.dwell.set_target(1);
+            assert(aimed);
+        }
+        assert(!app.tooltip_visible());
+        return was_visible;
+    }
+
+    /// Steps the dwell. True only on the step that shows the tooltip.
+    fn step_dwell(app: *App, dt_ms: f32) bool {
+        assert(dt_ms >= 0);
+        const was_visible = app.tooltip_visible();
+        _ = app.dwell.step(dt_ms);
+        if (was_visible) {
+            assert(app.tooltip_visible());
+            return false;
+        }
+        return app.tooltip_visible();
+    }
+
+    /// The badge at the band's left end and the LED over the meter track, both clipped to
+    /// the panel. A band too short or too narrow for them omits them.
+    fn draw_title_marks(app: *const App, cx: anytype, panel_index: u32, clip: font.Clip) void {
+        assert(panel_index < panel_count);
+        const band = app.scene.widgets[panel_slot(panel_index)].panel.label.rect;
+        if (band.height < badge_px) {
+            return;
+        }
+        if (band.width < 4 * badge_px) {
+            return;
+        }
+        const clip_rect: [4]f32 = .{ clip.x0, clip.y0, clip.x1, clip.y1 };
+        const y = band.y + (band.height - badge_px) * 0.5;
+        append_or_skip(cx, quads.Image, app.badge_texture, .{
+            .rect = .{ band.x + badge_inset_px, y, badge_px, badge_px },
+            .clip = clip_rect,
+            .uv = .{ 0, 0, 1, 1 },
+            .tint = .{ 1, 1, 1, 1 },
+        });
+        const meter = app.scene.widgets[meter_slot(panel_index)].meter;
+        if (meter.rect.width <= 0) {
+            return;
+        }
+        const center_x = meter.rect.x + widgets.ring_inset + widgets.ring_size * 0.5;
+        const center_y = band.y + band.height * 0.5;
+        const light = led.at(center_x, center_y, led_color, meter.value, clip_rect);
+        append_or_skip(cx, led.Led, null, light);
+    }
+
+    /// The hovered knob's name and value in a bordered box on the overlay layer, so it
+    /// covers the neighbouring knob's text. See the module guide, section 3b.
+    fn draw_tooltip(app: *const App, cx: anytype, window: font.Clip) void {
+        if (!app.tooltip_visible()) {
+            return;
+        }
+        const knob = app.scene.widgets[app.dwell_slot.?].knob;
+        assert(knob.rect.width > 0);
+        const box = tooltip_rect(knob.rect);
+        const previous = cx.layer(.overlay);
+        defer _ = cx.layer(previous);
+        const text_color = theme.chrome.text;
+        append_or_skip(cx, quads.Box, null, .{
+            .rect = .{ box.x, box.y, box.width, box.height },
+            .clip = .{ window.x0, window.y0, window.x1, window.y1 },
+            .fill = tooltip_fill,
+            .border_color = text_color,
+            .radius = tooltip_radius,
+            .border_width = tooltip_border_px,
+            .hover = 0,
+            .down = 0,
+        });
+        var text: [tooltip_text_cap]u8 = undefined;
+        const label = tooltip_text(&text, knob);
+        font.place(cx, label, .{
+            .x = box.x,
+            .y = box.y,
+            .width = box.width,
+            .height = box.height,
+        }, .{ .r = text_color[0], .g = text_color[1], .b = text_color[2], .a = 1 }, window);
     }
 };
 
-fn widget_draw(
-    widget: *const Widget,
-    list: *quads.DrawList,
-    glyphs: *font.GlyphList,
-    clip: font.Clip,
-) void {
-    assert(list.count <= quads.instance_cap);
+fn widget_draw(widget: *const Widget, cx: anytype, clip: font.Clip) void {
     assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
     switch (widget.*) {
-        inline else => |*payload| payload.draw(list, glyphs, clip),
+        inline else => |*payload| payload.draw(cx, clip),
     }
-    assert(list.count <= quads.instance_cap);
-    assert(glyphs.count <= font.glyph_cap);
+}
+
+/// Appends through `cx`, skipping on a full pool or batch list (the context counts it).
+fn append_or_skip(cx: anytype, comptime T: type, texture: ?quads.TextureId, instance: T) void {
+    assert(instance.rect[2] > 0);
+    assert(instance.rect[3] > 0);
+    cx.append(T, texture, instance) catch |err| switch (err) {
+        error.PoolFull, error.BatchFull => {},
+        error.EdgeNotPositive, error.ClipUnordered => unreachable,
+    };
+}
+
+/// The knob slot under the pointer, or null when the hovered widget is not a visible knob.
+fn hovered_knob(scene: *const Scene) ?u32 {
+    const slot = scene.hovered orelse return null;
+    assert(slot < scene.count);
+    switch (scene.widgets[slot]) {
+        .knob => |knob| {
+            if (knob.rect.width <= 0) {
+                return null;
+            }
+            return slot;
+        },
+        else => return null,
+    }
+}
+
+fn same_slot(current: ?u32, next: ?u32) bool {
+    if (current) |a| {
+        if (next) |b| {
+            return a == b;
+        }
+        return false;
+    }
+    return next == null;
+}
+
+fn tooltip_rect(knob: turtle.Rect) turtle.Rect {
+    assert(knob.width > 0);
+    const rect: turtle.Rect = .{
+        .x = knob.x + tooltip_offset_x,
+        .y = knob.y + tooltip_offset_y,
+        .width = tooltip_width,
+        .height = tooltip_height,
+    };
+    assert(rect.width == tooltip_width);
+    assert(rect.x > knob.x);
+    return rect;
+}
+
+/// Writes "name d.dd" into `out` and returns the used prefix.
+fn tooltip_text(out: *[tooltip_text_cap]u8, knob: widgets.Knob) []const u8 {
+    assert(knob.name.len <= 8);
+    assert(knob.value_text[1] == '.');
+    const name_len = knob.name.len;
+    @memcpy(out[0..name_len], knob.name);
+    out[name_len] = ' ';
+    @memcpy(out[name_len + 1 ..][0..4], knob.value_text[0..4]);
+    const used = name_len + 1 + 4;
+    assert(used <= tooltip_text_cap);
+    return out[0..used];
 }
 
 fn fill_panel(scene: *Scene, panel_index: u32) void {
@@ -616,12 +869,21 @@ comptime {
     assert(demo_count <= widget_cap);
     assert(levels.meter_count == panel_count);
     assert(panel_stride == 1 + knobs_per_panel + 1);
-    // Worst-case faces: one per panel, two per knob (track and value arc), two per meter.
-    assert(panel_count + panel_count * knobs_per_panel * 2 + panel_count * 2 <=
-        quads.instance_cap);
+    // Worst-case boxes: one per panel, two per meter, and the tooltip.
+    assert(panel_count + panel_count * 2 + 1 <= box_cap);
+    // Worst-case arcs: two per knob (track and value arc).
+    assert(panel_count * knobs_per_panel * 2 <= arc_cap);
     // Worst-case glyphs: a label of up to 8 per panel, up to 8 for each knob name and 4 for
-    // each value text.
-    assert(panel_count * 8 + panel_count * knobs_per_panel * (8 + 4) <= font.glyph_cap);
+    // each value text, and the tooltip text.
+    assert(panel_count * 8 + panel_count * knobs_per_panel * (8 + 4) + tooltip_text_cap <=
+        glyph_cap);
+    // One badge and one LED per panel.
+    assert(panel_count <= image_cap);
+    assert(panel_count <= led_cap);
+    // Base: box, glyph, image, LED, arc; overlay: box and glyph.
+    assert(5 + 2 <= batch_cap);
+    // The box covers the neighbouring cell's whole name column.
+    assert(tooltip_offset_x + tooltip_width >= knob_cell_px + 8 + 72 + 72);
     assert(widget_cap <= turtle.child_cap);
     assert(column_padding.left == 16);
     assert(knob_table.len == panel_count * knobs_per_panel);
@@ -631,15 +893,37 @@ comptime {
     assert(knob_cell_px == 144);
 }
 
-fn new_app() App {
+const Context = patchwork.app.Context(App);
+
+/// The test app and draw context: static, like the hosts', so the badge pixels the context's
+/// queued write points at stay put, and the pools stay off the stack.
+const fixture = struct {
     var app: App = undefined;
-    App.init(&app);
-    return app;
+    var context: Context = undefined;
+};
+
+/// A fresh app, initialized against a fresh context the way a host does.
+fn new_app() *App {
+    fixture.context.init();
+    App.init(&fixture.app, &fixture.context.textures);
+    return &fixture.app;
 }
 
-// Pulls the levels module's tests into this app's test run.
+/// Resets the context and draws the app into it, the way a host does, then finalizes it.
+fn draw_frame(app: *App) *Context {
+    const cx = &fixture.context;
+    cx.reset();
+    app.draw(cx);
+    cx.finalize();
+    assert(cx.overflow_count == 0);
+    return cx;
+}
+
+// Pulls the levels, LED, and badge modules' tests into this app's test run.
 test {
     _ = levels;
+    _ = led;
+    _ = badge;
 }
 
 fn expect_rect(rect: turtle.Rect, x: f32, y: f32, width: f32, height: f32) !void {
@@ -649,11 +933,8 @@ fn expect_rect(rect: turtle.Rect, x: f32, y: f32, width: f32, height: f32) !void
     try std.testing.expectEqual(height, rect.height);
 }
 
-fn expect_box(instance: quads.Instance, x: f32, y: f32, width: f32, height: f32) !void {
-    try std.testing.expectEqual(x, instance.x);
-    try std.testing.expectEqual(y, instance.y);
-    try std.testing.expectEqual(width, instance.width);
-    try std.testing.expectEqual(height, instance.height);
+fn rect_of(rect: [4]f32) turtle.Rect {
+    return .{ .x = rect[0], .y = rect[1], .width = rect[2], .height = rect[3] };
 }
 
 fn knob_at(app: *App, panel_index: u32, knob_index: u32) *widgets.Knob {
@@ -667,47 +948,36 @@ fn meter_at(app: *App, panel_index: u32) *widgets.Meter {
 // Locks panel, knob, ring, and meter rects, the knob and meter clips, and the omitted value
 // arc of a zero-valued knob.
 test "rack layout at 1280 by 720" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 720);
     // Panel height = (720 - 2 * 16 padding - 2 * 8 gap) / 3; the panels start 8 below each other.
     try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 16, 1248, 224);
     try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 248, 1248, 224);
     try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 480, 1248, 224);
     // First knob: x = 16 panel + 8 padding + 8 cell margin, y = 16 + 8 + 24 title band.
-    try expect_rect(knob_at(&app, 0, 0).rect, 32, 48, 144, 72);
-    try expect_rect(widgets.ring_of(knob_at(&app, 0, 0).rect), 40, 56, 56, 56);
+    try expect_rect(knob_at(app, 0, 0).rect, 32, 48, 144, 72);
+    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 56, 56, 56);
     // Meter: right edge of the inner rect, 80 wide, body height 224 - 16 - 24.
-    try expect_rect(meter_at(&app, 0).rect, 1176, 48, 80, 184);
+    try expect_rect(meter_at(app, 0).rect, 1176, 48, 80, 184);
     const title = app.scene.widgets[panel_slot(0)].panel.label.rect;
     try std.testing.expectEqual(@as(f32, 24), title.height);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    // 3 panels + 12 knobs * 2 arcs + 3 meters * 2 faces, minus the zero-valued knob's arc.
-    try std.testing.expectEqual(@as(u32, 32), list.count);
-    try std.testing.expectEqual(@as(u32, 100), glyphs.count);
-    const ring = widgets.ring_of(knob_at(&app, 0, 3).rect);
+    const cx = draw_frame(app);
+    // 3 panels + 3 meters * 2 faces; 12 knobs * 2 arcs minus the zero-valued knob's arc.
+    try std.testing.expectEqual(@as(usize, 9), cx.items(quads.Box).len);
+    try std.testing.expectEqual(@as(usize, 23), cx.items(quads.Arc).len);
+    try std.testing.expectEqual(@as(usize, 100), cx.items(quads.Glyph).len);
+    try std.testing.expectEqual(@as(usize, 3), cx.items(quads.Image).len);
+    try std.testing.expectEqual(@as(usize, 3), cx.items(led.Led).len);
+    const ring = widgets.ring_of(knob_at(app, 0, 3).rect);
     var arcs: u32 = 0;
-    var index: u32 = 0;
-    while (index < list.count) : (index += 1) {
-        const face = list.items[index];
+    for (cx.items(quads.Arc)) |arc| {
         // The first ring clips to its panel rect.
-        if (face.x == 40 and face.y == 56) {
-            try std.testing.expectEqual(@as(f32, 16), face.clip_x0);
-            try std.testing.expectEqual(@as(f32, 16), face.clip_y0);
-            try std.testing.expectEqual(@as(f32, 1264), face.clip_x1);
-            try std.testing.expectEqual(@as(f32, 240), face.clip_y1);
+        if (arc.rect[0] == 40 and arc.rect[1] == 56) {
+            try std.testing.expectEqualSlices(f32, &.{ 16, 16, 1264, 240 }, &arc.clip);
         }
-        if (face.kind != quads.kind_arc) {
-            continue;
+        if (arc.rect[0] == ring.x and arc.rect[1] == ring.y) {
+            arcs += 1;
         }
-        if (face.x != ring.x) {
-            continue;
-        }
-        if (face.y != ring.y) {
-            continue;
-        }
-        arcs += 1;
     }
     try std.testing.expectEqual(@as(u32, 1), arcs);
     try std.testing.expect(!app.dirty());
@@ -715,98 +985,94 @@ test "rack layout at 1280 by 720" {
 
 // Locks that a smaller window shrinks panel heights and the meter cell, not the knob cells.
 test "rack layout at 800 by 600" {
-    var app = new_app();
+    const app = new_app();
     app.layout(800, 600);
     try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 16, 768, 184);
     try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 208, 768, 184);
     try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 400, 768, 184);
-    try expect_rect(widgets.ring_of(knob_at(&app, 0, 0).rect), 40, 56, 56, 56);
-    try expect_rect(meter_at(&app, 0).rect, 696, 48, 80, 144);
+    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 56, 56, 56);
+    try expect_rect(meter_at(app, 0).rect, 696, 48, 80, 144);
 }
 
 // Locks that `timer` writes meters only when a sample changes and knob drags never do.
 test "apply_meters writes the sample and a knob drag does not" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 720);
     try std.testing.expect(!app.timer(0));
-    try std.testing.expectEqual(@as(f32, 0.5), meter_at(&app, 0).value);
-    try std.testing.expectEqual(@as(f32, 0.5), meter_at(&app, 1).value);
-    try std.testing.expectEqual(@as(f32, 0.5), meter_at(&app, 2).value);
+    try std.testing.expectEqual(@as(f32, 0.5), meter_at(app, 0).value);
+    try std.testing.expectEqual(@as(f32, 0.5), meter_at(app, 1).value);
+    try std.testing.expectEqual(@as(f32, 0.5), meter_at(app, 2).value);
     try std.testing.expect(app.timer(500));
     const sampled = levels.sample(500);
     try std.testing.expectEqual(@as(f32, 1), sampled[0]);
     try std.testing.expect(sampled[1] != 1);
     try std.testing.expect(sampled[2] != 1);
-    try std.testing.expectEqual(sampled[0], meter_at(&app, 0).value);
-    try std.testing.expectEqual(sampled[1], meter_at(&app, 1).value);
-    try std.testing.expectEqual(sampled[2], meter_at(&app, 2).value);
-    const amp = meter_at(&app, 2).value;
-    const ring = widgets.ring_of(knob_at(&app, 2, 0).rect);
+    try std.testing.expectEqual(sampled[0], meter_at(app, 0).value);
+    try std.testing.expectEqual(sampled[1], meter_at(app, 1).value);
+    try std.testing.expectEqual(sampled[2], meter_at(app, 2).value);
+    const amp = meter_at(app, 2).value;
+    const ring = widgets.ring_of(knob_at(app, 2, 0).rect);
     const cx = ring.x + ring.width * 0.5;
     const cy = ring.y + ring.height * 0.5;
     try std.testing.expect(app.event(.{ .pointer_down = .{ .x = cx, .y = cy } }));
     try std.testing.expect(app.event(.{ .pointer_move = .{ .x = cx, .y = cy - 60 } }));
-    try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 2, 0).value);
-    try std.testing.expectEqual(amp, meter_at(&app, 2).value);
+    try std.testing.expectEqual(@as(f32, 1), knob_at(app, 2, 0).value);
+    try std.testing.expectEqual(amp, meter_at(app, 2).value);
     try std.testing.expect(!app.timer(500));
-    try std.testing.expectEqual(amp, meter_at(&app, 2).value);
+    try std.testing.expectEqual(amp, meter_at(app, 2).value);
 }
 
 // Locks ring drag and ring wheel through the scene, and that a wheel off the ring is ignored.
 test "a ring drag and a ring wheel change the knob" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 720);
-    const ring = widgets.ring_of(knob_at(&app, 0, 0).rect);
+    const ring = widgets.ring_of(knob_at(app, 0, 0).rect);
     const cx = ring.x + ring.width * 0.5;
     const cy = ring.y + ring.height * 0.5;
     try std.testing.expect(app.event(.{ .pointer_down = .{ .x = cx, .y = cy } }));
     try std.testing.expect(app.event(.{ .pointer_move = .{ .x = cx, .y = cy - 60 } }));
-    try std.testing.expectEqual(@as(f32, 0.75), knob_at(&app, 0, 0).value);
+    try std.testing.expectEqual(@as(f32, 0.75), knob_at(app, 0, 0).value);
     try std.testing.expect(app.event(.{ .pointer_up = .{ .x = cx, .y = cy - 60 } }));
     try std.testing.expect(app.event(.{ .wheel = .{ .x = cx, .y = cy, .dy = -60 } }));
-    try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 0, 0).value);
+    try std.testing.expectEqual(@as(f32, 1), knob_at(app, 0, 0).value);
     try std.testing.expect(app.event(.{ .pointer_move = .{ .x = 40, .y = 30 } }));
     try std.testing.expect(!app.event(.{ .wheel = .{ .x = 40, .y = 30, .dy = 40 } }));
-    try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 0, 0).value);
+    try std.testing.expectEqual(@as(f32, 1), knob_at(app, 0, 0).value);
 }
 
 // Locks that raising a zero-valued knob adds exactly one face.
 test "dragging mix off zero adds the value arc" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 720);
-    const ring = widgets.ring_of(knob_at(&app, 0, 3).rect);
+    const ring = widgets.ring_of(knob_at(app, 0, 3).rect);
     const cx = ring.x + ring.width * 0.5;
     const cy = ring.y + ring.height * 0.5;
     try std.testing.expect(app.event(.{ .pointer_down = .{ .x = cx, .y = cy } }));
     try std.testing.expect(app.event(.{ .pointer_move = .{ .x = cx, .y = cy - 60 } }));
-    try std.testing.expectEqual(@as(f32, 0.5), knob_at(&app, 0, 3).value);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    try std.testing.expectEqual(@as(u32, 33), list.count);
-    try std.testing.expectEqual(@as(u32, 100), glyphs.count);
+    try std.testing.expectEqual(@as(f32, 0.5), knob_at(app, 0, 3).value);
+    const drawn = draw_frame(app);
+    try std.testing.expectEqual(@as(usize, 24), drawn.items(quads.Arc).len);
+    try std.testing.expectEqual(@as(usize, 100), drawn.items(quads.Glyph).len);
 }
 
 // Locks hover easing and that a settled scene stays clean across frames.
 test "hover on rate eases and a later frame stays clean" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 720);
-    const ring = widgets.ring_of(knob_at(&app, 0, 0).rect);
+    const ring = widgets.ring_of(knob_at(app, 0, 0).rect);
     const point: input.Point = .{
         .x = ring.x + ring.width * 0.5,
         .y = ring.y + ring.height * 0.5,
     };
     try std.testing.expect(app.event(.{ .pointer_move = point }));
-    try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 0, 0).hover.target);
+    try std.testing.expectEqual(@as(f32, 1), knob_at(app, 0, 0).hover.target);
     try std.testing.expect(app.live());
     try std.testing.expect(app.event(.{ .frame = 50 }));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), knob_at(&app, 0, 0).hover.value, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), knob_at(app, 0, 0).hover.value, 0.0001);
     try std.testing.expect(app.event(.{ .frame = 1000 }));
-    try std.testing.expectEqual(@as(f32, 1), knob_at(&app, 0, 0).hover.value);
+    try std.testing.expectEqual(@as(f32, 1), knob_at(app, 0, 0).hover.value);
     try std.testing.expect(!app.live());
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    _ = draw_frame(app);
     try std.testing.expect(!app.dirty());
     try std.testing.expect(!app.event(.{ .frame = 16 }));
     try std.testing.expect(!app.dirty());
@@ -842,62 +1108,64 @@ fn rects_overlap(a: turtle.Rect, b: turtle.Rect) bool {
 
 // Locks that knob cells crossing the meter column are dropped, not painted over the bar.
 test "a narrow window keeps only knobs that clear the meter" {
-    var app = new_app();
+    const app = new_app();
     app.layout(400, 720);
-    try std.testing.expectEqual(@as(f32, 144), knob_at(&app, 0, 0).rect.width);
-    try std.testing.expectEqual(@as(f32, 0), knob_at(&app, 0, 1).rect.width);
-    try std.testing.expectEqual(@as(f32, 0), knob_at(&app, 0, 2).rect.width);
-    try std.testing.expectEqual(@as(f32, 0), knob_at(&app, 0, 3).rect.width);
-    try std.testing.expectEqual(@as(f32, 80), meter_at(&app, 0).rect.width);
-    try std.testing.expect(!rects_overlap(knob_at(&app, 0, 0).rect, meter_at(&app, 0).rect));
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    try std.testing.expect(list.count >= 3);
+    try std.testing.expectEqual(@as(f32, 144), knob_at(app, 0, 0).rect.width);
+    try std.testing.expectEqual(@as(f32, 0), knob_at(app, 0, 1).rect.width);
+    try std.testing.expectEqual(@as(f32, 0), knob_at(app, 0, 2).rect.width);
+    try std.testing.expectEqual(@as(f32, 0), knob_at(app, 0, 3).rect.width);
+    try std.testing.expectEqual(@as(f32, 80), meter_at(app, 0).rect.width);
+    try std.testing.expect(!rects_overlap(knob_at(app, 0, 0).rect, meter_at(app, 0).rect));
+    const cx = draw_frame(app);
+    try std.testing.expect(cx.items(quads.Box).len >= 3);
 }
 
 // Locks that a body shorter than a knob row drops the knob instead of leaking into the
 // next panel.
 test "a short window hides knobs that would leave the panel" {
-    var app = new_app();
+    const app = new_app();
     app.layout(1280, 200);
-    try std.testing.expectEqual(@as(f32, 0), knob_at(&app, 0, 0).rect.height);
-    try std.testing.expect(meter_at(&app, 0).rect.height > 0);
-    try std.testing.expect(meter_at(&app, 0).rect.height < widgets.knob_height);
-    try std.testing.expect(!rects_overlap(knob_at(&app, 0, 0).rect, meter_at(&app, 0).rect));
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    try std.testing.expect(list.count >= 3);
+    try std.testing.expectEqual(@as(f32, 0), knob_at(app, 0, 0).rect.height);
+    try std.testing.expect(meter_at(app, 0).rect.height > 0);
+    try std.testing.expect(meter_at(app, 0).rect.height < widgets.knob_height);
+    try std.testing.expect(!rects_overlap(knob_at(app, 0, 0).rect, meter_at(app, 0).rect));
+    const cx = draw_frame(app);
+    try std.testing.expect(cx.items(quads.Box).len >= 3);
 }
 
 // Locks that degenerate windows draw without aborting and never overlap a knob and a meter.
 test "a tiny window still draws" {
-    var app = new_app();
+    const app = new_app();
     app.layout(32, 32);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    try std.testing.expectEqual(@as(u32, 0), list.count);
+    const empty = draw_frame(app);
+    try std.testing.expectEqual(@as(usize, 0), empty.items(quads.Box).len);
     app.layout(48, 720);
-    app.draw(&list, &glyphs);
-    try std.testing.expect(list.count >= 1);
-    try std.testing.expect(!rects_overlap(knob_at(&app, 0, 0).rect, meter_at(&app, 0).rect));
+    const narrow = draw_frame(app);
+    try std.testing.expect(narrow.items(quads.Box).len >= 1);
+    try std.testing.expect(!rects_overlap(knob_at(app, 0, 0).rect, meter_at(app, 0).rect));
 }
 
-fn record(
-    app: *App,
-    renderer: *patchwork.renderer.Renderer,
-    buffer: *patchwork.commands.CommandBuffer,
-    list: *quads.DrawList,
-    glyphs: *font.GlyphList,
-    width_px: u32,
-) void {
+const fixture_gpu = struct {
+    var renderer: patchwork.renderer.Renderer(Context) = undefined;
+    var buffer: patchwork.commands.CommandBuffer = undefined;
+};
+
+/// Records the setup stream the way a host does after `App.init`.
+fn setup_renderer() void {
+    fixture_gpu.renderer.init();
+    fixture_gpu.buffer = .init();
+    fixture_gpu.renderer.setup(&fixture_gpu.buffer, &fixture.context);
+}
+
+/// Draws the app if it is dirty, then records one 1280 by 720 logical frame.
+fn record(app: *App, width_px: u32) void {
     if (app.dirty()) {
-        app.draw(list, glyphs);
+        fixture.context.reset();
+        app.draw(&fixture.context);
+        assert(fixture.context.overflow_count == 0);
     }
-    buffer.reset();
-    renderer.frame(buffer, list, glyphs, .{
+    fixture_gpu.buffer.reset();
+    fixture_gpu.renderer.frame(&fixture_gpu.buffer, &fixture.context, .{
         .width_logical = 1280,
         .height_logical = 720,
         .width_px = width_px,
@@ -905,44 +1173,138 @@ fn record(
     });
 }
 
-// Locks the rack's command streams: setup once, then a first frame of three writes, one pass,
-// two draws, and present; a scale-only frame writes nothing; a hover frame writes only the
-// changed face records, because the rebuilt glyph list is identical.
-test "rack frames record the step 11 op sequences" {
-    const Code = patchwork.commands.Code;
-    var app = new_app();
-    app.layout(1280, 720);
-    var renderer = patchwork.renderer.Renderer.init();
-    var buffer = patchwork.commands.CommandBuffer.init();
-    renderer.setup(&buffer);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    var codes: [32]Code = undefined;
-    var writes: [4]patchwork.commands.BufferWrite = undefined;
-
-    record(&app, &renderer, &buffer, &list, &glyphs, 1280);
-    const first = [_]Code{
-        .buffer_write,      .buffer_write,      .buffer_write,
-        .pass_begin,        .pipeline_set,      .bind_group_set,
-        .vertex_buffer_set, .vertex_buffer_set, .draw,
-        .pipeline_set,      .bind_group_set,    .bind_group_set,
-        .vertex_buffer_set, .vertex_buffer_set, .draw,
-        .pass_end_present,
-    };
-    try std.testing.expectEqualSlices(Code, &first, patchwork.renderer.codes(&buffer, &codes));
-
-    record(&app, &renderer, &buffer, &list, &glyphs, 2560);
-    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(&buffer, &writes).len);
-
-    const ring = widgets.ring_of(knob_at(&app, 0, 0).rect);
+/// Hovers the center of `knob`'s ring.
+fn hover_knob(app: *App, knob: *const widgets.Knob) !void {
+    const ring = widgets.ring_of(knob.rect);
     try std.testing.expect(app.event(.{ .pointer_move = .{
         .x = ring.x + ring.width * 0.5,
         .y = ring.y + ring.height * 0.5,
     } }));
+}
+
+// Locks the rack's command streams. Setup creates five pipelines and both textures (the atlas
+// and the badge). The first frame writes the uniform and the five pools, binds the frame group
+// and unit quad once, and draws one call per batch in first-appearance order: boxes, glyphs
+// (atlas), the badge, LEDs, arcs. A scale-only frame writes nothing, and a hover frame writes
+// only the changed arc records, because every other rebuilt pool is identical.
+test "rack frames record the step 12 op sequences" {
+    const Code = patchwork.commands.Code;
+    const app = new_app();
+    app.layout(1280, 720);
+    setup_renderer();
+    var codes: [64]Code = undefined;
+    const setup_codes = patchwork.renderer.codes(&fixture_gpu.buffer, &codes);
+    var textures: u32 = 0;
+    var pipelines: u32 = 0;
+    for (setup_codes) |code| {
+        if (code == .texture_create) textures += 1;
+        if (code == .pipeline_create) pipelines += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), textures);
+    try std.testing.expectEqual(@as(u32, 5), pipelines);
+    var writes: [8]patchwork.commands.BufferWrite = undefined;
+
+    record(app, 1280);
+    const first = [_]Code{
+        .buffer_write,      .buffer_write,      .buffer_write,
+        .buffer_write,      .buffer_write,      .buffer_write,
+        .pass_begin,        .bind_group_set,    .vertex_buffer_set,
+        .pipeline_set,      .vertex_buffer_set, .draw,
+        .pipeline_set,      .vertex_buffer_set, .bind_group_set,
+        .draw,              .pipeline_set,      .vertex_buffer_set,
+        .bind_group_set,    .draw,              .pipeline_set,
+        .vertex_buffer_set, .draw,              .pipeline_set,
+        .vertex_buffer_set, .draw,              .pass_end_present,
+    };
+    const first_codes = patchwork.renderer.codes(&fixture_gpu.buffer, &codes);
+    try std.testing.expectEqualSlices(Code, &first, first_codes);
+    const batches = fixture.context.batch_list();
+    try std.testing.expectEqual(@as(usize, 5), batches.len);
+    try std.testing.expectEqual(@as(u8, 0), batches[0].type_id);
+    try std.testing.expectEqual(@as(u8, 2), batches[1].type_id);
+    try std.testing.expectEqual(@as(u8, 3), batches[2].type_id);
+    try std.testing.expectEqual(app.badge_texture, batches[2].texture);
+    try std.testing.expectEqual(@as(u8, 4), batches[3].type_id);
+    try std.testing.expectEqual(@as(u8, 1), batches[4].type_id);
+
+    record(app, 2560);
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(
+        &fixture_gpu.buffer,
+        &writes,
+    ).len);
+
+    try hover_knob(app, knob_at(app, 0, 0));
     try std.testing.expect(app.event(.{ .frame = 50 }));
-    record(&app, &renderer, &buffer, &list, &glyphs, 2560);
-    const hover = patchwork.renderer.writes(&buffer, &writes);
+    record(app, 2560);
+    const hover = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
     try std.testing.expectEqual(@as(usize, 1), hover.len);
-    try std.testing.expectEqual(renderer.resources.instance_buffer, hover[0].id);
-    try std.testing.expect(hover[0].data.len < list.count * quads.instance_stride);
+    const arc_buffer = fixture_gpu.renderer.resources.instance_buffers[1];
+    try std.testing.expectEqual(arc_buffer, hover[0].id);
+    const arcs = fixture.context.items(quads.Arc);
+    try std.testing.expect(hover[0].data.len < arcs.len * @sizeOf(quads.Arc));
+}
+
+// Locks the layer rule for the tooltip: it appears only after `tooltip_delay_ms` of hover,
+// its box overlaps the neighbouring knob's name glyphs, it sits on the overlay layer, and both
+// overlay batches (box, then text) are drawn after every base batch. A move to the neighbour
+// hides it.
+test "the tooltip box covers the neighbour's text on the overlay layer" {
+    const app = new_app();
+    app.layout(1280, 720);
+    try hover_knob(app, knob_at(app, 0, 0));
+    try std.testing.expect(app.live());
+    var waited: u32 = 0;
+    while (waited < 4) : (waited += 1) {
+        try std.testing.expect(!app.event(.{ .frame = 100 }) or waited == 0);
+    }
+    try std.testing.expect(!app.tooltip_visible());
+    try std.testing.expect(app.event(.{ .frame = 100 }));
+    try std.testing.expect(app.tooltip_visible());
+    try std.testing.expect(!app.live());
+    const cx = draw_frame(app);
+    const boxes = cx.items(quads.Box);
+    const last = boxes.len - 1;
+    try std.testing.expectEqual(quads.Layer.overlay, cx.layer_at(quads.Box, @intCast(last)));
+    const tip = rect_of(boxes[last].rect);
+    const neighbour = knob_at(app, 0, 1).rect;
+    var covered: u32 = 0;
+    for (cx.items(quads.Glyph), 0..) |glyph, index| {
+        if (cx.layer_at(quads.Glyph, @intCast(index)) != .base) continue;
+        if (glyph.rect[0] < neighbour.x) continue;
+        if (rects_overlap(tip, rect_of(glyph.rect))) covered += 1;
+    }
+    try std.testing.expect(covered >= 1);
+    const batches = cx.batch_list();
+    const overlay: u8 = @intFromEnum(quads.Layer.overlay);
+    try std.testing.expectEqual(overlay, batches[batches.len - 2].layer);
+    try std.testing.expectEqual(@as(u8, 0), batches[batches.len - 2].type_id);
+    try std.testing.expectEqual(overlay, batches[batches.len - 1].layer);
+    try std.testing.expectEqual(@as(u8, 2), batches[batches.len - 1].type_id);
+    for (batches[0 .. batches.len - 2]) |batch| {
+        try std.testing.expectEqual(@as(u8, 0), batch.layer);
+    }
+    try hover_knob(app, knob_at(app, 0, 1));
+    try std.testing.expect(!app.tooltip_visible());
+}
+
+// Locks the title band: each panel's badge samples the badge texture and clears the centered
+// title text, and each LED's brightness is its panel's meter level.
+test "badges clear the title and leds follow the meters" {
+    const app = new_app();
+    app.layout(1280, 720);
+    try std.testing.expect(app.timer(500));
+    const cx = draw_frame(app);
+    const images = cx.items(quads.Image);
+    try std.testing.expectEqual(@as(usize, panel_count), images.len);
+    for (images) |image| {
+        for (cx.items(quads.Glyph)) |glyph| {
+            try std.testing.expect(!rects_overlap(rect_of(image.rect), rect_of(glyph.rect)));
+        }
+    }
+    const lights = cx.items(led.Led);
+    try std.testing.expectEqual(@as(usize, panel_count), lights.len);
+    var index: u32 = 0;
+    while (index < panel_count) : (index += 1) {
+        try std.testing.expectEqual(meter_at(app, index).value, lights[index].brightness);
+    }
 }

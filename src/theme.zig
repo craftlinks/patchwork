@@ -3,10 +3,10 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Why the Theme Rides in the Frame Uniform
-//! Both pipelines (`quad.wgsl`, `glyph.wgsl`) bind one uniform at `@group(0) @binding(0)`
-//! whose WGSL type is `Frame { ortho: mat4x4<f32>, theme: Theme }`. Placing `Theme` directly
-//! after the projection matrix lets both pipelines share one bind group layout and one bind
-//! group, and keeps color and arc-angle literals out of WGSL: widgets read `chrome` on the CPU
+//! Every draw type's pipeline binds one uniform at `@group(0) @binding(0)` whose WGSL type is
+//! `Frame { ortho: mat4x4<f32>, theme: Theme }` (`draw/prelude.wgsl`). Placing `Theme`
+//! directly after the projection matrix lets all pipelines share one bind group layout and one
+//! bind group, and keeps color and arc-angle literals out of WGSL: widgets read `chrome` on the CPU
 //! to fill per-instance colors, while the fragment shader reads `lighten`, `darken`, and `arc`
 //! from the uniform.
 //!
@@ -18,14 +18,15 @@
 //! angles turn clockwise as seen on screen. The open ring starts at `arc_start`, sweeps
 //! clockwise by `arc_sweep`, and leaves a gap of `tau - arc_sweep` that closes back at
 //! `arc_start`. Test "open ring gap is a quarter turn that closes at the start angle" locks
-//! this, and test "sdf arc locks the open ring" in `draw.zig` locks the distance field.
+//! this, and test "sdf arc locks the open ring" in `draw/types.zig` locks the distance field.
 //!
 //! ## 3. Layout Contract
-//! `Theme` is an `extern struct` of `vec4<f32>` slots in the exact order of the `Theme` struct
-//! declared in both `.wgsl` files. WGSL packs each `vec4<f32>` at 16 bytes, so slot `i` lives
-//! at byte `16 * i` of the record. The `comptime` block below enforces the slot size, the
-//! per-field offsets, `bytes`, and `slot_count`; test "wgsl declarations match the Zig
-//! layouts" in `draw.zig` locks the shader side. The `pad*` slots stay zero so the record has
+//! `Theme` is an `extern struct` of `vec4<f32>` slots. `draw/registry.zig` generates the WGSL
+//! `Theme` struct from this record's fields, in order, so the shader side cannot drift. WGSL
+//! packs each `vec4<f32>` at 16 bytes, so slot `i` lives at byte `16 * i` of the record. The
+//! `comptime` block below enforces the slot size, the per-field offsets, `bytes`, and
+//! `slot_count`; test "source declares locations 1 to N and names every field" in
+//! `draw/registry.zig` checks the generated declaration. The `pad*` slots stay zero so the record has
 //! no uninitialized bytes when copied to the GPU.
 //!
 //! ## 4. Upload Flow
@@ -34,7 +35,7 @@
 //! changes it records one `buffer_write` of the whole record, which both hosts replay. `chrome`
 //! is a `comptime`-known constant, so the theme never changes at runtime and needs no
 //! allocation.
-//! Knob accents are per-instance fills in `draw.Instance`, not theme slots.
+//! Knob accents are per-instance colors in `draw.Arc`, not theme slots.
 
 const std = @import("std");
 const assert = std.debug.assert;

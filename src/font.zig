@@ -12,9 +12,9 @@
 //! coverage atlas (`font_atlas.bin`) and a pre-scaled metrics table (`font_metrics.bin`). Both
 //! are `@embedFile`d, so the frame path decodes nothing at runtime and allocates nothing.
 //!
-//! Glyph quads use their own pipeline (`glyph.wgsl`) and share the quad instance stride
-//! (`glyph_stride`). Text carries no `Animator`, so static labels never keep the frame loop
-//! alive.
+//! Glyph quads are the `draw.Glyph` draw type, which samples this atlas as texture 0
+//! (`draw.TextureId.atlas`). Text carries no `Animator`, so static labels never keep the frame
+//! loop alive.
 //!
 //! ## 2. Coordinate Spaces & Layout Algebra
 //! - **Bake pixel space:** the rasterizer grid, Y-down. Internal to the baker.
@@ -50,10 +50,8 @@
 //! on half-texel centers".
 //!
 //! ## 3. Layouts
-//! - **`Glyph`** is an `extern struct` of four consecutive `float32x4` vertex attributes in
-//!   this order: dest rect `(x, y, w, h)`, UV rect `(u0, v0, u1, v1)`, color `(r, g, b, a)`,
-//!   clip `(x0, y0, x1, y1)`. See the vertex input of `glyph.wgsl`. The comptime block below
-//!   asserts the size, stride, and the offset of each group.
+//! - **`draw.Glyph`** (`draw/types.zig`) follows the draw type convention: dest rect
+//!   `(x, y, w, h)`, clip `(x0, y0, x1, y1)`, UV rect `(u0, v0, u1, v1)`, color `(r, g, b, a)`.
 //! - **`font_metrics.bin`** is little-endian: a header of `header_bytes`, then
 //!   `codepoint_count` records of `record_bytes`. Every field is four bytes.
 //!   - Header: `atlas_width`, `atlas_height`, `glyph_count`, `codepoint_first` (all `u32`),
@@ -69,24 +67,23 @@
 //!   `gpu_wgpu.zig`); the comptime block asserts it.
 //!
 //! ## 4. Data Flow
-//! `widgets.place_label` computes the padded box, `place` appends one `Glyph` per ink glyph, and
-//! every `append` or `clear` bumps `GlyphList.revision`. When the revision moved,
-//! `draw.UploadCursor.glyph_range` compares the records with the last upload, and
-//! `draw/renderer.zig` records a write of only the glyphs that changed, then the glyph pass.
+//! `widgets.place_label` computes the padded box, and `place` appends one `draw.Glyph` per ink
+//! glyph to the draw context on its current layer. A full glyph pool drops the rest of the
+//! string; the context counts each drop in `overflow_count`.
 //!
 //! ## 5. Cross-Platform Seams
-//! `draw/renderer.zig` records `atlas_bytes` as the span of one `texture_write` in its setup
-//! stream, so both hosts upload it once at startup with no copy. The glyph pipeline, its
-//! layouts, and its sampler are recorded there too; the hosts only replay them.
+//! `draw.Context.init` creates the atlas as texture 0 and queues `atlas_bytes` as the span of
+//! one `texture_write`, which the renderer records into its setup stream, so both hosts upload
+//! it once at startup with no copy.
 //!
 //! ## 6. TigerStyle Invariants
-//! - Bounded by `glyph_cap`, `text_cap`, and the closed range of `codepoint_count` codepoints
-//!   starting at `codepoint_first`.
-//! - No heap: `GlyphList` is a fixed array and the metrics are decoded at compile time.
-//! - `append` rejects bad input with an error; `place` requires its capacity precondition.
+//! - Bounded by `text_cap` and the closed range of `codepoint_count` codepoints starting at
+//!   `codepoint_first`.
+//! - No heap: the metrics are decoded at compile time.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const types = @import("draw/types.zig");
 
 const metrics_file: []const u8 = @embedFile("font_metrics.bin");
 
@@ -94,22 +91,13 @@ const metrics_file: []const u8 = @embedFile("font_metrics.bin");
 /// row-major.
 pub const atlas_bytes: []const u8 = @embedFile("font_atlas.bin");
 
-/// Glyph shader. Separate from `quad.wgsl` while sharing the quad instance stride.
-pub const shader_file: []const u8 = @embedFile("glyph.wgsl");
-
 /// Atlas dimensions in texels. Must match the baker's constants and the metrics header; the
 /// comptime block below checks the header.
 pub const atlas_width: u32 = 512;
 pub const atlas_height: u32 = 256;
 
-/// Hard cap on glyph quads queued for one frame.
-pub const glyph_cap: u32 = 256;
-
 /// Hard cap on a label string, in bytes.
 pub const text_cap: u32 = 64;
-
-/// Byte size of one `Glyph` instance. Enforced equal to `@sizeOf(Glyph)` below.
-pub const glyph_stride: u32 = 64;
 
 /// Count of printable ASCII codepoints covered, `codepoint_first` through its last.
 const codepoint_count: u32 = 95;
@@ -122,34 +110,6 @@ const header_bytes: u32 = 32;
 
 /// Byte size of one `font_metrics.bin` record: ten four-byte fields.
 const record_bytes: u32 = 40;
-
-/// One instanced glyph quad in the glyph vertex buffer.
-///
-/// `extern struct` so the field order is the GPU attribute order with no compiler padding.
-/// Fields group into four `float32x4` attributes, each asserted by `@offsetOf` in the comptime
-/// block: the destination rect `x, y, width, height` in UI logical pixels; the UV rect
-/// `u0, v0, u1, v1` (half-texel inset, within `[0, 1]`); the straight (non-premultiplied)
-/// color `r, g, b, a` that the fragment shader scales by atlas coverage; and the exclusive-max
-/// clip `clip_x0, clip_y0, clip_x1, clip_y1`. The fragment applies a hard inside mask, and
-/// there is no "unclipped" sentinel.
-pub const Glyph = extern struct {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    u0: f32,
-    v0: f32,
-    u1: f32,
-    v1: f32,
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
-    clip_x0: f32,
-    clip_y0: f32,
-    clip_x1: f32,
-    clip_y1: f32,
-};
 
 /// Exclusive-max clip in logical pixels. `x1 > x0` and `y1 > y0`, all finite.
 pub const Clip = struct {
@@ -199,98 +159,10 @@ const Baked = struct {
     glyphs: [codepoint_count]Metric,
 };
 
-/// Fixed-capacity list of glyph instances for the glyph draw pass, bounded by `glyph_cap`.
-///
-/// `revision` bumps on every append and clear so `draw.UploadCursor` can skip comparing an
-/// unchanged list.
-pub const GlyphList = struct {
-    items: [glyph_cap]Glyph,
-    count: u32,
-    revision: u32,
-
-    /// Empty list with zeroed storage, so no stale bytes reach the GPU buffer.
-    pub fn init() GlyphList {
-        const list: GlyphList = .{
-            .items = std.mem.zeroes([glyph_cap]Glyph),
-            .count = 0,
-            .revision = 0,
-        };
-        assert(list.count == 0);
-        assert(list.revision == 0);
-        return list;
-    }
-
-    pub const AppendError = error{
-        EdgeNotPositive,
-        UvOutOfRange,
-        ListFull,
-        ClipUnordered,
-    };
-
-    /// Appends one ink quad. The list is unchanged on error.
-    ///
-    /// - `error.EdgeNotPositive`: `width <= 0` or `height <= 0`.
-    /// - `error.UvOutOfRange`: not `0 <= u0 < u1 <= 1` and `0 <= v0 < v1 <= 1`.
-    /// - `error.ClipUnordered`: a clip edge is non-finite, or `clip_x1 <= clip_x0`, or
-    ///   `clip_y1 <= clip_y0`.
-    /// - `error.ListFull`: `count == glyph_cap`.
-    ///
-    /// Success increments both `count` and `revision`.
-    pub fn append(self: *GlyphList, glyph: Glyph) AppendError!void {
-        assert(self.count <= glyph_cap);
-        if (glyph.width <= 0) {
-            return error.EdgeNotPositive;
-        }
-        if (glyph.height <= 0) {
-            return error.EdgeNotPositive;
-        }
-        if (!uv_ok(glyph.u0, glyph.u1)) {
-            return error.UvOutOfRange;
-        }
-        if (!uv_ok(glyph.v0, glyph.v1)) {
-            return error.UvOutOfRange;
-        }
-        if (!clip_ordered(glyph)) {
-            return error.ClipUnordered;
-        }
-        if (self.count == glyph_cap) {
-            return error.ListFull;
-        }
-        assert(glyph.width > 0);
-        assert(glyph.u0 < glyph.u1);
-        self.items[self.count] = glyph;
-        self.count += 1;
-        self.revision += 1;
-        assert(self.items[self.count - 1].width > 0);
-        assert(self.items[self.count - 1].clip_x1 > self.items[self.count - 1].clip_x0);
-        assert(self.count <= glyph_cap);
-    }
-
-    /// Resets `count` to zero and bumps `revision`, even when already empty, so the upload
-    /// cursor always observes a frame that rebuilt the list.
-    pub fn clear(self: *GlyphList) void {
-        assert(self.count <= glyph_cap);
-        self.count = 0;
-        self.revision += 1;
-        assert(self.count == 0);
-        assert(self.revision >= 1);
-    }
-};
-
-// The vertex layout in `glyph.wgsl` and the embedded binaries are produced outside this file, so
-// every fact they must agree on is asserted here rather than trusted.
+// The embedded binaries are produced outside this file, so every fact they must agree on is
+// asserted here rather than trusted.
 comptime {
-    // Glyph instance layout: four consecutive float32x4 attributes.
-    assert(@sizeOf(Glyph) == 64);
-    assert(@alignOf(Glyph) >= 4);
-    assert(glyph_stride == @sizeOf(Glyph));
-    assert(@offsetOf(Glyph, "x") == 0);
-    assert(@offsetOf(Glyph, "u0") == 16);
-    assert(@offsetOf(Glyph, "r") == 32);
-    assert(@offsetOf(Glyph, "clip_x0") == 48);
-    assert(glyph_cap == 256);
     assert(text_cap == 64);
-    assert(shader_file.len >= 1);
 
     // Atlas: one byte per texel. The row length must be a multiple of the WebGPU
     // buffer-to-texture `bytesPerRow` alignment of 256 so the upload needs no row padding.
@@ -343,17 +215,18 @@ pub fn measure(text: []const u8) f32 {
     return sum;
 }
 
-/// Centers `text` in `rect` (UI logical pixels) and appends one quad per glyph with positive
-/// width, using the algebra in the module guide. Every quad copies `color` and `clip`.
+/// Centers `text` in `rect` (UI logical pixels) and appends one `draw.Glyph` per glyph with
+/// positive width to `cx` (a `*draw.Context`), using the algebra in the module guide. Every
+/// quad copies `color` and `clip` and samples the atlas.
 ///
-/// Preconditions: every byte satisfies `codepoint_ok`, at least `text.len` slots are free, and
-/// `clip` is finite and ordered. Under them `append` cannot fail, so its error is `unreachable`.
-pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color, clip: Clip) void {
+/// Preconditions: every byte satisfies `codepoint_ok`, and `clip` is finite and ordered, so
+/// only a full pool or batch list can refuse a glyph; the context counts those and the glyph
+/// is skipped.
+pub fn place(cx: anytype, text: []const u8, rect: Rect, color: Color, clip: Clip) void {
     assert(text.len <= text_cap);
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
     const count: u32 = @intCast(text.len);
-    assert(glyph_cap - list.count >= count);
     const text_width = measure(text);
     var pen_x = rect.x + (rect.width - text_width) * 0.5;
     const line_height = baked.line_height;
@@ -363,82 +236,23 @@ pub fn place(list: *GlyphList, text: []const u8, rect: Rect, color: Color, clip:
         const metric = metric_at(text[index]);
         if (metric.width > 0) {
             assert(metric.height > 0);
-            list.append(.{
-                .x = pen_x + metric.left,
-                .y = baseline_y + metric.top,
-                .width = metric.width,
-                .height = metric.height,
-                .u0 = metric.u0,
-                .v0 = metric.v0,
-                .u1 = metric.u1,
-                .v1 = metric.v1,
-                .r = color.r,
-                .g = color.g,
-                .b = color.b,
-                .a = color.a,
-                .clip_x0 = clip.x0,
-                .clip_y0 = clip.y0,
-                .clip_x1 = clip.x1,
-                .clip_y1 = clip.y1,
-            }) catch unreachable;
+            const x = pen_x + metric.left;
+            const y = baseline_y + metric.top;
+            const glyph: types.Glyph = .{
+                .rect = .{ x, y, metric.width, metric.height },
+                .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+                .uv = .{ metric.u0, metric.v0, metric.u1, metric.v1 },
+                .color = .{ color.r, color.g, color.b, color.a },
+            };
+            cx.append(types.Glyph, .atlas, glyph) catch |err| switch (err) {
+                // Counted in the context's `overflow_count`; the glyph is skipped.
+                error.PoolFull, error.BatchFull => {},
+                error.EdgeNotPositive, error.ClipUnordered => unreachable,
+            };
         }
         pen_x += metric.advance;
     }
     assert(index == count);
-    assert(list.count <= glyph_cap);
-}
-
-/// False for NaN and infinities.
-fn finite_f32(value: f32) bool {
-    if (value != value) {
-        return false;
-    }
-    if (std.math.isInf(value)) {
-        return false;
-    }
-    assert(value == value);
-    return true;
-}
-
-/// True when all four clip edges are finite and ordered `x0 < x1`, `y0 < y1`.
-fn clip_ordered(glyph: Glyph) bool {
-    if (!finite_f32(glyph.clip_x0)) {
-        return false;
-    }
-    if (!finite_f32(glyph.clip_y0)) {
-        return false;
-    }
-    if (!finite_f32(glyph.clip_x1)) {
-        return false;
-    }
-    if (!finite_f32(glyph.clip_y1)) {
-        return false;
-    }
-    if (!(glyph.clip_x1 > glyph.clip_x0)) {
-        return false;
-    }
-    if (!(glyph.clip_y1 > glyph.clip_y0)) {
-        return false;
-    }
-    assert(glyph.clip_x1 > glyph.clip_x0);
-    assert(glyph.clip_y1 > glyph.clip_y0);
-    return true;
-}
-
-/// True if and only if `0 <= min_c < max_c <= 1`.
-fn uv_ok(min_c: f32, max_c: f32) bool {
-    if (min_c < 0) {
-        return false;
-    }
-    if (min_c >= max_c) {
-        return false;
-    }
-    if (max_c > 1) {
-        return false;
-    }
-    assert(min_c >= 0);
-    assert(min_c < max_c);
-    return true;
 }
 
 /// Pen advance for `byte` in UI logical pixels. Precondition: `codepoint_ok(byte)`.
@@ -517,30 +331,28 @@ const sample_rect: Rect = .{ .x = 10, .y = 20, .width = 400, .height = 64 };
 
 const sample_clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
 
-/// A glyph that passes every `append` check, for capacity and rejection tests.
-fn unit_glyph() Glyph {
-    const glyph: Glyph = .{
-        .x = 0,
-        .y = 0,
-        .width = 1,
-        .height = 1,
-        .u0 = 0,
-        .v0 = 0,
-        .u1 = 1,
-        .v1 = 1,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-        .clip_x0 = 0,
-        .clip_y0 = 0,
-        .clip_x1 = 1,
-        .clip_y1 = 1,
-    };
-    assert(glyph.width > 0);
-    assert(glyph.u0 < glyph.u1);
-    return glyph;
-}
+/// Collects glyphs like `draw.Context.append`, so placement tests need no context.
+const Collector = struct {
+    glyphs: [16]types.Glyph,
+    count: u32,
+
+    fn init() Collector {
+        return .{ .glyphs = undefined, .count = 0 };
+    }
+
+    fn append(
+        self: *Collector,
+        comptime T: type,
+        texture: ?@import("draw/textures.zig").TextureId,
+        glyph: T,
+    ) types.AppendError!void {
+        comptime assert(T == types.Glyph);
+        assert(texture.? == .atlas);
+        if (self.count == self.glyphs.len) return error.PoolFull;
+        self.glyphs[self.count] = glyph;
+        self.count += 1;
+    }
+};
 
 // Locks the printable range: space is accepted; the bytes just outside it are rejected.
 test "codepoint_ok accepts space and rejects the neighbors" {
@@ -565,16 +377,16 @@ test "measure of Cycle is the five advances" {
 // widens the text by one space advance, which moves the pen start left by half of it; the
 // space then advances the full amount, so 'A' lands half a space advance to the right.
 test "space places no quad and a positive pen delta" {
-    var blank = GlyphList.init();
+    var blank = Collector.init();
     place(&blank, " ", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 0), blank.count);
-    var alone = GlyphList.init();
+    var alone = Collector.init();
     place(&alone, "A", sample_rect, white, sample_clip);
-    var spaced = GlyphList.init();
+    var spaced = Collector.init();
     place(&spaced, " A", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 1), alone.count);
     try std.testing.expectEqual(@as(u32, 1), spaced.count);
-    const delta = spaced.items[0].x - alone.items[0].x;
+    const delta = spaced.glyphs[0].rect[0] - alone.glyphs[0].rect[0];
     try std.testing.expect(delta > 0);
     try std.testing.expectApproxEqAbs(advance_at(' ') * 0.5, delta, 0.0001);
 }
@@ -582,42 +394,17 @@ test "space places no quad and a positive pen delta" {
 // Locks one quad per ink glyph, and UVs strictly inside the unit square (the half-texel inset
 // keeps them off the atlas border).
 test "Patchwork places nine quads inside the unit square" {
-    var list = GlyphList.init();
+    var list = Collector.init();
     place(&list, "Patchwork", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 9), list.count);
-    var index: u32 = 0;
-    while (index < list.count) : (index += 1) {
-        const glyph = list.items[index];
-        try std.testing.expect(glyph.u0 > 0);
-        try std.testing.expect(glyph.u1 < 1);
-        try std.testing.expect(glyph.u0 < glyph.u1);
-        try std.testing.expect(glyph.v0 > 0);
-        try std.testing.expect(glyph.v1 < 1);
-        try std.testing.expect(glyph.v0 < glyph.v1);
+    for (list.glyphs[0..list.count]) |glyph| {
+        try std.testing.expect(glyph.uv[0] > 0);
+        try std.testing.expect(glyph.uv[2] < 1);
+        try std.testing.expect(glyph.uv[0] < glyph.uv[2]);
+        try std.testing.expect(glyph.uv[1] > 0);
+        try std.testing.expect(glyph.uv[3] < 1);
+        try std.testing.expect(glyph.uv[1] < glyph.uv[3]);
     }
-}
-
-// Locks that the append after `glyph_cap` quads fails with `error.ListFull`.
-test "a full glyph list returns ListFull" {
-    var list = GlyphList.init();
-    var index: u32 = 0;
-    while (index < glyph_cap) : (index += 1) {
-        try list.append(unit_glyph());
-    }
-    try std.testing.expectError(error.ListFull, list.append(unit_glyph()));
-    try std.testing.expectEqual(glyph_cap, list.count);
-}
-
-// Locks that a non-positive width or height is rejected and leaves the list unchanged.
-test "a non-positive edge returns EdgeNotPositive" {
-    var list = GlyphList.init();
-    var glyph = unit_glyph();
-    glyph.width = 0;
-    try std.testing.expectError(error.EdgeNotPositive, list.append(glyph));
-    glyph = unit_glyph();
-    glyph.height = -1;
-    try std.testing.expectError(error.EdgeNotPositive, list.append(glyph));
-    try std.testing.expectEqual(@as(u32, 0), list.count);
 }
 
 // Locks the centering algebra from the module guide for a single glyph: horizontal centering
@@ -625,20 +412,20 @@ test "a non-positive edge returns EdgeNotPositive" {
 // `top` offset the quad from the pen and baseline. Also locks that `color` and `clip` are
 // copied into the instance.
 test "place centers a glyph on the line box" {
-    var list = GlyphList.init();
+    var list = Collector.init();
     place(&list, "A", sample_rect, white, sample_clip);
     try std.testing.expectEqual(@as(u32, 1), list.count);
     const metric = metric_at('A');
     const pen_x = sample_rect.x + (sample_rect.width - metric.advance) * 0.5;
     const line_top = sample_rect.y + (sample_rect.height - baked.line_height) * 0.5;
     const baseline_y = line_top + baked.ascent;
-    const glyph = list.items[0];
-    try std.testing.expectApproxEqAbs(pen_x + metric.left, glyph.x, 0.0001);
-    try std.testing.expectApproxEqAbs(baseline_y + metric.top, glyph.y, 0.0001);
-    try std.testing.expectEqual(metric.width, glyph.width);
-    try std.testing.expectEqual(metric.height, glyph.height);
-    try std.testing.expectEqual(white.a, glyph.a);
-    try std.testing.expectEqual(sample_clip.x1, glyph.clip_x1);
+    const glyph = list.glyphs[0];
+    try std.testing.expectApproxEqAbs(pen_x + metric.left, glyph.rect[0], 0.0001);
+    try std.testing.expectApproxEqAbs(baseline_y + metric.top, glyph.rect[1], 0.0001);
+    try std.testing.expectEqual(metric.width, glyph.rect[2]);
+    try std.testing.expectEqual(metric.height, glyph.rect[3]);
+    try std.testing.expectEqual(white.a, glyph.color[3]);
+    try std.testing.expectEqual(sample_clip.x1, glyph.clip[2]);
 }
 
 // Locks the half-texel UV inset from the module guide: every ink glyph's `u0, v0` is a texel

@@ -88,7 +88,8 @@
 //!   `setInterval` instead of a `timerfd`, arming nothing when the period is zero.
 //!
 //! ## 6. TigerStyle Invariants
-//! - `State` lives on the stack of `run`; the loop allocates nothing.
+//! - `State` lives on the stack of `run`; the draw context and renderer are static in
+//!   `Host(App)`, because their size follows `App.config.draw`. The loop allocates nothing.
 //! - Every loop is bounded: input drain by `input.queue_cap`, `EINTR` retry by a fixed guard.
 //! - Wayland callbacks are leaf writers; all app and GPU work happens in the loop body.
 
@@ -97,8 +98,6 @@ const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
 const commands = @import("../gpu/commands.zig");
-const draw = @import("../draw.zig");
-const font = @import("../font.zig");
 const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
@@ -152,11 +151,7 @@ pub const State = struct {
     xdg_surface: ?*xdg.XdgSurface,
     toplevel: ?*xdg.XdgToplevel,
     gpu: gpu.Gpu,
-    list: draw.DrawList,
-    glyphs: font.GlyphList,
-    /// Records setup and frames; owns the upload cursor and the uniform record.
-    renderer: renderer.Renderer,
-    /// The stream `renderer` records into and `gpu.submit` replays, reused every frame.
+    /// The stream the renderer records into and `gpu.submit` replays, reused every frame.
     commands: commands.CommandBuffer,
     /// Host timestamps from `wl_callback.done`. Reset when no animator is live.
     clock: animator.Clock,
@@ -392,14 +387,17 @@ comptime {
 /// 3. Creates the surface and desktop window (`xdg_surface`, `xdg_toplevel`), titled with
 ///    `App.config.title`.
 /// 4. Initializes the native WebGPU rendering context (`gpu.Gpu`).
-/// 5. Confirms initial state: draw list is empty (`state.list.count == 0`) and
-///    `state.frame.relayout` is true.
+/// 5. Records and submits the renderer's setup stream, and confirms the initial state: no
+///    batches and `state.frame.relayout` true.
 /// 6. Arms the host timer only when `App.config.timer_period_ms` is not zero.
 /// 7. Enters the blocking event loop (`Host(App).loop`).
 ///
-/// All storage, the window state and the app, lives on this stack frame.
+/// The window state and the app live on this stack frame. The draw context and the renderer,
+/// whose pools and shadows are sized by `App.config.draw`, are static (`Host(App)`), so a
+/// large configuration never grows the stack.
 pub fn run(comptime App: type) !void {
     comptime app_contract.check(App);
+    const AppHost = Host(App);
     var state: State = .{
         .frame = .init(),
         .display = undefined,
@@ -409,9 +407,6 @@ pub fn run(comptime App: type) !void {
         .xdg_surface = null,
         .toplevel = null,
         .gpu = undefined,
-        .list = .init(),
-        .glyphs = font.GlyphList.init(),
-        .renderer = .init(),
         .commands = .init(),
         .clock = animator.Clock.init(),
         .queue = input.EventQueue.init(),
@@ -436,15 +431,18 @@ pub fn run(comptime App: type) !void {
         .pending_height = 0,
         .global_count = 0,
     };
+    AppHost.context.init();
+    AppHost.render.init();
     var app: App = undefined;
-    App.init(&app);
+    App.init(&app, &AppHost.context.textures);
     try connect(&state);
     try bind_globals(&state);
     try create_toplevel(&state, App.config.title);
     try create_device(&state);
-    assert(state.list.count == 0);
+    var host: AppHost = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
+    try host.setup();
+    assert(AppHost.context.batch_count == 0);
     assert(state.frame.relayout);
-    var host: Host(App) = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
     if (App.config.timer_period_ms != 0) {
         host.timer_fd = try arm_timer(App.config.timer_period_ms);
     }
@@ -466,10 +464,46 @@ const no_timer_fd: i32 = -1;
 fn Host(comptime App: type) type {
     return struct {
         const Self = @This();
+        const Context = app_contract.Context(App);
+        const Renderer = renderer.Renderer(Context);
 
         state: *State,
         app: *App,
         timer_fd: i32,
+
+        /// The app's draw context and renderer. Static so pools and shadows sized by
+        /// `App.config.draw` stay off the stack; `run` initializes both in place.
+        var context: Context = undefined;
+        var render: Renderer = undefined;
+
+        /// Records the renderer's setup stream (every long-lived resource and the textures
+        /// queued so far) and submits it.
+        fn setup(self: *Self) !void {
+            const state = self.state;
+            state.commands.reset();
+            render.setup(&state.commands, &context);
+            try gpu.submit(&state.gpu, &state.commands);
+            assert(render.ready);
+            assert(context.textures.created == context.textures.count);
+        }
+
+        /// Records one frame of the draw context and submits it to the GPU, then marks the
+        /// frame presented. The renderer updates its shadows while recording.
+        fn submit_frame(self: *Self) !void {
+            const state = self.state;
+            assert(state.frame.redraw);
+            assert(state.frame.width_px != 0);
+            state.commands.reset();
+            render.frame(&state.commands, &context, .{
+                .width_logical = state.frame.width_logical,
+                .height_logical = state.frame.height_logical,
+                .width_px = state.frame.width_px,
+                .height_px = state.frame.height_px,
+            });
+            try gpu.submit(&state.gpu, &state.commands);
+            state.frame.mark_presented();
+            assert(!state.frame.redraw);
+        }
 
         /// Blocking loop. Callbacks only write the queue and the frame-done flag.
         /// Order is ack, drain input, step the clock, present if due, then sleep in poll.
@@ -568,12 +602,12 @@ fn Host(comptime App: type) type {
             // Both requests attach to the next commit, and `gpu.submit` is that commit.
             arm_frame(state);
             arm_feedback(state);
-            try submit_frame(state);
+            try self.submit_frame();
             assert(!self.app.dirty());
         }
 
-        /// Prepares app layout and draw lists before presentation.
-        /// Runs layout if `relayout` is set, and repopulates `DrawList` and `GlyphList` if
+        /// Prepares app layout and draw pools before presentation.
+        /// Runs layout if `relayout` is set, and resets and repopulates the draw context if
         /// the app reports `dirty`. `draw` must leave the app clean.
         fn prepare_app(self: *Self) void {
             const state = self.state;
@@ -583,7 +617,8 @@ fn Host(comptime App: type) type {
             }
             assert(!state.frame.relayout);
             if (self.app.dirty()) {
-                self.app.draw(&state.list, &state.glyphs);
+                context.reset();
+                self.app.draw(&context);
             }
             assert(!self.app.dirty());
         }
@@ -734,7 +769,7 @@ fn create_toplevel(state: *State, title: [:0]const u8) !void {
     assert(state.toplevel != null);
 }
 
-/// Initializes the hardware WebGPU device, then records and submits the renderer's setup
+/// Initializes the hardware WebGPU device. `Host.setup` then records the renderer's setup
 /// stream, which creates every long-lived GPU resource.
 fn create_device(state: *State) !void {
     const display = state.display;
@@ -742,10 +777,6 @@ fn create_device(state: *State) !void {
     state.gpu = try gpu.create(@ptrCast(display), @ptrCast(surface));
     assert(state.gpu.configured_width == 0);
     assert(state.gpu.configured_height == 0);
-    state.commands.reset();
-    state.renderer.setup(&state.commands);
-    try gpu.submit(&state.gpu, &state.commands);
-    assert(state.renderer.ready);
 }
 
 /// Acknowledges pending configure serials sent by the compositor.
@@ -759,23 +790,6 @@ fn ack_if_needed(state: *State) void {
     state.frame.apply_configure(state.pending_width, state.pending_height);
     state.ack_pending = false;
     assert(!state.ack_pending);
-}
-
-/// Records one frame of the quad and glyph lists and submits it to the GPU, then marks the
-/// frame presented. The renderer marks its upload cursor while recording.
-fn submit_frame(state: *State) !void {
-    assert(state.frame.redraw);
-    assert(state.frame.width_px != 0);
-    state.commands.reset();
-    state.renderer.frame(&state.commands, &state.list, &state.glyphs, .{
-        .width_logical = state.frame.width_logical,
-        .height_logical = state.frame.height_logical,
-        .width_px = state.frame.width_px,
-        .height_px = state.frame.height_px,
-    });
-    try gpu.submit(&state.gpu, &state.commands);
-    state.frame.mark_presented();
-    assert(!state.frame.redraw);
 }
 
 /// Requests one frame callback before the commit. `wl_surface.frame` takes effect

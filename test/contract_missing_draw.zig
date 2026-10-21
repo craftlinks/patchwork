@@ -10,10 +10,15 @@ const patchwork = @import("patchwork");
 
 /// Satisfies every declaration of the contract except `draw`.
 const MissingDraw = struct {
-    pub const config: patchwork.app.Config = .{ .title = "missing draw", .timer_period_ms = 0 };
+    pub const config: patchwork.app.Config = .{
+        .title = "missing draw",
+        .timer_period_ms = 0,
+        .draw = &.{.{ .type = patchwork.draw.Box, .cap = 4 }},
+    };
 
-    pub fn init(app: *MissingDraw) void {
+    pub fn init(app: *MissingDraw, textures: *patchwork.draw.Textures) void {
         _ = app;
+        _ = textures;
     }
 
     pub fn layout(app: *MissingDraw, width_logical: u32, height_logical: u32) void {

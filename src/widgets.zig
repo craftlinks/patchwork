@@ -2,12 +2,15 @@
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
-//! ## 1. Why Retained Widgets Over Ephemeral Draw Lists
-//! The draw list and glyph list are wiped and rebuilt on every dirty frame, so no interaction
+//! ## 1. Why Retained Widgets Over Ephemeral Draw Pools
+//! The draw context's pools are wiped and rebuilt on every dirty frame, so no interaction
 //! state can live in them. Everything that must survive a frame (border-box `Rect`, layout
 //! `Walk`, `Animator`s, the normalized `value` in `[0, 1]`, the scroll offset) lives in the
-//! widget structs. `draw` only projects that state into fresh `quads.Instance` and `font.Glyph`
-//! records, so the shaders never learn about widget kinds.
+//! widget structs. `draw(cx, ...)` only projects that state into fresh `draw.Box`,
+//! `draw.Arc`, and `draw.Glyph` records, so the shaders never learn about widget kinds. `cx`
+//! is the app's `*draw.Context`; it is `anytype` because the context type depends on the
+//! app's registered draw types, and a widget fails to compile against an app that did not
+//! register a type it draws.
 //!
 //! Widgets used directly as `ui.Scene` payloads implement the member set documented in the
 //! `ui.zig` guide. `Toggle` has no `contains` because it is only ever hit through `Scroll`.
@@ -38,10 +41,9 @@
 //!   wheel are relative: `value' = clamp(value - delta / drag_span_px, 0, 1)` with
 //!   `delta = point.y - drag_y` for drags and `delta = wheel.dy` for the wheel, so upward
 //!   motion increases the value. Test "knob drag is relative and clamped" locks this.
-//! - **Arc instances:** the ring is a `quads.kind_arc` face with `radius = ring_thickness`.
-//!   Its `hover` field is the lighten weight and its `down` field carries the sweep fraction
-//!   in `[0, 1]`. The track arc sweeps fully; the value arc sweeps `value` and is omitted
-//!   when `value == 0`.
+//! - **Arc instances:** the ring is a `draw.Arc` with `thickness = ring_thickness`, `hover`
+//!   the lighten weight, and `sweep` the sweep fraction in `[0, 1]`. The track arc sweeps
+//!   fully; the value arc sweeps `value` and is omitted when `value == 0`.
 //! - **Value text:** hundredths are formatted as `d.dd` into the fixed `[8]u8` `value_text`,
 //!   with the unused tail zeroed so no stale bytes survive a shorter string.
 //! - **Meter:** the track is `meter_track_w` by `meter_track_h`, centered over the ring column
@@ -68,16 +70,19 @@
 //!   Test "scroll thumb follows the offset and the pointer" locks these formulas.
 //!
 //! ## 3. Layout and Capacity Contracts
-//! Widgets write complete `quads.Instance` records through `append_weighted` and `append_arc`;
-//! the record layout and its size are owned and asserted by `draw.zig`, not restated here.
+//! Widgets write complete `draw.Box` and `draw.Arc` records through `append_weighted` and
+//! `append_arc`, and glyphs through `font.place`; the record layouts are owned and asserted by
+//! `draw/types.zig`, not restated here. Every append goes through `push`, which skips an
+//! instance whose pool or batch list is full; the context counts the drop in
+//! `overflow_count`, and app tests assert it stays zero for their worst case.
 //!
 //! Every `Scroll` child draws with `clip = clip_of(viewport)`, so a partially visible row is
 //! masked by the fragment shader instead of a GPU scissor. A child whose row does not overlap
 //! the viewport emits no faces or glyphs and cannot be hit.
 //!
 //! A scroll emits at most one panel face, one thumb face, and two faces per child (arc pair,
-//! meter track and fill, or pill and thumb). The comptime block asserts that
-//! `scroll_child_cap` children fit `quads.instance_cap` and `font.glyph_cap`.
+//! meter track and fill, or pill and thumb), plus up to 12 glyphs per child. Apps size their
+//! `draw.Box`, `draw.Arc`, and `draw.Glyph` capacities from these counts.
 //!
 //! ## 4. Scroll Event Delegation
 //! - `hover_out` clears the hot child; `move` retargets the hot child, sending it `hover_out`
@@ -91,8 +96,8 @@
 //! - Children are scanned last to first, so a later child wins an overlap.
 //!
 //! ## 5. TigerStyle Invariants
-//! - No allocation: children, text, and draw output live in fixed arrays bounded by
-//!   `scroll_child_cap`, `quads.instance_cap`, and `font.glyph_cap`.
+//! - No allocation: children and text live in fixed arrays bounded by `scroll_child_cap`
+//!   and `font.text_cap`, and draw output lives in the app's fixed draw pools.
 //! - Geometry helpers are pure; the `handle` dispatchers are the only mutators.
 //! - Hosts normalize pointer coordinates and wheel deltas to logical pixels before they
 //!   reach any widget.
@@ -175,11 +180,11 @@ pub const Label = struct {
     a: f32,
 
     /// Places one coverage quad per ink glyph inside `rect`. Every quad copies `clip`.
-    pub fn draw(self: Label, glyphs: *font.GlyphList, clip: font.Clip) void {
+    pub fn draw(self: Label, cx: anytype, clip: font.Clip) void {
         assert(self.text.len <= font.text_cap);
         assert(self.a >= 0);
         assert(clip.x1 > clip.x0);
-        font.place(glyphs, self.text, .{
+        font.place(cx, self.text, .{
             .x = self.rect.x,
             .y = self.rect.y,
             .width = self.rect.width,
@@ -254,11 +259,11 @@ pub const Panel = struct {
         return face_contains(self.rect, self.paint.radius, x, y);
     }
 
-    pub fn draw(self: Panel, list: *quads.DrawList, glyphs: *font.GlyphList, clip: font.Clip) void {
+    pub fn draw(self: Panel, cx: anytype, clip: font.Clip) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
-        append_weighted(list, self.rect, self.paint, self.hover, self.down, clip);
-        self.label.draw(glyphs, clip);
+        append_weighted(cx, self.rect, self.paint, self.hover, self.down, clip);
+        self.label.draw(cx, clip);
     }
 };
 
@@ -317,14 +322,13 @@ pub const Button = struct {
 
     pub fn draw(
         self: Button,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         clip: font.Clip,
     ) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
-        append_weighted(list, self.rect, self.paint, self.hover, self.down, clip);
-        self.label.draw(glyphs, clip);
+        append_weighted(cx, self.rect, self.paint, self.hover, self.down, clip);
+        self.label.draw(cx, clip);
     }
 };
 
@@ -381,15 +385,13 @@ pub const Slider = struct {
         return face_contains(self.rect, knob_radius, x, y);
     }
 
-    /// Track, then fill (omitted at value 0), then the knob on top. A slider has no
-    /// text, so `glyphs` is only checked; it keeps the signature uniform across widgets.
+    /// Track, then fill (omitted at value 0), then the knob on top: three boxes in one
+    /// batch, drawn in append order.
     pub fn draw(
         self: Slider,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         clip: font.Clip,
     ) void {
-        assert(glyphs.count <= font.glyph_cap);
         assert(self.value >= 0);
         assert(self.value <= 1);
         if (self.rect.width <= 0) {
@@ -406,15 +408,14 @@ pub const Slider = struct {
         const rest = animator.Animator.init(down_rate_per_ms);
         assert(rest.value == 0);
         assert(rest.target == 0);
-        append_weighted(list, track, self.track, self.hover, rest, clip);
+        append_weighted(cx, track, self.track, self.hover, rest, clip);
         if (self.value > 0) {
             var fill_rect = track;
             fill_rect.width = self.value * track.width;
-            append_weighted(list, fill_rect, self.fill, self.hover, rest, clip);
+            append_weighted(cx, fill_rect, self.fill, self.hover, rest, clip);
         }
         const knob = knob_rect(self.rect, self.value);
-        append_weighted(list, knob, self.knob, self.hover, rest, clip);
-        assert(list.count <= quads.instance_cap);
+        append_weighted(cx, knob, self.knob, self.hover, rest, clip);
     }
 
     fn set_value_at(self: *Slider, x: f32) bool {
@@ -527,8 +528,21 @@ fn face_contains(rect: turtle.Rect, radius: f32, x: f32, y: f32) bool {
     return quads.contains_box(rect.x, rect.y, rect.width, rect.height, radius, x, y);
 }
 
+/// Appends `instance` to `cx`, skipping it when its pool or the batch list is full; the
+/// context counts every such drop in `overflow_count`. Widgets append only positive,
+/// finite, ordered geometry, so the geometry errors cannot occur.
+fn push(cx: anytype, comptime T: type, instance: T) void {
+    comptime assert(T.texture == null);
+    assert(instance.rect[2] > 0);
+    assert(instance.clip[2] > instance.clip[0]);
+    cx.append(T, null, instance) catch |err| switch (err) {
+        error.PoolFull, error.BatchFull => {},
+        error.EdgeNotPositive, error.ClipUnordered => unreachable,
+    };
+}
+
 fn append_weighted(
-    list: *quads.DrawList,
+    cx: anytype,
     rect: turtle.Rect,
     paint: Paint,
     hover: animator.Animator,
@@ -536,7 +550,6 @@ fn append_weighted(
     clip: font.Clip,
 ) void {
     assert(paint.radius >= 0);
-    assert(list.count <= quads.instance_cap);
     if (rect.width <= 0) {
         assert(rect.width <= 0);
         return;
@@ -547,26 +560,16 @@ fn append_weighted(
     }
     const hover_weight = mix_weight(hover.value, hover_lighten);
     const down_weight = mix_weight(down.value, down_darken);
-    list.append(.{
-        .x = rect.x,
-        .y = rect.y,
-        .width = rect.width,
-        .height = rect.height,
-        .r = paint.r,
-        .g = paint.g,
-        .b = paint.b,
-        .a = paint.a,
+    push(cx, quads.Box, .{
+        .rect = .{ rect.x, rect.y, rect.width, rect.height },
+        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+        .fill = .{ paint.r, paint.g, paint.b, paint.a },
+        .border_color = .{ 0, 0, 0, 0 },
         .radius = paint.radius,
+        .border_width = 0,
         .hover = hover_weight,
         .down = down_weight,
-        .kind = quads.kind_box,
-        .clip_x0 = clip.x0,
-        .clip_y0 = clip.y0,
-        .clip_x1 = clip.x1,
-        .clip_y1 = clip.y1,
-    }) catch unreachable;
-    assert(list.count >= 1);
-    assert(list.count <= quads.instance_cap);
+    });
 }
 
 fn mix_weight(amount: f32, scale: f32) f32 {
@@ -707,19 +710,17 @@ pub const Knob = struct {
     /// Draws the knob in its own `rect`.
     pub fn draw(
         self: Knob,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         clip: font.Clip,
     ) void {
-        self.draw_row(list, glyphs, self.rect, clip);
+        self.draw_row(cx, self.rect, clip);
     }
 
     /// Draws the knob into `row`, a rect other than `self.rect`. `Scroll` uses this for
     /// children whose visual row is offset by the scroll position.
     pub fn draw_row(
         self: Knob,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         row: turtle.Rect,
         clip: font.Clip,
     ) void {
@@ -735,14 +736,13 @@ pub const Knob = struct {
         }
         const ring = ring_of(row);
         const track = paint_of(theme.chrome.track, ring_thickness);
-        append_arc(list, ring, track, 0, 1, clip);
+        append_arc(cx, ring, track, 0, 1, clip);
         if (self.value > 0) {
             const weight = mix_weight(self.hover.value, hover_lighten);
-            append_arc(list, ring, self.accent, weight, self.value, clip);
+            append_arc(cx, ring, self.accent, weight, self.value, clip);
         }
-        place_text(glyphs, self.name, name_box(row), clip);
-        place_text(glyphs, self.value_text[0..4], value_box(row), clip);
-        assert(list.count <= quads.instance_cap);
+        place_text(cx, self.name, name_box(row), clip);
+        place_text(cx, self.value_text[0..4], value_box(row), clip);
     }
 
     pub fn set_value(self: *Knob, value: f32) void {
@@ -838,18 +838,16 @@ pub const Meter = struct {
     /// Draws the meter in its own `rect`.
     pub fn draw(
         self: Meter,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         clip: font.Clip,
     ) void {
-        self.draw_row(list, glyphs, self.rect, clip);
+        self.draw_row(cx, self.rect, clip);
     }
 
     /// Draws the meter into `row`, a rect other than `self.rect`. See `Knob.draw_row`.
     pub fn draw_row(
         self: Meter,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         row: turtle.Rect,
         clip: font.Clip,
     ) void {
@@ -865,13 +863,13 @@ pub const Meter = struct {
         }
         const track = meter_track(row);
         const rest = animator.Animator.init(down_rate_per_ms);
-        append_weighted(list, track, paint_of(theme.chrome.track, meter_radius), rest, rest, clip);
+        append_weighted(cx, track, paint_of(theme.chrome.track, meter_radius), rest, rest, clip);
         if (self.value > 0) {
             var fill = track;
             fill.height = self.value * track.height;
             fill.y = track.y + track.height - fill.height;
             append_weighted(
-                list,
+                cx,
                 fill,
                 paint_of(theme.chrome.meter, meter_radius),
                 rest,
@@ -879,8 +877,7 @@ pub const Meter = struct {
                 clip,
             );
         }
-        place_text(glyphs, self.name, side_box(row), clip);
-        assert(list.count >= 1);
+        place_text(cx, self.name, side_box(row), clip);
     }
 };
 
@@ -928,8 +925,7 @@ pub const Toggle = struct {
 
     pub fn draw(
         self: Toggle,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         row: turtle.Rect,
         clip: font.Clip,
     ) void {
@@ -937,12 +933,11 @@ pub const Toggle = struct {
         assert(self.thumb.value <= 1);
         const pill = pill_of(row);
         const rest = animator.Animator.init(down_rate_per_ms);
-        append_weighted(list, pill, paint_of(theme.chrome.track, pill_radius), rest, rest, clip);
+        append_weighted(cx, pill, paint_of(theme.chrome.track, pill_radius), rest, rest, clip);
         const thumb = toggle_thumb(pill, self.thumb.value);
         const disc = paint_of(theme.chrome.control, thumb_side * 0.5);
-        append_weighted(list, thumb, disc, self.hover, rest, clip);
-        place_text(glyphs, self.name, side_box(row), clip);
-        assert(list.count >= 1);
+        append_weighted(cx, thumb, disc, self.hover, rest, clip);
+        place_text(cx, self.name, side_box(row), clip);
     }
 
     fn flip(self: *Toggle) bool {
@@ -1019,25 +1014,22 @@ pub const Scroll = struct {
 
     pub fn draw(
         self: Scroll,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         window: font.Clip,
     ) void {
         assert(self.id != 0);
         assert(window.x1 > window.x0);
         const rest = animator.Animator.init(down_rate_per_ms);
-        append_weighted(list, self.rect, paint_of(theme.chrome.panel, 0), rest, rest, window);
+        append_weighted(cx, self.rect, paint_of(theme.chrome.panel, 0), rest, rest, window);
         const view = self.viewport();
         const clip = clip_of(view);
-        self.draw_children(list, glyphs, view, clip);
+        self.draw_children(cx, view, clip);
         if (self.max_scroll() > 0) {
             if (view.height > 0) {
                 const thumb = paint_of(theme.chrome.control, 4);
-                append_weighted(list, self.thumb_rect(), thumb, rest, rest, window);
+                append_weighted(cx, self.thumb_rect(), thumb, rest, rest, window);
             }
         }
-        assert(list.count <= quads.instance_cap);
-        assert(glyphs.count <= font.glyph_cap);
     }
 
     /// Places children in the content column, then clamps `scroll_y`.
@@ -1104,8 +1096,7 @@ pub const Scroll = struct {
 
     fn draw_children(
         self: Scroll,
-        list: *quads.DrawList,
-        glyphs: *font.GlyphList,
+        cx: anytype,
         view: turtle.Rect,
         clip: font.Clip,
     ) void {
@@ -1117,7 +1108,7 @@ pub const Scroll = struct {
             if (!overlaps(row, view)) {
                 continue;
             }
-            control_draw(&self.children[index], list, glyphs, row, clip);
+            control_draw(&self.children[index], cx, row, clip);
         }
         assert(index == self.child_count);
     }
@@ -1623,11 +1614,11 @@ fn same_optional(hot: ?u32, next: ?u32) bool {
     return false;
 }
 
-fn place_text(glyphs: *font.GlyphList, text: []const u8, rect: turtle.Rect, clip: font.Clip) void {
+fn place_text(cx: anytype, text: []const u8, rect: turtle.Rect, clip: font.Clip) void {
     assert(text.len <= 8);
     assert(clip.x1 > clip.x0);
     const color = theme.chrome.text;
-    font.place(glyphs, text, .{
+    font.place(cx, text, .{
         .x = rect.x,
         .y = rect.y,
         .width = rect.width,
@@ -1638,11 +1629,10 @@ fn place_text(glyphs: *font.GlyphList, text: []const u8, rect: turtle.Rect, clip
         .b = color[2],
         .a = color[3],
     }, clip);
-    assert(glyphs.count <= font.glyph_cap);
 }
 
 fn append_arc(
-    list: *quads.DrawList,
+    cx: anytype,
     rect: turtle.Rect,
     paint: Paint,
     hover: f32,
@@ -1653,27 +1643,16 @@ fn append_arc(
     assert(hover <= 1);
     assert(sweep >= 0);
     assert(sweep <= 1);
-    assert(list.count < quads.instance_cap);
-    list.append(.{
-        .x = rect.x,
-        .y = rect.y,
-        .width = rect.width,
-        .height = rect.height,
-        .r = paint.r,
-        .g = paint.g,
-        .b = paint.b,
-        .a = paint.a,
-        .radius = ring_thickness,
+    assert(rect.width == ring_size);
+    push(cx, quads.Arc, .{
+        .rect = .{ rect.x, rect.y, rect.width, rect.height },
+        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+        .color = .{ paint.r, paint.g, paint.b, paint.a },
+        .thickness = ring_thickness,
+        .sweep = sweep,
         .hover = hover,
-        .down = sweep,
-        .kind = quads.kind_arc,
-        .clip_x0 = clip.x0,
-        .clip_y0 = clip.y0,
-        .clip_x1 = clip.x1,
-        .clip_y1 = clip.y1,
-    }) catch unreachable;
-    assert(list.items[list.count - 1].kind == quads.kind_arc);
-    assert(list.count <= quads.instance_cap);
+        .pad = 0,
+    });
 }
 
 fn control_handle(control: *Control, hit: Hit) bool {
@@ -1708,17 +1687,15 @@ fn control_live(control: *const Control) bool {
 
 fn control_draw(
     control: *const Control,
-    list: *quads.DrawList,
-    glyphs: *font.GlyphList,
+    cx: anytype,
     row: turtle.Rect,
     clip: font.Clip,
 ) void {
     assert(clip.y1 > clip.y0);
-    assert(list.count <= quads.instance_cap);
     switch (control.*) {
-        .knob => |*knob| knob.draw_row(list, glyphs, row, clip),
-        .meter => |*meter| meter.draw_row(list, glyphs, row, clip),
-        .toggle => |*toggle| toggle.draw(list, glyphs, row, clip),
+        .knob => |*knob| knob.draw_row(cx, row, clip),
+        .meter => |*meter| meter.draw_row(cx, row, clip),
+        .toggle => |*toggle| toggle.draw(cx, row, clip),
     }
 }
 
@@ -1826,7 +1803,6 @@ comptime {
     assert(hover_rate_per_ms > 0);
     assert(down_rate_per_ms > hover_rate_per_ms);
     assert(scroll_child_cap == 16);
-    assert(scroll_child_cap * 12 <= font.glyph_cap);
     assert(gutter_px == 16);
     assert(drag_span_px == 120);
     assert(ring_size == 56);
@@ -1843,8 +1819,6 @@ comptime {
     assert(track_radius * 2 == track_height);
     assert(pill_radius * 2 == pill_h);
     assert(meter_radius * 2 == meter_track_w);
-    // Panel, thumb, and two faces per child must fit one draw list.
-    assert(1 + 1 + scroll_child_cap * 2 <= quads.instance_cap);
 }
 
 // Locks the slider's pointer-to-value map, its clamping, and the track and knob placement.
@@ -1920,6 +1894,23 @@ fn sample_slider() Slider {
 
 const sample_clip: font.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
 
+const test_draw = [_]quads.DrawType{
+    .{ .type = quads.Box, .cap = 16 },
+    .{ .type = quads.Arc, .cap = 16 },
+    .{ .type = quads.Glyph, .cap = 64 },
+};
+
+const TestContext = quads.Context(&test_draw, 16);
+
+/// A freshly initialized static context, so tests keep pools off the stack.
+fn test_context() *TestContext {
+    const static = struct {
+        var context: TestContext = undefined;
+    };
+    static.context.init();
+    return &static.context;
+}
+
 test "button up inside counts one click" {
     var button = sample_button();
     try std.testing.expect(button.handle(.hover_in));
@@ -1948,20 +1939,19 @@ test "slider drag sets an absolute value" {
     try std.testing.expectEqual(@as(f32, 1), slider.hover.target);
     try std.testing.expect(slider.animate(hover_duration_ms));
     try std.testing.expectEqual(@as(f32, 1), slider.hover.value);
-    var held = quads.DrawList.init();
-    var held_glyphs = font.GlyphList.init();
-    slider.draw(&held, &held_glyphs, sample_clip);
-    try std.testing.expectEqual(@as(u32, 3), held.count);
-    var face: u32 = 0;
-    while (face < 3) : (face += 1) {
-        try std.testing.expectEqual(hover_lighten, held.items[face].hover);
-        try std.testing.expectEqual(@as(f32, 0), held.items[face].down);
+    const cx = test_context();
+    slider.draw(cx, sample_clip);
+    const held = cx.items(quads.Box);
+    try std.testing.expectEqual(@as(usize, 3), held.len);
+    for (held) |face| {
+        try std.testing.expectEqual(hover_lighten, face.hover);
+        try std.testing.expectEqual(@as(f32, 0), face.down);
     }
     try std.testing.expect(slider.handle(.{ .drag = .{ .x = 28, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 0), slider.value);
-    var list = quads.DrawList.init();
-    slider.draw(&list, &held_glyphs, sample_clip);
-    try std.testing.expectEqual(@as(u32, 2), list.count);
+    cx.reset();
+    slider.draw(cx, sample_clip);
+    try std.testing.expectEqual(@as(usize, 2), cx.items(quads.Box).len);
     try std.testing.expect(slider.handle(.{ .drag = .{ .x = 2000, .y = 628 } }));
     try std.testing.expectEqual(@as(f32, 1), slider.value);
 }
@@ -2050,19 +2040,19 @@ test "meter fill grows upward from the track bottom" {
     };
     const row: turtle.Rect = .{ .x = 0, .y = 0, .width = 100, .height = meter_height };
     const track = meter_track(row);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    meter.draw_row(&list, &glyphs, row, sample_clip);
-    try std.testing.expectEqual(@as(u32, 2), list.count);
+    const cx = test_context();
+    meter.draw_row(cx, row, sample_clip);
+    try std.testing.expectEqual(@as(usize, 2), cx.items(quads.Box).len);
     // Quarter value: fill height = 0.25 * meter_track_h (exact in binary floating point).
-    const fill = list.items[1];
-    try std.testing.expectEqual(@as(f32, 0.25) * meter_track_h, fill.height);
-    try std.testing.expectEqual(track.y + track.height, fill.y + fill.height);
-    try std.testing.expectEqual(track.x, fill.x);
-    var empty = quads.DrawList.init();
+    const fill = cx.items(quads.Box)[1];
+    try std.testing.expectEqual(@as(f32, 0.25) * meter_track_h, fill.rect[3]);
+    try std.testing.expectEqual(track.y + track.height, fill.rect[1] + fill.rect[3]);
+    try std.testing.expectEqual(track.x, fill.rect[0]);
+    cx.reset();
     meter.value = 0;
-    meter.draw_row(&empty, &glyphs, row, sample_clip);
-    try std.testing.expectEqual(@as(u32, 1), empty.count);
+    meter.draw_row(cx, row, sample_clip);
+    try std.testing.expectEqual(@as(usize, 1), cx.items(quads.Box).len);
+    try std.testing.expectEqual(@as(u32, 0), cx.overflow_count);
 }
 
 // Locks the scrollbar formulas: thumb height, thumb position from the offset, the inverse

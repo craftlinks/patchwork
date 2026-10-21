@@ -1,47 +1,67 @@
-//! Records the quad and glyph passes as a GPU command stream.
+//! Records the draw context's pools and batches as a GPU command stream.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Role
-//! `Renderer` is the only code that knows what the GPU is asked to do. `setup` records every
-//! long-lived resource once, right after the host creates its device: two shader modules, two
-//! bind group layouts, four buffers, the atlas texture and sampler, two bind groups, two
-//! pipelines, and the uploads of the unit quad and the atlas. `frame` records one frame:
-//! the buffer writes `draw.UploadCursor` asks for, then one pass that draws faces and glyphs
-//! back to front and presents. The hosts only replay the stream (`gpu/commands.zig`), so
-//! this file is pure and every recording is unit tested without a GPU.
+//! `Renderer(Context)` is the only code that knows what the GPU is asked to do, and it is
+//! generic over the app's draw context, so its tables are sized by `App.config.draw`. `setup`
+//! records every long-lived resource once, right after the host creates its device: one
+//! shader module (labelled with the type name), pipeline, and instance buffer per draw type,
+//! the frame and texture bind group layouts, the unit quad and uniform buffers, the sampler,
+//! the frame bind group, the unit quad upload, and the textures queued so far (the atlas
+//! first). `frame` records one frame: queued textures, the uploads the shadows ask for, then
+//! one pass with one draw per batch, then present. The hosts only replay the stream
+//! (`gpu/commands.zig`), so this file is pure and every recording is unit tested without a GPU.
 //!
-//! ## 2. Descriptors From Zig Layouts
-//! Vertex layouts are built from `@offsetOf` on `draw.Instance` and `font.Glyph`, so the
-//! attribute offsets cannot drift from the records. Buffer 0 is the unit quad stepped per
-//! vertex (location 0, `float32x2`); buffer 1 is the record list stepped per instance
-//! (locations 1 to 4, one `float32x4` each). Group 0 is the frame uniform, shared by both
-//! pipelines; group 1 is the atlas texture and its linear sampler, glyph pipeline only.
+//! ## 2. Descriptors
+//! Buffer 0 is the unit quad stepped per vertex (location 0, `float32x2`); buffer 1 is the
+//! type's pool stepped per instance (`registry.instance_layout`). Group 0 is the frame
+//! uniform, shared by every pipeline; group 1 is a texture and the shared clamping linear
+//! sampler, for textured types only, with one bind group per texture.
 //!
 //! ## 3. Frame Shape
 //! ```text
-//! buffer_write uniform           only when the logical size changed (or first frame)
-//! buffer_write instances [range] only the records that changed (draw.dirty_range)
-//! buffer_write glyphs    [range] same
+//! buffer_write uniform            only when the logical size changed (or first frame)
+//! texture_create, bind_group_create, texture_write   whatever `Textures` queued
+//! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed
 //! pass_begin
-//!   pipeline_set quad  bind_group_set 0  vertex_buffer_set 0, 1  draw    when faces exist
-//!   pipeline_set glyph bind_group_set 0, 1  vertex_buffer_set 0, 1  draw when glyphs exist
+//!   bind_group_set 0, vertex_buffer_set 0                   once, when any batch exists
+//!   per batch, in order:
+//!     pipeline_set, vertex_buffer_set 1    only when the type differs from the last batch
+//!     bind_group_set 1                     only when a textured batch changes texture
+//!     draw (6 vertices, count instances, first_instance = batch.first)
 //! pass_end_present
 //! ```
-//! That is at most `frame_op_cap` ops. The cursor is marked as the writes are recorded,
-//! because hosts execute ops in order and every write precedes the pass that could fail.
+//! `frame_op_cap` and `frame_bytes_max` bound this at compile time from the type count and
+//! `batch_cap`; `app.check` rejects a configuration whose worst frame would not fit one
+//! `commands.CommandBuffer`.
 //!
-//! ## 4. Lifetime
-//! Spans point into the caller's lists, into `Renderer.uniform`, and into static data, so the
-//! renderer and both lists must stay put until the host's submit returns. Both hosts submit
-//! synchronously from the same call that recorded the stream.
+//! ## 4. Uploads (Dirty Ranges per Pool)
+//! Each pool has a shadow of what the GPU last received and the revision it was taken at.
+//! - Revision equal to the shadow's: nothing, without looking at the records. This is the
+//!   idle path, and a scale-only present takes it for every pool.
+//! - Revision moved: the finalized (sorted) records are compared with the shadow, and
+//!   `draw.dirty_range` returns the smallest record range covering every change plus every
+//!   record past the shadow's count. An identical rebuild writes nothing, and a hover that
+//!   changes one arc writes one record of the arc pool only.
+//! Only the written range is copied into the shadow, because records outside it are equal by
+//! construction. The counting sort is stable by key and overlays sort last, so content that
+//! appears on a higher layer lands at the tail of its pool and keeps ranges small.
+//!
+//! ## 5. Lifetime
+//! Spans point into the context's pools, `Textures`' queued writes, `Renderer.uniform`, and
+//! static data, so all of them must stay put until the host's submit returns. Both hosts
+//! submit synchronously from the call that recorded the stream.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const commands = @import("../gpu/commands.zig");
 const draw = @import("../draw.zig");
-const font = @import("../font.zig");
+const pools = @import("pools.zig");
+const registry = @import("registry.zig");
+const textures = @import("textures.zig");
 const theme = @import("../theme.zig");
+const types = @import("types.zig");
 
 /// Straight (non-premultiplied) RGBA color with components in `[0, 1]`.
 pub const Color = struct {
@@ -53,16 +73,13 @@ pub const Color = struct {
 
 /// Framebuffer clear color. Deliberately neither black nor white, so a skipped clear, a failed
 /// pass, or a swapchain glitch is unmistakable in review. It also shows through wherever a
-/// quad fragment has zero coverage, such as outside a rounded corner.
+/// fragment has zero coverage, such as outside a rounded corner.
 pub const clear_color: Color = .{
     .r = 0.11,
     .g = 0.12,
     .b = 0.16,
     .a = 1.0,
 };
-
-/// Upper bound on the ops `frame` records; see the module guide's frame shape.
-pub const frame_op_cap: u32 = 16;
 
 /// The frame uniform: projection followed by the theme, `draw.uniform_bytes` in all.
 pub const Uniform = extern struct {
@@ -78,273 +95,375 @@ pub const Size = struct {
     height_px: u32,
 };
 
-/// The ids `setup` allocated, one per resource.
-pub const Resources = struct {
-    quad_shader: u16,
-    glyph_shader: u16,
-    frame_layout: u16,
-    atlas_layout: u16,
-    unit_buffer: u16,
-    instance_buffer: u16,
-    glyph_buffer: u16,
-    uniform_buffer: u16,
-    atlas: u16,
-    atlas_sampler: u16,
-    frame_group: u16,
-    atlas_group: u16,
-    quad_pipeline: u16,
-    glyph_pipeline: u16,
-};
+const BindGroupEntries = [commands.bind_group_entry_cap]commands.BindGroupEntry;
+const LayoutEntries = [commands.layout_entry_cap]commands.LayoutEntry;
 
-pub const Renderer = struct {
-    ids: commands.Ids,
-    resources: Resources,
-    cursor: draw.UploadCursor,
-    uniform: Uniform,
-    ready: bool,
+/// Ops a frame records at most per batch: pipeline, instance buffer, texture group, draw.
+const batch_op_cap: u32 = 4;
 
-    pub fn init() Renderer {
-        const renderer: Renderer = .{
-            .ids = .init(),
-            .resources = undefined,
-            .cursor = .init(),
-            .uniform = .{ .ortho = undefined, .theme = theme.chrome },
-            .ready = false,
-        };
-        assert(!renderer.ready);
-        return renderer;
-    }
-
-    /// Records every long-lived resource and its static upload. Called once, on an empty
-    /// buffer, before the first `frame`.
-    pub fn setup(self: *Renderer, buffer: *commands.CommandBuffer) void {
-        assert(!self.ready);
-        assert(buffer.len == 0);
-        const r = &self.resources;
-        r.quad_shader = self.ids.take(.shader);
-        r.glyph_shader = self.ids.take(.shader);
-        buffer.push(.{ .shader_create = .{
-            .id = r.quad_shader,
-            .source = .of(draw.shader_file),
-        } });
-        buffer.push(.{ .shader_create = .{
-            .id = r.glyph_shader,
-            .source = .of(font.shader_file),
-        } });
-
-        r.frame_layout = self.ids.take(.layout);
-        r.atlas_layout = self.ids.take(.layout);
-        var frame_entries = std.mem.zeroes([commands.layout_entry_cap]commands.LayoutEntry);
-        frame_entries[0] = .{
-            .binding = 0,
-            .visibility = commands.stage_vertex | commands.stage_fragment,
-            .kind = .uniform,
-        };
-        buffer.push(.{ .layout_create = .{
-            .id = r.frame_layout,
-            .entry_count = 1,
-            .entries = frame_entries,
-        } });
-        var atlas_entries = std.mem.zeroes([commands.layout_entry_cap]commands.LayoutEntry);
-        const fragment = commands.stage_fragment;
-        atlas_entries[0] = .{ .binding = 0, .visibility = fragment, .kind = .texture };
-        atlas_entries[1] = .{ .binding = 1, .visibility = fragment, .kind = .sampler };
-        buffer.push(.{ .layout_create = .{
-            .id = r.atlas_layout,
-            .entry_count = 2,
-            .entries = atlas_entries,
-        } });
-
-        const vertex_usage = commands.usage_vertex | commands.usage_copy_dst;
-        r.unit_buffer = self.create_buffer(buffer, vertex_usage, draw.quad_bytes);
-        r.instance_buffer = self.create_buffer(
-            buffer,
-            vertex_usage,
-            draw.instance_cap * draw.instance_stride,
-        );
-        r.glyph_buffer = self.create_buffer(
-            buffer,
-            vertex_usage,
-            font.glyph_cap * font.glyph_stride,
-        );
-        r.uniform_buffer = self.create_buffer(
-            buffer,
-            commands.usage_uniform | commands.usage_copy_dst,
-            draw.uniform_bytes,
-        );
-
-        r.atlas = self.ids.take(.texture);
-        buffer.push(.{ .texture_create = .{
-            .id = r.atlas,
-            .format = .r8unorm,
-            .width = font.atlas_width,
-            .height = font.atlas_height,
-        } });
-        r.atlas_sampler = self.ids.take(.sampler);
-        buffer.push(.{ .sampler_create = .{ .id = r.atlas_sampler, .filter = .linear } });
-
-        r.frame_group = self.ids.take(.bind_group);
-        r.atlas_group = self.ids.take(.bind_group);
-        var frame_bindings = std.mem.zeroes([commands.bind_group_entry_cap]commands.BindGroupEntry);
-        frame_bindings[0] = .{ .binding = 0, .resource = r.uniform_buffer };
-        buffer.push(.{ .bind_group_create = .{
-            .id = r.frame_group,
-            .layout = r.frame_layout,
-            .entry_count = 1,
-            .entries = frame_bindings,
-        } });
-        var atlas_bindings = std.mem.zeroes([commands.bind_group_entry_cap]commands.BindGroupEntry);
-        atlas_bindings[0] = .{ .binding = 0, .resource = r.atlas };
-        atlas_bindings[1] = .{ .binding = 1, .resource = r.atlas_sampler };
-        buffer.push(.{ .bind_group_create = .{
-            .id = r.atlas_group,
-            .layout = r.atlas_layout,
-            .entry_count = 2,
-            .entries = atlas_bindings,
-        } });
-
-        r.quad_pipeline = self.ids.take(.pipeline);
-        r.glyph_pipeline = self.ids.take(.pipeline);
-        buffer.push(.{ .pipeline_create = .{
-            .id = r.quad_pipeline,
-            .shader = r.quad_shader,
-            .layout_count = 1,
-            .buffer_count = 2,
-            .blend = .alpha,
-            .layouts = .{ r.frame_layout, 0, 0, 0 },
-            .vertex = .{ unit_layout(), records_layout(draw.Instance, quad_fields) },
-        } });
-        buffer.push(.{ .pipeline_create = .{
-            .id = r.glyph_pipeline,
-            .shader = r.glyph_shader,
-            .layout_count = 2,
-            .buffer_count = 2,
-            .blend = .alpha,
-            .layouts = .{ r.frame_layout, r.atlas_layout, 0, 0 },
-            .vertex = .{ unit_layout(), records_layout(font.Glyph, glyph_fields) },
-        } });
-
-        buffer.push(.{ .buffer_write = .{
-            .id = r.unit_buffer,
-            .offset = 0,
-            .data = .of(std.mem.asBytes(&draw.unit_quad)),
-        } });
-        // Rows are tightly packed; `font.atlas_width` is also a multiple of 256, so a
-        // staging-buffer copy would need no repacking (`comptime` block below).
-        buffer.push(.{ .texture_write = .{
-            .id = r.atlas,
-            .x = 0,
-            .y = 0,
-            .width = font.atlas_width,
-            .height = font.atlas_height,
-            .bytes_per_row = font.atlas_width,
-            .data = .of(font.atlas_bytes),
-        } });
-        self.ready = true;
-        assert(self.ready);
-    }
-
-    fn create_buffer(self: *Renderer, buffer: *commands.CommandBuffer, usage: u32, size: u32) u16 {
-        assert(usage != 0);
-        assert(size != 0);
-        const id = self.ids.take(.buffer);
-        buffer.push(.{ .buffer_create = .{ .id = id, .usage = usage, .size = size } });
-        return id;
-    }
-
-    /// Records one frame of `list` and `glyphs` into an empty `buffer`, then marks the
-    /// cursor. The module guide lists the ops.
-    pub fn frame(
-        self: *Renderer,
-        buffer: *commands.CommandBuffer,
-        list: *const draw.DrawList,
-        glyphs: *const font.GlyphList,
-        size: Size,
-    ) void {
-        assert(self.ready);
-        assert(buffer.len == 0);
-        assert(size.width_px != 0);
-        assert(size.height_px != 0);
-        const r = &self.resources;
-        if (self.cursor.uniform_dirty(size.width_logical, size.height_logical)) {
-            draw.ortho_y_down(&self.uniform.ortho, size.width_logical, size.height_logical);
-            buffer.push(.{ .buffer_write = .{
-                .id = r.uniform_buffer,
-                .offset = 0,
-                .data = .of(std.mem.asBytes(&self.uniform)),
-            } });
-        }
-        if (self.cursor.instance_range(list)) |range| {
-            const records = list.items[0..list.count];
-            write_records(buffer, r.instance_buffer, draw.Instance, records, range);
-        }
-        if (self.cursor.glyph_range(glyphs)) |range| {
-            const records = glyphs.items[0..glyphs.count];
-            write_records(buffer, r.glyph_buffer, font.Glyph, records, range);
-        }
-        self.cursor.mark(list, glyphs, size.width_logical, size.height_logical);
-
-        buffer.push(.{ .pass_begin = .{
-            .width_px = size.width_px,
-            .height_px = size.height_px,
-            .clear = .{ clear_color.r, clear_color.g, clear_color.b, clear_color.a },
-        } });
-        if (list.count != 0) {
-            buffer.push(.{ .pipeline_set = .{ .id = r.quad_pipeline } });
-            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = r.frame_group } });
-            self.draw_records(buffer, r.instance_buffer, list.count);
-        }
-        if (glyphs.count != 0) {
-            buffer.push(.{ .pipeline_set = .{ .id = r.glyph_pipeline } });
-            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = r.frame_group } });
-            buffer.push(.{ .bind_group_set = .{ .slot = 1, .id = r.atlas_group } });
-            self.draw_records(buffer, r.glyph_buffer, glyphs.count);
-        }
-        buffer.push(.{ .pass_end_present = .{} });
-        assert(buffer.count <= frame_op_cap);
-    }
-
-    fn draw_records(
-        self: *Renderer,
-        buffer: *commands.CommandBuffer,
-        records: u16,
-        count: u32,
-    ) void {
-        assert(count != 0);
-        buffer.push(.{ .vertex_buffer_set = .{
-            .slot = 0,
-            .buffer = self.resources.unit_buffer,
-            .offset = 0,
-        } });
-        buffer.push(.{ .vertex_buffer_set = .{ .slot = 1, .buffer = records, .offset = 0 } });
-        buffer.push(.{ .draw = .{
-            .vertex_count = draw.vertex_count,
-            .instance_count = count,
-            .first_vertex = 0,
-            .first_instance = 0,
-        } });
-    }
-};
-
-fn write_records(
-    buffer: *commands.CommandBuffer,
-    id: u16,
-    comptime T: type,
-    records: []const T,
-    range: draw.Range,
-) void {
-    assert(range.first < range.end);
-    assert(range.end <= records.len);
-    buffer.push(.{ .buffer_write = .{
-        .id = id,
-        .offset = range.first * @sizeOf(T),
-        .data = .of(std.mem.sliceAsBytes(records[range.first..range.end])),
-    } });
+/// Upper bound on the ops `frame` records; see the module guide's frame shape.
+pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
+    const texture_ops = 2 * textures.texture_cap + textures.write_cap;
+    return 1 + texture_ops + type_count + 3 + batch_cap * batch_op_cap + 1;
 }
 
-/// The four vec4 groups of each record type, in shader location order 1 to 4.
-const quad_fields = [4][]const u8{ "x", "r", "radius", "clip_x0" };
-const glyph_fields = [4][]const u8{ "x", "u0", "r", "clip_x0" };
+/// Upper bound on the bytes `frame` records, for the same shape as `frame_op_cap`.
+pub fn frame_bytes_max(type_count: u32, batch_cap: u32) u32 {
+    const texture_bytes = textures.texture_cap *
+        (op_bytes(commands.TextureCreate) + op_bytes(commands.BindGroupCreate)) +
+        textures.write_cap * op_bytes(commands.TextureWrite);
+    const pass_bytes = op_bytes(commands.PassBegin) + op_bytes(commands.BindGroupSet) +
+        op_bytes(commands.VertexBufferSet) + op_bytes(commands.PassEndPresent);
+    const per_batch = op_bytes(commands.PipelineSet) + op_bytes(commands.VertexBufferSet) +
+        op_bytes(commands.BindGroupSet) + op_bytes(commands.Draw);
+    return (1 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
+        batch_cap * per_batch;
+}
+
+fn op_bytes(comptime Payload: type) u32 {
+    const size: u32 = @sizeOf(Payload);
+    return commands.header_bytes + (size + commands.op_align - 1) / commands.op_align *
+        commands.op_align;
+}
+
+/// The renderer for one draw context type (`draw.Context(...)`). See the module guide.
+pub fn Renderer(comptime Cx: type) type {
+    const R = Cx.Registry;
+    const shadow_types: [R.count]type = blk: {
+        var out: [R.count]type = undefined;
+        for (0..R.count) |index| out[index] = Shadow(R.Type(index), R.caps[index]);
+        break :blk out;
+    };
+    comptime {
+        assert(frame_bytes_max(R.count, Cx.batch_capacity) <= commands.capacity);
+    }
+    return struct {
+        const Self = @This();
+
+        ids: commands.Ids,
+        resources: Resources,
+        shadows: @Tuple(&shadow_types),
+        uniform: Uniform,
+        /// Logical size the uploaded uniform was built for; 0 before the first frame.
+        width_logical: u32,
+        height_logical: u32,
+        ready: bool,
+
+        /// Most ops one `frame` records.
+        pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity);
+
+        /// The ids `setup` allocated.
+        pub const Resources = struct {
+            shaders: [R.count]u16,
+            pipelines: [R.count]u16,
+            instance_buffers: [R.count]u16,
+            frame_layout: u16,
+            texture_layout: u16,
+            unit_buffer: u16,
+            uniform_buffer: u16,
+            sampler: u16,
+            frame_group: u16,
+            textures: [textures.texture_cap]u16,
+            texture_groups: [textures.texture_cap]u16,
+        };
+
+        /// Out-pointer init so a static renderer needs no stack copy.
+        pub fn init(self: *Self) void {
+            self.ids = .init();
+            self.uniform = .{ .ortho = undefined, .theme = theme.chrome };
+            self.width_logical = 0;
+            self.height_logical = 0;
+            self.ready = false;
+            inline for (0..R.count) |index| {
+                self.shadows[index].count = 0;
+                self.shadows[index].revision = 0;
+            }
+            assert(!self.ready);
+            assert(self.width_logical == 0);
+        }
+
+        /// Records every long-lived resource, the unit quad upload, and the textures queued
+        /// so far. Called once, on an empty buffer, before the first `frame`.
+        pub fn setup(self: *Self, buffer: *commands.CommandBuffer, cx: *Cx) void {
+            assert(!self.ready);
+            assert(buffer.len == 0);
+            self.setup_layouts(buffer);
+            const r = &self.resources;
+            const vertex_usage = commands.usage_vertex | commands.usage_copy_dst;
+            r.unit_buffer = self.create_buffer(buffer, vertex_usage, draw.quad_bytes);
+            r.uniform_buffer = self.create_buffer(
+                buffer,
+                commands.usage_uniform | commands.usage_copy_dst,
+                draw.uniform_bytes,
+            );
+            r.sampler = self.ids.take(.sampler);
+            buffer.push(.{ .sampler_create = .{ .id = r.sampler, .filter = .linear } });
+            r.frame_group = self.ids.take(.bind_group);
+            var frame_bindings = std.mem.zeroes(BindGroupEntries);
+            frame_bindings[0] = .{ .binding = 0, .resource = r.uniform_buffer };
+            buffer.push(.{ .bind_group_create = .{
+                .id = r.frame_group,
+                .layout = r.frame_layout,
+                .entry_count = 1,
+                .entries = frame_bindings,
+            } });
+            inline for (0..R.count) |index| {
+                self.setup_type(buffer, index);
+            }
+            buffer.push(.{ .buffer_write = .{
+                .id = r.unit_buffer,
+                .offset = 0,
+                .data = .of(std.mem.asBytes(&draw.unit_quad)),
+            } });
+            self.flush_textures(buffer, &cx.textures);
+            self.ready = true;
+            assert(self.ready);
+            assert(cx.textures.created == cx.textures.count);
+        }
+
+        fn setup_layouts(self: *Self, buffer: *commands.CommandBuffer) void {
+            const r = &self.resources;
+            r.frame_layout = self.ids.take(.layout);
+            var frame_entries = std.mem.zeroes(LayoutEntries);
+            frame_entries[0] = .{
+                .binding = 0,
+                .visibility = commands.stage_vertex | commands.stage_fragment,
+                .kind = .uniform,
+            };
+            buffer.push(.{ .layout_create = .{
+                .id = r.frame_layout,
+                .entry_count = 1,
+                .entries = frame_entries,
+            } });
+            r.texture_layout = self.ids.take(.layout);
+            var texture_entries = std.mem.zeroes(LayoutEntries);
+            const fragment = commands.stage_fragment;
+            texture_entries[0] = .{ .binding = 0, .visibility = fragment, .kind = .texture };
+            texture_entries[1] = .{ .binding = 1, .visibility = fragment, .kind = .sampler };
+            buffer.push(.{ .layout_create = .{
+                .id = r.texture_layout,
+                .entry_count = 2,
+                .entries = texture_entries,
+            } });
+            assert(r.frame_layout != r.texture_layout);
+        }
+
+        fn setup_type(self: *Self, buffer: *commands.CommandBuffer, comptime index: u32) void {
+            const T = R.Type(index);
+            const r = &self.resources;
+            r.shaders[index] = self.ids.take(.shader);
+            buffer.push(.{ .shader_create = .{
+                .id = r.shaders[index],
+                .source = .of(R.sources[index]),
+                .label = .of(R.labels[index]),
+            } });
+            r.instance_buffers[index] = self.create_buffer(
+                buffer,
+                commands.usage_vertex | commands.usage_copy_dst,
+                R.caps[index] * @sizeOf(T),
+            );
+            r.pipelines[index] = self.ids.take(.pipeline);
+            const layout_count: u8 = if (R.textured[index]) 2 else 1;
+            buffer.push(.{ .pipeline_create = .{
+                .id = r.pipelines[index],
+                .shader = r.shaders[index],
+                .layout_count = layout_count,
+                .buffer_count = 2,
+                .blend = .alpha,
+                .layouts = .{ r.frame_layout, r.texture_layout, 0, 0 },
+                .vertex = .{ unit_layout(), R.vertex_layout(index) },
+            } });
+        }
+
+        fn create_buffer(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            usage: u32,
+            size: u32,
+        ) u16 {
+            assert(usage != 0);
+            assert(size != 0);
+            const id = self.ids.take(.buffer);
+            buffer.push(.{ .buffer_create = .{ .id = id, .usage = usage, .size = size } });
+            return id;
+        }
+
+        /// Records every texture `Textures` created since the last stream, with its bind
+        /// group, then every queued write, and empties the write queue.
+        fn flush_textures(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            table: *textures.Textures,
+        ) void {
+            assert(table.created <= table.count);
+            assert(table.write_count <= textures.write_cap);
+            const r = &self.resources;
+            while (table.created < table.count) : (table.created += 1) {
+                const index = table.created;
+                r.textures[index] = self.ids.take(.texture);
+                buffer.push(.{ .texture_create = .{
+                    .id = r.textures[index],
+                    .format = textures.gpu_format(table.formats[index]),
+                    .width = table.widths[index],
+                    .height = table.heights[index],
+                } });
+                r.texture_groups[index] = self.ids.take(.bind_group);
+                var bindings = std.mem.zeroes(BindGroupEntries);
+                bindings[0] = .{ .binding = 0, .resource = r.textures[index] };
+                bindings[1] = .{ .binding = 1, .resource = r.sampler };
+                buffer.push(.{ .bind_group_create = .{
+                    .id = r.texture_groups[index],
+                    .layout = r.texture_layout,
+                    .entry_count = 2,
+                    .entries = bindings,
+                } });
+            }
+            for (table.writes[0..table.write_count]) |write| {
+                buffer.push(.{ .texture_write = .{
+                    .id = r.textures[@intFromEnum(write.id)],
+                    .x = write.region.x,
+                    .y = write.region.y,
+                    .width = write.region.width,
+                    .height = write.region.height,
+                    .bytes_per_row = write.bytes_per_row,
+                    .data = .of(write.data),
+                } });
+            }
+            table.write_count = 0;
+            assert(table.created == table.count);
+        }
+
+        /// Records one frame of `cx` into an empty `buffer`. Finalizes the context (sorting
+        /// and batching it if it changed) and updates the shadows. See the module guide.
+        pub fn frame(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            cx: *Cx,
+            size: Size,
+        ) void {
+            assert(self.ready);
+            assert(buffer.len == 0);
+            assert(size.width_px != 0);
+            assert(size.height_px != 0);
+            assert(size.width_logical != 0);
+            if (self.uniform_dirty(size.width_logical, size.height_logical)) {
+                draw.ortho_y_down(&self.uniform.ortho, size.width_logical, size.height_logical);
+                buffer.push(.{ .buffer_write = .{
+                    .id = self.resources.uniform_buffer,
+                    .offset = 0,
+                    .data = .of(std.mem.asBytes(&self.uniform)),
+                } });
+                self.width_logical = size.width_logical;
+                self.height_logical = size.height_logical;
+            }
+            self.flush_textures(buffer, &cx.textures);
+            cx.finalize();
+            inline for (0..R.count) |index| {
+                self.upload_pool(buffer, index, &cx.pools[index]);
+            }
+            buffer.push(.{ .pass_begin = .{
+                .width_px = size.width_px,
+                .height_px = size.height_px,
+                .clear = .{ clear_color.r, clear_color.g, clear_color.b, clear_color.a },
+            } });
+            self.draw_batches(buffer, cx.batch_list());
+            buffer.push(.{ .pass_end_present = .{} });
+            assert(buffer.count <= op_cap);
+            assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity));
+        }
+
+        fn uniform_dirty(self: *const Self, width_logical: u32, height_logical: u32) bool {
+            assert(width_logical != 0);
+            assert(height_logical != 0);
+            if (self.width_logical != width_logical) {
+                return true;
+            }
+            return self.height_logical != height_logical;
+        }
+
+        fn upload_pool(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            comptime index: u32,
+            pool: anytype,
+        ) void {
+            const T = R.Type(index);
+            const shadow = &self.shadows[index];
+            assert(pool.count <= R.caps[index]);
+            assert(shadow.count <= R.caps[index]);
+            if (shadow.revision == pool.revision) {
+                return;
+            }
+            const records = pool.items[0..pool.count];
+            if (draw.dirty_range(T, shadow.items[0..shadow.count], records)) |range| {
+                buffer.push(.{ .buffer_write = .{
+                    .id = self.resources.instance_buffers[index],
+                    .offset = range.first * @sizeOf(T),
+                    .data = .of(std.mem.sliceAsBytes(records[range.first..range.end])),
+                } });
+                // Records outside the range already equal the shadow (module guide, 4).
+                @memcpy(shadow.items[range.first..range.end], records[range.first..range.end]);
+            }
+            shadow.count = pool.count;
+            shadow.revision = pool.revision;
+            assert(shadow.count == pool.count);
+        }
+
+        fn draw_batches(
+            self: *const Self,
+            buffer: *commands.CommandBuffer,
+            batches: []const pools.Batch,
+        ) void {
+            assert(batches.len <= Cx.batch_capacity);
+            if (batches.len == 0) {
+                return;
+            }
+            const r = &self.resources;
+            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = r.frame_group } });
+            buffer.push(.{ .vertex_buffer_set = .{
+                .slot = 0,
+                .buffer = r.unit_buffer,
+                .offset = 0,
+            } });
+            var type_bound: ?u8 = null;
+            var group_bound: ?u16 = null;
+            for (batches) |batch| {
+                assert(batch.type_id < R.count);
+                assert(batch.count != 0);
+                if (type_bound != batch.type_id) {
+                    buffer.push(.{ .pipeline_set = .{ .id = r.pipelines[batch.type_id] } });
+                    buffer.push(.{ .vertex_buffer_set = .{
+                        .slot = 1,
+                        .buffer = r.instance_buffers[batch.type_id],
+                        .offset = 0,
+                    } });
+                    type_bound = batch.type_id;
+                }
+                if (R.textured[batch.type_id]) {
+                    const group = r.texture_groups[@intFromEnum(batch.texture)];
+                    if (group_bound != group) {
+                        buffer.push(.{ .bind_group_set = .{ .slot = 1, .id = group } });
+                        group_bound = group;
+                    }
+                }
+                buffer.push(.{ .draw = .{
+                    .vertex_count = draw.vertex_count,
+                    .instance_count = batch.count,
+                    .first_vertex = 0,
+                    .first_instance = batch.first,
+                } });
+            }
+        }
+    };
+}
+
+fn Shadow(comptime T: type, comptime cap: u32) type {
+    return struct {
+        items: [cap]T,
+        count: u32,
+        revision: u64,
+    };
+}
 
 fn unit_layout() commands.VertexBuffer {
     var attributes = std.mem.zeroes([commands.attribute_cap]commands.VertexAttribute);
@@ -357,32 +476,11 @@ fn unit_layout() commands.VertexBuffer {
     };
 }
 
-fn records_layout(comptime T: type, comptime fields: [4][]const u8) commands.VertexBuffer {
-    var attributes = std.mem.zeroes([commands.attribute_cap]commands.VertexAttribute);
-    inline for (fields, 0..) |name, i| {
-        attributes[i] = .{
-            .location = i + 1,
-            .format = .float32x4,
-            .offset = @offsetOf(T, name),
-        };
-    }
-    return .{
-        .stride = @sizeOf(T),
-        .step = .instance,
-        .attribute_count = fields.len,
-        .attributes = attributes,
-    };
-}
-
 comptime {
     assert(@sizeOf(Uniform) == draw.uniform_bytes);
     assert(@offsetOf(Uniform, "theme") == draw.matrix_bytes);
     assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
-    // Each group is one float32x4, so consecutive fields start 16 bytes apart.
-    for (quad_fields, 0..) |name, i| assert(@offsetOf(draw.Instance, name) == 16 * i);
-    for (glyph_fields, 0..) |name, i| assert(@offsetOf(font.Glyph, name) == 16 * i);
-    assert(font.atlas_width % 256 == 0);
-    assert(font.atlas_bytes.len == font.atlas_width * font.atlas_height);
+    assert(batch_op_cap == 4);
 }
 
 const testing = std.testing;
@@ -419,156 +517,194 @@ pub fn writes(
     return out[0..count];
 }
 
-fn face(x: f32) draw.Instance {
-    return .{
-        .x = x,
-        .y = 0,
-        .width = 10,
-        .height = 10,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-        .radius = 0,
-        .hover = 0,
-        .down = 0,
-        .kind = draw.kind_box,
-        .clip_x0 = 0,
-        .clip_y0 = 0,
-        .clip_x1 = 100,
-        .clip_y1 = 100,
-    };
-}
-
-fn label(glyphs: *font.GlyphList) void {
-    font.place(glyphs, "Hi", .{ .x = 0, .y = 0, .width = 64, .height = 32 }, .{
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-    }, .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 32 });
-}
-
-const size_720: Size = .{
-    .width_logical = 1280,
-    .height_logical = 720,
-    .width_px = 1280,
-    .height_px = 720,
+const test_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 8 },
+    .{ .type = types.Arc, .cap = 8 },
+    .{ .type = types.Glyph, .cap = 16 },
 };
 
-// Locks the setup recording: each resource is created once, pipelines after the layouts and
-// shaders they name, and the two static uploads last.
-test "setup records every resource once" {
-    var renderer = Renderer.init();
-    var buffer = commands.CommandBuffer.init();
-    renderer.setup(&buffer);
-    var storage: [32]commands.Code = undefined;
-    const expected = [_]commands.Code{
-        .shader_create,     .shader_create,
-        .layout_create,     .layout_create,
-        .buffer_create,     .buffer_create,
-        .buffer_create,     .buffer_create,
-        .texture_create,    .sampler_create,
-        .bind_group_create, .bind_group_create,
-        .pipeline_create,   .pipeline_create,
-        .buffer_write,      .texture_write,
+const TestContext = draw.Context(&test_draw, 8);
+const TestRenderer = Renderer(TestContext);
+
+const Fixture = struct {
+    var context: TestContext = undefined;
+    var renderer: TestRenderer = undefined;
+    var buffer: commands.CommandBuffer = undefined;
+
+    fn setup_only() void {
+        context.init();
+        renderer.init();
+        buffer = .init();
+        renderer.setup(&buffer, &context);
+    }
+
+    fn start() void {
+        setup_only();
+        buffer.reset();
+    }
+
+    fn record(width_px: u32) void {
+        buffer.reset();
+        renderer.frame(&buffer, &context, .{
+            .width_logical = 1280,
+            .height_logical = 720,
+            .width_px = width_px,
+            .height_px = width_px * 720 / 1280,
+        });
+    }
+};
+
+fn face(x: f32) types.Box {
+    return .{
+        .rect = .{ x, 0, 10, 10 },
+        .clip = .{ 0, 0, 100, 100 },
+        .fill = .{ 1, 1, 1, 1 },
+        .border_color = .{ 0, 0, 0, 0 },
+        .radius = 0,
+        .border_width = 0,
+        .hover = 0,
+        .down = 0,
     };
-    try testing.expectEqualSlices(commands.Code, &expected, codes(&buffer, &storage));
-    try testing.expect(renderer.ready);
-    // The decoded quad pipeline carries the Instance offsets.
-    var reader = buffer.reader();
+}
+
+fn ring(x: f32, hover: f32) types.Arc {
+    return .{
+        .rect = .{ x, 0, 56, 56 },
+        .clip = .{ 0, 0, 100, 100 },
+        .color = .{ 1, 1, 1, 1 },
+        .thickness = 4,
+        .sweep = 1,
+        .hover = hover,
+        .pad = 0,
+    };
+}
+
+fn glyph(x: f32) types.Glyph {
+    return .{
+        .rect = .{ x, 0, 4, 8 },
+        .clip = .{ 0, 0, 100, 100 },
+        .uv = .{ 0, 0, 1, 1 },
+        .color = .{ 1, 1, 1, 1 },
+    };
+}
+
+/// Box, glyph, box, glyph, then an arc: the scene most tests below record.
+fn scene(hover: f32) !void {
+    const cx = &Fixture.context;
+    cx.reset();
+    try cx.append(types.Box, null, face(0));
+    try cx.append(types.Glyph, .atlas, glyph(0));
+    try cx.append(types.Box, null, face(20));
+    try cx.append(types.Glyph, .atlas, glyph(20));
+    try cx.append(types.Arc, null, ring(0, hover));
+    try cx.append(types.Arc, null, ring(60, 0));
+}
+
+// Locks the setup recording: per type a shader (labelled), a buffer, and a pipeline; the
+// atlas texture and its bind group last, after the unit quad upload.
+test "setup records one shader, buffer, and pipeline per type and the atlas" {
+    Fixture.setup_only();
+    var storage: [64]commands.Code = undefined;
+    const expected = [_]commands.Code{
+        .layout_create, .layout_create,  .buffer_create,
+        .buffer_create, .sampler_create, .bind_group_create,
+        .shader_create, .buffer_create,  .pipeline_create,
+        .shader_create, .buffer_create,  .pipeline_create,
+        .shader_create, .buffer_create,  .pipeline_create,
+        .buffer_write,  .texture_create, .bind_group_create,
+        .texture_write,
+    };
+    try testing.expectEqualSlices(commands.Code, &expected, codes(&Fixture.buffer, &storage));
+    var reader = Fixture.buffer.reader();
+    var pipelines: u32 = 0;
     while (reader.next()) |op| {
         switch (op) {
+            .shader_create => |shader| {
+                try testing.expect(std.mem.endsWith(u8, shader.label.slice(), "Box") or
+                    std.mem.endsWith(u8, shader.label.slice(), "Arc") or
+                    std.mem.endsWith(u8, shader.label.slice(), "Glyph"));
+            },
             .pipeline_create => |pipeline| {
-                try testing.expectEqual(@as(u16, draw.instance_stride), pipeline.vertex[1].stride);
-                try testing.expectEqual(@as(u16, 48), pipeline.vertex[1].attributes[3].offset);
-                try testing.expectEqual(@as(u8, 4), pipeline.vertex[1].attributes[3].location);
-                break;
+                // Box: 80 bytes in five groups; the glyph pipeline also binds the texture.
+                if (pipelines == 0) {
+                    try testing.expectEqual(@as(u16, 80), pipeline.vertex[1].stride);
+                    try testing.expectEqual(@as(u8, 5), pipeline.vertex[1].attribute_count);
+                    try testing.expectEqual(@as(u8, 1), pipeline.layout_count);
+                }
+                if (pipelines == 2) {
+                    try testing.expectEqual(@as(u8, 2), pipeline.layout_count);
+                }
+                pipelines += 1;
+            },
+            .texture_create => |texture| {
+                try testing.expectEqual(commands.TextureFormat.r8unorm, texture.format);
             },
             else => {},
         }
     }
+    try testing.expectEqual(@as(u32, 3), pipelines);
+    try testing.expect(Fixture.renderer.ready);
 }
 
-// Locks the first frame: three whole-list writes, one pass, two draws, present.
-test "the first frame writes three buffers and draws twice" {
-    var renderer = Renderer.init();
-    var buffer = commands.CommandBuffer.init();
-    renderer.setup(&buffer);
-    var list = draw.DrawList.init();
-    try list.append(face(0));
-    try list.append(face(20));
-    var glyphs = font.GlyphList.init();
-    label(&glyphs);
-    buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, size_720);
-    var storage: [32]commands.Code = undefined;
+// Locks the first frame: the uniform and three pool writes, then three batches with the
+// frame group and unit quad bound once and each pipeline set once.
+test "the first frame writes every pool and draws one call per batch" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(1280);
+    var storage: [64]commands.Code = undefined;
     const expected = [_]commands.Code{
-        .buffer_write,      .buffer_write,      .buffer_write,
-        .pass_begin,        .pipeline_set,      .bind_group_set,
-        .vertex_buffer_set, .vertex_buffer_set, .draw,
-        .pipeline_set,      .bind_group_set,    .bind_group_set,
-        .vertex_buffer_set, .vertex_buffer_set, .draw,
-        .pass_end_present,
+        .buffer_write,      .buffer_write, .buffer_write,
+        .buffer_write,      .pass_begin,   .bind_group_set,
+        .vertex_buffer_set, .pipeline_set, .vertex_buffer_set,
+        .draw,              .pipeline_set, .vertex_buffer_set,
+        .bind_group_set,    .draw,         .pipeline_set,
+        .vertex_buffer_set, .draw,         .pass_end_present,
     };
-    try testing.expectEqualSlices(commands.Code, &expected, codes(&buffer, &storage));
-    try testing.expectEqual(frame_op_cap, buffer.count);
-    var write_storage: [4]commands.BufferWrite = undefined;
-    const recorded = writes(&buffer, &write_storage);
-    try testing.expectEqual(renderer.resources.uniform_buffer, recorded[0].id);
+    try testing.expectEqualSlices(commands.Code, &expected, codes(&Fixture.buffer, &storage));
+    var write_storage: [8]commands.BufferWrite = undefined;
+    const recorded = writes(&Fixture.buffer, &write_storage);
+    const r = &Fixture.renderer.resources;
+    try testing.expectEqual(r.uniform_buffer, recorded[0].id);
     try testing.expectEqual(draw.uniform_bytes, recorded[0].data.len);
-    try testing.expectEqual(renderer.resources.instance_buffer, recorded[1].id);
-    try testing.expectEqual(2 * draw.instance_stride, recorded[1].data.len);
-    try testing.expectEqual(renderer.resources.glyph_buffer, recorded[2].id);
-    try testing.expectEqual(glyphs.count * font.glyph_stride, recorded[2].data.len);
+    try testing.expectEqual(r.instance_buffers[0], recorded[1].id);
+    try testing.expectEqual(@as(u32, 2 * 80), recorded[1].data.len);
+    try testing.expectEqual(r.instance_buffers[2], recorded[3].id);
 }
 
-// Locks the scale-only frame: same lists and logical size at a new physical size write
-// nothing and still carry the new size in the pass.
-test "a scale-only frame writes nothing" {
-    var renderer = Renderer.init();
-    var buffer = commands.CommandBuffer.init();
-    renderer.setup(&buffer);
-    var list = draw.DrawList.init();
-    try list.append(face(0));
-    var glyphs = font.GlyphList.init();
-    label(&glyphs);
-    buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, size_720);
-    buffer.reset();
-    var scaled = size_720;
-    scaled.width_px = 2560;
-    scaled.height_px = 1440;
-    renderer.frame(&buffer, &list, &glyphs, scaled);
-    var write_storage: [4]commands.BufferWrite = undefined;
-    try testing.expectEqual(@as(usize, 0), writes(&buffer, &write_storage).len);
-    var reader = buffer.reader();
+// Locks the idle paths: a scale-only frame and an identical rebuild write nothing.
+test "a scale-only frame and an identical rebuild write nothing" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(1280);
+    Fixture.record(2560);
+    var write_storage: [8]commands.BufferWrite = undefined;
+    try testing.expectEqual(@as(usize, 0), writes(&Fixture.buffer, &write_storage).len);
+    var reader = Fixture.buffer.reader();
     try testing.expectEqual(@as(u32, 2560), reader.next().?.pass_begin.width_px);
+    try scene(0);
+    Fixture.record(2560);
+    try testing.expectEqual(@as(usize, 0), writes(&Fixture.buffer, &write_storage).len);
 }
 
-// Locks a hover frame: a rebuilt list where one face changed writes that one record at its
-// offset and nothing else; an empty glyph list records no glyph draw.
-test "a changed face writes one record" {
-    var renderer = Renderer.init();
-    var buffer = commands.CommandBuffer.init();
-    renderer.setup(&buffer);
-    var list = draw.DrawList.init();
-    try list.append(face(0));
-    try list.append(face(20));
-    try list.append(face(40));
-    const glyphs = font.GlyphList.init();
-    buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, size_720);
-    try testing.expect(list.set_state(1, 0.5, 0));
-    buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, size_720);
-    var write_storage: [4]commands.BufferWrite = undefined;
-    const recorded = writes(&buffer, &write_storage);
+// Locks per-pool uploads: a hover that changes one arc writes that one record of the arc pool
+// and nothing in the box or glyph pools.
+test "changing one pool writes only that pool" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(1280);
+    try scene(0.18);
+    Fixture.record(1280);
+    var write_storage: [8]commands.BufferWrite = undefined;
+    const recorded = writes(&Fixture.buffer, &write_storage);
     try testing.expectEqual(@as(usize, 1), recorded.len);
-    try testing.expectEqual(renderer.resources.instance_buffer, recorded[0].id);
-    try testing.expectEqual(draw.instance_stride, recorded[0].offset);
-    try testing.expectEqual(draw.instance_stride, recorded[0].data.len);
-    var storage: [32]commands.Code = undefined;
-    const recorded_codes = codes(&buffer, &storage);
-    try testing.expectEqual(@as(usize, 1 + 1 + 5 + 1), recorded_codes.len);
+    try testing.expectEqual(Fixture.renderer.resources.instance_buffers[1], recorded[0].id);
+    try testing.expectEqual(@as(u32, 0), recorded[0].offset);
+    try testing.expectEqual(@as(u32, @sizeOf(types.Arc)), recorded[0].data.len);
+}
+
+// Locks the worst-case bound the comptime check relies on.
+test "the frame op bound covers every batch" {
+    try testing.expect(TestRenderer.op_cap >= 1 + 3 + 3 + 8 * 4 + 1);
+    try testing.expect(frame_bytes_max(16, 256) <= commands.capacity);
 }

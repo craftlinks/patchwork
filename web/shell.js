@@ -28,7 +28,9 @@
 // Ids map to WebGPU objects through one array per kind, sized by the table's `caps`.
 // Creating an id twice or using an unset id throws with the op name. The setup stream (the
 // one `start` submits) runs each op inside `pushErrorScope("validation")`, so a failure names
-// the op index and op; `main` awaits those scopes before the first frame. Later errors
+// the op index and op (with the shader label, the draw type's name, for `shader_create`);
+// `main` awaits those scopes before the first frame. Shader modules and their pipelines carry
+// the same label, so WGSL compilation messages name the draw type. Later errors
 // arrive on the device's `uncapturederror` event and are logged with the last frame's ops.
 // Loading the page with `?trace=1` logs the op names of every submitted stream.
 //
@@ -72,7 +74,7 @@ let pass = null;
 /** WebGPU vocabulary for the Zig payload enums, keyed by Zig tag name (guide, section 2). */
 const VERTEX_FORMAT_TABLE = { float32x2: "float32x2", float32x4: "float32x4" };
 const STEP_MODE_TABLE = { vertex: "vertex", instance: "instance" };
-const TEXTURE_FORMAT_TABLE = { r8unorm: "r8unorm" };
+const TEXTURE_FORMAT_TABLE = { r8unorm: "r8unorm", rgba8unorm: "rgba8unorm" };
 const FILTER_TABLE = { nearest: "nearest", linear: "linear" };
 const BLEND_TABLE = {
     none: undefined,
@@ -182,11 +184,13 @@ function open_pass(op) {
 const OPS = {
     shader_create(p, index) {
         const code = new TextDecoder().decode(span_bytes(p.source));
-        const module = device.createShaderModule({ code });
+        const label = new TextDecoder().decode(span_bytes(p.label));
+        const module = device.createShaderModule({ label, code });
         module.getCompilationInfo().then((info) => {
             for (const message of info.messages) {
                 if (message.type === "error") {
-                    console.error(`op ${index} shader_create ${p.id}: ${message.message}`);
+                    const where = `${p.id} (${label} line ${message.lineNum}:${message.linePos})`;
+                    console.error(`op ${index} shader_create ${where}: ${message.message}`);
                 }
             }
         });
@@ -217,7 +221,9 @@ const OPS = {
                 format: VERTEX_FORMAT_TABLE[attribute.format],
             })),
         }));
+        // The module label (the draw type's name) also names the pipeline in error messages.
         const pipeline = device.createRenderPipeline({
+            label: module.label,
             layout: device.createPipelineLayout({ bindGroupLayouts }),
             vertex: { module, entryPoint: table.entry.vertex, buffers },
             fragment: {
@@ -339,14 +345,17 @@ function submit_js(ptr, len) {
             throw new Error(`command ${index}: ${op.name} payload is ${size} bytes, expected ${op.size}`);
         }
         const payload = decode(new DataView(wasm.memory.buffer, ptr + offset + table.header_bytes, size), 0, op.type);
-        names.push(op.name);
+        // A shader's label (its draw type) is read now, while its span is valid.
+        const name = payload.label === undefined
+            ? op.name
+            : `${op.name} ${new TextDecoder().decode(span_bytes(payload.label))}`;
+        names.push(name);
         if (setupScopes !== null) {
             device.pushErrorScope("validation");
         }
         OPS[op.name](payload, index);
         if (setupScopes !== null) {
             const at = index;
-            const name = op.name;
             setupScopes.push(device.popErrorScope().then((error) => {
                 if (error !== null) {
                     throw new Error(`setup op ${at} (${name}) failed: ${error.message}`);

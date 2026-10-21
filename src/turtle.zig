@@ -66,13 +66,13 @@
 //!   Test: "align_x does not move a row child".
 //! - Oversized fixed spans are not clamped.
 //! - A non-positive resolved edge is still stored and the cursor still advances, so siblings
-//!   keep stable positions. `DrawList.append` later rejects such an edge with
-//!   `error.EdgeNotPositive`, which omits the child from the draw call.
+//!   keep stable positions. Widgets skip such an edge when drawing, and `draw.Context.append`
+//!   rejects one with `error.EdgeNotPositive`, so it never reaches the GPU.
 //!
 //! ## 6. Layout Types and Capacity
 //! The plain-data types are laid out as `f32` fields in declaration order with 4-byte
-//! alignment. The comptime block below asserts their sizes. `child_cap` keeps one draw-list
-//! slot free for the container background quad the scene appends.
+//! alignment. The comptime block below asserts their sizes. `child_cap` bounds one column or
+//! row; it is independent of the draw pools, whose capacities each app configures.
 //!
 //! ## 7. Scale Invariance
 //! Layout runs in logical pixels, so a display scale change must not trigger it. That rule is
@@ -86,11 +86,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const draw = @import("draw.zig");
-
-/// Maximum walks in one column or row. One draw-list slot stays free for the container
-/// background quad the scene appends.
-pub const child_cap: u32 = draw.instance_cap - 1;
+/// Maximum walks in one column or row.
+pub const child_cap: u32 = 255;
 
 /// Axis-aligned border box in UI logical pixels. `(x, y)` is the top-left corner.
 pub const Rect = struct {
@@ -138,7 +135,6 @@ const AxisCost = struct {
 };
 
 comptime {
-    assert(child_cap == draw.instance_cap - 1);
     assert(child_cap == 255);
     assert(@sizeOf(Rect) == 16);
     assert(@sizeOf(Inset) == 16);

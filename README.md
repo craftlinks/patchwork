@@ -12,14 +12,21 @@ An application defines a type satisfying the contract in `src/app.zig`:
 
 ```zig
 pub const App = struct {
-    pub const config: patchwork.app.Config = .{ .title = "...", .timer_period_ms = 0 };
-    pub fn init(app: *App) void
+    pub const config: patchwork.app.Config = .{
+        .title = "...",
+        .timer_period_ms = 0,
+        .draw = &.{
+            .{ .type = patchwork.draw.Box, .cap = 64 },
+            .{ .type = patchwork.draw.Glyph, .cap = 256 },
+        },
+    };
+    pub fn init(app: *App, textures: *patchwork.draw.Textures) void
     pub fn layout(app: *App, width_logical: u32, height_logical: u32) void
     pub fn event(app: *App, event: patchwork.input.Event) bool      // true: dirty
     pub fn timer(app: *App, now_ms: u64) bool                      // true: dirty
     pub fn live(app: *const App) bool
     pub fn dirty(app: *const App) bool
-    pub fn draw(app: *App, list: *DrawList, glyphs: *GlyphList) void
+    pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 };
 ```
 
@@ -27,17 +34,19 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | Settings: `title` (`[:0]const u8`), `timer_period_ms` (`u32`). |
-| `init` | `fn (*App) void` | Called once at startup before any other call. |
+| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`. |
+| `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `layout` | `fn (*App, u32, u32) void` | Positions widgets for logical `(w, h)` on size change. |
 | `event` | `fn (*App, Event) bool` | Applies pointer/frame events; returns true if dirty. |
 | `timer` | `fn (*App, u64) bool` | Called on host timer expiration; returns true if dirty. |
 | `live` | `fn (*const App) bool` | True while an animator is moving; gates frame callbacks. |
 | `dirty` | `fn (*const App) bool` | True when `draw` is owed; cleared by `draw`. |
-| `draw` | `fn (*App, *DrawList, *GlyphList) void` | Rebuilds GPU quads and glyphs back-to-front. |
+| `draw` | `fn (*App, *app.Context(App)) void` | Appends every instance to the reset draw context. |
 
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
-mistyped declarations produce a clear `@compileError` naming the exact problem.
+mistyped declarations, a draw type that breaks the instance convention (the message names
+the type), a zero capacity, and a `batch_cap` whose worst frame would not fit one command
+buffer produce a clear `@compileError` naming the exact problem.
 
 Applications manage widget collections using `patchwork.ui.Scene(Widget, widget_cap)`,
 a generic dispatcher that implements back-to-front hit testing, hover tracking, and
@@ -52,19 +61,22 @@ patchwork/
 │   ├── app.zig                 # App contract definitions and comptime check
 │   ├── ui.zig                  # Generic Scene(Widget, widget_cap) dispatcher
 │   ├── widgets.zig             # Retained widgets (Panel, Button, Slider, Knob, Meter, Toggle, Scroll)
-│   ├── draw.zig                # Instanced quad drawing, DrawList, distance fields, UploadCursor
+│   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
+│   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
+│   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
+│   ├── draw/types.zig          # Library draw types (Box, Arc, Glyph, Image) and CPU twins
+│   ├── draw/pools.zig          # Context: per-type pools, layers, counting sort, sticky batches
+│   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId
 │   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
 │   ├── turtle.zig              # 2D turtle layout engine (place_column, place_row, Walk, Size)
-│   ├── font.zig                # Embedded font atlas, metrics, GlyphList
+│   ├── font.zig                # Embedded font atlas, metrics, glyph placement
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Pointer events and bounded EventQueue
 │   ├── theme.zig               # Theme uniform record packed behind the projection matrix
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
-│   ├── serve.zig               # Built-in static HTTP server for browser testing
-│   ├── quad.wgsl               # Instanced quad shader (SDF rounded boxes and ring arcs)
-│   └── glyph.wgsl              # Instanced glyph text shader
+│   └── serve.zig               # Built-in static HTTP server for browser testing
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native executable entry point: runs linux_window.run(app.App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
@@ -78,14 +90,17 @@ patchwork/
 ├── examples/                   # Example applications
 │   ├── rack/                   # Modular synthesizer rack
 │   │   ├── app.zig             # Rack App implementing the patchwork.app contract
-│   │   └── levels.zig          # Procedural triangle-wave meter sampling
+│   │   ├── levels.zig          # Procedural triangle-wave meter sampling
+│   │   ├── led.zig             # The rack's own draw type: a glowing LED
+│   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
 │   └── column/                 # Scroll column regression app
 │       └── app.zig             # Column App (config.timer_period_ms = 0)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
 └── test/                       # Regression tests
-    └── contract_missing_draw.zig # Test verifying that missing draw fails compilation
+    ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
+    └── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
 ```
 
 ## Build Steps
@@ -105,7 +120,7 @@ zig build serve-column    # Serve the scroll column WebGPU application on localh
 
 # Validation
 zig build test            # Run unit tests across the library and both examples
-zig build test-contract   # Verify compile error when an app is missing `draw`
+zig build test-contract   # Verify compile errors for a missing `draw` and a ragged draw type
 ```
 
 An optional override flag `-Dwgpu-lib-dir=` is available if you wish to link against a
@@ -182,6 +197,7 @@ const widgets = patchwork.widgets;
 const turtle = patchwork.turtle;
 const animator = patchwork.animator;
 const theme = patchwork.theme;
+const quads = patchwork.draw;
 
 const Widget = union(enum) { panel: widgets.Panel, knob: widgets.Knob };
 const Scene = patchwork.ui.Scene(Widget, 2);
@@ -190,9 +206,18 @@ const none: turtle.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
 pub const App = struct {
     scene: Scene,
 
-    pub const config: patchwork.app.Config = .{ .title = "synth", .timer_period_ms = 0 };
+    pub const config: patchwork.app.Config = .{
+        .title = "synth",
+        .timer_period_ms = 0,
+        .draw = &.{
+            .{ .type = quads.Box, .cap = 8 },
+            .{ .type = quads.Arc, .cap = 8 },
+            .{ .type = quads.Glyph, .cap = 64 },
+        },
+    };
 
-    pub fn init(app: *App) void {
+    pub fn init(app: *App, textures: *quads.Textures) void {
+        _ = textures;
         app.scene = Scene.init(2);
         const c = theme.chrome.panel;
         app.scene.widgets[0] = .{ .panel = .{
@@ -243,28 +268,30 @@ pub const App = struct {
         return app.scene.dirty;
     }
 
-    pub fn draw(app: *App, list: *patchwork.draw.DrawList, glyphs: *patchwork.font.GlyphList) void {
-        list.clear();
-        glyphs.clear();
+    pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         const w: f32 = @floatFromInt(app.scene.width_logical);
         const h: f32 = @floatFromInt(app.scene.height_logical);
         const clip: patchwork.font.Clip = .{ .x0 = 0, .y0 = 0, .x1 = w, .y1 = h };
-        app.scene.widgets[0].panel.draw(list, glyphs, clip);
-        app.scene.widgets[1].knob.draw(list, glyphs, clip);
+        app.scene.widgets[0].panel.draw(cx, clip);
+        app.scene.widgets[1].knob.draw(cx, clip);
         app.scene.finish_draw();
     }
 };
 
+// Static, like the hosts' context, so the pools stay off the stack.
+var context: patchwork.app.Context(App) = undefined;
+
 test "layout then draw is clean" {
+    context.init();
     var app: App = undefined;
-    App.init(&app);
+    App.init(&app, &context.textures);
     app.layout(400, 300);
     try std.testing.expect(app.dirty());
-    var list = patchwork.draw.DrawList.init();
-    var glyphs = patchwork.font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    context.reset();
+    app.draw(&context);
     try std.testing.expect(!app.dirty());
-    try std.testing.expect(list.count >= 3);
+    try std.testing.expectEqual(@as(u32, 0), context.overflow_count);
+    try std.testing.expect(context.items(quads.Arc).len >= 1);
 }
 ```
 
@@ -281,13 +308,12 @@ Children with `fill` height in a column share leftover main-axis space equally. 
 among siblings). `align_x` is checked and does not move a row child; rows have no cross-axis
 alignment. Oversized fixed dimensions are not clamped. If a child resolves to a non-positive
 edge, it is still placed and still advances the cursor so siblings keep their positions, but
-`DrawList.append` rejects it to protect the GPU from degenerate quads.
+widgets skip it and `draw.Context.append` rejects it to protect the GPU from degenerate quads.
 
-Layout executes in two bounded passes with zero heap allocation. `turtle.child_cap` is derived
-from `draw.instance_cap` so every child walk still has room for its container background quad in
-one draw list. Window resize sets `Frame.relayout`, rebuilding the instance list. A display scale
-change leaves `Frame.relayout` false, presenting the new physical framebuffer without re-walking
-the column or bumping instance revisions.
+Layout executes in two bounded passes with zero heap allocation, bounded by `turtle.child_cap`.
+Window resize sets `Frame.relayout`, rebuilding the draw pools. A display scale change leaves
+`Frame.relayout` false, presenting the new physical framebuffer without re-walking the column
+or bumping pool revisions.
 
 ## Example Applications
 
@@ -300,12 +326,20 @@ A modular rack in a full-window column: a stack of panels, each holding a row of
 level meter. It demonstrates:
 - **Flat widget list.** One `Scene` array holds panels, knobs, and meters. Hit testing scans
   back to front and later slots win, so a knob or meter wins over its backing panel without
-  nested containers. The slot and instance budgets are `comptime` asserts in `app.zig`.
+  nested containers. The slot and per-pool budgets are `comptime` asserts in `app.zig`.
 - **Clipping.** Knob faces clip to the parent panel and meter faces clip to the meter cell,
   so a track cannot cover the title. A knob or meter whose box does not fit is omitted rather
   than drawn over its neighbor. Panel faces carry the window clip.
-- **Per-instance accents.** Knob accents are per-instance fills (`Instance.fill`), not theme
+- **Per-instance accents.** Knob accents are per-instance colors (`draw.Arc.color`), not theme
   slots. The palette is `widgets.accents`.
+- **An app-defined draw type** (`examples/rack/led.zig`). `Led` is an `extern struct` plus a
+  WGSL `pixel` function, registered in `config.draw` with no library edit. Each panel's LED
+  sits in the title band over the meter and glows with the meter level.
+- **An image texture** (`examples/rack/badge.zig`). `init` generates a 32 by 32 RGBA badge,
+  creates a texture for it, and queues its pixels; each title band draws it as a `draw.Image`.
+- **Layers.** Hovering a knob for `tooltip_delay_ms` (500 ms) shows a tooltip that covers the
+  neighbouring knob's name. It is drawn on the overlay layer, so it covers the base layer's
+  text batch; test "the tooltip box covers the neighbour's text on the overlay layer" locks it.
 - **Procedural meters** (`examples/rack/levels.zig`). Integer-period triangle waves sampled
   from the clock: no trigonometry, no `f64`. Sampling never reads knobs, and dragging a knob
   never changes a bar. Sample values are locked by the test in `levels.zig`.
@@ -327,7 +361,7 @@ A regression app for a single docked `Scroll` container beside a root column. It
   captures the scroll container, and the scroll arbitrates `press` between no target, a child
   index, and the thumb.
 - **Unscrolled storage.** Child rects are stored unscrolled; drawing and hit testing subtract
-  `scroll_y`. Children outside the viewport are culled from draw lists, and children that
+  `scroll_y`. Children outside the viewport are culled from the draw pools, and children that
   cross the viewport edge carry the viewport clip rect.
 - **Thumb.** Its height is the viewport-to-content ratio of the viewport height, floored at
   `widgets.thumb_min_px`, and hidden when nothing can scroll. Thumb drag maps absolute pointer
@@ -345,11 +379,15 @@ replay it: native through `gpu_wgpu.execute`, the browser through `submit_js(ptr
 `draw/renderer.zig` records them.
 
 ```text
-draw.Renderer.setup  (once, after device creation)
-  shader_create  layout_create  buffer_create  texture_create  sampler_create
-  bind_group_create  pipeline_create  buffer_write (unit quad)  texture_write (atlas)
-draw.Renderer.frame  (every presented frame)
-  buffer_write*  pass_begin  [pipeline_set bind_group_set vertex_buffer_set draw]*
+Renderer.setup  (once, after device creation)
+  layout_create  buffer_create  sampler_create  bind_group_create (frame)
+  per draw type: shader_create (labelled with the type)  buffer_create  pipeline_create
+  buffer_write (unit quad)  per queued texture: texture_create  bind_group_create
+  texture_write* (the atlas, then the app's images)
+Renderer.frame  (every presented frame)
+  buffer_write (uniform, if the size changed)  queued texture ops  buffer_write* (pools)
+  pass_begin  bind_group_set 0  vertex_buffer_set 0
+  per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
   pass_end_present
 ```
 
@@ -361,38 +399,61 @@ time as `commands.table_json`. The wasm module exports it, so `shell.js` decodes
 name and cannot drift from the Zig layouts. Load the page with `?trace=1` to log the op names
 of every submitted stream.
 
-`draw.UploadCursor` decides which `buffer_write` ops a frame records. The uniform is written
-only when the logical size changes. A list whose revision moved is compared record by record
-with a shadow of the last upload, and only the changed range is written. A scale-only frame
-writes nothing, an identical rebuild writes nothing, and a hover writes the changed faces
-only. The exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack
-frames record the step 11 op sequences" in `examples/rack/app.zig`.
+The renderer keeps a shadow of each pool's last upload. The uniform is written only when the
+logical size changes. A pool whose revision moved is compared record by record with its
+shadow, and only the changed range is written. A scale-only frame writes nothing, an identical
+rebuild writes nothing, and a hover writes the changed arc records only. Pipeline, vertex
+buffer, and texture bind group sets are skipped when the previous batch already set them. The
+exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack frames record
+the step 12 op sequences" in `examples/rack/app.zig`.
 
-## GPU Pipeline and Memory Layouts
+## Draw Types, Layers, and Batches
 
-`Instance` and `Glyph` records share one stride (`draw.instance_stride`, `font.glyph_stride`).
-The renderer builds both vertex layouts from their `@offsetOf` values, and `comptime` asserts
-in `draw.zig` and `draw/renderer.zig` pin the four `float32x4` groups the WGSL structs read.
-The static unit quad is `draw.quad_bytes`. In both instance formats the last `float32x4` attribute is the
-exclusive-max clip rectangle `(clip_x0, clip_y0, clip_x1, clip_y1)`. `kind` selects the
-primitive (`draw.kind_box`, `draw.kind_arc`). Shaders evaluate an analytic hard clip mask:
+A draw type is an `extern struct` plus a WGSL `fn pixel(px: Pixel) -> vec4<f32>`. The app
+lists its types and pool capacities in `config.draw`; the library provides `draw.Box` (fill,
+border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (atlas text), and
+`draw.Image` (an `rgba8` texture), and an app adds its own (the rack's `Led`).
+
+- **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
+  pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
+  follow. Every field is `f32` or `[4]f32`, the size is a multiple of 16, and each 16 bytes is
+  one `float32x4` attribute at locations 1 to 8. `app.check` fails the build naming the type
+  otherwise (`zig build test-contract` locks one case).
+- **WGSL assembly.** `draw/registry.zig` concatenates `draw/prelude.wgsl` (the `Frame`
+  uniform, a shared `vs_main`, an `fs_main` that applies the clip mask, and `coverage`,
+  `stroke`, `sdf_box`, `sdf_circle`, `sdf_segment`, `sdf_arc`), a `Theme` struct generated from
+  `theme.Theme`, the per-type `Instance`, `Varyings`, and `Pixel` structs, and the type's
+  `pixel`. Derivatives and `textureSample` must stay in uniform control flow, so `pixel`
+  must not call them inside branches on instance data; the prelude guide explains.
+- **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
+  layer (`cx.layer(.overlay)` returns the previous layer for restoring). A full pool or batch
+  list refuses the instance and counts it in `cx.overflow_count`.
+- **Sticky batches.** At frame end each pool is stably sorted by (layer, texture) with a
+  counting sort, skipped when appends were already in order, and each (layer, type, texture)
+  run is one draw call. Layers draw in order; within a layer, batches draw in order of first
+  appearance. Box, glyph, box, glyph in one layer is two draw calls, not four.
+- **Textures.** `textures.create(.r8 | .rgba8, width, height)` returns a `TextureId` and
+  `textures.write(id, region, bytes)` queues pixels; both are recorded into the next stream,
+  each texture with its own bind group. The font atlas is texture 0.
+- **Clip mask.** Shaders evaluate an analytic hard clip mask instead of scissor state:
 
 ```text
 pos = rect.xy + local
 inside = step(clip.x, pos.x) * step(clip.y, pos.y) * step(pos.x, clip.z) * step(pos.y, clip.w)
-alpha = fill.a * coverage * inside
+alpha = pixel(px).a * inside
 ```
 
 There is no unclipped sentinel: chrome and panel faces use the window rect, while panel
 children use the panel border box clip.
 
 The uniform buffer (`draw.uniform_bytes`) stores the 4x4 projection matrix first and the
-`Theme` record (`src/theme.zig`) after it. The size is a multiple of WebGPU's minimum uniform
-offset alignment so both pipelines bind one shared bind group. `quad.wgsl` branches on `kind`,
-mixes toward the theme's lighten and darken slots, reads arc angles from the uniform (no WGSL
-color or angle literals), and applies the clip mask. `glyph.wgsl` reads the same uniform view
-and applies the same clip mask. The exact `Theme` slot order is enforced by `comptime` asserts
-in `theme.zig` and the test "wgsl declarations match the Zig layouts".
+`Theme` record (`src/theme.zig`) after it, shared by every pipeline through one bind group.
+Colors live in instances and in the theme's lighten, darken, and arc slots, never in WGSL
+literals.
+
+Memory: each pool holds `cap` records plus a renderer shadow of the same size, and one scratch
+buffer of the largest pool backs the counting sort. The hosts keep the context and renderer in
+static memory (BSS on wasm), so the linker sizes the wasm initial memory to cover them.
 
 ## Platform Hosts
 
@@ -419,12 +480,14 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   `src/host/gpu_wgpu.zig`, and `src/host/wp_presentation.zig`.
 - GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
   stream. The device's uncaptured-error callback is installed, so a validation error fails the
-  frame with the op index, the op name, and the driver message instead of aborting.
+  frame with the op index, the op name (with the draw type's label for a shader), and the
+  driver message instead of aborting.
 
 ### Browser (WebAssembly + WebGPU)
 
 In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
-- `start()` initializes static Wasm state without heap allocation.
+- `start()` initializes static Wasm state (the draw context and renderer live in BSS) without
+  heap allocation, then initializes the app before recording the setup stream.
 - `web/shell.js` invokes `arm_timer()`, querying `wasm.timer_period_ms()`. When 0, no interval
   is set. When non-zero, it runs a `setInterval` calling `wasm.timer(now_ms)`. If `timer` returns
   1, `shell.js` schedules a single `requestAnimationFrame`.
