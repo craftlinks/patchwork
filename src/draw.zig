@@ -32,30 +32,30 @@
 //! ```
 //! Worked values: see test "ortho maps the four corners and the center".
 //!
-//! ## 3. Uniform Size and the Present Header
+//! ## 3. Uniform Size
 //! The frame uniform holds the projection matrix followed by `theme.Theme`; `uniform_bytes`
 //! is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
 //! offsets to be multiples of the `minUniformBufferOffsetAlignment` limit (WebGPU "Limits"
 //! table, default 256). The buffer size is kept a multiple of that limit
 //! (`min_uniform_offset_alignment`) so the record stays valid if it is ever bound at an offset.
-//!
-//! `PresentHeader` is an `extern struct` that the host reads in place across the platform
-//! boundary: native code as a Zig struct and `web/shell.js` through a `DataView` over Wasm
-//! linear memory. Its size and every field offset are the ABI, enforced by `comptime` asserts
-//! on `@sizeOf` and `@offsetOf`; there is no padding except the explicit `pad` field, which
-//! `fill_header` writes as zero so no uninitialized bytes cross the boundary.
+//! `draw/renderer.zig` owns the uniform record and records its uploads.
 //!
 //! ## 4. Dirty Tracking (`UploadCursor`)
-//! Each GPU `writeBuffer` has driver synchronization cost, so `UploadCursor` remembers what
-//! the GPU last received and `flags` reports only what changed:
-//! - Unprimed cursor: upload everything (`flag_instances | flag_uniform | flag_glyphs`).
-//! - `DrawList.revision` differs: `flag_instances`. `GlyphList.revision` differs: `flag_glyphs`.
-//! - Logical width or height differs: `flag_uniform`, because the projection depends only on
-//!   the logical size.
-//! - Nothing differs, including a present that changes only the physical pixel scale: zero,
-//!   so neither instance buffer is rewritten.
-//! Revision counters only increase and are compared for inequality, never reset. Each
-//! scenario above is locked by one of the `UploadCursor` tests at the end of this file.
+//! Each GPU buffer write has driver synchronization cost, so `UploadCursor` keeps a shadow of
+//! what the GPU last received and reports only what changed:
+//! - Unprimed cursor: the uniform and every live record of both lists.
+//! - Logical width or height differs: the uniform, because the projection depends only on
+//!   the logical size. A present that changes only the physical pixel scale writes nothing.
+//! - `DrawList.revision` (or `GlyphList.revision`) equal to the shadow's: nothing, without
+//!   looking at the records. This is the common idle path.
+//! - Revision differs: the records are compared with the shadow, and `dirty_range` returns
+//!   the smallest record range `[first, end)` that covers every changed record plus every
+//!   record past the shadow's count. An app that clears and rebuilds identical lists, which
+//!   bumps the revision, writes nothing; a hover that changes one face writes one record.
+//! A shrunk list needs no write: the draw count bounds what the GPU reads. Comparison is by
+//! bytes, so it is exact and never misses a change. Revision counters only increase and are
+//! compared for inequality, never reset. Each case is locked by an `UploadCursor` test at
+//! the end of this file.
 //!
 //! ## 5. Rounded-Box and Open-Ring Distance Fields
 //! The same unit quad, draw call, and straight-alpha blend serve boxes and rings: the fragment
@@ -155,15 +155,6 @@ const min_uniform_offset_alignment: u32 = 256;
 /// equal `matrix_bytes + theme.bytes` and to be a multiple of `min_uniform_offset_alignment`.
 pub const uniform_bytes: u32 = 256;
 
-/// Upload flag: the face instance buffer must be rewritten.
-pub const flag_instances: u32 = 1;
-
-/// Upload flag: the frame uniform (projection matrix and theme) must be rewritten.
-pub const flag_uniform: u32 = 2;
-
-/// Upload flag: the glyph instance buffer must be rewritten.
-pub const flag_glyphs: u32 = 4;
-
 /// Two triangles covering the unit square, as flat `[x, y]` pairs drawn as a triangle list
 /// without an index buffer. The winding is clockwise on screen after the projection's Y flip,
 /// which is harmless because both pipelines disable face culling.
@@ -200,28 +191,6 @@ pub const Instance = extern struct {
     clip_y0: f32,
     clip_x1: f32,
     clip_y1: f32,
-};
-
-/// The frame description handed to the graphics backend, read in place by the host. See the
-/// module guide for the ABI rules; field offsets are enforced by the `comptime` block below.
-///
-/// `width_px` and `height_px` are physical swapchain pixels. `instance_count` and
-/// `glyph_count` are the number of live records, bounded by `instance_cap` and
-/// `font.glyph_cap`. `flags` is a bitmask of `flag_instances`, `flag_uniform`, and
-/// `flag_glyphs`. `clear_*` is the straight RGBA clear color and `ortho` is the column-major
-/// projection from `ortho_y_down`. `pad` is always written as zero.
-pub const PresentHeader = extern struct {
-    width_px: u32,
-    height_px: u32,
-    instance_count: u32,
-    flags: u32,
-    clear_r: f32,
-    clear_g: f32,
-    clear_b: f32,
-    clear_a: f32,
-    ortho: [16]f32,
-    glyph_count: u32,
-    pad: u32,
 };
 
 /// A fixed-capacity list of face instances for one frame. `revision` increases on every
@@ -344,58 +313,122 @@ pub const DrawList = struct {
     }
 };
 
-/// Remembers the revisions and logical size last uploaded, so an unchanged present skips every
-/// GPU buffer write. See the module guide for the flag rules.
+/// A record range `[first, end)` to upload; `end > first`.
+pub const Range = struct {
+    first: u32,
+    end: u32,
+};
+
+/// The smallest range covering every record of `new` that differs from `old` at the same
+/// index, plus every record of `new` past `old.len`. Null when there is none, including when
+/// `new` is a prefix of `old`. Records compare by bytes.
+pub fn dirty_range(comptime T: type, old: []const T, new: []const T) ?Range {
+    assert(old.len <= std.math.maxInt(u32));
+    assert(new.len <= std.math.maxInt(u32));
+    const shared: u32 = @intCast(@min(old.len, new.len));
+    const count: u32 = @intCast(new.len);
+    var first: u32 = 0;
+    while (first < shared) : (first += 1) {
+        if (!same_record(T, &old[first], &new[first])) break;
+    }
+    if (first == count) {
+        return null;
+    }
+    // A grown list always writes through its new count; otherwise trim unchanged records off
+    // the back of the shared prefix.
+    var end: u32 = count;
+    if (count <= shared) {
+        while (end > first + 1) : (end -= 1) {
+            if (!same_record(T, &old[end - 1], &new[end - 1])) break;
+        }
+    }
+    assert(first < end);
+    assert(end <= count);
+    return .{ .first = first, .end = end };
+}
+
+fn same_record(comptime T: type, a: *const T, b: *const T) bool {
+    return std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b));
+}
+
+/// Remembers what the GPU last received: the logical size behind the uniform and a shadow of
+/// both record lists with their revisions. See the module guide for the rules.
 pub const UploadCursor = struct {
     primed: bool,
-    revision: u32,
-    glyph_revision: u32,
     width_logical: u32,
     height_logical: u32,
+    revision: u32,
+    instance_count: u32,
+    instances: [instance_cap]Instance,
+    glyph_revision: u32,
+    glyph_count: u32,
+    glyphs: [font.glyph_cap]font.Glyph,
 
+    /// An unprimed cursor. The shadows are undefined past their zero counts.
     pub fn init() UploadCursor {
         const cursor: UploadCursor = .{
             .primed = false,
-            .revision = 0,
-            .glyph_revision = 0,
             .width_logical = 0,
             .height_logical = 0,
+            .revision = 0,
+            .instance_count = 0,
+            .instances = undefined,
+            .glyph_revision = 0,
+            .glyph_count = 0,
+            .glyphs = undefined,
         };
         assert(!cursor.primed);
-        assert(cursor.glyph_revision == 0);
+        assert(cursor.glyph_count == 0);
         return cursor;
     }
 
-    /// Returns the `flag_*` bitmask of buffers to upload for this frame. Pure: the cursor is
-    /// only updated by `mark`, after the upload actually happened.
-    pub fn flags(
-        self: UploadCursor,
-        list: *const DrawList,
-        glyphs: *const font.GlyphList,
-        width_logical: u32,
-        height_logical: u32,
-    ) u32 {
-        assert(list.count <= instance_cap);
-        assert(glyphs.count <= font.glyph_cap);
+    /// True when the uniform must be written for this logical size.
+    pub fn uniform_dirty(self: *const UploadCursor, width_logical: u32, height_logical: u32) bool {
+        assert(width_logical != 0);
+        assert(height_logical != 0);
         if (!self.primed) {
-            return flag_instances | flag_uniform | flag_glyphs;
-        }
-        var result: u32 = 0;
-        if (self.revision != list.revision) {
-            result |= flag_instances;
-        }
-        if (self.glyph_revision != glyphs.revision) {
-            result |= flag_glyphs;
+            return true;
         }
         if (self.width_logical != width_logical) {
-            result |= flag_uniform;
-        } else if (self.height_logical != height_logical) {
-            result |= flag_uniform;
+            return true;
         }
-        return result;
+        return self.height_logical != height_logical;
     }
 
-    /// Records that the current revisions and dimensions were uploaded.
+    /// The face records to write, or null.
+    pub fn instance_range(self: *const UploadCursor, list: *const DrawList) ?Range {
+        assert(list.count <= instance_cap);
+        assert(self.instance_count <= instance_cap);
+        if (self.primed) {
+            if (self.revision == list.revision) {
+                return null;
+            }
+        }
+        return dirty_range(
+            Instance,
+            self.instances[0..self.instance_count],
+            list.items[0..list.count],
+        );
+    }
+
+    /// The glyph records to write, or null.
+    pub fn glyph_range(self: *const UploadCursor, glyphs: *const font.GlyphList) ?Range {
+        assert(glyphs.count <= font.glyph_cap);
+        assert(self.glyph_count <= font.glyph_cap);
+        if (self.primed) {
+            if (self.glyph_revision == glyphs.revision) {
+                return null;
+            }
+        }
+        return dirty_range(
+            font.Glyph,
+            self.glyphs[0..self.glyph_count],
+            glyphs.items[0..glyphs.count],
+        );
+    }
+
+    /// Records that the uniform for this logical size and both lists' live records are on the
+    /// GPU. Copies a list into its shadow only when its revision moved.
     pub fn mark(
         self: *UploadCursor,
         list: *const DrawList,
@@ -406,58 +439,24 @@ pub const UploadCursor = struct {
         assert(list.count <= instance_cap);
         assert(glyphs.count <= font.glyph_cap);
         assert(width_logical != 0);
+        assert(height_logical != 0);
+        if (!self.primed or self.revision != list.revision) {
+            @memcpy(self.instances[0..list.count], list.items[0..list.count]);
+            self.instance_count = list.count;
+            self.revision = list.revision;
+        }
+        if (!self.primed or self.glyph_revision != glyphs.revision) {
+            @memcpy(self.glyphs[0..glyphs.count], glyphs.items[0..glyphs.count]);
+            self.glyph_count = glyphs.count;
+            self.glyph_revision = glyphs.revision;
+        }
         self.primed = true;
-        self.revision = list.revision;
-        self.glyph_revision = glyphs.revision;
         self.width_logical = width_logical;
         self.height_logical = height_logical;
-        assert(self.primed);
-        assert(self.height_logical != 0);
+        assert(self.instance_count == list.count);
+        assert(self.glyph_count == glyphs.count);
     }
 };
-
-/// Inputs to `fill_header`. `width_logical` and `height_logical` size the projection, while
-/// `width_px` and `height_px` are the physical framebuffer size; both must be nonzero.
-pub const HeaderOptions = struct {
-    list: *const DrawList,
-    glyphs: *const font.GlyphList,
-    cursor: UploadCursor,
-    width_logical: u32,
-    height_logical: u32,
-    width_px: u32,
-    height_px: u32,
-    clear_r: f32,
-    clear_g: f32,
-    clear_b: f32,
-    clear_a: f32,
-};
-
-/// Fills every field of `header` from `options`, including the upload flags and a projection
-/// built from the logical size. Does not call `UploadCursor.mark`.
-pub fn fill_header(header: *PresentHeader, options: HeaderOptions) void {
-    assert(options.width_px != 0);
-    assert(options.height_px != 0);
-    header.width_px = options.width_px;
-    header.height_px = options.height_px;
-    header.instance_count = options.list.count;
-    header.glyph_count = options.glyphs.count;
-    header.pad = 0;
-    header.flags = options.cursor.flags(
-        options.list,
-        options.glyphs,
-        options.width_logical,
-        options.height_logical,
-    );
-    header.clear_r = options.clear_r;
-    header.clear_g = options.clear_g;
-    header.clear_b = options.clear_b;
-    header.clear_a = options.clear_a;
-    ortho_y_down(&header.ortho, options.width_logical, options.height_logical);
-    assert(header.instance_count <= instance_cap);
-    assert(header.glyph_count <= font.glyph_cap);
-    assert(header.pad == 0);
-    assert(header.ortho[0] > 0);
-}
 
 /// Writes the column-major projection from top-left, Y-down logical pixels to WebGPU NDC.
 /// The derivation is in the module guide; `width` and `height` are nonzero logical pixels.
@@ -736,21 +735,6 @@ comptime {
     assert(@offsetOf(Instance, "clip_x0") == 48);
     assert(kind_box == 0);
     assert(kind_arc == 1);
-
-    assert(@sizeOf(PresentHeader) == 104);
-    assert(@offsetOf(PresentHeader, "width_px") == 0);
-    assert(@offsetOf(PresentHeader, "height_px") == 4);
-    assert(@offsetOf(PresentHeader, "instance_count") == 8);
-    assert(@offsetOf(PresentHeader, "flags") == 12);
-    assert(@offsetOf(PresentHeader, "clear_r") == 16);
-    assert(@offsetOf(PresentHeader, "ortho") == 32);
-    assert(@offsetOf(PresentHeader, "glyph_count") == 96);
-    assert(@offsetOf(PresentHeader, "pad") == 100);
-
-    // Flags are disjoint bits so they can be OR-ed and tested independently.
-    assert(flag_instances == 1);
-    assert(flag_uniform == 2);
-    assert(flag_glyphs == 4);
 
     assert(quad_bytes == @sizeOf(@TypeOf(unit_quad)));
     assert(unit_quad.len == 2 * vertex_count);
@@ -1079,74 +1063,121 @@ test "sdf oversized radius saturates into a disc" {
     try std.testing.expect(corner > 0);
 }
 
-// Locks that an unprimed cursor requests every upload, so the first frame is complete.
-test "the first present uploads instances and the uniform" {
+fn moved(x: f32) Instance {
+    var instance = rect(10, 10);
+    instance.x = x;
+    assert(instance.x == x);
+    return instance;
+}
+
+// Locks that an unprimed cursor writes the uniform and every live record, so the first frame
+// is complete, and that an empty list has nothing to write even then.
+test "the first upload covers the uniform and every record" {
     var list = DrawList.init();
-    try list.append(rect(10, 10));
+    try list.append(moved(0));
+    try list.append(moved(1));
     const glyphs = font.GlyphList.init();
     const cursor = UploadCursor.init();
-    const flags = cursor.flags(&list, &glyphs, 1280, 720);
-    try std.testing.expectEqual(flag_instances | flag_uniform | flag_glyphs, flags);
+    try std.testing.expect(cursor.uniform_dirty(1280, 720));
+    try std.testing.expectEqual(Range{ .first = 0, .end = 2 }, cursor.instance_range(&list).?);
+    try std.testing.expectEqual(@as(?Range, null), cursor.glyph_range(&glyphs));
 }
 
-// Locks that a primed cursor with a changed face revision requests only `flag_instances`.
-test "a revision change uploads instances" {
-    var list = DrawList.init();
-    try list.append(rect(10, 10));
-    const glyphs = font.GlyphList.init();
-    var cursor = UploadCursor.init();
-    cursor.mark(&list, &glyphs, 1280, 720);
-    list.clear();
-    try list.append(face(.{
-        .x = 8,
-        .y = 8,
-        .width = 16,
-        .height = 16,
-        .r = 1,
-        .g = 1,
-        .b = 1,
-        .a = 1,
-        .radius = 0,
-        .hover = 0,
-        .down = 0,
-    }));
-    const flags = cursor.flags(&list, &glyphs, 1280, 720);
-    try std.testing.expectEqual(flag_instances, flags);
-}
-
-// Locks that a primed cursor with a changed logical width requests only `flag_uniform`.
-test "a logical size change uploads the uniform" {
-    var list = DrawList.init();
-    try list.append(rect(10, 10));
-    const glyphs = font.GlyphList.init();
-    var cursor = UploadCursor.init();
-    cursor.mark(&list, &glyphs, 1280, 720);
-    const flags = cursor.flags(&list, &glyphs, 800, 720);
-    try std.testing.expectEqual(flag_uniform, flags);
-}
-
-// Locks that identical revisions and logical size request no upload, even if the physical
-// pixel scale changed.
+// Locks the idle path: an unchanged revision and logical size write nothing, even when the
+// physical pixel scale changed (the cursor never sees it).
 test "a scale-style present with the same logical size uploads nothing" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
     const glyphs = font.GlyphList.init();
     var cursor = UploadCursor.init();
     cursor.mark(&list, &glyphs, 800, 600);
-    const flags = cursor.flags(&list, &glyphs, 800, 600);
-    try std.testing.expectEqual(@as(u32, 0), flags);
+    try std.testing.expect(!cursor.uniform_dirty(800, 600));
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
+    try std.testing.expectEqual(@as(?Range, null), cursor.glyph_range(&glyphs));
 }
 
-// Locks that a primed cursor with a changed glyph revision requests only `flag_glyphs`.
-test "a glyph revision change uploads glyphs" {
+// Locks that a logical width or height change dirties the uniform and nothing else.
+test "a logical size change uploads the uniform" {
+    var list = DrawList.init();
+    try list.append(rect(10, 10));
+    const glyphs = font.GlyphList.init();
+    var cursor = UploadCursor.init();
+    cursor.mark(&list, &glyphs, 1280, 720);
+    try std.testing.expect(cursor.uniform_dirty(800, 720));
+    try std.testing.expect(cursor.uniform_dirty(1280, 600));
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
+}
+
+// Locks that clearing and rebuilding identical records, which bumps the revision, writes
+// nothing: this is every redraw's unchanged glyph list.
+test "an identical rebuild uploads nothing" {
+    var list = DrawList.init();
+    try list.append(moved(0));
+    try list.append(moved(1));
+    var glyphs = font.GlyphList.init();
+    var cursor = UploadCursor.init();
+    cursor.mark(&list, &glyphs, 1280, 720);
+    list.clear();
+    try list.append(moved(0));
+    try list.append(moved(1));
+    glyphs.clear();
+    try std.testing.expect(list.revision != cursor.revision);
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
+    try std.testing.expectEqual(@as(?Range, null), cursor.glyph_range(&glyphs));
+}
+
+// Locks that one changed record writes exactly that record, and two changed records write
+// the span between them.
+test "a changed record uploads only its range" {
+    var list = DrawList.init();
+    var index: u32 = 0;
+    while (index < 6) : (index += 1) {
+        try list.append(moved(@floatFromInt(index)));
+    }
+    const glyphs = font.GlyphList.init();
+    var cursor = UploadCursor.init();
+    cursor.mark(&list, &glyphs, 1280, 720);
+    try std.testing.expect(list.set_state(3, 0.5, 0));
+    try std.testing.expectEqual(Range{ .first = 3, .end = 4 }, cursor.instance_range(&list).?);
+    try std.testing.expect(list.set_state(1, 0.5, 0));
+    try std.testing.expectEqual(Range{ .first = 1, .end = 4 }, cursor.instance_range(&list).?);
+    cursor.mark(&list, &glyphs, 1280, 720);
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
+}
+
+// Locks the count rules: a grown list writes through its new count, and a shrunk list whose
+// remaining records match writes nothing.
+test "a grown list uploads its tail and a shrunk list uploads nothing" {
+    var list = DrawList.init();
+    try list.append(moved(0));
+    try list.append(moved(1));
+    const glyphs = font.GlyphList.init();
+    var cursor = UploadCursor.init();
+    cursor.mark(&list, &glyphs, 1280, 720);
+    try list.append(moved(2));
+    try std.testing.expectEqual(Range{ .first = 2, .end = 3 }, cursor.instance_range(&list).?);
+    list.clear();
+    try list.append(moved(0));
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
+}
+
+// Locks that a changed glyph writes only glyph records.
+test "a glyph change uploads glyphs" {
     var list = DrawList.init();
     try list.append(rect(10, 10));
     var glyphs = font.GlyphList.init();
     var cursor = UploadCursor.init();
     cursor.mark(&list, &glyphs, 1280, 720);
-    glyphs.clear();
-    const flags = cursor.flags(&list, &glyphs, 1280, 720);
-    try std.testing.expectEqual(flag_glyphs, flags);
+    font.place(&glyphs, "Hi", .{ .x = 0, .y = 0, .width = 64, .height = 32 }, .{
+        .r = 1,
+        .g = 1,
+        .b = 1,
+        .a = 1,
+    }, .{ .x0 = 0, .y0 = 0, .x1 = 64, .y1 = 32 });
+    try std.testing.expect(glyphs.count != 0);
+    const whole: Range = .{ .first = 0, .end = glyphs.count };
+    try std.testing.expectEqual(whole, cursor.glyph_range(&glyphs).?);
+    try std.testing.expectEqual(@as(?Range, null), cursor.instance_range(&list));
 }
 
 // Locks the Zig-to-WGSL contract that `comptime` cannot see: both shaders declare `Theme` with

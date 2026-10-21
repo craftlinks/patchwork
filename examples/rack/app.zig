@@ -884,3 +884,65 @@ test "a tiny window still draws" {
     try std.testing.expect(list.count >= 1);
     try std.testing.expect(!rects_overlap(knob_at(&app, 0, 0).rect, meter_at(&app, 0).rect));
 }
+
+fn record(
+    app: *App,
+    renderer: *patchwork.renderer.Renderer,
+    buffer: *patchwork.commands.CommandBuffer,
+    list: *quads.DrawList,
+    glyphs: *font.GlyphList,
+    width_px: u32,
+) void {
+    if (app.dirty()) {
+        app.draw(list, glyphs);
+    }
+    buffer.reset();
+    renderer.frame(buffer, list, glyphs, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = width_px,
+        .height_px = width_px * 720 / 1280,
+    });
+}
+
+// Locks the rack's command streams: setup once, then a first frame of three writes, one pass,
+// two draws, and present; a scale-only frame writes nothing; a hover frame writes only the
+// changed face records, because the rebuilt glyph list is identical.
+test "rack frames record the step 11 op sequences" {
+    const Code = patchwork.commands.Code;
+    var app = new_app();
+    app.layout(1280, 720);
+    var renderer = patchwork.renderer.Renderer.init();
+    var buffer = patchwork.commands.CommandBuffer.init();
+    renderer.setup(&buffer);
+    var list = quads.DrawList.init();
+    var glyphs = font.GlyphList.init();
+    var codes: [32]Code = undefined;
+    var writes: [4]patchwork.commands.BufferWrite = undefined;
+
+    record(&app, &renderer, &buffer, &list, &glyphs, 1280);
+    const first = [_]Code{
+        .buffer_write,      .buffer_write,      .buffer_write,
+        .pass_begin,        .pipeline_set,      .bind_group_set,
+        .vertex_buffer_set, .vertex_buffer_set, .draw,
+        .pipeline_set,      .bind_group_set,    .bind_group_set,
+        .vertex_buffer_set, .vertex_buffer_set, .draw,
+        .pass_end_present,
+    };
+    try std.testing.expectEqualSlices(Code, &first, patchwork.renderer.codes(&buffer, &codes));
+
+    record(&app, &renderer, &buffer, &list, &glyphs, 2560);
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(&buffer, &writes).len);
+
+    const ring = widgets.ring_of(knob_at(&app, 0, 0).rect);
+    try std.testing.expect(app.event(.{ .pointer_move = .{
+        .x = ring.x + ring.width * 0.5,
+        .y = ring.y + ring.height * 0.5,
+    } }));
+    try std.testing.expect(app.event(.{ .frame = 50 }));
+    record(&app, &renderer, &buffer, &list, &glyphs, 2560);
+    const hover = patchwork.renderer.writes(&buffer, &writes);
+    try std.testing.expectEqual(@as(usize, 1), hover.len);
+    try std.testing.expectEqual(renderer.resources.instance_buffer, hover[0].id);
+    try std.testing.expect(hover[0].data.len < list.count * quads.instance_stride);
+}

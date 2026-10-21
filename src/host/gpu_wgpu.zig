@@ -6,8 +6,8 @@
 //! The backend links `libwgpu_native.so` through `webgpu.h` types declared here with
 //! `extern struct` and `callconv(.c)`, so the build needs no wrapper library, code generator,
 //! or package manager. Every declaration is pinned to the wgpu-native version above; a version
-//! bump must re-check each struct against the new header (the `comptime` block after the
-//! struct declarations enforces the sizes this file depends on).
+//! bump must re-check each struct against the new header (the `comptime` blocks after the
+//! struct declarations enforce the sizes this file depends on).
 //!
 //! ## 2. Opaque Handles and Chained Structs
 //! Each handle is a distinct `*opaque {}` type, so passing an `Adapter` where a `Device` is
@@ -21,48 +21,42 @@
 //! range, not in core WebGPU. Chain nodes must outlive the call that consumes them, which is
 //! why each is a local in the function that passes it.
 //!
-//! ## 3. Vertex Layout Contract
-//! Both pipelines use the same two-buffer layout (`fill_vertex_layouts`):
-//! - Buffer 0, `step_vertex`: the shared unit quad (`draw.unit_quad`), one `float32x2`
-//!   attribute at location 0.
-//! - Buffer 1, `step_instance`: four `float32x4` attributes at locations 1 to 4, stride
-//!   `draw.instance_stride`. For quads they are rect, fill, shape `(radius, hover, down,
-//!   kind)`, and clip. `font.Glyph` is fetched through the same attributes.
+//! ## 3. A Replayer, Not a Renderer
+//! `create` makes the instance, surface, adapter, device, and queue, and nothing else. Every
+//! resource and every frame arrives as a `commands.CommandBuffer` that `execute` replays op by
+//! op (`gpu/commands.zig` defines the encoding, `draw/renderer.zig` what is recorded). Ids map
+//! to handles through fixed tables in `Gpu`, one per `commands.Kind`, sized by
+//! `commands.caps`. Creating an id twice or using an id that was never created panics with
+//! the op name. A layout's entries are kept beside its handle, because a bind group entry's
+//! resource id names a buffer, a texture, or a sampler according to the layout entry at the
+//! same binding. A texture's default view is created with it and is what bind groups bind.
+//! Pipelines target `Gpu.format` and use the conventions listed in `gpu/commands.zig`.
 //!
-//! The attribute offsets are the field offsets of `draw.Instance` and `font.Glyph`;
-//! `instance_attrs` is pinned to them by `comptime` asserts so a struct edit cannot desync
-//! the vertex fetch. The browser host (`web/shell.js`) mirrors the same locations.
-//!
-//! ## 4. Frame Lifecycle (`present`)
+//! ## 4. Frame Lifecycle
 //! ```text
-//! configure_surface  -> only when the physical size differs from the configured size
-//! write_uploads      -> only the buffers named by header.flags (see draw.UploadCursor)
-//! acquire_texture    -> current swapchain texture, or an error
-//! encode_submit_present
-//!     clear pass -> draw_quads -> draw_glyphs -> submit -> present -> release handles
+//! pass_begin        -> reconfigure the surface if the size changed, acquire its texture,
+//!                      create the view, encoder, and clearing render pass
+//! pipeline_set .. draw -> recorded into that pass; they panic when no pass is open
+//! pass_end_present  -> end, finish, submit, present, release every per-frame handle
 //! ```
-//! `present` must be called with nonzero dimensions and with counts within the capacities
-//! the buffers were created for. Every per-frame handle (texture, view, encoder, pass,
-//! command buffer) is released before `encode_submit_present` returns.
+//! Buffer and texture writes go straight to the queue, so a write recorded before
+//! `pass_begin` is visible to the pass. If `execute` returns early, a deferred release frees
+//! whatever per-frame handles exist.
 //!
-//! ## 5. Uniform Buffer and Bind Groups
-//! Group 0 is one uniform buffer (matrix at offset 0, theme at offset `draw.matrix_bytes`),
-//! sized `draw.uniform_bytes` (see `draw.zig` for the WebGPU uniform alignment rule). It is
-//! visible to vertex and fragment stages and shared by both pipelines through one explicit
-//! layout, because `layout: auto` layouts are private to a pipeline and cannot be shared.
-//! Group 1 (glyph pipeline only) holds the atlas texture and a filtering sampler with
-//! clamp-to-edge addressing; the baker's half-texel UV inset (see `font.zig`) keeps linear
-//! filtering from sampling outside a glyph cell.
+//! ## 5. Errors
+//! `request_device` installs `uncaptured_error`, which wgpu-native calls synchronously from
+//! inside the failing call. It keeps the first message in `error_slot`; `execute` checks the
+//! slot after every op and fails the frame with `error.GpuValidation`, logging the op index,
+//! the op name, and the message. Without the callback wgpu-native would abort the process.
 //!
 //! ## 6. Texture Upload Rules
 //! - Texture and buffer usage flags use different bit assignments: `COPY_DST` is
 //!   `texture_usage_copy_dst` for textures but `usage_copy_dst` for buffers, and the buffer
 //!   value is `STORAGE_BINDING` on a texture, which `r8unorm` forbids and which makes
-//!   `wgpuDeviceCreateTexture` panic. `create_atlas` asserts the two differ.
+//!   `wgpuDeviceCreateTexture` panic. `texture_create` asserts the two differ.
 //! - WebGPU requires `bytesPerRow` to be a multiple of 256 for buffer-to-texture copies
-//!   (`GPUCommandEncoder.copyBufferToTexture`). `wgpuQueueWriteTexture` does not enforce it,
-//!   but the atlas rows satisfy it anyway so a staging-buffer upload would need no repacking;
-//!   the `comptime` block asserts it.
+//!   (`GPUCommandEncoder.copyBufferToTexture`). `wgpuQueueWriteTexture` does not enforce it;
+//!   the renderer keeps the atlas rows aligned anyway.
 //! - Texture writes use `TexelCopyTextureInfo` and `TexelCopyBufferLayout`, which must match
 //!   `wgpuQueueWriteTexture` field for field.
 //!
@@ -71,7 +65,7 @@
 //! - `wgpuInstanceWaitAny` is declared in the header but panics inside Rust. `wait_future`
 //!   instead pumps `wgpuInstanceProcessEvents` in a loop bounded by `wait_max`.
 //! - `wgpuShaderModuleGetCompilationInfo` panics, so shader and pipeline creation is checked
-//!   only by a non-null handle.
+//!   by a non-null handle and by the uncaptured-error callback (section 5).
 //! - `desiredMaximumFrameLatency` is requested as `frame_latency` through
 //!   `SurfaceConfigurationExtras`, but Mesa's Wayland WSI clamps it to its swapchain image
 //!   minimum. It is therefore not a pacing control; pacing comes from the window loop (see
@@ -90,18 +84,18 @@
 //! preference if a Mesa release makes FIFO a single commit per present.
 //!
 //! ## 9. TigerStyle Invariants
-//! All GPU memory is created once in `create`; the frame path allocates nothing and never
-//! creates or destroys long-lived resources. Searches over driver-reported lists are
-//! bounded by `present_mode_cap` and `format_cap`, and waiting is bounded by `wait_max`.
+//! Long-lived resources are created only by setup ops, into fixed tables; frame ops create
+//! and release only per-frame handles. Searches over driver-reported lists are bounded by
+//! `present_mode_cap` and `format_cap`, waiting is bounded by `wait_max`, and an error
+//! message is truncated to `error_message_cap` bytes.
 
 const std = @import("std");
 const assert = std.debug.assert;
-const draw = @import("../draw.zig");
-const font = @import("../font.zig");
-const theme = @import("../theme.zig");
+const commands = @import("../gpu/commands.zig");
 
-/// Every native WebGPU handle the backend owns. Created once by `create`; never freed, since
-/// the process lifetime equals the window lifetime.
+/// Every native WebGPU handle the backend owns. The device objects are created by `create`
+/// and the resource tables are filled by setup ops; nothing is freed, since the process
+/// lifetime equals the window lifetime.
 pub const Gpu = struct {
     instance: Instance,
     adapter: Adapter,
@@ -113,17 +107,22 @@ pub const Gpu = struct {
     present_mode: PresentMode,
     configured_width: u32,
     configured_height: u32,
-    pipeline: RenderPipeline,
-    glyph_pipeline: RenderPipeline,
-    quad_buffer: Buffer,
-    instance_buffer: Buffer,
-    glyph_buffer: Buffer,
-    uniform_buffer: Buffer,
-    bind_group: BindGroup,
-    glyph_bind_group: BindGroup,
-    atlas: Texture,
-    glyph_sampler: Sampler,
+    shaders: [cap(.shader)]?ShaderModule,
+    layouts: [cap(.layout)]?BindGroupLayout,
+    /// The entries each layout was created with, read by `bind_group_create`.
+    layout_entries: [cap(.layout)]commands.LayoutCreate,
+    pipelines: [cap(.pipeline)]?RenderPipeline,
+    buffers: [cap(.buffer)]?Buffer,
+    textures: [cap(.texture)]?Texture,
+    /// Default view of the texture with the same id.
+    views: [cap(.texture)]?TextureView,
+    samplers: [cap(.sampler)]?Sampler,
+    bind_groups: [cap(.bind_group)]?BindGroup,
 };
+
+fn cap(comptime kind: commands.Kind) usize {
+    return commands.caps.get(kind);
+}
 
 const Instance = *opaque {};
 const Adapter = *opaque {};
@@ -210,6 +209,8 @@ const blend_add: BlendOperation = 0x00000001;
 const blend_src_alpha: BlendFactor = 0x00000005;
 const blend_one_minus_src_alpha: BlendFactor = 0x00000006;
 const buffer_uniform: BufferBindingType = 0x00000002;
+const buffer_read_only_storage: BufferBindingType = 0x00000004;
+const error_type_no_error: u32 = 0x00000001;
 const shader_vertex: Flags = 0x0000000000000001;
 const shader_fragment: Flags = 0x0000000000000002;
 const format_r8_unorm: TextureFormat = 0x00000001;
@@ -220,6 +221,7 @@ const dimension_2d: u32 = 0x00000002;
 const sample_float: u32 = 0x00000002;
 const view_2d: u32 = 0x00000002;
 const address_clamp_to_edge: u32 = 0x00000001;
+const filter_nearest: u32 = 0x00000001;
 const filter_linear: u32 = 0x00000002;
 const mip_nearest: u32 = 0x00000001;
 const sampler_filtering: u32 = 0x00000002;
@@ -582,6 +584,50 @@ comptime {
     assert(@sizeOf(SamplerDescriptor) == 64);
 }
 
+const QueueDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+};
+
+const DeviceLostCallbackInfo = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    mode: CallbackMode,
+    callback: ?*const anyopaque,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+};
+
+const UncapturedErrorCallbackInfo = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    callback: ?*const fn (
+        device: ?*const anyopaque,
+        type: u32,
+        message: StringView,
+        userdata1: ?*anyopaque,
+        userdata2: ?*anyopaque,
+    ) callconv(.c) void,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+};
+
+const DeviceDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    required_feature_count: usize,
+    required_features: ?*const anyopaque,
+    required_limits: ?*const anyopaque,
+    default_queue: QueueDescriptor,
+    device_lost_callback_info: DeviceLostCallbackInfo,
+    uncaptured_error_callback_info: UncapturedErrorCallbackInfo,
+};
+
+comptime {
+    assert(@sizeOf(QueueDescriptor) == 24);
+    assert(@sizeOf(DeviceLostCallbackInfo) == 40);
+    assert(@sizeOf(UncapturedErrorCallbackInfo) == 32);
+    assert(@sizeOf(DeviceDescriptor) == 144);
+}
+
 const AdapterSlot = struct {
     adapter: ?Adapter,
     ok: bool,
@@ -590,12 +636,6 @@ const AdapterSlot = struct {
 const DeviceSlot = struct {
     device: ?Device,
     ok: bool,
-};
-
-const Buffers = struct {
-    quad: Buffer,
-    instances: Buffer,
-    uniform: Buffer,
 };
 
 extern fn wgpuCreateInstance(descriptor: ?*const anyopaque) ?Instance;
@@ -714,6 +754,7 @@ extern fn wgpuTextureRelease(texture: Texture) void;
 extern fn wgpuCommandEncoderRelease(encoder: CommandEncoder) void;
 extern fn wgpuCommandBufferRelease(buffer: CommandBuffer) void;
 extern fn wgpuRenderPassEncoderRelease(pass: RenderPassEncoder) void;
+extern fn wgpuPipelineLayoutRelease(layout: PipelineLayout) void;
 
 comptime {
     assert(@sizeOf(Color) == 32);
@@ -723,27 +764,15 @@ comptime {
     assert(@sizeOf(ShaderSourceWgsl) == 32);
     // chain (16) plus the latency u32, rounded up to the pointer alignment.
     assert(@sizeOf(SurfaceConfigurationExtras) == 24);
-
-    // The glyph pipeline reuses the instance vertex layout, so both structs must expose the
-    // same four vec4 groups at the offsets in `instance_attrs`, and the unit-quad buffer
-    // stride in `fill_vertex_layouts` must match `draw.unit_quad`.
-    assert(instance_attrs[0].offset == @offsetOf(draw.Instance, "x"));
-    assert(instance_attrs[1].offset == @offsetOf(draw.Instance, "r"));
-    assert(instance_attrs[2].offset == @offsetOf(draw.Instance, "radius"));
-    assert(instance_attrs[3].offset == @offsetOf(draw.Instance, "clip_x0"));
-    assert(instance_attrs[0].offset == @offsetOf(font.Glyph, "x"));
-    assert(instance_attrs[1].offset == @offsetOf(font.Glyph, "u0"));
-    assert(instance_attrs[2].offset == @offsetOf(font.Glyph, "r"));
-    assert(instance_attrs[3].offset == @offsetOf(font.Glyph, "clip_x0"));
-    assert(@sizeOf(draw.Instance) == @sizeOf(font.Glyph));
-    assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
-    // Buffer-to-texture copy rows must be 256-byte aligned (module guide section 6).
-    assert(font.atlas_width % 256 == 0);
+    // Usage and stage bits pass through from the stream unchanged (module guide section 3).
+    assert(usage_copy_dst == commands.usage_copy_dst);
+    assert(usage_vertex == commands.usage_vertex);
+    assert(usage_uniform == commands.usage_uniform);
+    assert(shader_vertex == commands.stage_vertex);
+    assert(shader_fragment == commands.stage_fragment);
 }
 
 const empty_label: StringView = .{ .data = null, .length = 0 };
-const vs_main_name: []const u8 = "vs_main";
-const fs_main_name: []const u8 = "fs_main";
 
 const alpha_blend: BlendState = .{
     .color = .{
@@ -758,46 +787,22 @@ const alpha_blend: BlendState = .{
     },
 };
 
-const unit_attr: VertexAttribute = .{
-    .next_in_chain = null,
-    .format = vertex_float32x2,
-    .offset = 0,
-    .shader_location = 0,
+/// Longest error message kept by `uncaptured_error`; longer messages are truncated.
+const error_message_cap: u32 = 1024;
+
+/// The first uncaptured device error since `execute` last reported one (module guide
+/// section 5). Static because wgpu-native needs a stable userdata address before `Gpu` exists.
+const ErrorSlot = struct {
+    failed: bool,
+    len: u32,
+    message: [error_message_cap]u8,
 };
 
-/// Per-instance vertex fetch shared by the quad and glyph pipelines. `shader_location` values
-/// match `@location` in `quad.wgsl` and `glyph.wgsl`. Offsets are pinned to the field offsets
-/// of `draw.Instance` and `font.Glyph` by the `comptime` block below.
-const instance_attrs = [_]VertexAttribute{
-    .{
-        .next_in_chain = null,
-        .format = vertex_float32x4,
-        .offset = 0,
-        .shader_location = 1,
-    },
-    .{
-        .next_in_chain = null,
-        .format = vertex_float32x4,
-        .offset = 16,
-        .shader_location = 2,
-    },
-    .{
-        .next_in_chain = null,
-        .format = vertex_float32x4,
-        .offset = 32,
-        .shader_location = 3,
-    },
-    .{
-        .next_in_chain = null,
-        .format = vertex_float32x4,
-        .offset = 48,
-        .shader_location = 4,
-    },
-};
+var error_slot: ErrorSlot = .{ .failed = false, .len = 0, .message = undefined };
 
-/// Creates the instance, Wayland-backed surface, adapter, device, queue, and every long-lived
-/// GPU resource. `display` and `wl_surface` must be live Wayland handles that outlive the
-/// returned `Gpu`. The swapchain is left unconfigured until the first `present`.
+/// Creates the instance, Wayland-backed surface, adapter, device, and queue, with empty
+/// resource tables. `display` and `wl_surface` must be live Wayland handles that outlive the
+/// returned `Gpu`. The swapchain is left unconfigured until the first `pass_begin`.
 /// Errors: any failed handle request, `error.WaitTimeout`, or `error.Bgra8Unsupported`.
 pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     assert(@intFromPtr(display) != 0);
@@ -808,7 +813,6 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
     const device = try request_device(instance, adapter);
     const queue = wgpuDeviceGetQueue(device);
     const chosen = try pick_format(surface, adapter);
-    const resources = try create_resources(device, queue, chosen.format);
     return .{
         .instance = instance,
         .adapter = adapter,
@@ -819,121 +823,502 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
         .present_mode = chosen.present_mode,
         .configured_width = 0,
         .configured_height = 0,
-        .pipeline = resources.pipeline,
-        .glyph_pipeline = resources.glyph_pipeline,
-        .quad_buffer = resources.quad,
-        .instance_buffer = resources.instances,
-        .glyph_buffer = resources.glyph_buffer,
-        .uniform_buffer = resources.uniform,
-        .bind_group = resources.bind_group,
-        .glyph_bind_group = resources.glyph_bind_group,
-        .atlas = resources.atlas,
-        .glyph_sampler = resources.glyph_sampler,
+        .shaders = @splat(null),
+        .layouts = @splat(null),
+        .layout_entries = undefined,
+        .pipelines = @splat(null),
+        .buffers = @splat(null),
+        .textures = @splat(null),
+        .views = @splat(null),
+        .samplers = @splat(null),
+        .bind_groups = @splat(null),
     };
 }
 
-const PipelineResources = struct {
-    pipeline: RenderPipeline,
-    glyph_pipeline: RenderPipeline,
-    quad: Buffer,
-    instances: Buffer,
-    glyph_buffer: Buffer,
-    uniform: Buffer,
-    bind_group: BindGroup,
-    glyph_bind_group: BindGroup,
-    atlas: Texture,
-    glyph_sampler: Sampler,
+/// Per-frame handles between `pass_begin` and `pass_end_present`. All null outside a pass.
+const Frame = struct {
+    texture: ?Texture,
+    view: ?TextureView,
+    encoder: ?CommandEncoder,
+    pass: ?RenderPassEncoder,
+
+    const empty: Frame = .{ .texture = null, .view = null, .encoder = null, .pass = null };
+
+    /// Releases whatever exists, innermost first. Only reached with handles on an error path.
+    fn release(self: *Frame) void {
+        if (self.pass) |pass| wgpuRenderPassEncoderRelease(pass);
+        if (self.encoder) |encoder| wgpuCommandEncoderRelease(encoder);
+        if (self.view) |view| wgpuTextureViewRelease(view);
+        if (self.texture) |texture| wgpuTextureRelease(texture);
+        self.* = empty;
+    }
 };
 
-/// Builds every GPU resource for both pipelines and uploads the static unit quad and atlas.
-fn create_resources(
-    device: Device,
-    queue: Queue,
-    format: TextureFormat,
-) !PipelineResources {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(queue) != 0);
-    const shader = create_shader(device);
-    const buffers = try create_buffers(device);
-    write_quad(queue, buffers.quad);
-    const layout = create_bind_group_layout(device);
-    const pipeline_layout = create_pipeline_layout(device, layout);
-    const bind_group = create_bind_group(device, layout, buffers.uniform);
-    const pipeline = create_pipeline(device, shader, pipeline_layout, format);
-    const glyphs = try create_glyph_resources(device, queue, format, layout);
-    return .{
-        .pipeline = pipeline,
-        .glyph_pipeline = glyphs.pipeline,
-        .quad = buffers.quad,
-        .instances = buffers.instances,
-        .glyph_buffer = glyphs.buffer,
-        .uniform = buffers.uniform,
-        .bind_group = bind_group,
-        .glyph_bind_group = glyphs.bind_group,
-        .atlas = glyphs.atlas,
-        .glyph_sampler = glyphs.sampler,
-    };
+/// Replays `buffer` op by op (module guide sections 3 and 4). Returns the error from
+/// `acquire_texture` when no swapchain texture is available, or `error.GpuValidation` after
+/// logging the failing op when the device reported an error.
+pub fn execute(self: *Gpu, buffer: *const commands.CommandBuffer) !void {
+    assert(buffer.len != 0);
+    assert(!error_slot.failed);
+    var frame: Frame = .empty;
+    defer frame.release();
+    var reader = buffer.reader();
+    while (reader.next()) |op| {
+        try run(self, op, &frame);
+        if (error_slot.failed) {
+            std.log.err("gpu op {d} ({s}) failed: {s}", .{
+                reader.index - 1,
+                @tagName(op),
+                error_slot.message[0..error_slot.len],
+            });
+            error_slot.failed = false;
+            return error.GpuValidation;
+        }
+    }
+    assert(frame.pass == null);
+    assert(reader.index == buffer.count);
 }
 
-/// GPU resources owned by the glyph pipeline alone.
-const GlyphResources = struct {
-    pipeline: RenderPipeline,
-    buffer: Buffer,
-    bind_group: BindGroup,
-    atlas: Texture,
-    sampler: Sampler,
-};
+fn run(self: *Gpu, op: commands.Op, frame: *Frame) !void {
+    switch (op) {
+        .shader_create => |p| shader_create(self, p),
+        .layout_create => |p| layout_create(self, p),
+        .pipeline_create => |p| pipeline_create(self, p),
+        .buffer_create => |p| try buffer_create(self, p),
+        .texture_create => |p| try texture_create(self, p),
+        .sampler_create => |p| sampler_create(self, p),
+        .bind_group_create => |p| bind_group_create(self, p),
+        .buffer_write => |p| {
+            const data = p.data.slice();
+            const target = get(Buffer, "buffer_write", &self.buffers, p.id);
+            wgpuQueueWriteBuffer(self.queue, target, p.offset, data.ptr, data.len);
+        },
+        .texture_write => |p| texture_write(self, p),
+        .pass_begin => |p| try pass_begin(self, p, frame),
+        .pipeline_set => |p| {
+            const pipeline = get(RenderPipeline, "pipeline_set", &self.pipelines, p.id);
+            wgpuRenderPassEncoderSetPipeline(open_pass("pipeline_set", frame), pipeline);
+        },
+        .bind_group_set => |p| {
+            const group = get(BindGroup, "bind_group_set", &self.bind_groups, p.id);
+            const pass = open_pass("bind_group_set", frame);
+            wgpuRenderPassEncoderSetBindGroup(pass, p.slot, group, 0, null);
+        },
+        .vertex_buffer_set => |p| {
+            const vertices = get(Buffer, "vertex_buffer_set", &self.buffers, p.buffer);
+            const pass = open_pass("vertex_buffer_set", frame);
+            wgpuRenderPassEncoderSetVertexBuffer(pass, p.slot, vertices, p.offset, whole_size);
+        },
+        .draw => |p| wgpuRenderPassEncoderDraw(
+            open_pass("draw", frame),
+            p.vertex_count,
+            p.instance_count,
+            p.first_vertex,
+            p.first_instance,
+        ),
+        .pass_end_present => pass_end_present(self, frame),
+    }
+}
 
-/// Creates the glyph instance buffer (`font.glyph_cap` records of `font.glyph_stride` bytes),
-/// the uploaded atlas texture, sampler, group 1 layout and bind group, and the glyph pipeline.
-/// `uniform_layout` is the shared group 0 layout so both pipelines can bind one bind group.
-fn create_glyph_resources(
-    device: Device,
-    queue: Queue,
-    format: TextureFormat,
-    uniform_layout: BindGroupLayout,
-) !GlyphResources {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(uniform_layout) != 0);
-    const shader = create_glyph_shader(device);
-    const byte_count: u32 = font.glyph_cap * font.glyph_stride;
-    const buffer = try create_buffer(device, byte_count, usage_vertex | usage_copy_dst);
-    const atlas = try create_atlas(device);
-    write_atlas(queue, atlas);
-    const sampler = create_glyph_sampler(device);
-    const glyph_layout = create_glyph_bind_group_layout(device);
-    const bind_group = create_glyph_bind_group(device, glyph_layout, atlas, sampler);
-    const pipeline_layout = create_glyph_pipeline_layout(device, uniform_layout, glyph_layout);
-    const pipeline = create_glyph_pipeline(device, shader, pipeline_layout, format);
+/// The handle for `id` in `table`. Panics, naming `op`, when the id is out of range or was
+/// never created.
+fn get(comptime T: type, comptime op: []const u8, table: []const ?T, id: u16) T {
+    if (id >= table.len) {
+        std.debug.panic("{s}: id {d} is out of range {d}", .{ op, id, table.len });
+    }
+    return table[id] orelse std.debug.panic("{s}: id {d} was never created", .{ op, id });
+}
+
+/// Asserts `id` names an empty slot of `table`. Panics, naming `op`, otherwise.
+fn claim(comptime T: type, comptime op: []const u8, table: []const ?T, id: u16) void {
+    if (id >= table.len) {
+        std.debug.panic("{s}: id {d} is out of range {d}", .{ op, id, table.len });
+    }
+    if (table[id] != null) {
+        std.debug.panic("{s}: id {d} was already created", .{ op, id });
+    }
+}
+
+fn string_view(text: []const u8) StringView {
+    assert(text.len != 0);
+    return .{ .data = text.ptr, .length = text.len };
+}
+
+fn open_pass(comptime op: []const u8, frame: *const Frame) RenderPassEncoder {
+    return frame.pass orelse std.debug.panic("{s}: no render pass is open", .{op});
+}
+
+fn shader_create(self: *Gpu, p: commands.ShaderCreate) void {
+    claim(ShaderModule, "shader_create", &self.shaders, p.id);
+    const source_text = p.source.slice();
+    var source: ShaderSourceWgsl = .{
+        .chain = .{ .next = null, .s_type = s_type_shader_source_wgsl },
+        .code = .{ .data = source_text.ptr, .length = source_text.len },
+    };
+    const descriptor: ShaderModuleDescriptor = .{
+        .next_in_chain = @ptrCast(&source.chain),
+        .label = empty_label,
+    };
+    const shader = wgpuDeviceCreateShaderModule(self.device, &descriptor);
+    assert(@intFromPtr(shader) != 0);
+    self.shaders[p.id] = shader;
+}
+
+fn layout_create(self: *Gpu, p: commands.LayoutCreate) void {
+    claim(BindGroupLayout, "layout_create", &self.layouts, p.id);
+    assert(p.entry_count <= commands.layout_entry_cap);
+    var entries: [commands.layout_entry_cap]BindGroupLayoutEntry = undefined;
+    for (p.entries[0..p.entry_count], entries[0..p.entry_count]) |entry, *out| {
+        out.* = .{
+            .next_in_chain = null,
+            .binding = entry.binding,
+            .visibility = entry.visibility,
+            .binding_array_size = 0,
+            .buffer = std.mem.zeroes(BufferBindingLayout),
+            .sampler = std.mem.zeroes(SamplerBindingLayout),
+            .texture = std.mem.zeroes(TextureBindingLayout),
+            .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
+        };
+        switch (entry.kind) {
+            .uniform => out.buffer.type = buffer_uniform,
+            .storage_read => out.buffer.type = buffer_read_only_storage,
+            .texture => {
+                out.texture.sample_type = sample_float;
+                out.texture.view_dimension = view_2d;
+            },
+            .sampler => out.sampler.type = sampler_filtering,
+        }
+    }
+    const descriptor: BindGroupLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .entry_count = p.entry_count,
+        .entries = &entries,
+    };
+    const layout = wgpuDeviceCreateBindGroupLayout(self.device, &descriptor);
+    assert(@intFromPtr(layout) != 0);
+    self.layouts[p.id] = layout;
+    self.layout_entries[p.id] = p;
+}
+
+fn pipeline_create(self: *Gpu, p: commands.PipelineCreate) void {
+    claim(RenderPipeline, "pipeline_create", &self.pipelines, p.id);
+    assert(p.layout_count <= commands.pipeline_layout_cap);
+    assert(p.buffer_count <= commands.vertex_buffer_cap);
+    const shader = get(ShaderModule, "pipeline_create", &self.shaders, p.shader);
+    var groups: [commands.pipeline_layout_cap]BindGroupLayout = undefined;
+    for (p.layouts[0..p.layout_count], groups[0..p.layout_count]) |id, *out| {
+        out.* = get(BindGroupLayout, "pipeline_create", &self.layouts, id);
+    }
+    const layout_descriptor: PipelineLayoutDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .bind_group_layout_count = p.layout_count,
+        .bind_group_layouts = &groups,
+        .immediate_size = 0,
+    };
+    const layout = wgpuDeviceCreatePipelineLayout(self.device, &layout_descriptor);
+    assert(@intFromPtr(layout) != 0);
+    var attributes: [commands.vertex_buffer_cap][commands.attribute_cap]VertexAttribute = undefined;
+    var buffers: [commands.vertex_buffer_cap]VertexBufferLayout = undefined;
+    for (p.vertex[0..p.buffer_count], buffers[0..p.buffer_count], 0..) |source, *out, i| {
+        assert(source.attribute_count <= commands.attribute_cap);
+        const used = source.attributes[0..source.attribute_count];
+        for (used, attributes[i][0..used.len]) |attribute, *slot| {
+            slot.* = .{
+                .next_in_chain = null,
+                .format = switch (attribute.format) {
+                    .float32x2 => vertex_float32x2,
+                    .float32x4 => vertex_float32x4,
+                },
+                .offset = attribute.offset,
+                .shader_location = attribute.location,
+            };
+        }
+        out.* = .{
+            .next_in_chain = null,
+            .step_mode = switch (source.step) {
+                .vertex => step_vertex,
+                .instance => step_instance,
+            },
+            .array_stride = source.stride,
+            .attribute_count = source.attribute_count,
+            .attributes = &attributes[i],
+        };
+    }
+    const target: ColorTargetState = .{
+        .next_in_chain = null,
+        .format = self.format,
+        .blend = switch (p.blend) {
+            .none => null,
+            .alpha => &alpha_blend,
+        },
+        .write_mask = color_write_all,
+    };
+    const fragment: FragmentState = .{
+        .next_in_chain = null,
+        .module = shader,
+        .entry_point = string_view(commands.fragment_entry),
+        .constant_count = 0,
+        .constants = null,
+        .target_count = 1,
+        .targets = @ptrCast(&target),
+    };
+    const descriptor: RenderPipelineDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .vertex = .{
+            .next_in_chain = null,
+            .module = shader,
+            .entry_point = string_view(commands.vertex_entry),
+            .constant_count = 0,
+            .constants = null,
+            .buffer_count = p.buffer_count,
+            .buffers = &buffers,
+        },
+        .primitive = .{
+            .next_in_chain = null,
+            .topology = topology_triangle_list,
+            .strip_index_format = index_undefined,
+            .front_face = front_ccw,
+            .cull_mode = cull_none,
+            .unclipped_depth = 0,
+        },
+        .depth_stencil = null,
+        .multisample = .{
+            .next_in_chain = null,
+            .count = 1,
+            .mask = 0xFFFFFFFF,
+            .alpha_to_coverage_enabled = 0,
+        },
+        .fragment = &fragment,
+    };
+    const pipeline = wgpuDeviceCreateRenderPipeline(self.device, &descriptor);
+    // `GetCompilationInfo` is unusable on this pin (module guide section 7), so a non-null
+    // pipeline and the error callback are the only compile checks.
     assert(@intFromPtr(pipeline) != 0);
-    assert(font.atlas_bytes.len == 131072);
-    return .{
-        .pipeline = pipeline,
-        .buffer = buffer,
-        .bind_group = bind_group,
-        .atlas = atlas,
-        .sampler = sampler,
-    };
+    wgpuPipelineLayoutRelease(layout);
+    self.pipelines[p.id] = pipeline;
 }
 
-/// Presents one frame; the sequence is module guide section 4. `header` dimensions must be
-/// nonzero and its counts within capacity. `instances` and `glyphs` must hold at least the
-/// header's counts when the matching upload flag is set. Returns the error from
-/// `acquire_texture` when no swapchain texture is available.
-pub fn present(
-    self: *Gpu,
-    header: *const draw.PresentHeader,
-    instances: [*]const draw.Instance,
-    glyphs: [*]const font.Glyph,
-) !void {
-    assert(header.width_px != 0);
-    assert(header.height_px != 0);
-    assert(header.instance_count <= draw.instance_cap);
-    assert(header.glyph_count <= font.glyph_cap);
-    configure_surface(self, header.width_px, header.height_px);
-    write_uploads(self, header, instances, glyphs);
+fn buffer_create(self: *Gpu, p: commands.BufferCreate) !void {
+    claim(Buffer, "buffer_create", &self.buffers, p.id);
+    assert(p.size != 0);
+    assert(p.usage != 0);
+    const descriptor: BufferDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = p.usage,
+        .size = p.size,
+        .mapped_at_creation = 0,
+    };
+    const buffer = wgpuDeviceCreateBuffer(self.device, &descriptor) orelse {
+        return error.BufferFailed;
+    };
+    self.buffers[p.id] = buffer;
+}
+
+fn texture_create(self: *Gpu, p: commands.TextureCreate) !void {
+    claim(Texture, "texture_create", &self.textures, p.id);
+    assert(p.width != 0);
+    assert(p.height != 0);
+    // Module guide section 6: the buffer COPY_DST bit is STORAGE_BINDING on a texture.
+    assert(texture_usage_copy_dst != usage_copy_dst);
+    const descriptor: TextureDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = texture_usage_copy_dst | usage_texture_binding,
+        .dimension = dimension_2d,
+        .size = .{ .width = p.width, .height = p.height, .depth_or_array_layers = 1 },
+        .format = switch (p.format) {
+            .r8unorm => format_r8_unorm,
+        },
+        .mip_level_count = 1,
+        .sample_count = 1,
+        .view_format_count = 0,
+        .view_formats = null,
+    };
+    const texture = wgpuDeviceCreateTexture(self.device, &descriptor) orelse {
+        return error.TextureFailed;
+    };
+    const view = wgpuTextureCreateView(texture, null);
+    assert(@intFromPtr(view) != 0);
+    self.textures[p.id] = texture;
+    self.views[p.id] = view;
+}
+
+fn sampler_create(self: *Gpu, p: commands.SamplerCreate) void {
+    claim(Sampler, "sampler_create", &self.samplers, p.id);
+    const filter: u32 = switch (p.filter) {
+        .nearest => filter_nearest,
+        .linear => filter_linear,
+    };
+    const descriptor: SamplerDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .address_mode_u = address_clamp_to_edge,
+        .address_mode_v = address_clamp_to_edge,
+        .address_mode_w = address_clamp_to_edge,
+        .mag_filter = filter,
+        .min_filter = filter,
+        .mipmap_filter = mip_nearest,
+        .lod_min_clamp = 0,
+        .lod_max_clamp = 32,
+        .compare = 0,
+        .max_anisotropy = 1,
+    };
+    const sampler = wgpuDeviceCreateSampler(self.device, &descriptor);
+    assert(@intFromPtr(sampler) != 0);
+    self.samplers[p.id] = sampler;
+}
+
+fn bind_group_create(self: *Gpu, p: commands.BindGroupCreate) void {
+    claim(BindGroup, "bind_group_create", &self.bind_groups, p.id);
+    assert(p.entry_count <= commands.bind_group_entry_cap);
+    const layout = get(BindGroupLayout, "bind_group_create", &self.layouts, p.layout);
+    const layout_entries = &self.layout_entries[p.layout];
+    var entries: [commands.bind_group_entry_cap]BindGroupEntry = undefined;
+    for (p.entries[0..p.entry_count], entries[0..p.entry_count]) |entry, *out| {
+        out.* = .{
+            .next_in_chain = null,
+            .binding = entry.binding,
+            .buffer = null,
+            .offset = 0,
+            .size = whole_size,
+            .sampler = null,
+            .texture_view = null,
+        };
+        switch (binding_kind(layout_entries, entry.binding)) {
+            .uniform, .storage_read => {
+                out.buffer = get(Buffer, "bind_group_create", &self.buffers, entry.resource);
+            },
+            .texture => {
+                const views = &self.views;
+                out.texture_view = get(TextureView, "bind_group_create", views, entry.resource);
+            },
+            .sampler => {
+                out.sampler = get(Sampler, "bind_group_create", &self.samplers, entry.resource);
+            },
+        }
+    }
+    const descriptor: BindGroupDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .layout = layout,
+        .entry_count = p.entry_count,
+        .entries = &entries,
+    };
+    const group = wgpuDeviceCreateBindGroup(self.device, &descriptor);
+    assert(@intFromPtr(group) != 0);
+    self.bind_groups[p.id] = group;
+}
+
+/// The kind of the layout entry at `binding`. Panics when the layout has no such binding.
+fn binding_kind(layout: *const commands.LayoutCreate, binding: u16) commands.BindingKind {
+    for (layout.entries[0..layout.entry_count]) |entry| {
+        if (entry.binding == binding) return entry.kind;
+    }
+    std.debug.panic("bind_group_create: layout {d} has no binding {d}", .{ layout.id, binding });
+}
+
+fn texture_write(self: *Gpu, p: commands.TextureWrite) void {
+    const texture = get(Texture, "texture_write", &self.textures, p.id);
+    const data = p.data.slice();
+    assert(data.len >= p.bytes_per_row * (p.height - 1) + p.width);
+    const destination: TexelCopyTextureInfo = .{
+        .texture = texture,
+        .mip_level = 0,
+        .origin = .{ .x = p.x, .y = p.y, .z = 0 },
+        .aspect = 0,
+    };
+    const layout: TexelCopyBufferLayout = .{
+        .offset = 0,
+        .bytes_per_row = p.bytes_per_row,
+        .rows_per_image = p.height,
+    };
+    const size: Extent3D = .{ .width = p.width, .height = p.height, .depth_or_array_layers = 1 };
+    wgpuQueueWriteTexture(self.queue, &destination, data.ptr, data.len, &layout, &size);
+}
+
+/// Reconfigures the surface if needed, acquires its texture, and opens a clearing pass.
+fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
+    if (frame.pass != null) {
+        std.debug.panic("pass_begin: a render pass is already open", .{});
+    }
+    assert(p.width_px != 0);
+    assert(p.height_px != 0);
+    configure_surface(self, p.width_px, p.height_px);
     const texture = try acquire_texture(self.surface);
-    encode_submit_present(self, texture, header);
+    frame.texture = texture;
+    const view = wgpuTextureCreateView(texture, null);
+    frame.view = view;
+    const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
+    frame.encoder = encoder;
+    assert(@intFromPtr(view) != 0);
+    assert(@intFromPtr(encoder) != 0);
+    const attachment: RenderPassColorAttachment = .{
+        .next_in_chain = null,
+        .view = view,
+        .depth_slice = depth_slice_undefined,
+        .resolve_target = null,
+        .load_op = load_clear,
+        .store_op = store_store,
+        .clear_value = .{ .r = p.clear[0], .g = p.clear[1], .b = p.clear[2], .a = p.clear[3] },
+    };
+    const descriptor: RenderPassDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .color_attachment_count = 1,
+        .color_attachments = @ptrCast(&attachment),
+        .depth_stencil_attachment = null,
+        .occlusion_query_set = null,
+        .timestamp_writes = null,
+    };
+    frame.pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+}
+
+/// Ends the pass, submits, presents, and releases every per-frame handle.
+fn pass_end_present(self: *Gpu, frame: *Frame) void {
+    const pass = open_pass("pass_end_present", frame);
+    const encoder = frame.encoder.?;
+    wgpuRenderPassEncoderEnd(pass);
+    const commands_buffer = wgpuCommandEncoderFinish(encoder, null);
+    wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands_buffer));
+    _ = wgpuSurfacePresent(self.surface);
+    wgpuCommandBufferRelease(commands_buffer);
+    frame.release();
+    assert(frame.pass == null);
+    assert(frame.texture == null);
+}
+
+/// C ABI callback installed by `request_device` (module guide section 5). Keeps the first
+/// message until `execute` reports it.
+fn uncaptured_error(
+    device: ?*const anyopaque,
+    error_type: u32,
+    message: StringView,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+) callconv(.c) void {
+    _ = device;
+    _ = userdata1;
+    _ = userdata2;
+    if (error_type == error_type_no_error) return;
+    if (error_slot.failed) return;
+    var len: u32 = 0;
+    if (message.data) |data| {
+        // `WGPU_STRLEN` (all ones) marks a null-terminated message.
+        const full = if (message.length == std.math.maxInt(usize))
+            std.mem.len(@as([*:0]const u8, @ptrCast(data)))
+        else
+            message.length;
+        len = @intCast(@min(full, error_message_cap));
+        @memcpy(error_slot.message[0..len], data[0..len]);
+    }
+    error_slot.len = len;
+    error_slot.failed = true;
+    assert(error_slot.len <= error_message_cap);
 }
 
 /// Creates the top-level WebGPU instance handle. Startup waits use `wait_future`, not
@@ -992,7 +1377,8 @@ fn request_adapter(instance: Instance, surface: Surface) !Adapter {
     return adapter;
 }
 
-/// Requests a device from `adapter` and blocks (bounded) until it resolves.
+/// Requests a device from `adapter` with `uncaptured_error` installed (module guide section
+/// 5) and blocks (bounded) until it resolves.
 fn request_device(instance: Instance, adapter: Adapter) !Device {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(adapter) != 0);
@@ -1004,7 +1390,28 @@ fn request_device(instance: Instance, adapter: Adapter) !Device {
         .userdata1 = @ptrCast(&slot),
         .userdata2 = null,
     };
-    const future = wgpuAdapterRequestDevice(adapter, null, info);
+    const descriptor: DeviceDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .required_feature_count = 0,
+        .required_features = null,
+        .required_limits = null,
+        .default_queue = .{ .next_in_chain = null, .label = empty_label },
+        .device_lost_callback_info = .{
+            .next_in_chain = null,
+            .mode = callback_process_events,
+            .callback = null,
+            .userdata1 = null,
+            .userdata2 = null,
+        },
+        .uncaptured_error_callback_info = .{
+            .next_in_chain = null,
+            .callback = uncaptured_error,
+            .userdata1 = null,
+            .userdata2 = null,
+        },
+    };
+    const future = wgpuAdapterRequestDevice(adapter, &descriptor, info);
     try wait_future(instance, future, &slot.ok);
     const device = slot.device orelse return error.DeviceFailed;
     assert(slot.ok);
@@ -1029,7 +1436,7 @@ fn wait_future(instance: Instance, future: Future, ok: *bool) !void {
 }
 
 /// Swapchain format and present mode chosen from the surface capabilities. The format is
-/// always `format_bgra8_unorm`, which the pipelines are built for.
+/// always `format_bgra8_unorm`, which every pipeline targets.
 const SurfaceChoice = struct {
     format: TextureFormat,
     present_mode: PresentMode,
@@ -1105,289 +1512,6 @@ fn find_bgra8(capabilities: SurfaceCapabilities) ?TextureFormat {
     return null;
 }
 
-/// Creates the quad shader module from `draw.shader_file`.
-fn create_shader(device: Device) ShaderModule {
-    assert(@intFromPtr(device) != 0);
-    assert(draw.shader_file.len >= 1);
-    var source: ShaderSourceWgsl = .{
-        .chain = .{ .next = null, .s_type = s_type_shader_source_wgsl },
-        .code = .{
-            .data = draw.shader_file.ptr,
-            .length = draw.shader_file.len,
-        },
-    };
-    const descriptor: ShaderModuleDescriptor = .{
-        .next_in_chain = @ptrCast(&source.chain),
-        .label = empty_label,
-    };
-    const shader = wgpuDeviceCreateShaderModule(device, &descriptor);
-    assert(@intFromPtr(shader) != 0);
-    return shader;
-}
-
-/// Allocates the unit quad, instance, and uniform buffers. Sizes are fixed for the life of
-/// the device; a frame uploads only the records it has.
-fn create_buffers(device: Device) !Buffers {
-    assert(@intFromPtr(device) != 0);
-    const instance_bytes: u32 = draw.instance_cap * draw.instance_stride;
-    const vertex_usage: Flags = usage_vertex | usage_copy_dst;
-    const uniform_usage: Flags = usage_uniform | usage_copy_dst;
-    const quad = try create_buffer(device, draw.quad_bytes, vertex_usage);
-    const instances = try create_buffer(device, instance_bytes, vertex_usage);
-    const uniform = try create_buffer(device, draw.uniform_bytes, uniform_usage);
-    assert(@intFromPtr(instances) != 0);
-    assert(@intFromPtr(uniform) != 0);
-    return .{ .quad = quad, .instances = instances, .uniform = uniform };
-}
-
-/// Creates one GPU buffer; `size` and `usage` must be nonzero.
-fn create_buffer(device: Device, size: u32, usage: Flags) !Buffer {
-    assert(size != 0);
-    assert(usage != 0);
-    const descriptor: BufferDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .usage = usage,
-        .size = size,
-        .mapped_at_creation = 0,
-    };
-    const buffer = wgpuDeviceCreateBuffer(device, &descriptor) orelse return error.BufferFailed;
-    assert(@intFromPtr(buffer) != 0);
-    return buffer;
-}
-
-/// Uploads `draw.unit_quad` (`draw.quad_bytes` bytes) once at startup.
-fn write_quad(queue: Queue, buffer: Buffer) void {
-    assert(@intFromPtr(queue) != 0);
-    assert(@intFromPtr(buffer) != 0);
-    wgpuQueueWriteBuffer(queue, buffer, 0, @ptrCast(&draw.unit_quad), @intCast(draw.quad_bytes));
-}
-
-/// Group 0 layout: one uniform buffer of `draw.uniform_bytes`, visible to vertex and fragment.
-fn create_bind_group_layout(device: Device) BindGroupLayout {
-    assert(@intFromPtr(device) != 0);
-    const entry: BindGroupLayoutEntry = .{
-        .next_in_chain = null,
-        .binding = 0,
-        .visibility = shader_vertex | shader_fragment,
-        .binding_array_size = 0,
-        .buffer = .{
-            .next_in_chain = null,
-            .type = buffer_uniform,
-            .has_dynamic_offset = 0,
-            .min_binding_size = draw.uniform_bytes,
-        },
-        .sampler = std.mem.zeroes(SamplerBindingLayout),
-        .texture = std.mem.zeroes(TextureBindingLayout),
-        .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
-    };
-    const descriptor: BindGroupLayoutDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .entry_count = 1,
-        .entries = @ptrCast(&entry),
-    };
-    const layout = wgpuDeviceCreateBindGroupLayout(device, &descriptor);
-    assert(@intFromPtr(layout) != 0);
-    return layout;
-}
-
-/// Quad pipeline layout: group 0 only.
-fn create_pipeline_layout(device: Device, bind_layout: BindGroupLayout) PipelineLayout {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(bind_layout) != 0);
-    const descriptor: PipelineLayoutDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .bind_group_layout_count = 1,
-        .bind_group_layouts = @ptrCast(&bind_layout),
-        .immediate_size = 0,
-    };
-    const layout = wgpuDeviceCreatePipelineLayout(device, &descriptor);
-    assert(@intFromPtr(layout) != 0);
-    return layout;
-}
-
-/// Binds the whole uniform buffer to group 0 binding 0.
-fn create_bind_group(device: Device, layout: BindGroupLayout, uniform: Buffer) BindGroup {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(uniform) != 0);
-    const entry: BindGroupEntry = .{
-        .next_in_chain = null,
-        .binding = 0,
-        .buffer = uniform,
-        .offset = 0,
-        .size = draw.uniform_bytes,
-        .sampler = null,
-        .texture_view = null,
-    };
-    const descriptor: BindGroupDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .layout = layout,
-        .entry_count = 1,
-        .entries = @ptrCast(&entry),
-    };
-    const group = wgpuDeviceCreateBindGroup(device, &descriptor);
-    assert(@intFromPtr(group) != 0);
-    return group;
-}
-
-/// Quad render pipeline: shared vertex layout, triangle list, straight-alpha source-over blend.
-fn create_pipeline(
-    device: Device,
-    shader: ShaderModule,
-    layout: PipelineLayout,
-    format: TextureFormat,
-) RenderPipeline {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(shader) != 0);
-    var buffers: [2]VertexBufferLayout = undefined;
-    fill_vertex_layouts(&buffers);
-    const vertex = vertex_state(shader, &buffers);
-    const target: ColorTargetState = .{
-        .next_in_chain = null,
-        .format = format,
-        .blend = &alpha_blend,
-        .write_mask = color_write_all,
-    };
-    const fragment = fragment_state(shader, &target);
-    const descriptor: RenderPipelineDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .layout = layout,
-        .vertex = vertex,
-        .primitive = .{
-            .next_in_chain = null,
-            .topology = topology_triangle_list,
-            .strip_index_format = index_undefined,
-            .front_face = front_ccw,
-            .cull_mode = cull_none,
-            .unclipped_depth = 0,
-        },
-        .depth_stencil = null,
-        .multisample = .{
-            .next_in_chain = null,
-            .count = 1,
-            .mask = 0xFFFFFFFF,
-            .alpha_to_coverage_enabled = 0,
-        },
-        .fragment = &fragment,
-    };
-    const pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
-    // `GetCompilationInfo` is unusable on this pin (module guide section 7), so a non-null
-    // pipeline is the only compile check.
-    assert(@intFromPtr(pipeline) != 0);
-    return pipeline;
-}
-
-/// Fills the two-buffer vertex layout described in module guide section 3.
-fn fill_vertex_layouts(buffers: *[2]VertexBufferLayout) void {
-    buffers[0] = .{
-        .next_in_chain = null,
-        .step_mode = step_vertex,
-        .array_stride = 8,
-        .attribute_count = 1,
-        .attributes = @ptrCast(&unit_attr),
-    };
-    buffers[1] = .{
-        .next_in_chain = null,
-        .step_mode = step_instance,
-        .array_stride = draw.instance_stride,
-        .attribute_count = 4,
-        .attributes = &instance_attrs,
-    };
-    assert(buffers[0].attribute_count == 1);
-    assert(buffers[1].attribute_count == 4);
-}
-
-/// Vertex stage descriptor using entry point `vs_main`.
-fn vertex_state(shader: ShaderModule, buffers: [*]const VertexBufferLayout) VertexState {
-    assert(@intFromPtr(shader) != 0);
-    assert(vs_main_name.len == 7);
-    return .{
-        .next_in_chain = null,
-        .module = shader,
-        .entry_point = .{ .data = vs_main_name.ptr, .length = vs_main_name.len },
-        .constant_count = 0,
-        .constants = null,
-        .buffer_count = 2,
-        .buffers = buffers,
-    };
-}
-
-/// Fragment stage descriptor using entry point `fs_main`; `target` must be BGRA8Unorm.
-fn fragment_state(shader: ShaderModule, target: *const ColorTargetState) FragmentState {
-    assert(@intFromPtr(shader) != 0);
-    assert(target.format == format_bgra8_unorm);
-    return .{
-        .next_in_chain = null,
-        .module = shader,
-        .entry_point = .{ .data = fs_main_name.ptr, .length = fs_main_name.len },
-        .constant_count = 0,
-        .constants = null,
-        .target_count = 1,
-        .targets = @ptrCast(target),
-    };
-}
-
-/// Uploads the buffers selected by `header.flags`. The uniform upload writes the matrix at
-/// offset 0 and the theme at offset `draw.matrix_bytes`. Instance and glyph uploads write
-/// only the first `count` records and are skipped when the count is zero.
-fn write_uploads(
-    self: *Gpu,
-    header: *const draw.PresentHeader,
-    instances: [*]const draw.Instance,
-    glyphs: [*]const font.Glyph,
-) void {
-    assert(header.instance_count <= draw.instance_cap);
-    assert(header.glyph_count <= font.glyph_cap);
-    if ((header.flags & draw.flag_uniform) != 0) {
-        wgpuQueueWriteBuffer(
-            self.queue,
-            self.uniform_buffer,
-            0,
-            @ptrCast(&header.ortho),
-            @intCast(draw.matrix_bytes),
-        );
-        wgpuQueueWriteBuffer(
-            self.queue,
-            self.uniform_buffer,
-            draw.matrix_bytes,
-            @ptrCast(&theme.chrome),
-            @intCast(theme.bytes),
-        );
-    }
-    if ((header.flags & draw.flag_instances) != 0) {
-        if (header.instance_count != 0) {
-            // Paired with the Wasm export and `web/shell.js`, which check the same stride.
-            assert(draw.instance_stride == 64);
-            const byte_count: u32 = header.instance_count * draw.instance_stride;
-            wgpuQueueWriteBuffer(
-                self.queue,
-                self.instance_buffer,
-                0,
-                @ptrCast(instances),
-                @intCast(byte_count),
-            );
-        }
-    }
-    if ((header.flags & draw.flag_glyphs) != 0) {
-        if (header.glyph_count != 0) {
-            assert(font.glyph_stride == 64);
-            const byte_count: u32 = header.glyph_count * font.glyph_stride;
-            wgpuQueueWriteBuffer(
-                self.queue,
-                self.glyph_buffer,
-                0,
-                @ptrCast(glyphs),
-                @intCast(byte_count),
-            );
-        }
-    }
-    assert(@intFromPtr(self.queue) != 0);
-}
-
 /// Configures the swapchain, or reconfigures it when the physical size differs from the last
 /// configuration; otherwise a no-op. Both dimensions must be nonzero. Requests `frame_latency`
 /// through a chained `SurfaceConfigurationExtras` and uses `self.present_mode`.
@@ -1442,362 +1566,6 @@ fn acquire_texture(surface: Surface) !Texture {
         return texture;
     }
     return error.TextureAcquireFailed;
-}
-
-/// Records the clear pass with both draws, submits, presents, and releases every handle it
-/// created plus `texture`.
-fn encode_submit_present(
-    self: *Gpu,
-    texture: Texture,
-    header: *const draw.PresentHeader,
-) void {
-    assert(@intFromPtr(texture) != 0);
-    const view = wgpuTextureCreateView(texture, null);
-    const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
-    assert(@intFromPtr(view) != 0);
-    assert(@intFromPtr(encoder) != 0);
-    const pass = begin_clear_pass(encoder, view, header);
-    draw_quads(self, pass, header.instance_count);
-    draw_glyphs(self, pass, header.glyph_count);
-    wgpuRenderPassEncoderEnd(pass);
-    const commands = wgpuCommandEncoderFinish(encoder, null);
-    wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands));
-    _ = wgpuSurfacePresent(self.surface);
-    wgpuRenderPassEncoderRelease(pass);
-    wgpuCommandEncoderRelease(encoder);
-    wgpuCommandBufferRelease(commands);
-    wgpuTextureViewRelease(view);
-    wgpuTextureRelease(texture);
-}
-
-/// Begins a single-attachment pass that clears to the header's clear color and stores.
-fn begin_clear_pass(
-    encoder: CommandEncoder,
-    view: TextureView,
-    header: *const draw.PresentHeader,
-) RenderPassEncoder {
-    assert(@intFromPtr(encoder) != 0);
-    assert(@intFromPtr(view) != 0);
-    const attachment: RenderPassColorAttachment = .{
-        .next_in_chain = null,
-        .view = view,
-        .depth_slice = depth_slice_undefined,
-        .resolve_target = null,
-        .load_op = load_clear,
-        .store_op = store_store,
-        .clear_value = .{
-            .r = header.clear_r,
-            .g = header.clear_g,
-            .b = header.clear_b,
-            .a = header.clear_a,
-        },
-    };
-    const pass_desc: RenderPassDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .color_attachment_count = 1,
-        .color_attachments = @ptrCast(&attachment),
-        .depth_stencil_attachment = null,
-        .occlusion_query_set = null,
-        .timestamp_writes = null,
-    };
-    return wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-}
-
-/// Draws `instance_count` quads; zero is valid and draws nothing.
-fn draw_quads(self: *Gpu, pass: RenderPassEncoder, instance_count: u32) void {
-    assert(@intFromPtr(pass) != 0);
-    assert(instance_count <= draw.instance_cap);
-    wgpuRenderPassEncoderSetPipeline(pass, self.pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.quad_buffer, 0, whole_size);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.instance_buffer, 0, whole_size);
-    wgpuRenderPassEncoderDraw(pass, draw.vertex_count, instance_count, 0, 0);
-}
-
-/// Creates the single-mip `r8unorm` atlas texture sized `font.atlas_width` by
-/// `font.atlas_height`. Must use `texture_usage_copy_dst`, never the buffer flag
-/// (module guide section 6).
-fn create_atlas(device: Device) !Texture {
-    assert(@intFromPtr(device) != 0);
-    assert(texture_usage_copy_dst != usage_copy_dst);
-    assert(font.atlas_height == 256);
-    const descriptor: TextureDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .usage = texture_usage_copy_dst | usage_texture_binding,
-        .dimension = dimension_2d,
-        .size = .{
-            .width = font.atlas_width,
-            .height = font.atlas_height,
-            .depth_or_array_layers = 1,
-        },
-        .format = format_r8_unorm,
-        .mip_level_count = 1,
-        .sample_count = 1,
-        .view_format_count = 0,
-        .view_formats = null,
-    };
-    const texture = wgpuDeviceCreateTexture(device, &descriptor) orelse return error.AtlasFailed;
-    assert(@intFromPtr(texture) != 0);
-    assert(descriptor.format == format_r8_unorm);
-    return texture;
-}
-
-/// Uploads `font.atlas_bytes` once at startup. Rows are tightly packed, so
-/// `bytes_per_row` equals `font.atlas_width` (alignment rule in module guide section 6).
-fn write_atlas(queue: Queue, texture: Texture) void {
-    assert(@intFromPtr(queue) != 0);
-    assert(@intFromPtr(texture) != 0);
-    assert(font.atlas_width % 256 == 0);
-    assert(font.atlas_bytes.len == 131072);
-    const destination: TexelCopyTextureInfo = .{
-        .texture = texture,
-        .mip_level = 0,
-        .origin = .{ .x = 0, .y = 0, .z = 0 },
-        .aspect = 0,
-    };
-    const layout: TexelCopyBufferLayout = .{
-        .offset = 0,
-        .bytes_per_row = font.atlas_width,
-        .rows_per_image = font.atlas_height,
-    };
-    const size: Extent3D = .{
-        .width = font.atlas_width,
-        .height = font.atlas_height,
-        .depth_or_array_layers = 1,
-    };
-    wgpuQueueWriteTexture(
-        queue,
-        &destination,
-        font.atlas_bytes.ptr,
-        font.atlas_bytes.len,
-        &layout,
-        &size,
-    );
-    assert(layout.bytes_per_row == 512);
-    assert(size.depth_or_array_layers == 1);
-}
-
-/// Bilinear sampler with clamp-to-edge addressing on all axes; edge bleed is prevented by
-/// the baker's UV inset (module guide section 5).
-fn create_glyph_sampler(device: Device) Sampler {
-    assert(@intFromPtr(device) != 0);
-    const descriptor: SamplerDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .address_mode_u = address_clamp_to_edge,
-        .address_mode_v = address_clamp_to_edge,
-        .address_mode_w = address_clamp_to_edge,
-        .mag_filter = filter_linear,
-        .min_filter = filter_linear,
-        .mipmap_filter = mip_nearest,
-        .lod_min_clamp = 0,
-        .lod_max_clamp = 32,
-        .compare = 0,
-        .max_anisotropy = 1,
-    };
-    const sampler = wgpuDeviceCreateSampler(device, &descriptor);
-    assert(@intFromPtr(sampler) != 0);
-    assert(descriptor.mag_filter == filter_linear);
-    return sampler;
-}
-
-/// Group 1 layout: binding 0 is the float 2D atlas texture, binding 1 a filtering sampler,
-/// both fragment-only.
-fn create_glyph_bind_group_layout(device: Device) BindGroupLayout {
-    assert(@intFromPtr(device) != 0);
-    const entries = [2]BindGroupLayoutEntry{
-        .{
-            .next_in_chain = null,
-            .binding = 0,
-            .visibility = shader_fragment,
-            .binding_array_size = 0,
-            .buffer = std.mem.zeroes(BufferBindingLayout),
-            .sampler = std.mem.zeroes(SamplerBindingLayout),
-            .texture = .{
-                .next_in_chain = null,
-                .sample_type = sample_float,
-                .view_dimension = view_2d,
-                .multisampled = 0,
-            },
-            .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
-        },
-        .{
-            .next_in_chain = null,
-            .binding = 1,
-            .visibility = shader_fragment,
-            .binding_array_size = 0,
-            .buffer = std.mem.zeroes(BufferBindingLayout),
-            .sampler = .{
-                .next_in_chain = null,
-                .type = sampler_filtering,
-            },
-            .texture = std.mem.zeroes(TextureBindingLayout),
-            .storage_texture = std.mem.zeroes(StorageTextureBindingLayout),
-        },
-    };
-    const descriptor: BindGroupLayoutDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .entry_count = entries.len,
-        .entries = &entries,
-    };
-    const layout = wgpuDeviceCreateBindGroupLayout(device, &descriptor);
-    assert(@intFromPtr(layout) != 0);
-    assert(entries[0].binding == 0);
-    return layout;
-}
-
-/// Group 1 bind group: a default view of `texture` at binding 0 and `sampler` at binding 1.
-fn create_glyph_bind_group(
-    device: Device,
-    layout: BindGroupLayout,
-    texture: Texture,
-    sampler: Sampler,
-) BindGroup {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(texture) != 0);
-    const view = wgpuTextureCreateView(texture, null);
-    assert(@intFromPtr(view) != 0);
-    const entries = [2]BindGroupEntry{
-        .{
-            .next_in_chain = null,
-            .binding = 0,
-            .buffer = null,
-            .offset = 0,
-            .size = 0,
-            .sampler = null,
-            .texture_view = view,
-        },
-        .{
-            .next_in_chain = null,
-            .binding = 1,
-            .buffer = null,
-            .offset = 0,
-            .size = 0,
-            .sampler = sampler,
-            .texture_view = null,
-        },
-    };
-    const descriptor: BindGroupDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .layout = layout,
-        .entry_count = entries.len,
-        .entries = &entries,
-    };
-    const group = wgpuDeviceCreateBindGroup(device, &descriptor);
-    assert(@intFromPtr(group) != 0);
-    assert(entries[1].sampler != null);
-    return group;
-}
-
-/// Glyph pipeline layout: shared group 0 followed by the atlas group 1.
-fn create_glyph_pipeline_layout(
-    device: Device,
-    uniform_layout: BindGroupLayout,
-    glyph_layout: BindGroupLayout,
-) PipelineLayout {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(uniform_layout) != 0);
-    const groups = [2]BindGroupLayout{ uniform_layout, glyph_layout };
-    const descriptor: PipelineLayoutDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .bind_group_layout_count = groups.len,
-        .bind_group_layouts = &groups,
-        .immediate_size = 0,
-    };
-    const layout = wgpuDeviceCreatePipelineLayout(device, &descriptor);
-    assert(@intFromPtr(layout) != 0);
-    assert(descriptor.bind_group_layout_count == 2);
-    return layout;
-}
-
-/// Creates the glyph shader module from `font.shader_file`.
-fn create_glyph_shader(device: Device) ShaderModule {
-    assert(@intFromPtr(device) != 0);
-    assert(font.shader_file.len >= 1);
-    var source: ShaderSourceWgsl = .{
-        .chain = .{ .next = null, .s_type = s_type_shader_source_wgsl },
-        .code = .{
-            .data = font.shader_file.ptr,
-            .length = font.shader_file.len,
-        },
-    };
-    const descriptor: ShaderModuleDescriptor = .{
-        .next_in_chain = @ptrCast(&source.chain),
-        .label = empty_label,
-    };
-    const shader = wgpuDeviceCreateShaderModule(device, &descriptor);
-    assert(@intFromPtr(shader) != 0);
-    assert(font.glyph_stride == 64);
-    return shader;
-}
-
-/// Glyph render pipeline. Reuses `fill_vertex_layouts` and `alpha_blend`, which is valid
-/// because `font.Glyph` has the same attribute layout as `draw.Instance`.
-fn create_glyph_pipeline(
-    device: Device,
-    shader: ShaderModule,
-    layout: PipelineLayout,
-    format: TextureFormat,
-) RenderPipeline {
-    assert(@intFromPtr(device) != 0);
-    assert(@intFromPtr(shader) != 0);
-    var buffers: [2]VertexBufferLayout = undefined;
-    fill_vertex_layouts(&buffers);
-    const vertex = vertex_state(shader, &buffers);
-    const target: ColorTargetState = .{
-        .next_in_chain = null,
-        .format = format,
-        .blend = &alpha_blend,
-        .write_mask = color_write_all,
-    };
-    const fragment = fragment_state(shader, &target);
-    const descriptor: RenderPipelineDescriptor = .{
-        .next_in_chain = null,
-        .label = empty_label,
-        .layout = layout,
-        .vertex = vertex,
-        .primitive = .{
-            .next_in_chain = null,
-            .topology = topology_triangle_list,
-            .strip_index_format = index_undefined,
-            .front_face = front_ccw,
-            .cull_mode = cull_none,
-            .unclipped_depth = 0,
-        },
-        .depth_stencil = null,
-        .multisample = .{
-            .next_in_chain = null,
-            .count = 1,
-            .mask = 0xFFFFFFFF,
-            .alpha_to_coverage_enabled = 0,
-        },
-        .fragment = &fragment,
-    };
-    const pipeline = wgpuDeviceCreateRenderPipeline(device, &descriptor);
-    assert(@intFromPtr(pipeline) != 0);
-    assert(format == format_bgra8_unorm);
-    return pipeline;
-}
-
-/// Draws `glyph_count` glyph quads in the already-open pass; issues no commands when zero.
-fn draw_glyphs(self: *Gpu, pass: RenderPassEncoder, glyph_count: u32) void {
-    assert(@intFromPtr(pass) != 0);
-    assert(glyph_count <= font.glyph_cap);
-    if (glyph_count == 0) {
-        assert(glyph_count == 0);
-        return;
-    }
-    wgpuRenderPassEncoderSetPipeline(pass, self.glyph_pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, self.bind_group, 0, null);
-    wgpuRenderPassEncoderSetBindGroup(pass, 1, self.glyph_bind_group, 0, null);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, self.quad_buffer, 0, whole_size);
-    wgpuRenderPassEncoderSetVertexBuffer(pass, 1, self.glyph_buffer, 0, whole_size);
-    wgpuRenderPassEncoderDraw(pass, draw.vertex_count, glyph_count, 0, 0);
 }
 
 /// C ABI callback: `userdata1` is the `AdapterSlot` that `wait_future` polls.

@@ -70,14 +70,14 @@
 //!
 //! ## 4. Data Flow
 //! `widgets.place_label` computes the padded box, `place` appends one `Glyph` per ink glyph, and
-//! every `append` or `clear` bumps `GlyphList.revision`. `draw.UploadCursor.flags` compares that
-//! revision with its remembered one and sets `flag_glyphs`; the host then uploads
-//! `count * glyph_stride` bytes and draws the glyph pass.
+//! every `append` or `clear` bumps `GlyphList.revision`. When the revision moved,
+//! `draw.UploadCursor.glyph_range` compares the records with the last upload, and
+//! `draw/renderer.zig` records a write of only the glyphs that changed, then the glyph pass.
 //!
 //! ## 5. Cross-Platform Seams
-//! On `wasm32-freestanding`, `web_exports.zig` exposes `atlas_bytes` to JavaScript by pointer
-//! and length with no copy. The host uploads it once at startup. Texture usage flags and bind
-//! group layout rules for the two pipelines live with their owners (`gpu_wgpu.zig`, `shell.js`).
+//! `draw/renderer.zig` records `atlas_bytes` as the span of one `texture_write` in its setup
+//! stream, so both hosts upload it once at startup with no copy. The glyph pipeline, its
+//! layouts, and its sampler are recorded there too; the hosts only replay them.
 //!
 //! ## 6. TigerStyle Invariants
 //! - Bounded by `glyph_cap`, `text_cap`, and the closed range of `codepoint_count` codepoints
@@ -201,8 +201,8 @@ const Baked = struct {
 
 /// Fixed-capacity list of glyph instances for the glyph draw pass, bounded by `glyph_cap`.
 ///
-/// `revision` bumps on every append and clear so `draw.UploadCursor` can detect change and
-/// raise `flag_glyphs`.
+/// `revision` bumps on every append and clear so `draw.UploadCursor` can skip comparing an
+/// unchanged list.
 pub const GlyphList = struct {
     items: [glyph_cap]Glyph,
     count: u32,

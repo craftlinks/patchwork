@@ -29,10 +29,11 @@
 //! no uninitialized bytes when copied to the GPU.
 //!
 //! ## 4. Upload Flow
-//! When `draw.flag_uniform` is set, the host writes the projection matrix at uniform offset 0
-//! and then `Theme` at offset `draw.matrix_bytes`. Wasm hosts read it through the
-//! `theme_ptr()` / `theme_len()` exports; native hosts copy the same bytes. `chrome` is a
-//! `comptime`-known constant, so the theme never changes at runtime and needs no allocation.
+//! `draw/renderer.zig` keeps a `Uniform` record of the projection matrix at offset 0 followed by
+//! `Theme` at offset `draw.matrix_bytes`, initialized from `chrome`. When the logical size
+//! changes it records one `buffer_write` of the whole record, which both hosts replay. `chrome`
+//! is a `comptime`-known constant, so the theme never changes at runtime and needs no
+//! allocation.
 //! Knob accents are per-instance fills in `draw.Instance`, not theme slots.
 
 const std = @import("std");

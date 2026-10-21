@@ -53,13 +53,15 @@ patchwork/
 │   ├── ui.zig                  # Generic Scene(Widget, widget_cap) dispatcher
 │   ├── widgets.zig             # Retained widgets (Panel, Button, Slider, Knob, Meter, Toggle, Scroll)
 │   ├── draw.zig                # Instanced quad drawing, DrawList, distance fields, UploadCursor
+│   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
 │   ├── turtle.zig              # 2D turtle layout engine (place_column, place_row, Walk, Size)
 │   ├── font.zig                # Embedded font atlas, metrics, GlyphList
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Pointer events and bounded EventQueue
 │   ├── theme.zig               # Theme uniform record packed behind the projection matrix
-│   ├── gpu.zig                 # Cross-platform GPU abstraction seam
+│   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
+│   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
 │   ├── quad.wgsl               # Instanced quad shader (SDF rounded boxes and ring arcs)
 │   └── glyph.wgsl              # Instanced glyph text shader
@@ -68,7 +70,7 @@ patchwork/
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
 │   ├── linux_window.zig        # Linux Wayland event loop, timerfd, and Host(App)
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
-│   ├── gpu_wgpu.zig            # Native wgpu-native pipeline and swapchain
+│   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain
 │   ├── wl_seat.zig             # Wayland seat and pointer listener
 │   ├── wl_callback.zig         # Wayland frame completion callback
 │   ├── wp_presentation.zig     # Wayland presentation-time feedback listener
@@ -81,7 +83,7 @@ patchwork/
 │       └── app.zig             # Column App (config.timer_period_ms = 0)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
-│   └── shell.js                # WebGPU pipeline compiler, Wasm bridge, and input handler
+│   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
 └── test/                       # Regression tests
     └── contract_missing_draw.zig # Test verifying that missing draw fails compilation
 ```
@@ -335,12 +337,43 @@ A regression app for a single docked `Scroll` container beside a root column. It
 The docked rectangle's coordinates at specific window sizes are locked by the layout tests
 in `examples/column/app.zig`.
 
+## GPU Command Stream
+
+Zig records every GPU operation into a fixed `commands.CommandBuffer` (64 KiB) and both hosts
+replay it: native through `gpu_wgpu.execute`, the browser through `submit_js(ptr, len)` in
+`web/shell.js`. The hosts contain no WGSL, vertex layouts, or pipeline descriptions;
+`draw/renderer.zig` records them.
+
+```text
+draw.Renderer.setup  (once, after device creation)
+  shader_create  layout_create  buffer_create  texture_create  sampler_create
+  bind_group_create  pipeline_create  buffer_write (unit quad)  texture_write (atlas)
+draw.Renderer.frame  (every presented frame)
+  buffer_write*  pass_begin  [pipeline_set bind_group_set vertex_buffer_set draw]*
+  pass_end_present
+```
+
+Each op is an 8-byte header `{ code, size, pad }` followed by an `extern struct` payload,
+8-byte aligned. Memory is referenced by `Span { address, len }`, valid for the duration of the
+submit. Resources are `u16` ids that Zig allocates and each host maps to its own handle table.
+The op table (codes, names, sizes, and every field's offset and type) is generated at compile
+time as `commands.table_json`. The wasm module exports it, so `shell.js` decodes payloads by
+name and cannot drift from the Zig layouts. Load the page with `?trace=1` to log the op names
+of every submitted stream.
+
+`draw.UploadCursor` decides which `buffer_write` ops a frame records. The uniform is written
+only when the logical size changes. A list whose revision moved is compared record by record
+with a shadow of the last upload, and only the changed range is written. A scale-only frame
+writes nothing, an identical rebuild writes nothing, and a hover writes the changed faces
+only. The exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack
+frames record the step 11 op sequences" in `examples/rack/app.zig`.
+
 ## GPU Pipeline and Memory Layouts
 
-`Instance` and `Glyph` records share one stride (`draw.instance_stride`, `font.glyph_stride`),
-and `comptime` asserts in `draw.zig` and `font.zig` check their field offsets against the
-vertex attributes in `gpu_wgpu.zig`, `web_exports.zig`, and the WGSL structs. The static unit
-quad is `draw.quad_bytes`. In both instance formats the last `float32x4` attribute is the
+`Instance` and `Glyph` records share one stride (`draw.instance_stride`, `font.glyph_stride`).
+The renderer builds both vertex layouts from their `@offsetOf` values, and `comptime` asserts
+in `draw.zig` and `draw/renderer.zig` pin the four `float32x4` groups the WGSL structs read.
+The static unit quad is `draw.quad_bytes`. In both instance formats the last `float32x4` attribute is the
 exclusive-max clip rectangle `(clip_x0, clip_y0, clip_x1, clip_y1)`. `kind` selects the
 primitive (`draw.kind_box`, `draw.kind_arc`). Shaders evaluate an analytic hard clip mask:
 
@@ -384,6 +417,9 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   when the surface offers it. The rationale, the Mesa/compositor behavior behind it, and the
   conditions for removing the workaround are in `src/host/linux_window.zig`,
   `src/host/gpu_wgpu.zig`, and `src/host/wp_presentation.zig`.
+- GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
+  stream. The device's uncaptured-error callback is installed, so a validation error fails the
+  frame with the op index, the op name, and the driver message instead of aborting.
 
 ### Browser (WebAssembly + WebGPU)
 
@@ -398,6 +434,8 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   chain animation frames.
 - Pointer coordinates from DOM events are scaled by `window.devicePixelRatio` before calling
   `wasm.pointer_move`, `pointer_down`, `pointer_up`, and `pointer_wheel`.
-- In `present_frame()`, `draw.PresentHeader` is allocated directly on Zig's call stack;
-  JavaScript reads dimensions, flags, and linear memory pointers synchronously via `present_js()`
-  with zero intermediate heap copying.
+- `start()` submits the renderer's setup stream; `shell.js` runs each setup op in a
+  `pushErrorScope("validation")` and reports a failure with its op index and name.
+- `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.
+  JavaScript decodes the stream and its spans in place, with no intermediate copies, and
+  asserts that `pass_begin` carries the canvas backing size.

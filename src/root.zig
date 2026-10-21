@@ -20,6 +20,8 @@ pub const widgets = @import("widgets.zig");
 pub const ui = @import("ui.zig");
 pub const app = @import("app.zig");
 pub const gpu = @import("gpu.zig");
+pub const commands = @import("gpu/commands.zig");
+pub const renderer = @import("draw/renderer.zig");
 
 /// The platform hosts. `linux_window.run` and `web_exports.export_app` are the only entry
 /// points an app build uses.
@@ -43,6 +45,8 @@ test {
     _ = widgets;
     _ = ui;
     _ = app;
+    _ = commands;
+    _ = renderer;
     _ = host.wp_presentation;
     // These two hosts carry layout asserts and tests shared with the web shell and the wgpu
     // pipelines; referencing them here makes those checks part of `zig build test`.
