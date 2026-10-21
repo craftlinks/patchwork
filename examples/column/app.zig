@@ -19,10 +19,14 @@
 //! host never calls `timer`, so a resting pointer causes no wakeups; `timer` exists only to
 //! satisfy the contract and always returns false.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. Draw Types
+//! The column registers the library's `Box`, `Arc`, and `Glyph` (`config.draw`). It draws
+//! everything on the base layer, so the frame is three batches at most.
+//!
+//! ## 5. TigerStyle Invariants
 //! - One fixed widget slot and no allocation.
 //! - Every loop is bounded by `Scroll.child_count`, which is at most `widgets.scroll_child_cap`.
-//!   The comptime block asserts that a full scroll fits the instance and glyph caps.
+//!   The comptime block asserts that a full scroll fits the configured pool capacities.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -66,6 +70,12 @@ pub const Widget = union(enum) {
 
 const Scene = ui.Scene(Widget, widget_cap);
 
+/// Pool capacities: one panel and one thumb box plus two faces per child, two arcs per knob,
+/// and up to 12 glyphs per child. The comptime block checks them against the scroll's cap.
+const box_cap: u32 = 64;
+const arc_cap: u32 = 32;
+const glyph_cap: u32 = 256;
+
 /// The column app. `timer_period_ms` is 0: nothing wakes the host while the pointer rests.
 pub const App = struct {
     scene: Scene,
@@ -73,9 +83,16 @@ pub const App = struct {
     pub const config: patchwork.app.Config = .{
         .title = "patchwork column",
         .timer_period_ms = 0,
+        .draw = &.{
+            .{ .type = quads.Box, .cap = box_cap },
+            .{ .type = quads.Arc, .cap = arc_cap },
+            .{ .type = quads.Glyph, .cap = glyph_cap },
+        },
     };
 
-    pub fn init(app: *App) void {
+    /// The column draws no images, so it creates no textures.
+    pub fn init(app: *App, textures: *quads.Textures) void {
+        assert(textures.count >= 1);
         app.scene = Scene.init(widget_cap);
         app.scene.widgets[slot_scroll] = .{ .scroll = demo_scroll() };
         assert(app.scene.count == widget_cap);
@@ -128,22 +145,19 @@ pub const App = struct {
         return app.scene.dirty;
     }
 
-    /// Clears both lists and draws the scroll. The window clip is the full frame.
-    pub fn draw(app: *App, list: *quads.DrawList, glyphs: *font.GlyphList) void {
+    /// Draws the scroll into the freshly reset context. The window clip is the full frame.
+    pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         assert(app.scene.width_logical != 0);
         assert(app.scene.height_logical != 0);
-        list.clear();
-        glyphs.clear();
         const clip: font.Clip = .{
             .x0 = 0,
             .y0 = 0,
             .x1 = @floatFromInt(app.scene.width_logical),
             .y1 = @floatFromInt(app.scene.height_logical),
         };
-        app.scene.widgets[slot_scroll].scroll.draw(list, glyphs, clip);
+        app.scene.widgets[slot_scroll].scroll.draw(cx, clip);
         app.scene.finish_draw();
-        assert(list.count <= quads.instance_cap);
-        assert(glyphs.count <= font.glyph_cap);
+        assert(cx.overflow_count == 0);
     }
 };
 
@@ -241,17 +255,20 @@ fn row_walk(height: f32) turtle.Walk {
 
 comptime {
     assert(widget_cap == 1);
-    assert(1 + 1 + widgets.scroll_child_cap * 2 <= quads.instance_cap);
-    assert(widgets.scroll_child_cap * 12 <= font.glyph_cap);
+    assert(1 + 1 + widgets.scroll_child_cap * 2 <= box_cap);
+    assert(widgets.scroll_child_cap * 2 <= arc_cap);
+    assert(widgets.scroll_child_cap * 12 <= glyph_cap);
     assert(widget_cap <= turtle.child_cap);
     assert(column_padding.left == 16);
     assert(scroll_padding.left == 8);
     assert(knob_specs.len == 8);
 }
 
+/// A fresh app, initialized against a fresh test context the way a host does.
 fn new_app() App {
+    test_context.init();
     var app: App = undefined;
-    App.init(&app);
+    App.init(&app, &test_context.textures);
     return app;
 }
 
@@ -267,29 +284,43 @@ fn expect_rect(rect: turtle.Rect, x: f32, y: f32, width: f32, height: f32) !void
     try std.testing.expectEqual(height, rect.height);
 }
 
-fn expect_box(instance: quads.Instance, x: f32, y: f32, width: f32, height: f32) !void {
-    try std.testing.expectEqual(x, instance.x);
-    try std.testing.expectEqual(y, instance.y);
-    try std.testing.expectEqual(width, instance.width);
-    try std.testing.expectEqual(height, instance.height);
+fn expect_box(rect: [4]f32, x: f32, y: f32, width: f32, height: f32) !void {
+    try std.testing.expectEqual(x, rect[0]);
+    try std.testing.expectEqual(y, rect[1]);
+    try std.testing.expectEqual(width, rect[2]);
+    try std.testing.expectEqual(height, rect[3]);
 }
 
 const view_clip: font.Clip = .{ .x0 = 952, .y0 = 24, .x1 = 1256, .y1 = 696 };
 
-fn glyph_has_clip(glyph: font.Glyph, clip: font.Clip) bool {
-    if (glyph.clip_x0 != clip.x0) {
+fn has_clip(instance_clip: [4]f32, clip: font.Clip) bool {
+    if (instance_clip[0] != clip.x0) {
         return false;
     }
-    if (glyph.clip_y0 != clip.y0) {
+    if (instance_clip[1] != clip.y0) {
         return false;
     }
-    if (glyph.clip_x1 != clip.x1) {
+    if (instance_clip[2] != clip.x1) {
         return false;
     }
-    if (glyph.clip_y1 != clip.y1) {
+    if (instance_clip[3] != clip.y1) {
         return false;
     }
     return true;
+}
+
+const Context = patchwork.app.Context(App);
+
+/// The test draw context: static, like the hosts', so its pools stay off the stack.
+var test_context: Context = undefined;
+
+/// Resets the context and draws `app` into it, the way a host does, then finalizes it.
+fn draw_frame(app: *App) *Context {
+    test_context.reset();
+    app.draw(&test_context);
+    test_context.finalize();
+    assert(test_context.overflow_count == 0);
+    return &test_context;
 }
 
 // Locks the scroll, viewport, and content column rects, the first knob's faces, and that
@@ -305,14 +336,12 @@ test "demo layout at 1280 by 720" {
     try std.testing.expectEqual(@as(f32, 232), scroll.max_scroll());
     try expect_rect(scroll.children[0].knob.rect, 952, 32, 288, 72);
     try expect_rect(widgets.ring_of(scroll.children[0].knob.rect), 960, 40, 56, 56);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    try expect_box(list.items[1], 960, 40, 56, 56);
-    try std.testing.expectEqual(quads.kind_arc, list.items[1].kind);
-    try std.testing.expectEqual(@as(f32, 1), list.items[1].down);
-    try expect_box(list.items[2], 960, 40, 56, 56);
-    try std.testing.expectEqual(@as(f32, 0.25), list.items[2].down);
+    const cx = draw_frame(&app);
+    const arcs = cx.items(quads.Arc);
+    try expect_box(arcs[0].rect, 960, 40, 56, 56);
+    try std.testing.expectEqual(@as(f32, 1), arcs[0].sweep);
+    try expect_box(arcs[1].rect, 960, 40, 56, 56);
+    try std.testing.expectEqual(@as(f32, 0.25), arcs[1].sweep);
     try std.testing.expect(!app.dirty());
 }
 
@@ -331,35 +360,24 @@ test "demo layout at 800 by 600" {
 test "scroll 0 clips the meter and omits the toggles" {
     var app = new_app();
     app.layout(1280, 720);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    const cx = draw_frame(&app);
     var meter_faces: u32 = 0;
-    var index: u32 = 0;
-    while (index < list.count) : (index += 1) {
-        const face = list.items[index];
-        if (face.y >= 840) {
-            try std.testing.expect(false);
-        }
-        if (face.width == widgets.meter_track_w) {
+    for (cx.items(quads.Box)) |face| {
+        try std.testing.expect(face.rect[1] < 840);
+        if (face.rect[2] == widgets.meter_track_w) {
             meter_faces += 1;
-            try std.testing.expectEqual(view_clip.x0, face.clip_x0);
-            try std.testing.expectEqual(view_clip.y0, face.clip_y0);
-            try std.testing.expectEqual(view_clip.x1, face.clip_x1);
-            try std.testing.expectEqual(view_clip.y1, face.clip_y1);
+            try std.testing.expect(has_clip(face.clip, view_clip));
         }
     }
     try std.testing.expect(meter_faces >= 1);
     var gain_glyph = false;
     var meter_glyph = false;
-    index = 0;
-    while (index < glyphs.count) : (index += 1) {
-        const glyph = glyphs.items[index];
-        try std.testing.expect(glyph_has_clip(glyph, view_clip));
-        if (glyph.y < 80) {
+    for (cx.items(quads.Glyph)) |glyph| {
+        try std.testing.expect(has_clip(glyph.clip, view_clip));
+        if (glyph.rect[1] < 80) {
             gain_glyph = true;
         }
-        if (glyph.y > 700) {
+        if (glyph.rect[1] > 700) {
             meter_glyph = true;
         }
     }
@@ -373,20 +391,12 @@ test "value 0 omits the value arc" {
     app.layout(1280, 720);
     const skew = scroll_of(&app).children[3].knob.rect;
     const ring = widgets.ring_of(skew);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    const cx = draw_frame(&app);
     var arcs: u32 = 0;
-    var index: u32 = 0;
-    while (index < list.count) : (index += 1) {
-        const face = list.items[index];
-        if (face.kind != quads.kind_arc) {
-            continue;
+    for (cx.items(quads.Arc)) |arc| {
+        if (arc.rect[1] == ring.y) {
+            arcs += 1;
         }
-        if (face.y != ring.y) {
-            continue;
-        }
-        arcs += 1;
     }
     try std.testing.expectEqual(@as(u32, 1), arcs);
 }
@@ -397,20 +407,17 @@ test "a tall window draws the short toggle rows" {
     app.layout(1280, 1000);
     const scroll = scroll_of(&app);
     try std.testing.expectEqual(@as(f32, 0), scroll.max_scroll());
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    const cx = draw_frame(&app);
     const drums = scroll.children[10].toggle.rect;
     const pill_y = drums.y + (drums.height - widgets.pill_h) * 0.5;
     var found = false;
-    var index: u32 = 0;
-    while (index < list.count) : (index += 1) {
-        if (list.items[index].y == pill_y) {
+    for (cx.items(quads.Box)) |face| {
+        if (face.rect[1] == pill_y) {
             found = true;
         }
     }
     try std.testing.expect(found);
-    try std.testing.expect(glyphs.count > 0);
+    try std.testing.expect(cx.items(quads.Glyph).len > 0);
 }
 
 // Locks wheel scrolling to the last row and its clamp at `max_scroll`.
@@ -543,9 +550,7 @@ test "hover on gain eases and a later frame stays clean" {
     try std.testing.expect(app.event(.{ .frame = 1000 }));
     try std.testing.expectEqual(@as(f32, 1), scroll_of(&app).children[0].knob.hover.value);
     try std.testing.expect(!app.live());
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
+    _ = draw_frame(&app);
     try std.testing.expect(!app.dirty());
     try std.testing.expect(!app.event(.{ .frame = 16 }));
     try std.testing.expect(!app.dirty());
@@ -587,15 +592,19 @@ test "pointer leave during a knob press releases capture" {
 test "a settled scene does not rebuild on a scale-style present" {
     var app = new_app();
     app.layout(1280, 720);
-    var list = quads.DrawList.init();
-    var glyphs = font.GlyphList.init();
-    app.draw(&list, &glyphs);
-    const revision = list.revision;
-    var renderer = patchwork.renderer.Renderer.init();
-    var buffer = patchwork.commands.CommandBuffer.init();
-    renderer.setup(&buffer);
+    const cx = draw_frame(&app);
+    const revision = cx.revision(quads.Box);
+    const static = struct {
+        var renderer: patchwork.renderer.Renderer(Context) = undefined;
+        var buffer: patchwork.commands.CommandBuffer = undefined;
+    };
+    const renderer = &static.renderer;
+    const buffer = &static.buffer;
+    renderer.init();
+    buffer.* = .init();
+    renderer.setup(buffer, cx);
     buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, .{
+    renderer.frame(buffer, cx, .{
         .width_logical = 1280,
         .height_logical = 720,
         .width_px = 1280,
@@ -603,13 +612,13 @@ test "a settled scene does not rebuild on a scale-style present" {
     });
     try std.testing.expect(!app.dirty());
     buffer.reset();
-    renderer.frame(&buffer, &list, &glyphs, .{
+    renderer.frame(buffer, cx, .{
         .width_logical = 1280,
         .height_logical = 720,
         .width_px = 2560,
         .height_px = 1440,
     });
     var writes: [4]patchwork.commands.BufferWrite = undefined;
-    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(&buffer, &writes).len);
-    try std.testing.expectEqual(revision, list.revision);
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(buffer, &writes).len);
+    try std.testing.expectEqual(revision, cx.revision(quads.Box));
 }

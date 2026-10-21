@@ -21,7 +21,8 @@
 //!
 //! ## 3. Synchronous Stack-Frame Memory Sharing
 //! `gpu.submit` passes the stream's offset and length to `submit_js`. Spans inside it point
-//! at `state` (the lists and the renderer's uniform record) and at static data. This is
+//! at the static draw context (its pools and queued texture bytes), the renderer's uniform
+//! record, the app's own static storage, and static data. This is
 //! memory safe because host calls are synchronous on one thread: the engine suspends Zig
 //! inside the call and JavaScript must finish reading before control returns. JavaScript must
 //! not retain the stream, any span, or any view over them after `submit_js` returns.
@@ -37,7 +38,7 @@
 //! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
 //!   `.frame`, presents if dirty, and returns 1 only while `app.live()`. Returning 0 ends
 //!   the rAF chain, and `clock.reset` makes the next sample after idle report a zero delta.
-//! - `start` submits the setup stream, then leaves the draw list empty and `relayout` set;
+//! - `start` submits the setup stream, then leaves the draw pools empty and `relayout` set;
 //!   the first layout walk happens in `present_frame` after `resize` has supplied real canvas
 //!   dimensions.
 //! - Pointer coordinates are device pixels (canvas backing store), the same unit `resize`
@@ -46,7 +47,10 @@
 //!   isolation headers are required.
 //!
 //! ## 5. TigerStyle Invariants
-//! - `State` and the app live in static (BSS) linear memory; there is no runtime allocation.
+//! - `state`, the draw context, the renderer, and the app are static globals declared
+//!   `undefined`, so they occupy BSS rather than data: the module does not carry their bytes,
+//!   and the linker sizes the initial memory to cover them. `start` initializes each in
+//!   place. There is no runtime allocation.
 //! - Payload layouts shared with the browser are described by `commands.table_json`, which
 //!   is generated from the Zig types, so there is no hand-mirrored layout to check.
 //! - Every export runs in bounded time with no recursion.
@@ -56,8 +60,6 @@ const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
 const commands = @import("../gpu/commands.zig");
-const draw = @import("../draw.zig");
-const font = @import("../font.zig");
 const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
@@ -98,44 +100,41 @@ pub fn export_app(comptime App: type) void {
 /// The app-facing half of the browser host. `state` and `app` are static (BSS) storage.
 fn WebApp(comptime App: type) type {
     return struct {
+        const Context = app_contract.Context(App);
+        const Renderer = renderer.Renderer(Context);
+
         const State = struct {
             frame: frame.Frame,
-            list: draw.DrawList,
-            glyphs: font.GlyphList,
-            renderer: renderer.Renderer,
             commands: commands.CommandBuffer,
             clock: animator.Clock,
         };
 
-        var state: State = .{
-            .frame = frame.Frame.init(),
-            .list = draw.DrawList.init(),
-            .glyphs = font.GlyphList.init(),
-            .renderer = renderer.Renderer.init(),
-            .commands = commands.CommandBuffer.init(),
-            .clock = animator.Clock.init(),
-        };
-
+        // Module guide, section 5: `undefined` keeps these in BSS; `start` initializes them.
+        var state: State = undefined;
+        var context: Context = undefined;
+        var render: Renderer = undefined;
         var app: App = undefined;
 
-        /// Resets host state, submits the renderer's setup stream, and initializes the app.
-        /// Called once by JavaScript after the device exists. The draw list stays empty and
-        /// `relayout` stays set because the first layout needs the canvas size that only
-        /// `resize` supplies. Returns the dirty flag (see `dirty_flag`).
+        /// Initializes host state, the draw context, the renderer, and the app, then submits
+        /// the setup stream. Called once by JavaScript after the device exists. The app runs
+        /// first, as on native, so the textures it creates are in the setup stream and its
+        /// per-op validation scopes. The pools stay empty and `relayout` stays set because the
+        /// first layout needs the canvas size that only `resize` supplies. Returns the dirty
+        /// flag (see `dirty_flag`).
         fn start() callconv(.c) u32 {
             state.frame = frame.Frame.init();
-            state.list = draw.DrawList.init();
-            state.glyphs = font.GlyphList.init();
-            state.renderer = renderer.Renderer.init();
             state.clock = animator.Clock.init();
-            state.commands.reset();
-            state.renderer.setup(&state.commands);
+            state.commands.len = 0;
+            state.commands.count = 0;
+            context.init();
+            render.init();
+            App.init(&app, &context.textures);
+            render.setup(&state.commands, &context);
             var unused: gpu.Gpu = .{};
             gpu.submit(&unused, &state.commands) catch unreachable;
-            App.init(&app);
             assert(state.frame.running);
             assert(state.frame.relayout);
-            assert(state.list.count == 0);
+            assert(context.batch_count == 0);
             assert(!app.live());
             return dirty_flag();
         }
@@ -249,13 +248,14 @@ fn WebApp(comptime App: type) type {
             }
             assert(!state.frame.relayout);
             if (app.dirty()) {
-                app.draw(&state.list, &state.glyphs);
+                context.reset();
+                app.draw(&context);
             }
             assert(!app.dirty());
-            // Spans must outlive the host call; module guide section 3 explains why `state`
-            // is enough.
+            // Spans must outlive the host call; module guide section 3 explains why static
+            // storage is enough.
             state.commands.reset();
-            state.renderer.frame(&state.commands, &state.list, &state.glyphs, .{
+            render.frame(&state.commands, &context, .{
                 .width_logical = state.frame.width_logical,
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,

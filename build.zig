@@ -38,7 +38,8 @@
 //!   the address and port.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests. `zig build test-contract`
-//!   compiles an app with no `draw` and passes only if the compiler rejects it.
+//!   compiles an app with no `draw` and an app whose draw type is not a multiple of 16 bytes,
+//!   and passes only if the compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, and `wasm` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 
@@ -303,7 +304,7 @@ fn add_example_steps(
 
 /// `test` runs the library tests and every example's tests. A test root that imported only
 /// the library would drop the examples without an error, so each example is listed here.
-/// `test-contract` runs a compile that must fail.
+/// `test-contract` runs compiles that must fail.
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
@@ -316,17 +317,30 @@ fn add_test_steps(
         test_step.dependOn(example.tests);
     }
 
-    const contract = b.createModule(.{
-        .root_source_file = b.path("test/contract_missing_draw.zig"),
-        .target = library.resolved_target,
-        .optimize = library.optimize.?,
-    });
-    contract.addImport("patchwork", library);
-    const contract_test = b.addTest(.{ .root_module = contract });
-    contract_test.expect_errors = .{ .contains = "App is missing `pub fn draw`" };
     const contract_step = b.step(
         "test-contract",
-        "Check that an app without `draw` fails to compile",
+        "Check that a broken app contract or draw type fails to compile",
     );
-    contract_step.dependOn(&contract_test.step);
+    const contracts = [_]struct { path: []const u8, expected: []const u8 }{
+        .{
+            .path = "test/contract_missing_draw.zig",
+            .expected = "App is missing `pub fn draw`",
+        },
+        .{
+            .path = "test/contract_ragged_type.zig",
+            .expected = "contract_ragged_type.Ragged: @sizeOf must be a multiple of 16 " ++
+                "(one vec4 per 16 bytes)",
+        },
+    };
+    for (contracts) |case| {
+        const contract = b.createModule(.{
+            .root_source_file = b.path(case.path),
+            .target = library.resolved_target,
+            .optimize = library.optimize.?,
+        });
+        contract.addImport("patchwork", library);
+        const contract_test = b.addTest(.{ .root_module = contract });
+        contract_test.expect_errors = .{ .contains = case.expected };
+        contract_step.dependOn(&contract_test.step);
+    }
 }

@@ -47,7 +47,9 @@
 //! `request_device` installs `uncaptured_error`, which wgpu-native calls synchronously from
 //! inside the failing call. It keeps the first message in `error_slot`; `execute` checks the
 //! slot after every op and fails the frame with `error.GpuValidation`, logging the op index,
-//! the op name, and the message. Without the callback wgpu-native would abort the process.
+//! the op name, the shader label for a `shader_create` (the draw type's name), and the
+//! message. The label is also the shader module's own label, so wgpu names the draw type in
+//! pipeline errors too. Without the callback wgpu-native would abort the process.
 //!
 //! ## 6. Texture Upload Rules
 //! - Texture and buffer usage flags use different bit assignments: `COPY_DST` is
@@ -214,6 +216,7 @@ const error_type_no_error: u32 = 0x00000001;
 const shader_vertex: Flags = 0x0000000000000001;
 const shader_fragment: Flags = 0x0000000000000002;
 const format_r8_unorm: TextureFormat = 0x00000001;
+const format_rgba8_unorm: TextureFormat = 0x00000016;
 /// Texture `COPY_DST` is 0x2. Buffer `usage_copy_dst` is 0x8, which is texture `STORAGE_BINDING`.
 const texture_usage_copy_dst: TextureUsage = 0x0000000000000002;
 const usage_texture_binding: TextureUsage = 0x0000000000000004;
@@ -866,9 +869,12 @@ pub fn execute(self: *Gpu, buffer: *const commands.CommandBuffer) !void {
     while (reader.next()) |op| {
         try run(self, op, &frame);
         if (error_slot.failed) {
-            std.log.err("gpu op {d} ({s}) failed: {s}", .{
+            const label = op_label(op);
+            std.log.err("gpu op {d} ({s}{s}{s}) failed: {s}", .{
                 reader.index - 1,
                 @tagName(op),
+                if (label.len == 0) "" else " ",
+                label,
                 error_slot.message[0..error_slot.len],
             });
             error_slot.failed = false;
@@ -877,6 +883,20 @@ pub fn execute(self: *Gpu, buffer: *const commands.CommandBuffer) !void {
     }
     assert(frame.pass == null);
     assert(reader.index == buffer.count);
+}
+
+/// The shader label for a `shader_create` op; empty for any other op.
+/// A WGSL error then names the draw type whose module failed.
+fn op_label(op: commands.Op) []const u8 {
+    switch (op) {
+        .shader_create => |p| {
+            const label = p.label.slice();
+            assert(label.len != 0);
+            // The label is static text, so returning a slice of it outlives this call.
+            return label;
+        },
+        else => return "",
+    }
 }
 
 fn run(self: *Gpu, op: commands.Op, frame: *Frame) !void {
@@ -957,7 +977,7 @@ fn shader_create(self: *Gpu, p: commands.ShaderCreate) void {
     };
     const descriptor: ShaderModuleDescriptor = .{
         .next_in_chain = @ptrCast(&source.chain),
-        .label = empty_label,
+        .label = string_view(p.label.slice()),
     };
     const shader = wgpuDeviceCreateShaderModule(self.device, &descriptor);
     assert(@intFromPtr(shader) != 0);
@@ -1133,6 +1153,7 @@ fn texture_create(self: *Gpu, p: commands.TextureCreate) !void {
         .size = .{ .width = p.width, .height = p.height, .depth_or_array_layers = 1 },
         .format = switch (p.format) {
             .r8unorm => format_r8_unorm,
+            .rgba8unorm => format_rgba8_unorm,
         },
         .mip_level_count = 1,
         .sample_count = 1,

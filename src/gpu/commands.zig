@@ -28,6 +28,9 @@
 //! handle tables, bounded by `caps`. The stream is therefore byte-identical on both targets,
 //! and a unit test can record a frame and assert its op sequence without a GPU. Creating an
 //! id twice or using an id that was never created is a host assertion naming the op.
+//! A `shader_create` also carries a label (the draw type's name); both hosts give it to the
+//! shader module and print it with a failure, because WGSL errors appear only when a host
+//! compiles the module at startup.
 //!
 //! ## 4. Fixed Conventions
 //! Things every pipeline shares are conventions instead of payload fields: entry points are
@@ -151,8 +154,11 @@ pub const Blend = enum(u8) {
     alpha,
 };
 
+/// `r8unorm` is single-channel coverage (the font atlas); `rgba8unorm` is straight-alpha
+/// color (images). Both sample as filterable float, so one bind group layout serves both.
 pub const TextureFormat = enum(u8) {
     r8unorm,
+    rgba8unorm,
 };
 
 /// Min and mag filter of a sampler.
@@ -201,6 +207,9 @@ pub const ShaderCreate = extern struct {
     pad1: u32 = 0,
     /// WGSL source text.
     source: Span,
+    /// Debug label (the draw type's name). Hosts pass it to the shader module and name it in
+    /// error messages, because WGSL errors surface only when a host compiles the module.
+    label: Span,
 };
 
 pub const LayoutEntry = extern struct {
@@ -608,7 +617,7 @@ comptime {
             assert(field.value == i);
         }
     }
-    assert(@sizeOf(ShaderCreate) == 24);
+    assert(@sizeOf(ShaderCreate) == 40);
     assert(@sizeOf(PipelineCreate) == 88);
     assert(@sizeOf(TextureWrite) == 40);
     assert(@sizeOf(PassEndPresent) == 0);
@@ -631,7 +640,7 @@ fn samples() [@typeInfo(Op).@"union".fields.len]Op {
     var second = std.mem.zeroes([attribute_cap]VertexAttribute);
     second[0] = attribute(0, .float32x2, 0);
     return .{
-        .{ .shader_create = .{ .id = 3, .source = .of(sample_source) } },
+        .{ .shader_create = .{ .id = 3, .source = .of(sample_source), .label = .of("box") } },
         .{ .layout_create = .{ .id = 2, .entry_count = 2, .entries = .{
             .{ .binding = 0, .visibility = stage_fragment, .kind = .texture },
             .{ .binding = 1, .visibility = stage_fragment, .kind = .sampler },
@@ -656,7 +665,7 @@ fn samples() [@typeInfo(Op).@"union".fields.len]Op {
             },
         } },
         .{ .buffer_create = .{ .id = 7, .usage = usage_vertex | usage_copy_dst, .size = 4096 } },
-        .{ .texture_create = .{ .id = 1, .format = .r8unorm, .width = 512, .height = 256 } },
+        .{ .texture_create = .{ .id = 1, .format = .rgba8unorm, .width = 32, .height = 32 } },
         .{ .sampler_create = .{ .id = 1, .filter = .linear } },
         .{ .bind_group_create = .{ .id = 9, .layout = 2, .entry_count = 2, .entries = .{
             .{ .binding = 0, .resource = 1 },
