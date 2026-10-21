@@ -61,7 +61,7 @@
 //!   frame callback is in flight, and the latched deadline has passed. Otherwise it leaves
 //!   `redraw` set so pointer motion that arrives during the wait is drawn by the commit.
 //!   Layout and instance rebuild run only on that commit. Each commit requests
-//!   `wl_surface.frame` and (bounded) `wp_presentation.feedback` before `gpu.present`, because
+//!   `wl_surface.frame` and (bounded) `wp_presentation.feedback` before `gpu.submit`, because
 //!   both requests attach to the next `wl_surface.commit`.
 //! - `schedule_present`: the deadline is `frame.present_deadline` applied to an anchor, the
 //!   last `presented` pageflip while `frame.anchor_is_fresh`, else the receipt time of `done`.
@@ -96,11 +96,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
+const commands = @import("../gpu/commands.zig");
 const draw = @import("../draw.zig");
 const font = @import("../font.zig");
 const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
+const renderer = @import("../draw/renderer.zig");
 const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
 const wp_presentation = @import("wp_presentation.zig");
@@ -152,7 +154,10 @@ pub const State = struct {
     gpu: gpu.Gpu,
     list: draw.DrawList,
     glyphs: font.GlyphList,
-    cursor: draw.UploadCursor,
+    /// Records setup and frames; owns the upload cursor and the uniform record.
+    renderer: renderer.Renderer,
+    /// The stream `renderer` records into and `gpu.submit` replays, reused every frame.
+    commands: commands.CommandBuffer,
     /// Host timestamps from `wl_callback.done`. Reset when no animator is live.
     clock: animator.Clock,
     /// Pointer events queued by callbacks and drained once per wake.
@@ -406,7 +411,8 @@ pub fn run(comptime App: type) !void {
         .gpu = undefined,
         .list = .init(),
         .glyphs = font.GlyphList.init(),
-        .cursor = .init(),
+        .renderer = .init(),
+        .commands = .init(),
         .clock = animator.Clock.init(),
         .queue = input.EventQueue.init(),
         .last_x = 0,
@@ -559,7 +565,7 @@ fn Host(comptime App: type) type {
             state.present_at_ns = 0;
             self.prepare_app();
             set_buffer_scale(state);
-            // Both requests attach to the next commit, and `gpu.present` is that commit.
+            // Both requests attach to the next commit, and `gpu.submit` is that commit.
             arm_frame(state);
             arm_feedback(state);
             try submit_frame(state);
@@ -728,13 +734,18 @@ fn create_toplevel(state: *State, title: [:0]const u8) !void {
     assert(state.toplevel != null);
 }
 
-/// Initializes the hardware WebGPU device and creates native rendering resources.
+/// Initializes the hardware WebGPU device, then records and submits the renderer's setup
+/// stream, which creates every long-lived GPU resource.
 fn create_device(state: *State) !void {
     const display = state.display;
     const surface = state.surface orelse return error.MissingSurface;
     state.gpu = try gpu.create(@ptrCast(display), @ptrCast(surface));
     assert(state.gpu.configured_width == 0);
     assert(state.gpu.configured_height == 0);
+    state.commands.reset();
+    state.renderer.setup(&state.commands);
+    try gpu.submit(&state.gpu, &state.commands);
+    assert(state.renderer.ready);
 }
 
 /// Acknowledges pending configure serials sent by the compositor.
@@ -750,38 +761,25 @@ fn ack_if_needed(state: *State) void {
     assert(!state.ack_pending);
 }
 
-/// Fills the `draw.PresentHeader` and submits the quad and glyph lists to the GPU. Marks the
-/// upload cursor with the presented revisions, then marks the frame presented.
+/// Records one frame of the quad and glyph lists and submits it to the GPU, then marks the
+/// frame presented. The renderer marks its upload cursor while recording.
 fn submit_frame(state: *State) !void {
     assert(state.frame.redraw);
     assert(state.frame.width_px != 0);
-    var header: draw.PresentHeader = undefined;
-    draw.fill_header(&header, .{
-        .list = &state.list,
-        .glyphs = &state.glyphs,
-        .cursor = state.cursor,
+    state.commands.reset();
+    state.renderer.frame(&state.commands, &state.list, &state.glyphs, .{
         .width_logical = state.frame.width_logical,
         .height_logical = state.frame.height_logical,
         .width_px = state.frame.width_px,
         .height_px = state.frame.height_px,
-        .clear_r = gpu.clear_color.r,
-        .clear_g = gpu.clear_color.g,
-        .clear_b = gpu.clear_color.b,
-        .clear_a = gpu.clear_color.a,
     });
-    try gpu.present(&state.gpu, &header, &state.list.items, &state.glyphs.items);
-    state.cursor.mark(
-        &state.list,
-        &state.glyphs,
-        state.frame.width_logical,
-        state.frame.height_logical,
-    );
+    try gpu.submit(&state.gpu, &state.commands);
     state.frame.mark_presented();
     assert(!state.frame.redraw);
 }
 
 /// Requests one frame callback before the commit. `wl_surface.frame` takes effect
-/// on the next commit, so this runs before `gpu.present`. `present_if_dirty`
+/// on the next commit, so this runs before `gpu.submit`. `present_if_dirty`
 /// already returned if a callback was in flight; a second one is a bug.
 fn arm_frame(state: *State) void {
     assert(state.frame_callback == null);

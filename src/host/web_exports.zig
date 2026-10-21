@@ -7,24 +7,24 @@
 //! WebGPU. All communication with `web/shell.js` crosses three channels:
 //! - **Exports:** `export_app` publishes every symbol through `@export`; `rdynamic` in
 //!   `build.zig` keeps them in the module and `shell.js` looks each one up by name.
-//! - **Imports:** `present_js` is the only host import (see `gpu.present`).
+//! - **Imports:** `submit_js` is the only host import (see `gpu.submit`).
 //! - **Linear memory:** Pointers are `u32` byte offsets into `wasm.memory.buffer`. JavaScript
 //!   builds typed views over them, so no data is serialized or copied on the Zig side.
 //!
-//! ## 2. Zig as the Single Source of Truth for Graphics Layouts
-//! `shell.js` queries the exports below instead of duplicating shader text, strides, theme
-//! bytes, or atlas dimensions. Where `shell.js` still has to hard-code a layout fact (the
-//! `PresentHeader` field offsets, the instance and glyph attribute offsets, the flag bits),
-//! the `comptime` block at the end of this file enforces that fact on the Zig side so a
-//! layout change fails the build instead of silently corrupting the browser decode.
+//! ## 2. Zig as the Single Source of Truth for Graphics
+//! `shell.js` contains no WGSL, vertex layouts, strides, or pipeline literals. It learns
+//! everything from two sources: the op table `commands_json_ptr` / `commands_json_len` export
+//! once (`commands.table_json`, generated at compile time from the payload types), and the
+//! command streams Zig submits. The setup stream, recorded by `draw/renderer.zig` in `start`,
+//! carries the shader text, the static unit quad, the atlas, and every layout as spans and
+//! descriptors; JavaScript only maps op fields onto WebGPU calls.
 //!
 //! ## 3. Synchronous Stack-Frame Memory Sharing
-//! `present_frame` builds `draw.PresentHeader` on its own stack and passes three pointers
-//! (header, instances, glyphs) to `present_js`. This is memory safe because host calls are
-//! synchronous on one thread: the engine suspends Zig inside the call, the stack frame stays
-//! intact, and JavaScript must finish reading before control returns. JavaScript must not
-//! retain any of the three pointers or views after `present_js` returns. The upload flags
-//! and counts in the header decide which buffers JavaScript copies (see `draw.UploadCursor`).
+//! `gpu.submit` passes the stream's offset and length to `submit_js`. Spans inside it point
+//! at `state` (the lists and the renderer's uniform record) and at static data. This is
+//! memory safe because host calls are synchronous on one thread: the engine suspends Zig
+//! inside the call and JavaScript must finish reading before control returns. JavaScript must
+//! not retain the stream, any span, or any view over them after `submit_js` returns.
 //!
 //! ## 4. Frame Pacing: Dirty Flags, Optional Timer, and rAF Chaining
 //! The browser host does not run an unconditional `requestAnimationFrame` loop, because that
@@ -37,8 +37,9 @@
 //! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
 //!   `.frame`, presents if dirty, and returns 1 only while `app.live()`. Returning 0 ends
 //!   the rAF chain, and `clock.reset` makes the next sample after idle report a zero delta.
-//! - `start` leaves the draw list empty and `relayout` set; the first layout walk happens in
-//!   `present_frame` after `resize` has supplied real canvas dimensions.
+//! - `start` submits the setup stream, then leaves the draw list empty and `relayout` set;
+//!   the first layout walk happens in `present_frame` after `resize` has supplied real canvas
+//!   dimensions.
 //! - Pointer coordinates are device pixels (canvas backing store), the same unit `resize`
 //!   receives, so layout and hit testing share one frame of reference.
 //! - Timing is host-driven: no Web Workers, no `SharedArrayBuffer`, and no cross-origin
@@ -46,109 +47,32 @@
 //!
 //! ## 5. TigerStyle Invariants
 //! - `State` and the app live in static (BSS) linear memory; there is no runtime allocation.
-//! - Buffer sizes and strides shared with the browser are checked at compile time (see the
-//!   `comptime` block at the end of this file and "export ABI scalars match source constants").
+//! - Payload layouts shared with the browser are described by `commands.table_json`, which
+//!   is generated from the Zig types, so there is no hand-mirrored layout to check.
 //! - Every export runs in bounded time with no recursion.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
+const commands = @import("../gpu/commands.zig");
 const draw = @import("../draw.zig");
 const font = @import("../font.zig");
 const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
-const theme = @import("../theme.zig");
+const renderer = @import("../draw/renderer.zig");
 
-/// Linear-memory address of the embedded quad WGSL source (`draw.shader_file`).
-fn shader_ptr() callconv(.c) [*]const u8 {
-    assert(draw.shader_file.len >= 1);
-    assert(draw.instance_stride == 64);
-    return draw.shader_file.ptr;
+/// Linear-memory address of the op table (`commands.table_json`), UTF-8 JSON.
+fn commands_json_ptr() callconv(.c) [*]const u8 {
+    assert(commands.table_json.len >= 1);
+    return commands.table_json.ptr;
 }
 
-/// Byte length of the quad WGSL source.
-fn shader_len() callconv(.c) u32 {
-    assert(draw.shader_file.len >= 1);
-    return @intCast(draw.shader_file.len);
-}
-
-/// Linear-memory address of `draw.unit_quad`. JavaScript reads `quad_bytes()` bytes from it.
-fn quad_ptr() callconv(.c) [*]const f32 {
-    assert(draw.quad_bytes == 48);
-    return &draw.unit_quad;
-}
-
-/// Byte size of the unit quad vertex buffer (`draw.quad_bytes`).
-fn quad_bytes() callconv(.c) u32 {
-    assert(draw.unit_quad.len == 12);
-    return draw.quad_bytes;
-}
-
-/// Byte stride of `draw.Instance` (`draw.instance_stride`). `shell.js` checks it against its
-/// own hard-coded attribute layout; the offsets it assumes are enforced by the `comptime`
-/// block at the end of this file.
-fn instance_stride() callconv(.c) u32 {
-    assert(draw.instance_stride == 64);
-    return draw.instance_stride;
-}
-
-/// Linear-memory address of the glyph WGSL source (`font.shader_file`).
-fn glyph_shader_ptr() callconv(.c) [*]const u8 {
-    assert(font.shader_file.len >= 1);
-    assert(font.glyph_stride == 64);
-    return font.shader_file.ptr;
-}
-
-/// Byte length of the glyph WGSL source.
-fn glyph_shader_len() callconv(.c) u32 {
-    assert(font.shader_file.len >= 1);
-    return @intCast(font.shader_file.len);
-}
-
-/// Byte stride of `font.Glyph` (`font.glyph_stride`).
-fn glyph_stride() callconv(.c) u32 {
-    assert(font.glyph_stride == 64);
-    return font.glyph_stride;
-}
-
-/// Linear-memory address of `theme.chrome`. `shell.js` writes it right after the matrix,
-/// at uniform offset `draw.matrix_bytes`.
-fn theme_ptr() callconv(.c) [*]const u8 {
-    assert(@sizeOf(theme.Theme) == 192);
-    return @ptrCast(&theme.chrome);
-}
-
-/// Byte length of the theme record (`theme.bytes`).
-fn theme_len() callconv(.c) u32 {
-    assert(theme.bytes == 192);
-    return theme.bytes;
-}
-
-/// Linear-memory address of the pre-baked `r8unorm` coverage atlas (`font.atlas_bytes`).
-/// JavaScript uploads it once at startup; rows are `atlas_width()` bytes with no padding.
-fn atlas_ptr() callconv(.c) [*]const u8 {
-    assert(font.atlas_bytes.len == 131072);
-    return font.atlas_bytes.ptr;
-}
-
-/// Byte size of the atlas, equal to `atlas_width() * atlas_height()` for one byte per texel.
-fn atlas_len() callconv(.c) u32 {
-    assert(font.atlas_bytes.len == 131072);
-    return 131072;
-}
-
-/// Atlas width in texels (`font.atlas_width`).
-fn atlas_width() callconv(.c) u32 {
-    assert(font.atlas_width == 512);
-    return font.atlas_width;
-}
-
-/// Atlas height in texels (`font.atlas_height`).
-fn atlas_height() callconv(.c) u32 {
-    assert(font.atlas_height == 256);
-    return font.atlas_height;
+/// Byte length of the op table.
+fn commands_json_len() callconv(.c) u32 {
+    assert(commands.table_json.len >= 1);
+    return @intCast(commands.table_json.len);
 }
 
 /// Exports the whole browser surface for one app type. Called once, in a `comptime` block,
@@ -157,20 +81,8 @@ fn atlas_height() callconv(.c) u32 {
 pub fn export_app(comptime App: type) void {
     comptime app_contract.check(App);
     const Web = WebApp(App);
-    @export(&shader_ptr, .{ .name = "shader_ptr" });
-    @export(&shader_len, .{ .name = "shader_len" });
-    @export(&quad_ptr, .{ .name = "quad_ptr" });
-    @export(&quad_bytes, .{ .name = "quad_bytes" });
-    @export(&instance_stride, .{ .name = "instance_stride" });
-    @export(&glyph_shader_ptr, .{ .name = "glyph_shader_ptr" });
-    @export(&glyph_shader_len, .{ .name = "glyph_shader_len" });
-    @export(&glyph_stride, .{ .name = "glyph_stride" });
-    @export(&theme_ptr, .{ .name = "theme_ptr" });
-    @export(&theme_len, .{ .name = "theme_len" });
-    @export(&atlas_ptr, .{ .name = "atlas_ptr" });
-    @export(&atlas_len, .{ .name = "atlas_len" });
-    @export(&atlas_width, .{ .name = "atlas_width" });
-    @export(&atlas_height, .{ .name = "atlas_height" });
+    @export(&commands_json_ptr, .{ .name = "commands_json_ptr" });
+    @export(&commands_json_len, .{ .name = "commands_json_len" });
     @export(&Web.start, .{ .name = "start" });
     @export(&Web.resize, .{ .name = "resize" });
     @export(&Web.pointer_move, .{ .name = "pointer_move" });
@@ -190,7 +102,8 @@ fn WebApp(comptime App: type) type {
             frame: frame.Frame,
             list: draw.DrawList,
             glyphs: font.GlyphList,
-            cursor: draw.UploadCursor,
+            renderer: renderer.Renderer,
+            commands: commands.CommandBuffer,
             clock: animator.Clock,
         };
 
@@ -198,22 +111,27 @@ fn WebApp(comptime App: type) type {
             .frame = frame.Frame.init(),
             .list = draw.DrawList.init(),
             .glyphs = font.GlyphList.init(),
-            .cursor = draw.UploadCursor.init(),
+            .renderer = renderer.Renderer.init(),
+            .commands = commands.CommandBuffer.init(),
             .clock = animator.Clock.init(),
         };
 
         var app: App = undefined;
 
-        /// Resets host state and initializes the app. Called once by JavaScript after the
-        /// pipeline is compiled. The draw list stays empty and `relayout` stays set because
-        /// the first layout needs the canvas size that only `resize` supplies.
-        /// Returns the dirty flag (see `dirty_flag`).
+        /// Resets host state, submits the renderer's setup stream, and initializes the app.
+        /// Called once by JavaScript after the device exists. The draw list stays empty and
+        /// `relayout` stays set because the first layout needs the canvas size that only
+        /// `resize` supplies. Returns the dirty flag (see `dirty_flag`).
         fn start() callconv(.c) u32 {
             state.frame = frame.Frame.init();
             state.list = draw.DrawList.init();
             state.glyphs = font.GlyphList.init();
-            state.cursor = draw.UploadCursor.init();
+            state.renderer = renderer.Renderer.init();
             state.clock = animator.Clock.init();
+            state.commands.reset();
+            state.renderer.setup(&state.commands);
+            var unused: gpu.Gpu = .{};
+            gpu.submit(&unused, &state.commands) catch unreachable;
             App.init(&app);
             assert(state.frame.running);
             assert(state.frame.relayout);
@@ -334,30 +252,17 @@ fn WebApp(comptime App: type) type {
                 app.draw(&state.list, &state.glyphs);
             }
             assert(!app.dirty());
-            // The header must outlive the host call; module guide section 3 explains why the
-            // stack is safe.
-            var header: draw.PresentHeader = undefined;
-            draw.fill_header(&header, .{
-                .list = &state.list,
-                .glyphs = &state.glyphs,
-                .cursor = state.cursor,
+            // Spans must outlive the host call; module guide section 3 explains why `state`
+            // is enough.
+            state.commands.reset();
+            state.renderer.frame(&state.commands, &state.list, &state.glyphs, .{
                 .width_logical = state.frame.width_logical,
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,
                 .height_px = state.frame.height_px,
-                .clear_r = gpu.clear_color.r,
-                .clear_g = gpu.clear_color.g,
-                .clear_b = gpu.clear_color.b,
-                .clear_a = gpu.clear_color.a,
             });
             var unused: gpu.Gpu = .{};
-            gpu.present(&unused, &header, &state.list.items, &state.glyphs.items) catch unreachable;
-            state.cursor.mark(
-                &state.list,
-                &state.glyphs,
-                state.frame.width_logical,
-                state.frame.height_logical,
-            );
+            gpu.submit(&unused, &state.commands) catch unreachable;
             state.frame.mark_presented();
             assert(!state.frame.redraw);
             assert(!app.dirty());
@@ -376,52 +281,9 @@ fn WebApp(comptime App: type) type {
     };
 }
 
-comptime {
-    // `web/shell.js` decodes `PresentHeader` with hard-coded offsets and configures vertex
-    // attributes with hard-coded offsets. JavaScript cannot be checked at compile time, so
-    // every offset it assumes is pinned here; changing a layout fails the build and forces
-    // the matching edit in `web/shell.js`.
-    assert(@offsetOf(draw.PresentHeader, "width_px") == 0);
-    assert(@offsetOf(draw.PresentHeader, "height_px") == 4);
-    assert(@offsetOf(draw.PresentHeader, "instance_count") == 8);
-    assert(@offsetOf(draw.PresentHeader, "flags") == 12);
-    assert(@offsetOf(draw.PresentHeader, "clear_r") == 16);
-    assert(@offsetOf(draw.PresentHeader, "clear_a") == 28);
-    assert(@offsetOf(draw.PresentHeader, "ortho") == 32);
-    assert(@offsetOf(draw.PresentHeader, "glyph_count") == 96);
-    assert(@sizeOf(draw.PresentHeader) == 104);
-    assert(draw.flag_instances == 1);
-    assert(draw.flag_uniform == 2);
-    assert(draw.flag_glyphs == 4);
-    assert(draw.matrix_bytes == @sizeOf([16]f32));
-
-    // Both pipelines share one four-attribute vertex layout, so Instance and Glyph must agree
-    // on where each vec4 group starts.
-    assert(@offsetOf(draw.Instance, "x") == 0);
-    assert(@offsetOf(draw.Instance, "r") == 16);
-    assert(@offsetOf(draw.Instance, "radius") == 32);
-    assert(@offsetOf(draw.Instance, "clip_x0") == 48);
-    assert(@offsetOf(font.Glyph, "x") == 0);
-    assert(@offsetOf(font.Glyph, "u0") == 16);
-    assert(@offsetOf(font.Glyph, "r") == 32);
-    assert(@offsetOf(font.Glyph, "clip_x0") == 48);
-    assert(draw.instance_stride == font.glyph_stride);
-
-    // `shell.js` sizes both vertex buffers with one shared capacity constant.
-    assert(draw.instance_cap == font.glyph_cap);
-    assert(font.atlas_bytes.len == font.atlas_width * font.atlas_height);
-}
-
-// Locks the invariant that each exported scalar reports the Zig constant it is documented
-// to mirror, so `shell.js` validation against these exports cannot drift from the source.
-test "export ABI scalars match source constants" {
-    try std.testing.expectEqual(draw.instance_stride, instance_stride());
-    try std.testing.expectEqual(draw.quad_bytes, quad_bytes());
-    try std.testing.expectEqual(font.glyph_stride, glyph_stride());
-    try std.testing.expectEqual(theme.bytes, theme_len());
-    try std.testing.expectEqual(font.atlas_width, atlas_width());
-    try std.testing.expectEqual(font.atlas_height, atlas_height());
-    try std.testing.expectEqual(atlas_width() * atlas_height(), atlas_len());
-    try std.testing.expectEqual(@as(u32, @intCast(draw.shader_file.len)), shader_len());
-    try std.testing.expectEqual(@as(u32, @intCast(font.shader_file.len)), glyph_shader_len());
+// Locks that the exported op table is the generated one, so `shell.js` decodes exactly the
+// layouts the recorder encodes.
+test "the op table export is commands.table_json" {
+    const exported = commands_json_ptr()[0..commands_json_len()];
+    try std.testing.expectEqualStrings(commands.table_json, exported);
 }

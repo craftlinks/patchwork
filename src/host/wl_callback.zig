@@ -38,7 +38,7 @@
 //! `linux_window.zig`.
 //! ```text
 //!   redraw owed, no callback in flight
-//!       -> request_frame, then gpu.present() (the commit the callback attaches to)
+//!       -> request_frame, then gpu.submit() (the commit the callback attaches to)
 //!       -> callback in flight: later wakes leave redraw set and do not present
 //!       -> done: destroy proxy, record timestamp, clear in-flight state
 //!       -> redraw still owed?  yes: schedule the next commit   no: sleep in ppoll

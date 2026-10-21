@@ -583,7 +583,7 @@ test "pointer leave during a knob press releases capture" {
     try std.testing.expectEqual(@as(f32, 0.25), scroll_of(&app).children[0].knob.value);
 }
 
-// Locks that an unchanged scene produces no upload flags.
+// Locks that an unchanged scene records no buffer writes on a scale-style present.
 test "a settled scene does not rebuild on a scale-style present" {
     var app = new_app();
     app.layout(1280, 720);
@@ -591,9 +591,25 @@ test "a settled scene does not rebuild on a scale-style present" {
     var glyphs = font.GlyphList.init();
     app.draw(&list, &glyphs);
     const revision = list.revision;
-    var cursor = quads.UploadCursor.init();
-    cursor.mark(&list, &glyphs, 1280, 720);
+    var renderer = patchwork.renderer.Renderer.init();
+    var buffer = patchwork.commands.CommandBuffer.init();
+    renderer.setup(&buffer);
+    buffer.reset();
+    renderer.frame(&buffer, &list, &glyphs, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = 1280,
+        .height_px = 720,
+    });
     try std.testing.expect(!app.dirty());
-    try std.testing.expectEqual(@as(u32, 0), cursor.flags(&list, &glyphs, 1280, 720));
+    buffer.reset();
+    renderer.frame(&buffer, &list, &glyphs, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = 2560,
+        .height_px = 1440,
+    });
+    var writes: [4]patchwork.commands.BufferWrite = undefined;
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(&buffer, &writes).len);
     try std.testing.expectEqual(revision, list.revision);
 }

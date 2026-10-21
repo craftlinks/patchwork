@@ -5,34 +5,34 @@
 // ## 1. Role and Zero-Copy Memory Bridge
 // This file owns everything the freestanding Wasm module cannot touch: WebGPU device setup,
 // DOM events, timers, and animation-frame scheduling. The module exposes its linear memory
-// as `wasm.memory.buffer`. Pointers returned by exports (or passed to `present_js`) are u32
-// byte offsets into that buffer. JavaScript wraps them in typed views and hands the bytes
-// straight to `device.queue.writeBuffer` / `writeTexture`, so no data is serialized.
+// as `wasm.memory.buffer`. Pointers it passes are u32 byte offsets into that buffer.
+// JavaScript wraps them in typed views and hands the bytes straight to
+// `device.queue.writeBuffer` / `writeTexture`, so no data is serialized.
 //
-// ## 2. Contract With the Zig Exports
-// The Zig side is the source of truth for shaders, strides, theme bytes, and atlas size;
-// `create_pipeline` queries the exports in `src/host/web_exports.zig` rather than embedding
-// them. Where this file must hard-code a layout fact, the Zig side enforces the same fact
-// with `comptime` asserts (the block at the end of `web_exports.zig`). Strides, quad size,
-// theme length, and atlas size are additionally checked against the exports at runtime and
-// throw on mismatch; the header offsets and `INSTANCE_CAP` rely on the Zig asserts alone:
-// - `PresentHeader` field offsets and size: `draw.PresentHeader`; mirrored by
-//   `HEADER_BYTES` and the offsets decoded in `present_js`.
-// - Upload flag bits: `draw.flag_*`; mirrored by `FLAG_*`.
-// - Instance and glyph vertex attribute locations and offsets: `draw.Instance`,
-//   `font.Glyph`, and the vertex layout in `src/host/gpu_wgpu.zig`.
-// - Vertex buffer capacity: `draw.instance_cap` and `font.glyph_cap`; mirrored by
-//   `INSTANCE_CAP`.
-// - Uniform buffer size and theme offset: `draw.uniform_bytes` and `draw.matrix_bytes`.
-// Numeric values are deliberately not repeated in prose; read them from those names.
+// ## 2. A Generic Command Interpreter
+// Zig records every GPU operation into a command stream (`src/gpu/commands.zig`) and calls
+// `submit_js(ptr, len)`; `draw/renderer.zig` decides what is recorded. This file knows no
+// shader, stride, vertex layout, or pipeline. It reads the op table once from the
+// `commands_json_ptr` / `commands_json_len` exports. The table is generated in Zig from the
+// payload types and lists each op's code, name, size, and every field's offset and type.
+// `decode` reads payloads by that table, so a payload edit in Zig needs no edit here. What
+// stays here is the WebGPU vocabulary: the `*_TABLE` objects map Zig enum tag names to
+// WebGPU strings and descriptors, and `OPS` maps each op name to the call it makes.
 //
 // ## 3. Synchronous Call-Stack Longevity
-// `present_js` is invoked from inside Wasm. The engine suspends the Zig frame for the
-// duration of the call, so `headerPtr` points at a live `PresentHeader` on that stack.
-// `present_js` must finish reading it, and must not keep the pointer or any view over it,
-// before returning. Instance and glyph pointers follow the same rule.
+// `submit_js` is invoked from inside Wasm. The stream and every span in it are valid only
+// for the duration of the call; linear memory can grow and detach its `ArrayBuffer`, so no
+// view is kept after `submit_js` returns.
 //
-// ## 4. Frame Scheduling
+// ## 4. Resource Tables and Errors
+// Ids map to WebGPU objects through one array per kind, sized by the table's `caps`.
+// Creating an id twice or using an unset id throws with the op name. The setup stream (the
+// one `start` submits) runs each op inside `pushErrorScope("validation")`, so a failure names
+// the op index and op; `main` awaits those scopes before the first frame. Later errors
+// arrive on the device's `uncapturederror` event and are logged with the last frame's ops.
+// Loading the page with `?trace=1` logs the op names of every submitted stream.
+//
+// ## 5. Frame Scheduling
 // There is no unconditional `requestAnimationFrame` loop; an idle UI should not burn power.
 // - Every Wasm entry point that can dirty the frame returns a flag, and `schedule()` runs
 //   only when it is 1.
@@ -42,392 +42,351 @@
 //   nonzero. The timer requests a frame when the app reports a change; it never steps
 //   animators.
 //
-// ## 5. Pointer and DPI Handling
+// ## 6. Pointer and DPI Handling
 // `resize` receives physical canvas pixels (CSS size times `devicePixelRatio`), so pointer
 // positions, which the DOM reports in CSS pixels, are multiplied by the same ratio before
 // crossing into Wasm. Pointer capture keeps a drag that leaves the canvas deliverable;
 // `pointerleave` and `pointercancel` call `wasm.pointer_leave()` so the scene can release
 // any press in progress. Wheel deltas in line mode are converted to pixels before scaling.
-//
-// ## 6. Pipelines and Bind Groups
-// Pipelines created with `layout: "auto"` get private bind group layouts that cannot be
-// shared, so both pipelines are built from explicit layouts instead: group 0 (one uniform
-// buffer, shared) and group 1 (atlas texture and filtering sampler, glyph pipeline only).
-// Draw order inside the single render pass is quads, then glyphs. The blend state is
-// source-over on straight alpha, matching the fragment shaders' output.
-// `writeTexture` does not require 256-byte row alignment, but the Zig side keeps the atlas
-// width a multiple of 256 (`comptime` assert in `gpu_wgpu.zig`), which `create_pipeline`
-// re-checks.
+// `pass_begin` asserts that the recorded size equals the canvas backing size.
 
 const canvas = document.getElementById("surface");
+const trace = new URLSearchParams(window.location.search).get("trace") === "1";
 
 let device = null;
 let context = null;
 let format = null;
 let wasm = null;
 let raf = 0;
-let pipeline = null;
-let glyphPipeline = null;
-let quadBuffer = null;
-let instanceBuffer = null;
-let glyphBuffer = null;
-let uniformBuffer = null;
-let bindGroup = null;
-let glyphBindGroup = null;
-let configuredWidth = 0;
-let configuredHeight = 0;
+let table = null;
+let opsByCode = null;
+let resources = null;
+// Promises of the per-op error scopes opened while the setup stream runs (guide, section 4).
+let setupScopes = null;
+let lastTrace = "";
 
-// Mirrors of Zig constants; see the guide, section 2, for which names they track.
-const FLAG_INSTANCES = 1;
-const FLAG_UNIFORM = 2;
-const FLAG_GLYPHS = 4;
-const HEADER_BYTES = 104;
-const MATRIX_BYTES = 64;
-const INSTANCE_CAP = 256;
+// Interpreter state for the stream being replayed.
+let encoder = null;
+let pass = null;
+
+/** WebGPU vocabulary for the Zig payload enums, keyed by Zig tag name (guide, section 2). */
+const VERTEX_FORMAT_TABLE = { float32x2: "float32x2", float32x4: "float32x4" };
+const STEP_MODE_TABLE = { vertex: "vertex", instance: "instance" };
+const TEXTURE_FORMAT_TABLE = { r8unorm: "r8unorm" };
+const FILTER_TABLE = { nearest: "nearest", linear: "linear" };
+const BLEND_TABLE = {
+    none: undefined,
+    alpha: {
+        color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+        alpha: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+    },
+};
+const LAYOUT_ENTRY_TABLE = {
+    uniform: () => ({ buffer: { type: "uniform" } }),
+    storage_read: () => ({ buffer: { type: "read-only-storage" } }),
+    texture: () => ({ texture: { sampleType: "float" } }),
+    sampler: () => ({ sampler: { type: "filtering" } }),
+};
+const BIND_RESOURCE_TABLE = {
+    uniform: (id) => ({ buffer: lookup("buffer", id, "bind_group_create") }),
+    storage_read: (id) => ({ buffer: lookup("buffer", id, "bind_group_create") }),
+    texture: (id) => lookup("view", id, "bind_group_create"),
+    sampler: (id) => lookup("sampler", id, "bind_group_create"),
+};
 
 /**
- * Host import called synchronously from `present_frame` in `src/host/web_exports.zig`.
- * Decodes the `PresentHeader`, uploads the buffers its flags name, and draws one frame.
- * Must not retain any of the pointers after returning (guide, section 3).
+ * Reads one field of the given table type at `offset` (guide, section 2). Scalars are
+ * little-endian. A u64 is a zero-extended wasm32 address, so its high word must be zero.
  *
- * @param {number} headerPtr Byte offset of `PresentHeader` in Wasm linear memory.
- * @param {number} instancePtr Byte offset of the face `Instance` array.
- * @param {number} glyphPtr Byte offset of the glyph quad array.
+ * @param {DataView} view View over the payload.
+ * @param {number} offset Byte offset of the field in `view`.
+ * @param {string|object} type Table type: a scalar name, `{enum, int}`, `{array, len,
+ *     stride}`, or `{fields}`.
  */
-function present_js(headerPtr, instancePtr, glyphPtr) {
-    if (context === null || device === null || pipeline === null) {
-        throw new Error("present called before the graphics pipeline is initialized");
-    }
-
-    const memory = wasm.memory.buffer;
-    const view = new DataView(memory, headerPtr, HEADER_BYTES);
-
-    // WebAssembly memory is little-endian. Offsets are pinned by `web_exports.zig`.
-    const width = view.getUint32(0, true);
-    const height = view.getUint32(4, true);
-    const count = view.getUint32(8, true);
-    const flags = view.getUint32(12, true);
-    const r = view.getFloat32(16, true);
-    const g = view.getFloat32(20, true);
-    const b = view.getFloat32(24, true);
-    const a = view.getFloat32(28, true);
-    const glyphCount = view.getUint32(96, true);
-
-    // The matrix is the `ortho` field; the theme follows it in the uniform buffer.
-    if ((flags & FLAG_UNIFORM) !== 0) {
-        device.queue.writeBuffer(
-            uniformBuffer,
-            0,
-            new Uint8Array(memory, headerPtr + 32, MATRIX_BYTES),
-        );
-        const themeLen = wasm.theme_len();
-        if (themeLen !== 192) {
-            throw new Error("theme length mismatch: expected 192 bytes");
-        }
-        device.queue.writeBuffer(
-            uniformBuffer,
-            MATRIX_BYTES,
-            new Uint8Array(memory, wasm.theme_ptr(), themeLen),
-        );
-    }
-
-    // Only `count` records are uploaded; the buffer holds `INSTANCE_CAP`.
-    if ((flags & FLAG_INSTANCES) !== 0) {
-        if (count !== 0) {
-            const stride = wasm.instance_stride();
-            if (stride !== 64) {
-                throw new Error("instance stride mismatch: expected 64 bytes");
+function decode(view, offset, type) {
+    if (typeof type === "string") {
+        switch (type) {
+            case "u8": return view.getUint8(offset);
+            case "u16": return view.getUint16(offset, true);
+            case "u32": return view.getUint32(offset, true);
+            case "f32": return view.getFloat32(offset, true);
+            case "u64": {
+                if (view.getUint32(offset + 4, true) !== 0) {
+                    throw new Error("u64 field has a nonzero high word");
+                }
+                return view.getUint32(offset, true);
             }
-            device.queue.writeBuffer(
-                instanceBuffer,
-                0,
-                new Uint8Array(memory, instancePtr, count * stride),
-            );
+            default: throw new Error(`unknown scalar type ${type}`);
         }
     }
+    if (type.enum !== undefined) {
+        const value = decode(view, offset, type.int);
+        const name = table.enums[type.enum][value];
+        if (name === undefined) {
+            throw new Error(`${type.enum} has no value ${value}`);
+        }
+        return name;
+    }
+    if (type.array !== undefined) {
+        const items = [];
+        for (let i = 0; i < type.len; i += 1) {
+            items.push(decode(view, offset + i * type.stride, type.array));
+        }
+        return items;
+    }
+    const value = {};
+    for (const field of type.fields) {
+        value[field.name] = decode(view, offset + field.offset, field.type);
+    }
+    return value;
+}
 
-    // Glyph quads live in a second buffer. A zero count skips the upload.
-    if ((flags & FLAG_GLYPHS) !== 0) {
-        if (glyphCount !== 0) {
-            const glyphStride = wasm.glyph_stride();
-            if (glyphStride !== 64) {
-                throw new Error("glyph stride mismatch: expected 64 bytes");
+/**
+ * The bytes a decoded span names. Valid only during the current `submit_js` call.
+ * @param {{address: number, len: number}} span
+ */
+function span_bytes(span) {
+    return new Uint8Array(wasm.memory.buffer, span.address, span.len);
+}
+
+/** The object stored for `id` of `kind`; throws, naming `op`, when it was never created. */
+function lookup(kind, id, op) {
+    const object = resources[kind][id];
+    if (object === undefined) {
+        throw new Error(`${op}: ${kind} id ${id} was never created`);
+    }
+    return object;
+}
+
+/** Stores `object` as `id` of `kind`; throws, naming `op`, on a reused or out-of-range id. */
+function store(kind, id, object, op) {
+    const slots = resources[kind];
+    if (id >= slots.length) {
+        throw new Error(`${op}: ${kind} id ${id} is out of range ${slots.length}`);
+    }
+    if (slots[id] !== undefined) {
+        throw new Error(`${op}: ${kind} id ${id} was already created`);
+    }
+    slots[id] = object;
+}
+
+/** The open render pass; throws, naming `op`, when none is open. */
+function open_pass(op) {
+    if (pass === null) {
+        throw new Error(`${op}: no render pass is open`);
+    }
+    return pass;
+}
+
+/** One handler per op name. Each receives the decoded payload and the op index. */
+const OPS = {
+    shader_create(p, index) {
+        const code = new TextDecoder().decode(span_bytes(p.source));
+        const module = device.createShaderModule({ code });
+        module.getCompilationInfo().then((info) => {
+            for (const message of info.messages) {
+                if (message.type === "error") {
+                    console.error(`op ${index} shader_create ${p.id}: ${message.message}`);
+                }
             }
-            device.queue.writeBuffer(
-                glyphBuffer,
-                0,
-                new Uint8Array(memory, glyphPtr, glyphCount * glyphStride),
-            );
-        }
-    }
-
-    // The canvas texture must be reconfigured whenever the physical size changes.
-    if (width !== configuredWidth || height !== configuredHeight) {
-        context.configure({
-            device,
-            format,
-            usage: GPUTextureUsage.RENDER_ATTACHMENT,
-            alphaMode: "opaque",
-            presentMode: "fifo", // The only mode every WebGPU implementation must support.
-            width,
-            height,
         });
-        configuredWidth = width;
-        configuredHeight = height;
-    }
-
-    const encoder = device.createCommandEncoder();
-
-    const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-            view: context.getCurrentTexture().createView(),
-            loadOp: "clear",
-            storeOp: "store",
-            clearValue: { r, g, b, a },
-        }],
-    });
-
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.setVertexBuffer(0, quadBuffer);
-    pass.setVertexBuffer(1, instanceBuffer);
-    pass.draw(6, count);
-    if (glyphCount !== 0) {
-        pass.setPipeline(glyphPipeline);
-        pass.setBindGroup(0, bindGroup);
-        pass.setBindGroup(1, glyphBindGroup);
-        pass.setVertexBuffer(0, quadBuffer);
-        pass.setVertexBuffer(1, glyphBuffer);
-        pass.draw(6, glyphCount);
-    }
-    pass.end();
-
-    device.queue.submit([encoder.finish()]);
-}
+        store("shader", p.id, module, "shader_create");
+    },
+    layout_create(p) {
+        const used = p.entries.slice(0, p.entry_count);
+        const entries = used.map((entry) => ({
+            binding: entry.binding,
+            visibility: entry.visibility,
+            ...LAYOUT_ENTRY_TABLE[entry.kind](),
+        }));
+        // A bind group entry's resource id names a buffer, texture, or sampler according to
+        // the layout entry kind at the same binding, so keep the kinds beside the layout.
+        const kinds = new Map(used.map((entry) => [entry.binding, entry.kind]));
+        store("layout", p.id, { layout: device.createBindGroupLayout({ entries }), kinds }, "layout_create");
+    },
+    pipeline_create(p) {
+        const module = lookup("shader", p.shader, "pipeline_create");
+        const bindGroupLayouts = p.layouts.slice(0, p.layout_count)
+            .map((id) => lookup("layout", id, "pipeline_create").layout);
+        const buffers = p.vertex.slice(0, p.buffer_count).map((buffer) => ({
+            arrayStride: buffer.stride,
+            stepMode: STEP_MODE_TABLE[buffer.step],
+            attributes: buffer.attributes.slice(0, buffer.attribute_count).map((attribute) => ({
+                shaderLocation: attribute.location,
+                offset: attribute.offset,
+                format: VERTEX_FORMAT_TABLE[attribute.format],
+            })),
+        }));
+        const pipeline = device.createRenderPipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts }),
+            vertex: { module, entryPoint: table.entry.vertex, buffers },
+            fragment: {
+                module,
+                entryPoint: table.entry.fragment,
+                targets: [{ format, blend: BLEND_TABLE[p.blend] }],
+            },
+            primitive: { topology: "triangle-list" },
+        });
+        store("pipeline", p.id, pipeline, "pipeline_create");
+    },
+    buffer_create(p) {
+        store("buffer", p.id, device.createBuffer({ size: p.size, usage: p.usage }), "buffer_create");
+    },
+    texture_create(p) {
+        const texture = device.createTexture({
+            size: { width: p.width, height: p.height },
+            format: TEXTURE_FORMAT_TABLE[p.format],
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        store("texture", p.id, texture, "texture_create");
+        store("view", p.id, texture.createView(), "texture_create");
+    },
+    sampler_create(p) {
+        const filter = FILTER_TABLE[p.filter];
+        const sampler = device.createSampler({
+            addressModeU: "clamp-to-edge",
+            addressModeV: "clamp-to-edge",
+            magFilter: filter,
+            minFilter: filter,
+        });
+        store("sampler", p.id, sampler, "sampler_create");
+    },
+    bind_group_create(p) {
+        const layout = lookup("layout", p.layout, "bind_group_create");
+        const entries = p.entries.slice(0, p.entry_count).map((entry) => {
+            const kind = layout.kinds.get(entry.binding);
+            if (kind === undefined) {
+                throw new Error(`bind_group_create: layout ${p.layout} has no binding ${entry.binding}`);
+            }
+            return { binding: entry.binding, resource: BIND_RESOURCE_TABLE[kind](entry.resource) };
+        });
+        const group = device.createBindGroup({ layout: layout.layout, entries });
+        store("bind_group", p.id, group, "bind_group_create");
+    },
+    buffer_write(p) {
+        device.queue.writeBuffer(lookup("buffer", p.id, "buffer_write"), p.offset, span_bytes(p.data));
+    },
+    texture_write(p) {
+        device.queue.writeTexture(
+            { texture: lookup("texture", p.id, "texture_write"), origin: { x: p.x, y: p.y } },
+            span_bytes(p.data),
+            { bytesPerRow: p.bytes_per_row, rowsPerImage: p.height },
+            { width: p.width, height: p.height },
+        );
+    },
+    pass_begin(p) {
+        if (pass !== null) {
+            throw new Error("pass_begin: a render pass is already open");
+        }
+        if (p.width_px !== canvas.width || p.height_px !== canvas.height) {
+            throw new Error(
+                `pass_begin: frame is ${p.width_px}x${p.height_px} but the canvas is ` +
+                `${canvas.width}x${canvas.height}`,
+            );
+        }
+        encoder = device.createCommandEncoder();
+        const [r, g, b, a] = p.clear;
+        pass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: context.getCurrentTexture().createView(),
+                loadOp: "clear",
+                storeOp: "store",
+                clearValue: { r, g, b, a },
+            }],
+        });
+    },
+    pipeline_set(p) {
+        open_pass("pipeline_set").setPipeline(lookup("pipeline", p.id, "pipeline_set"));
+    },
+    bind_group_set(p) {
+        open_pass("bind_group_set").setBindGroup(p.slot, lookup("bind_group", p.id, "bind_group_set"));
+    },
+    vertex_buffer_set(p) {
+        const buffer = lookup("buffer", p.buffer, "vertex_buffer_set");
+        open_pass("vertex_buffer_set").setVertexBuffer(p.slot, buffer, p.offset);
+    },
+    draw(p) {
+        open_pass("draw").draw(p.vertex_count, p.instance_count, p.first_vertex, p.first_instance);
+    },
+    pass_end_present() {
+        open_pass("pass_end_present").end();
+        device.queue.submit([encoder.finish()]);
+        pass = null;
+        encoder = null;
+    },
+};
 
 /**
- * Compiles both shaders and creates every GPU resource, validating each export-reported
- * layout value against the constants this file assumes (guide, section 2).
- */
-async function create_pipeline() {
-    const stride = wasm.instance_stride();
-    const quadByteCount = wasm.quad_bytes();
-    const shaderLen = wasm.shader_len();
-
-    if (stride !== 64) {
-        throw new Error("instance stride mismatch: expected 64 bytes");
-    }
-    const glyphStride = wasm.glyph_stride();
-    if (glyphStride !== 64) {
-        throw new Error("glyph stride mismatch: expected 64 bytes");
-    }
-    if (quadByteCount !== 48) {
-        throw new Error("unit quad size mismatch: expected 48 bytes");
-    }
-    if (shaderLen === 0) {
-        throw new Error("shader source is empty");
-    }
-
-    const module = await compile_shader(wasm.shader_ptr(), shaderLen, "quad");
-    const glyphModule = await compile_shader(
-        wasm.glyph_shader_ptr(),
-        wasm.glyph_shader_len(),
-        "glyph",
-    );
-
-    quadBuffer = device.createBuffer({
-        size: quadByteCount,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-
-    instanceBuffer = device.createBuffer({
-        size: INSTANCE_CAP * stride,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-
-    // Size mirrors `draw.uniform_bytes`: matrix followed by theme.
-    uniformBuffer = device.createBuffer({
-        size: 256,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    const memory = wasm.memory.buffer;
-    // The unit quad never changes, so it is uploaded once.
-    device.queue.writeBuffer(
-        quadBuffer,
-        0,
-        new Uint8Array(memory, wasm.quad_ptr(), quadByteCount),
-    );
-
-    const atlasWidth = wasm.atlas_width();
-    const atlasHeight = wasm.atlas_height();
-    const atlasLen = wasm.atlas_len();
-    if (atlasWidth !== 512) {
-        throw new Error("atlas width mismatch: expected 512");
-    }
-    if (atlasLen !== 131072) {
-        throw new Error("atlas length mismatch: expected 131072 bytes");
-    }
-    if (atlasWidth % 256 !== 0) {
-        throw new Error("atlas bytesPerRow is not a multiple of 256");
-    }
-
-    glyphBuffer = device.createBuffer({
-        size: INSTANCE_CAP * wasm.glyph_stride(),
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-
-    // Explicit layouts are required so both pipelines can bind the same group 0 object.
-    const group0 = device.createBindGroupLayout({
-        entries: [{
-            binding: 0,
-            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-            buffer: { type: "uniform", minBindingSize: 256 },
-        }],
-    });
-    const group1 = device.createBindGroupLayout({
-        entries: [
-            {
-                binding: 0,
-                visibility: GPUShaderStage.FRAGMENT,
-                texture: { sampleType: "float" },
-            },
-            {
-                binding: 1,
-                visibility: GPUShaderStage.FRAGMENT,
-                sampler: { type: "filtering" },
-            },
-        ],
-    });
-    const quadLayout = device.createPipelineLayout({ bindGroupLayouts: [group0] });
-    const glyphLayout = device.createPipelineLayout({ bindGroupLayouts: [group0, group1] });
-    const blend = {
-        color: {
-            srcFactor: "src-alpha",
-            dstFactor: "one-minus-src-alpha",
-            operation: "add",
-        },
-        alpha: {
-            srcFactor: "src-alpha",
-            dstFactor: "one-minus-src-alpha",
-            operation: "add",
-        },
-    };
-    const unitBuffer = {
-        arrayStride: 8,
-        stepMode: "vertex",
-        attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
-    };
-
-    pipeline = device.createRenderPipeline({
-        layout: quadLayout,
-        vertex: {
-            module,
-            entryPoint: "vs_main",
-            buffers: [
-                unitBuffer,
-                {
-                    arrayStride: stride,
-                    stepMode: "instance",
-                    attributes: [
-                        { shaderLocation: 1, offset: 0, format: "float32x4" },
-                        { shaderLocation: 2, offset: 16, format: "float32x4" },
-                        { shaderLocation: 3, offset: 32, format: "float32x4" },
-                        { shaderLocation: 4, offset: 48, format: "float32x4" },
-                    ],
-                },
-            ],
-        },
-        fragment: {
-            module,
-            entryPoint: "fs_main",
-            targets: [{ format, blend }],
-        },
-        primitive: { topology: "triangle-list" },
-    });
-
-    glyphPipeline = device.createRenderPipeline({
-        layout: glyphLayout,
-        vertex: {
-            module: glyphModule,
-            entryPoint: "vs_main",
-            buffers: [
-                unitBuffer,
-                {
-                    arrayStride: glyphStride,
-                    stepMode: "instance",
-                    attributes: [
-                        { shaderLocation: 1, offset: 0, format: "float32x4" },
-                        { shaderLocation: 2, offset: 16, format: "float32x4" },
-                        { shaderLocation: 3, offset: 32, format: "float32x4" },
-                        { shaderLocation: 4, offset: 48, format: "float32x4" },
-                    ],
-                },
-            ],
-        },
-        fragment: {
-            module: glyphModule,
-            entryPoint: "fs_main",
-            targets: [{ format, blend }],
-        },
-        primitive: { topology: "triangle-list" },
-    });
-
-    bindGroup = device.createBindGroup({
-        layout: group0,
-        entries: [{
-            binding: 0,
-            resource: { buffer: uniformBuffer },
-        }],
-    });
-
-    const atlas = device.createTexture({
-        size: { width: atlasWidth, height: atlasHeight },
-        format: "r8unorm",
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    device.queue.writeTexture(
-        { texture: atlas },
-        new Uint8Array(memory, wasm.atlas_ptr(), atlasLen),
-        { bytesPerRow: atlasWidth, rowsPerImage: atlasHeight },
-        { width: atlasWidth, height: atlasHeight },
-    );
-    const glyphSampler = device.createSampler({
-        addressModeU: "clamp-to-edge",
-        addressModeV: "clamp-to-edge",
-        magFilter: "linear",
-        minFilter: "linear",
-    });
-    glyphBindGroup = device.createBindGroup({
-        layout: group1,
-        entries: [
-            { binding: 0, resource: atlas.createView() },
-            { binding: 1, resource: glyphSampler },
-        ],
-    });
-}
-
-/**
- * Compiles a WGSL module from Wasm memory and throws on any compilation error message.
+ * Host import called synchronously from `gpu.submit` in Zig. Decodes and runs every op of the
+ * stream at `ptr` (guide, sections 2 to 4). Must not retain any view after returning.
  *
- * @param {number} ptr - Byte offset of shader source text in Wasm linear memory.
- * @param {number} len - Byte length of shader source text.
- * @param {string} label - Human-readable label for error reporting ("quad" or "glyph").
- * @returns {Promise<GPUShaderModule>} Compiled WebGPU shader module.
+ * @param {number} ptr Byte offset of the stream in Wasm linear memory, 8-byte aligned.
+ * @param {number} len Byte length of the stream, a multiple of 8.
  */
-async function compile_shader(ptr, len, label) {
-    if (len === 0) {
-        throw new Error(`${label} shader source is empty`);
+function submit_js(ptr, len) {
+    const view = new DataView(wasm.memory.buffer, ptr, len);
+    const names = [];
+    let offset = 0;
+    let index = 0;
+    while (offset < len) {
+        const code = view.getUint16(offset, true);
+        const size = view.getUint16(offset + 2, true);
+        const op = opsByCode.get(code);
+        if (op === undefined) {
+            throw new Error(`command ${index}: unknown op code ${code}`);
+        }
+        if (size !== op.size) {
+            throw new Error(`command ${index}: ${op.name} payload is ${size} bytes, expected ${op.size}`);
+        }
+        const payload = decode(new DataView(wasm.memory.buffer, ptr + offset + table.header_bytes, size), 0, op.type);
+        names.push(op.name);
+        if (setupScopes !== null) {
+            device.pushErrorScope("validation");
+        }
+        OPS[op.name](payload, index);
+        if (setupScopes !== null) {
+            const at = index;
+            const name = op.name;
+            setupScopes.push(device.popErrorScope().then((error) => {
+                if (error !== null) {
+                    throw new Error(`setup op ${at} (${name}) failed: ${error.message}`);
+                }
+            }));
+        }
+        offset += table.header_bytes + Math.ceil(size / table.align) * table.align;
+        index += 1;
     }
-    const text = new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, ptr, len));
-    const module = device.createShaderModule({ code: text });
-    const info = await module.getCompilationInfo();
-    for (const message of info.messages) {
-        if (message.type === "error") {
-            throw new Error(`${label} WGSL: ${message.message}`);
+    if (pass !== null) {
+        throw new Error("stream ended inside a render pass");
+    }
+    lastTrace = names.join(" ");
+    if (trace) {
+        console.log(`submit ${index} ops: ${lastTrace}`);
+    }
+}
+
+/**
+ * Reads the op table export and sizes the resource tables from its caps (guide, section 2).
+ * Every op in the table must have a handler, and every handler an op.
+ */
+function load_table() {
+    const bytes = new Uint8Array(wasm.memory.buffer, wasm.commands_json_ptr(), wasm.commands_json_len());
+    table = JSON.parse(new TextDecoder().decode(bytes));
+    opsByCode = new Map(table.ops.map((op) => [op.code, op]));
+    for (const op of table.ops) {
+        if (OPS[op.name] === undefined) {
+            throw new Error(`op table names ${op.name}, which this interpreter does not handle`);
         }
     }
-    return module;
+    for (const name of Object.keys(OPS)) {
+        if (!table.ops.some((op) => op.name === name)) {
+            throw new Error(`interpreter handles ${name}, which the op table does not list`);
+        }
+    }
+    resources = { view: new Array(table.caps.texture).fill(undefined) };
+    for (const [kind, cap] of Object.entries(table.caps)) {
+        resources[kind] = new Array(cap).fill(undefined);
+    }
 }
 
 /**
@@ -439,7 +398,7 @@ function schedule() {
     }
     raf = requestAnimationFrame((now) => {
         raf = 0;
-        // `tick` returns 1 only while an animator is live (guide, section 4).
+        // `tick` returns 1 only while an animator is live (guide, section 5).
         if (wasm.tick(Math.floor(now)) === 1) {
             schedule();
         }
@@ -447,7 +406,7 @@ function schedule() {
 }
 
 /**
- * Arms the app timer if `wasm.timer_period_ms()` is nonzero (guide, section 4). The interval
+ * Arms the app timer if `wasm.timer_period_ms()` is nonzero (guide, section 5). The interval
  * stays armed for the life of the page.
  */
 function arm_timer() {
@@ -554,8 +513,9 @@ function on_pointer_leave() {
 }
 
 /**
- * Bootstrap order matters: the pipeline is built before `start` so the first `present_js`
- * finds its resources, and `fit_canvas` runs after `start` so layout sees the real size.
+ * Bootstrap order matters: the device and op table exist before `start`, whose setup stream
+ * creates every resource; its error scopes resolve before `fit_canvas` asks for the first
+ * frame, so layout sees the real size and a setup failure stops the page.
  */
 async function main() {
     if (navigator.gpu === undefined) {
@@ -568,18 +528,32 @@ async function main() {
     }
 
     device = await adapter.requestDevice();
+    device.addEventListener("uncapturederror", (event) => {
+        console.error(`WebGPU error after ops [${lastTrace}]: ${event.error.message}`);
+    });
     context = canvas.getContext("webgpu");
     format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device,
+        format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        alphaMode: "opaque",
+    });
 
     const response = await fetch("patchwork.wasm");
     const imported = await WebAssembly.instantiateStreaming(response, {
-        env: { present_js },
+        env: { submit_js },
     });
 
     wasm = imported.instance.exports;
+    load_table();
 
-    await create_pipeline();
+    setupScopes = [];
     wasm.start();
+    const scopes = setupScopes;
+    setupScopes = null;
+    await Promise.all(scopes);
+
     fit_canvas();
     arm_timer();
 
