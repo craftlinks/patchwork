@@ -42,6 +42,10 @@
 //!   settled app costs nothing.
 //! - `dirty` is true when `draw` has work to do. The host resets the context, then `draw`
 //!   appends every instance and must leave `dirty()` false. The hosts assert the latter.
+//!   The hosts also call `draw` on a clean app when the context's glyph cache owes a draw
+//!   (`text/cache.zig`: the display scale changed since the last draw, or glyphs were
+//!   skipped for the per-frame budget or a full atlas), so `draw` must be repeatable: a
+//!   clean app draws the same instances again.
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
@@ -54,7 +58,9 @@
 //! ## 3. Host Order Per Wake
 //! Drain queued events into `event`. When a frame callback completes, call `event(.frame)`.
 //! When the timer expires, call `timer`. At present time call `layout` if the window
-//! changed, then `draw` if `dirty()`.
+//! changed, then, if `dirty()` or `context.text.owes_draw(scale_120)`, set
+//! `context.text.scale_120`, reset the context, and call `draw`. After presenting, a cache
+//! that still owes a draw requests another frame.
 //!
 //! ## 4. The Optional Timer
 //! `timer_period_ms == 0` means no timer. The native host then creates no `timerfd` and

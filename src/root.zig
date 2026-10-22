@@ -10,7 +10,7 @@
 //! host.
 
 pub const frame = @import("frame.zig");
-pub const font = @import("font.zig");
+pub const text = @import("text.zig");
 pub const draw = @import("draw.zig");
 pub const turtle = @import("turtle.zig");
 pub const input = @import("input.zig");
@@ -32,11 +32,14 @@ pub const host = struct {
     /// root even though it declares extern `libwayland-client` functions: tests never call
     /// the helpers that reference them, so the library need not be linked.
     pub const wp_presentation = @import("host/wp_presentation.zig");
+    /// Protocol tables for `wp_fractional_scale_v1` and `wp_viewporter`; listed in the test
+    /// root for the same reason as `wp_presentation`.
+    pub const wp_fractional_scale = @import("host/wp_fractional_scale.zig");
 };
 
 test {
     _ = frame;
-    _ = font;
+    _ = text;
     _ = draw;
     _ = turtle;
     _ = input;
@@ -48,6 +51,7 @@ test {
     _ = commands;
     _ = renderer;
     _ = host.wp_presentation;
+    _ = host.wp_fractional_scale;
     // These two hosts carry layout asserts and tests shared with the web shell and the wgpu
     // pipelines; referencing them here makes those checks part of `zig build test`.
     _ = host.web_exports;

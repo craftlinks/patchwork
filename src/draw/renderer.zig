@@ -21,8 +21,9 @@
 //!
 //! ## 3. Frame Shape
 //! ```text
-//! buffer_write uniform            only when the logical size changed (or first frame)
-//! texture_create, bind_group_create, texture_write   whatever `Textures` queued
+//! buffer_write uniform            only when the device size or scale changed (or first frame)
+//! texture_create, bind_group_create, texture_write   whatever `Textures` queued, after the
+//!                                 glyph cache queued its dirty atlas rectangle (one write)
 //! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed
 //! pass_begin
 //!   bind_group_set 0, vertex_buffer_set 0                   once, when any batch exists
@@ -39,7 +40,7 @@
 //! ## 4. Uploads (Dirty Ranges per Pool)
 //! Each pool has a shadow of what the GPU last received and the revision it was taken at.
 //! - Revision equal to the shadow's: nothing, without looking at the records. This is the
-//!   idle path, and a scale-only present takes it for every pool.
+//!   idle path: a frame the host did not draw takes it for every pool.
 //! - Revision moved: the finalized (sorted) records are compared with the shadow, and
 //!   `draw.dirty_range` returns the smallest record range covering every change plus every
 //!   record past the shadow's count. An identical rebuild writes nothing, and a hover that
@@ -48,9 +49,15 @@
 //! construction. The counting sort is stable by key and overlays sort last, so content that
 //! appears on a higher layer lands at the tail of its pool and keeps ranges small.
 //!
+//! A scale change redraws the scene (glyphs are rasterized and snapped per device scale; see
+//! `text/cache.zig`), but only glyph records move: the box and arc pools compare equal and
+//! write nothing, and the frame writes the uniform, the new atlas rectangle, and the glyph
+//! range. Test "a scale change writes the uniform, the atlas, and glyphs only" locks it.
+//!
 //! ## 5. Lifetime
-//! Spans point into the context's pools, `Textures`' queued writes, `Renderer.uniform`, and
-//! static data, so all of them must stay put until the host's submit returns. Both hosts
+//! Spans point into the context's pools, `Textures`' queued writes (the glyph cache's mirror
+//! among them), `Renderer.uniform`, and static data, so all of them must stay put until the
+//! host's submit returns. Both hosts
 //! submit synchronously from the call that recorded the stream.
 
 const std = @import("std");
@@ -87,12 +94,15 @@ pub const Uniform = extern struct {
     theme: theme.Theme,
 };
 
-/// Logical size for the projection and physical size for the pass. All nonzero.
+/// Logical size, physical size for the pass, and the display scale in 1/120 units. The
+/// projection is built from the physical size and the scale (`draw.ortho_y_down`). All
+/// nonzero.
 pub const Size = struct {
     width_logical: u32,
     height_logical: u32,
     width_px: u32,
     height_px: u32,
+    scale_120: u32,
 };
 
 const BindGroupEntries = [commands.bind_group_entry_cap]commands.BindGroupEntry;
@@ -144,9 +154,10 @@ pub fn Renderer(comptime Cx: type) type {
         resources: Resources,
         shadows: @Tuple(&shadow_types),
         uniform: Uniform,
-        /// Logical size the uploaded uniform was built for; 0 before the first frame.
-        width_logical: u32,
-        height_logical: u32,
+        /// Device size and scale the uploaded uniform was built for; 0 before the first frame.
+        width_px: u32,
+        height_px: u32,
+        scale_120: u32,
         ready: bool,
 
         /// Most ops one `frame` records.
@@ -171,15 +182,16 @@ pub fn Renderer(comptime Cx: type) type {
         pub fn init(self: *Self) void {
             self.ids = .init();
             self.uniform = .{ .ortho = undefined, .theme = theme.chrome };
-            self.width_logical = 0;
-            self.height_logical = 0;
+            self.width_px = 0;
+            self.height_px = 0;
+            self.scale_120 = 0;
             self.ready = false;
             inline for (0..R.count) |index| {
                 self.shadows[index].count = 0;
                 self.shadows[index].revision = 0;
             }
             assert(!self.ready);
-            assert(self.width_logical == 0);
+            assert(self.width_px == 0);
         }
 
         /// Records every long-lived resource, the unit quad upload, and the textures queued
@@ -346,16 +358,24 @@ pub fn Renderer(comptime Cx: type) type {
             assert(size.width_px != 0);
             assert(size.height_px != 0);
             assert(size.width_logical != 0);
-            if (self.uniform_dirty(size.width_logical, size.height_logical)) {
-                draw.ortho_y_down(&self.uniform.ortho, size.width_logical, size.height_logical);
+            assert(size.scale_120 != 0);
+            if (self.uniform_dirty(size)) {
+                draw.ortho_y_down(
+                    &self.uniform.ortho,
+                    size.width_px,
+                    size.height_px,
+                    size.scale_120,
+                );
                 buffer.push(.{ .buffer_write = .{
                     .id = self.resources.uniform_buffer,
                     .offset = 0,
                     .data = .of(std.mem.asBytes(&self.uniform)),
                 } });
-                self.width_logical = size.width_logical;
-                self.height_logical = size.height_logical;
+                self.width_px = size.width_px;
+                self.height_px = size.height_px;
+                self.scale_120 = size.scale_120;
             }
+            cx.text.queue_upload(&cx.textures);
             self.flush_textures(buffer, &cx.textures);
             cx.finalize();
             inline for (0..R.count) |index| {
@@ -372,13 +392,16 @@ pub fn Renderer(comptime Cx: type) type {
             assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity));
         }
 
-        fn uniform_dirty(self: *const Self, width_logical: u32, height_logical: u32) bool {
-            assert(width_logical != 0);
-            assert(height_logical != 0);
-            if (self.width_logical != width_logical) {
+        fn uniform_dirty(self: *const Self, size: Size) bool {
+            assert(size.width_px != 0);
+            assert(size.height_px != 0);
+            if (self.width_px != size.width_px) {
                 return true;
             }
-            return self.height_logical != height_logical;
+            if (self.height_px != size.height_px) {
+                return true;
+            }
+            return self.scale_120 != size.scale_120;
         }
 
         fn upload_pool(
@@ -484,6 +507,8 @@ comptime {
 }
 
 const testing = std.testing;
+const text = @import("../text.zig");
+const turtle = @import("../turtle.zig");
 
 /// The op codes recorded in `buffer`, in order.
 pub fn codes(buffer: *const commands.CommandBuffer, out: []commands.Code) []commands.Code {
@@ -543,13 +568,15 @@ const Fixture = struct {
         buffer.reset();
     }
 
-    fn record(width_px: u32) void {
+    /// Records one 1280 by 720 logical frame at `scale_120`.
+    fn record(scale_120: u32) void {
         buffer.reset();
         renderer.frame(&buffer, &context, .{
             .width_logical = 1280,
             .height_logical = 720,
-            .width_px = width_px,
-            .height_px = width_px * 720 / 1280,
+            .width_px = 1280 * scale_120 / 120,
+            .height_px = 720 * scale_120 / 120,
+            .scale_120 = scale_120,
         });
     }
 };
@@ -591,6 +618,7 @@ fn glyph(x: f32) types.Glyph {
 /// Box, glyph, box, glyph, then an arc: the scene most tests below record.
 fn scene(hover: f32) !void {
     const cx = &Fixture.context;
+    cx.text.scale_120 = 120;
     cx.reset();
     try cx.append(types.Box, null, face(0));
     try cx.append(types.Glyph, .atlas, glyph(0));
@@ -601,7 +629,8 @@ fn scene(hover: f32) !void {
 }
 
 // Locks the setup recording: per type a shader (labelled), a buffer, and a pipeline; the
-// atlas texture and its bind group last, after the unit quad upload.
+// atlas texture and its bind group last, after the unit quad upload, with no texels: the
+// glyph cache uploads what it rasterizes in later frames.
 test "setup records one shader, buffer, and pipeline per type and the atlas" {
     Fixture.setup_only();
     var storage: [64]commands.Code = undefined;
@@ -612,7 +641,6 @@ test "setup records one shader, buffer, and pipeline per type and the atlas" {
         .shader_create, .buffer_create,  .pipeline_create,
         .shader_create, .buffer_create,  .pipeline_create,
         .buffer_write,  .texture_create, .bind_group_create,
-        .texture_write,
     };
     try testing.expectEqualSlices(commands.Code, &expected, codes(&Fixture.buffer, &storage));
     var reader = Fixture.buffer.reader();
@@ -651,7 +679,7 @@ test "setup records one shader, buffer, and pipeline per type and the atlas" {
 test "the first frame writes every pool and draws one call per batch" {
     Fixture.start();
     try scene(0);
-    Fixture.record(1280);
+    Fixture.record(120);
     var storage: [64]commands.Code = undefined;
     const expected = [_]commands.Code{
         .buffer_write,      .buffer_write, .buffer_write,
@@ -672,19 +700,71 @@ test "the first frame writes every pool and draws one call per batch" {
     try testing.expectEqual(r.instance_buffers[2], recorded[3].id);
 }
 
-// Locks the idle paths: a scale-only frame and an identical rebuild write nothing.
-test "a scale-only frame and an identical rebuild write nothing" {
+// Locks the idle paths: a frame recorded again without a draw and an identical rebuild write
+// nothing.
+test "an undrawn frame and an identical rebuild write nothing" {
     Fixture.start();
     try scene(0);
-    Fixture.record(1280);
-    Fixture.record(2560);
+    Fixture.record(120);
+    Fixture.record(120);
     var write_storage: [8]commands.BufferWrite = undefined;
     try testing.expectEqual(@as(usize, 0), writes(&Fixture.buffer, &write_storage).len);
     var reader = Fixture.buffer.reader();
-    try testing.expectEqual(@as(u32, 2560), reader.next().?.pass_begin.width_px);
+    try testing.expectEqual(@as(u32, 1280), reader.next().?.pass_begin.width_px);
     try scene(0);
-    Fixture.record(2560);
+    Fixture.record(120);
     try testing.expectEqual(@as(usize, 0), writes(&Fixture.buffer, &write_storage).len);
+}
+
+/// Two boxes, an arc, and a text label drawn through the glyph cache at `scale_120`, the way
+/// a host draws when the cache owes a draw.
+fn text_scene(scale_120: u32) void {
+    const cx = &Fixture.context;
+    cx.text.scale_120 = scale_120;
+    cx.reset();
+    cx.append(types.Box, null, face(0)) catch unreachable;
+    cx.append(types.Box, null, face(20)) catch unreachable;
+    cx.append(types.Arc, null, ring(0, 0)) catch unreachable;
+    const style: text.Style = .{ .face = .sans, .size = 16, .color = .{ 1, 1, 1, 1 } };
+    const rect: turtle.Rect = .{ .x = 3, .y = 50, .width = 90, .height = 24 };
+    const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+    text.place(cx, style, "Hi", rect, clip, .{
+        .align_x = .start,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+    assert(cx.overflow_count == 0);
+}
+
+// Locks the scale-change frame: the scene is redrawn at 1.5, the frame writes the uniform,
+// one atlas rectangle, and the glyph range, and the box and arc pools write nothing.
+test "a scale change writes the uniform, the atlas, and glyphs only" {
+    Fixture.start();
+    text_scene(120);
+    Fixture.record(120);
+    try testing.expect(!Fixture.context.text.owes_draw(120));
+    try testing.expect(Fixture.context.text.owes_draw(180));
+    text_scene(180);
+    Fixture.record(180);
+    var write_storage: [8]commands.BufferWrite = undefined;
+    const recorded = writes(&Fixture.buffer, &write_storage);
+    const r = &Fixture.renderer.resources;
+    try testing.expectEqual(@as(usize, 2), recorded.len);
+    try testing.expectEqual(r.uniform_buffer, recorded[0].id);
+    try testing.expectEqual(r.instance_buffers[2], recorded[1].id);
+    var atlas_writes: u32 = 0;
+    var reader = Fixture.buffer.reader();
+    while (reader.next()) |op| {
+        switch (op) {
+            .texture_write => |write| {
+                try testing.expectEqual(r.textures[0], write.id);
+                try testing.expectEqual(@as(u32, 1024), write.bytes_per_row);
+                atlas_writes += 1;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(u32, 1), atlas_writes);
 }
 
 // Locks per-pool uploads: a hover that changes one arc writes that one record of the arc pool
@@ -692,9 +772,9 @@ test "a scale-only frame and an identical rebuild write nothing" {
 test "changing one pool writes only that pool" {
     Fixture.start();
     try scene(0);
-    Fixture.record(1280);
+    Fixture.record(120);
     try scene(0.18);
-    Fixture.record(1280);
+    Fixture.record(120);
     var write_storage: [8]commands.BufferWrite = undefined;
     const recorded = writes(&Fixture.buffer, &write_storage);
     try testing.expectEqual(@as(usize, 1), recorded.len);

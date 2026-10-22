@@ -32,7 +32,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
 const animator = patchwork.animator;
-const font = patchwork.font;
 const quads = patchwork.draw;
 const input = patchwork.input;
 const turtle = patchwork.turtle;
@@ -149,7 +148,7 @@ pub const App = struct {
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         assert(app.scene.width_logical != 0);
         assert(app.scene.height_logical != 0);
-        const clip: font.Clip = .{
+        const clip: quads.Clip = .{
             .x0 = 0,
             .y0 = 0,
             .x1 = @floatFromInt(app.scene.width_logical),
@@ -291,9 +290,9 @@ fn expect_box(rect: [4]f32, x: f32, y: f32, width: f32, height: f32) !void {
     try std.testing.expectEqual(height, rect[3]);
 }
 
-const view_clip: font.Clip = .{ .x0 = 952, .y0 = 24, .x1 = 1256, .y1 = 696 };
+const view_clip: quads.Clip = .{ .x0 = 952, .y0 = 24, .x1 = 1256, .y1 = 696 };
 
-fn has_clip(instance_clip: [4]f32, clip: font.Clip) bool {
+fn has_clip(instance_clip: [4]f32, clip: quads.Clip) bool {
     if (instance_clip[0] != clip.x0) {
         return false;
     }
@@ -588,12 +587,30 @@ test "pointer leave during a knob press releases capture" {
     try std.testing.expectEqual(@as(f32, 0.25), scroll_of(&app).children[0].knob.value);
 }
 
-// Locks that an unchanged scene records no buffer writes on a scale-style present.
-test "a settled scene does not rebuild on a scale-style present" {
+/// Records one 1280 by 720 logical frame of `cx` at `scale_120`.
+fn record_at(
+    renderer: *patchwork.renderer.Renderer(Context),
+    buffer: *patchwork.commands.CommandBuffer,
+    cx: *Context,
+    scale_120: u32,
+) void {
+    buffer.reset();
+    renderer.frame(buffer, cx, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = patchwork.frame.pixel_size(1280, scale_120),
+        .height_px = patchwork.frame.pixel_size(720, scale_120),
+        .scale_120 = scale_120,
+    });
+}
+
+// Locks the scale rules for a settled scene: a present at the same scale draws nothing and
+// writes nothing; a scale change owes a draw, which writes the glyph pool (and uniform and
+// atlas) but no box or arc record; afterwards the scene is idle again and rasterizes nothing.
+test "a settled scene redraws only glyphs on a scale change" {
     var app = new_app();
     app.layout(1280, 720);
     const cx = draw_frame(&app);
-    const revision = cx.revision(quads.Box);
     const static = struct {
         var renderer: patchwork.renderer.Renderer(Context) = undefined;
         var buffer: patchwork.commands.CommandBuffer = undefined;
@@ -603,22 +620,30 @@ test "a settled scene does not rebuild on a scale-style present" {
     renderer.init();
     buffer.* = .init();
     renderer.setup(buffer, cx);
-    buffer.reset();
-    renderer.frame(buffer, cx, .{
-        .width_logical = 1280,
-        .height_logical = 720,
-        .width_px = 1280,
-        .height_px = 720,
-    });
+    record_at(renderer, buffer, cx, 120);
     try std.testing.expect(!app.dirty());
-    buffer.reset();
-    renderer.frame(buffer, cx, .{
-        .width_logical = 1280,
-        .height_logical = 720,
-        .width_px = 2560,
-        .height_px = 1440,
-    });
+    try std.testing.expect(!cx.text.owes_draw(120));
+    const box_revision = cx.revision(quads.Box);
+    record_at(renderer, buffer, cx, 120);
     var writes: [4]patchwork.commands.BufferWrite = undefined;
     try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(buffer, &writes).len);
-    try std.testing.expectEqual(revision, cx.revision(quads.Box));
+    try std.testing.expectEqual(box_revision, cx.revision(quads.Box));
+
+    try std.testing.expect(cx.text.owes_draw(240));
+    cx.text.scale_120 = 240;
+    _ = draw_frame(&app);
+    record_at(renderer, buffer, cx, 240);
+    const written = patchwork.renderer.writes(buffer, &writes);
+    const resources = &renderer.resources;
+    try std.testing.expectEqual(@as(usize, 2), written.len);
+    try std.testing.expectEqual(resources.uniform_buffer, written[0].id);
+    try std.testing.expectEqual(resources.instance_buffers[2], written[1].id);
+    try std.testing.expect(!cx.text.owes_draw(240));
+    try std.testing.expect(cx.text.new_count > 0);
+
+    // Idle: the host calls no draw, so nothing is rasterized and nothing is written.
+    const entries = cx.text.entry_count;
+    record_at(renderer, buffer, cx, 240);
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(buffer, &writes).len);
+    try std.testing.expectEqual(entries, cx.text.entry_count);
 }

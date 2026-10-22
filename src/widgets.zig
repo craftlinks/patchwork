@@ -71,7 +71,7 @@
 //!
 //! ## 3. Layout and Capacity Contracts
 //! Widgets write complete `draw.Box` and `draw.Arc` records through `append_weighted` and
-//! `append_arc`, and glyphs through `font.place`; the record layouts are owned and asserted by
+//! `append_arc`, and glyphs through `text.place`; the record layouts are owned and asserted by
 //! `draw/types.zig`, not restated here. Every append goes through `push`, which skips an
 //! instance whose pool or batch list is full; the context counts the drop in
 //! `overflow_count`, and app tests assert it stays zero for their worst case.
@@ -96,8 +96,14 @@
 //! - Children are scanned last to first, so a later child wins an overlap.
 //!
 //! ## 5. TigerStyle Invariants
-//! - No allocation: children and text live in fixed arrays bounded by `scroll_child_cap`
-//!   and `font.text_cap`, and draw output lives in the app's fixed draw pools.
+//! - No allocation: children live in fixed arrays bounded by `scroll_child_cap`, label text
+//!   points at app-owned bytes bounded by `text.byte_cap`, and a knob's value text is the
+//!   inline `[8]u8` `value_text`. Draw output lives in the app's fixed draw pools.
+//!
+//! ## 6. Text Styles
+//! Control names use `name_style` (Noto Sans 16 px) and knob values `value_style` (Noto Sans
+//! Mono 16 px), so value readouts keep their width as digits change. A `Label` carries its own
+//! `text.Style`, so an app picks the face and size of each panel title or button label.
 //! - Geometry helpers are pure; the `handle` dispatchers are the only mutators.
 //! - Hosts normalize pointer coordinates and wheel deltas to logical pixels before they
 //!   reach any widget.
@@ -105,8 +111,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("animator.zig");
-const font = @import("font.zig");
 const quads = @import("draw.zig");
+const text = @import("text.zig");
 const input = @import("input.zig");
 const theme = @import("theme.zig");
 const turtle = @import("turtle.zig");
@@ -169,33 +175,42 @@ pub const Paint = struct {
     radius: f32,
 };
 
-/// Text drawn into a padding box. Empty `text` appends no glyphs. The label
-/// does not hit-test, animate, or append a face quad. `text` points at a literal.
+/// Text drawn into a padding box, centered, in `style`. Empty `text` appends no glyphs. The
+/// label does not hit-test, animate, or append a face quad. `text` points at app-owned
+/// bytes (usually a literal) of at most `text.byte_cap`.
 pub const Label = struct {
     text: []const u8,
     rect: turtle.Rect,
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
+    style: text.Style,
 
     /// Places one coverage quad per ink glyph inside `rect`. Every quad copies `clip`.
-    pub fn draw(self: Label, cx: anytype, clip: font.Clip) void {
-        assert(self.text.len <= font.text_cap);
-        assert(self.a >= 0);
+    pub fn draw(self: Label, cx: anytype, clip: quads.Clip) void {
+        assert(self.text.len <= text.byte_cap);
+        assert(self.style.color[3] >= 0);
         assert(clip.x1 > clip.x0);
-        font.place(cx, self.text, .{
-            .x = self.rect.x,
-            .y = self.rect.y,
-            .width = self.rect.width,
-            .height = self.rect.height,
-        }, .{
-            .r = self.r,
-            .g = self.g,
-            .b = self.b,
-            .a = self.a,
-        }, clip);
+        text.place(cx, self.style, self.text, self.rect, clip, centered);
     }
+};
+
+/// Control names beside a ring, meter, or pill.
+pub const name_style: text.Style = .{
+    .face = .sans,
+    .size = 16,
+    .color = theme.chrome.text,
+};
+
+/// Knob value readouts: monospace, so the digits do not shift as the value changes.
+pub const value_style: text.Style = .{
+    .face = .mono,
+    .size = 16,
+    .color = theme.chrome.text,
+};
+
+/// Text centered on both axes, without an ellipsis.
+pub const centered: text.Options = .{
+    .align_x = .center,
+    .align_y = .center,
+    .ellipsis = false,
 };
 
 /// Writes the border box inset by `padding` onto `label.rect`.
@@ -211,7 +226,7 @@ pub fn place_label(label: *Label, border: turtle.Rect, padding: turtle.Inset) vo
         .height = border.height - padding.top - padding.bottom,
     };
     assert(label.rect.x == border.x + padding.left);
-    assert(label.text.len <= font.text_cap);
+    assert(label.text.len <= text.byte_cap);
 }
 
 /// Passive rounded rectangle. Hit-tested so it occludes, and then ignored.
@@ -259,7 +274,7 @@ pub const Panel = struct {
         return face_contains(self.rect, self.paint.radius, x, y);
     }
 
-    pub fn draw(self: Panel, cx: anytype, clip: font.Clip) void {
+    pub fn draw(self: Panel, cx: anytype, clip: quads.Clip) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
         append_weighted(cx, self.rect, self.paint, self.hover, self.down, clip);
@@ -323,7 +338,7 @@ pub const Button = struct {
     pub fn draw(
         self: Button,
         cx: anytype,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(self.id != 0);
         assert(self.paint.radius >= 0);
@@ -390,7 +405,7 @@ pub const Slider = struct {
     pub fn draw(
         self: Slider,
         cx: anytype,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(self.value >= 0);
         assert(self.value <= 1);
@@ -547,7 +562,7 @@ fn append_weighted(
     paint: Paint,
     hover: animator.Animator,
     down: animator.Animator,
-    clip: font.Clip,
+    clip: quads.Clip,
 ) void {
     assert(paint.radius >= 0);
     if (rect.width <= 0) {
@@ -711,7 +726,7 @@ pub const Knob = struct {
     pub fn draw(
         self: Knob,
         cx: anytype,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         self.draw_row(cx, self.rect, clip);
     }
@@ -722,7 +737,7 @@ pub const Knob = struct {
         self: Knob,
         cx: anytype,
         row: turtle.Rect,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(self.value >= 0);
         assert(self.value <= 1);
@@ -741,8 +756,8 @@ pub const Knob = struct {
             const weight = mix_weight(self.hover.value, hover_lighten);
             append_arc(cx, ring, self.accent, weight, self.value, clip);
         }
-        place_text(cx, self.name, name_box(row), clip);
-        place_text(cx, self.value_text[0..4], value_box(row), clip);
+        place_text(cx, name_style, self.name, name_box(row), clip);
+        place_text(cx, value_style, self.value_text[0..4], value_box(row), clip);
     }
 
     pub fn set_value(self: *Knob, value: f32) void {
@@ -839,7 +854,7 @@ pub const Meter = struct {
     pub fn draw(
         self: Meter,
         cx: anytype,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         self.draw_row(cx, self.rect, clip);
     }
@@ -849,7 +864,7 @@ pub const Meter = struct {
         self: Meter,
         cx: anytype,
         row: turtle.Rect,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(self.value >= 0);
         assert(self.value <= 1);
@@ -877,7 +892,7 @@ pub const Meter = struct {
                 clip,
             );
         }
-        place_text(cx, self.name, side_box(row), clip);
+        place_text(cx, name_style, self.name, side_box(row), clip);
     }
 };
 
@@ -927,7 +942,7 @@ pub const Toggle = struct {
         self: Toggle,
         cx: anytype,
         row: turtle.Rect,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(self.thumb.value >= 0);
         assert(self.thumb.value <= 1);
@@ -937,7 +952,7 @@ pub const Toggle = struct {
         const thumb = toggle_thumb(pill, self.thumb.value);
         const disc = paint_of(theme.chrome.control, thumb_side * 0.5);
         append_weighted(cx, thumb, disc, self.hover, rest, clip);
-        place_text(cx, self.name, side_box(row), clip);
+        place_text(cx, name_style, self.name, side_box(row), clip);
     }
 
     fn flip(self: *Toggle) bool {
@@ -1015,7 +1030,7 @@ pub const Scroll = struct {
     pub fn draw(
         self: Scroll,
         cx: anytype,
-        window: font.Clip,
+        window: quads.Clip,
     ) void {
         assert(self.id != 0);
         assert(window.x1 > window.x0);
@@ -1098,7 +1113,7 @@ pub const Scroll = struct {
         self: Scroll,
         cx: anytype,
         view: turtle.Rect,
-        clip: font.Clip,
+        clip: quads.Clip,
     ) void {
         assert(clip.x1 > clip.x0);
         assert(self.child_count <= scroll_child_cap);
@@ -1375,7 +1390,7 @@ pub fn ring_of(row: turtle.Rect) turtle.Rect {
     return ring;
 }
 
-pub fn write_hundredths(text: *[8]u8, value: f32) void {
+pub fn write_hundredths(out: *[8]u8, value: f32) void {
     assert(value >= 0);
     assert(value <= 1);
     var hundredths: i32 = @intFromFloat(@round(value * 100.0));
@@ -1386,18 +1401,18 @@ pub fn write_hundredths(text: *[8]u8, value: f32) void {
         hundredths = 100;
     }
     const whole: u32 = @intCast(hundredths);
-    text[0] = '0' + @as(u8, @intCast(whole / 100));
+    out[0] = '0' + @as(u8, @intCast(whole / 100));
     const rest = whole % 100;
-    text[1] = '.';
-    text[2] = '0' + @as(u8, @intCast(rest / 10));
-    text[3] = '0' + @as(u8, @intCast(rest % 10));
-    text[4] = 0;
-    text[5] = 0;
-    text[6] = 0;
-    text[7] = 0;
-    assert(text[1] == '.');
-    if (text[0] != '0') {
-        assert(text[0] == '1');
+    out[1] = '.';
+    out[2] = '0' + @as(u8, @intCast(rest / 10));
+    out[3] = '0' + @as(u8, @intCast(rest % 10));
+    out[4] = 0;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 0;
+    assert(out[1] == '.');
+    if (out[0] != '0') {
+        assert(out[0] == '1');
     }
 }
 
@@ -1476,10 +1491,10 @@ fn toggle_thumb(pill: turtle.Rect, value: f32) turtle.Rect {
     return thumb;
 }
 
-fn clip_of(rect: turtle.Rect) font.Clip {
+fn clip_of(rect: turtle.Rect) quads.Clip {
     assert(rect.width > 0);
     assert(rect.height > 0);
-    const clip: font.Clip = .{
+    const clip: quads.Clip = .{
         .x0 = rect.x,
         .y0 = rect.y,
         .x1 = rect.x + rect.width,
@@ -1614,21 +1629,16 @@ fn same_optional(hot: ?u32, next: ?u32) bool {
     return false;
 }
 
-fn place_text(cx: anytype, text: []const u8, rect: turtle.Rect, clip: font.Clip) void {
-    assert(text.len <= 8);
+fn place_text(
+    cx: anytype,
+    style: text.Style,
+    bytes: []const u8,
+    rect: turtle.Rect,
+    clip: quads.Clip,
+) void {
+    assert(bytes.len <= 8);
     assert(clip.x1 > clip.x0);
-    const color = theme.chrome.text;
-    font.place(cx, text, .{
-        .x = rect.x,
-        .y = rect.y,
-        .width = rect.width,
-        .height = rect.height,
-    }, .{
-        .r = color[0],
-        .g = color[1],
-        .b = color[2],
-        .a = color[3],
-    }, clip);
+    text.place(cx, style, bytes, rect, clip, centered);
 }
 
 fn append_arc(
@@ -1637,7 +1647,7 @@ fn append_arc(
     paint: Paint,
     hover: f32,
     sweep: f32,
-    clip: font.Clip,
+    clip: quads.Clip,
 ) void {
     assert(hover >= 0);
     assert(hover <= 1);
@@ -1689,7 +1699,7 @@ fn control_draw(
     control: *const Control,
     cx: anytype,
     row: turtle.Rect,
-    clip: font.Clip,
+    clip: quads.Clip,
 ) void {
     assert(clip.y1 > clip.y0);
     switch (control.*) {
@@ -1856,10 +1866,7 @@ fn sample_button() Button {
         .label = .{
             .text = "Cycle",
             .rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-            .r = 1,
-            .g = 1,
-            .b = 1,
-            .a = 1,
+            .style = .{ .face = .sans, .size = 16, .color = .{ 1, 1, 1, 1 } },
         },
         .paint = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = 24 },
         .hover = animator.Animator.init(hover_rate_per_ms),
@@ -1892,7 +1899,7 @@ fn sample_slider() Slider {
     return slider;
 }
 
-const sample_clip: font.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+const sample_clip: quads.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
 
 const test_draw = [_]quads.DrawType{
     .{ .type = quads.Box, .cap = 16 },

@@ -16,7 +16,7 @@
 //! everything from two sources: the op table `commands_json_ptr` / `commands_json_len` export
 //! once (`commands.table_json`, generated at compile time from the payload types), and the
 //! command streams Zig submits. The setup stream, recorded by `draw/renderer.zig` in `start`,
-//! carries the shader text, the static unit quad, the atlas, and every layout as spans and
+//! carries the shader text, the static unit quad, the textures, and every layout as spans and
 //! descriptors; JavaScript only maps op fields onto WebGPU calls.
 //!
 //! ## 3. Synchronous Stack-Frame Memory Sharing
@@ -36,13 +36,21 @@
 //!   Otherwise `timer` runs the app's timer, requests a redraw if it reports a change, and
 //!   never steps animators or chains rAF.
 //! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
-//!   `.frame`, presents if dirty, and returns 1 only while `app.live()`. Returning 0 ends
-//!   the rAF chain, and `clock.reset` makes the next sample after idle report a zero delta.
+//!   `.frame`, presents if dirty, and returns 1 while `app.live()` or while a redraw is still
+//!   owed (the glyph cache skipped glyphs for its per-frame budget or a full atlas, so it
+//!   requested another frame). Returning 0 ends the rAF chain, and `clock.reset` makes the
+//!   next sample after idle report a zero delta.
+//! - `present_frame` calls `App.draw` when `app.dirty()` or when the glyph cache owes a draw
+//!   (`Cache.owes_draw`: the scale changed since the last draw, or glyphs are pending).
 //! - `start` submits the setup stream, then leaves the draw pools empty and `relayout` set;
 //!   the first layout walk happens in `present_frame` after `resize` has supplied real canvas
 //!   dimensions.
-//! - Pointer coordinates are device pixels (canvas backing store), the same unit `resize`
-//!   receives, so layout and hit testing share one frame of reference.
+//! - `resize(css_width, css_height, scale_120)` receives the canvas size in CSS pixels, which
+//!   are the logical pixels layout uses, and `round(devicePixelRatio * 120)`. `Frame` derives
+//!   the backing size, and `shell.js` reads it back through `width_px` and `height_px` to size
+//!   the canvas, so Zig is the single source of truth for the framebuffer size that
+//!   `pass_begin` carries. Pointer coordinates and wheel deltas arrive in CSS pixels too, so
+//!   layout and hit testing share one frame of reference at every device pixel ratio.
 //! - Timing is host-driven: no Web Workers, no `SharedArrayBuffer`, and no cross-origin
 //!   isolation headers are required.
 //!
@@ -87,6 +95,8 @@ pub fn export_app(comptime App: type) void {
     @export(&commands_json_len, .{ .name = "commands_json_len" });
     @export(&Web.start, .{ .name = "start" });
     @export(&Web.resize, .{ .name = "resize" });
+    @export(&Web.width_px, .{ .name = "width_px" });
+    @export(&Web.height_px, .{ .name = "height_px" });
     @export(&Web.pointer_move, .{ .name = "pointer_move" });
     @export(&Web.pointer_down, .{ .name = "pointer_down" });
     @export(&Web.pointer_up, .{ .name = "pointer_up" });
@@ -139,16 +149,31 @@ fn WebApp(comptime App: type) type {
             return dirty_flag();
         }
 
-        /// Applies a canvas size in physical pixels; both must be nonzero. Layout then runs in
-        /// logical pixels derived by `frame.Frame.apply_configure`. Returns the dirty flag.
-        fn resize(width_px: u32, height_px: u32) callconv(.c) u32 {
+        /// Applies the canvas size in CSS (logical) pixels and the device pixel ratio in 1/120
+        /// units; all nonzero. `shell.js` then sizes the backing store from `width_px` and
+        /// `height_px`. Returns the dirty flag.
+        fn resize(css_width: u32, css_height: u32, scale_120: u32) callconv(.c) u32 {
             assert(state.frame.running);
-            state.frame.apply_configure(width_px, height_px);
+            assert(scale_120 != 0);
+            state.frame.apply_configure(css_width, css_height);
+            state.frame.apply_scale(scale_120) catch unreachable;
             assert(state.frame.width_px != 0);
             return dirty_flag();
         }
 
-        /// Pointer moved. `(x, y)` are device pixels, matching the canvas backing store.
+        /// The canvas backing width in device pixels (`Frame.width_px`).
+        fn width_px() callconv(.c) u32 {
+            assert(state.frame.width_px != 0);
+            return state.frame.width_px;
+        }
+
+        /// The canvas backing height in device pixels (`Frame.height_px`).
+        fn height_px() callconv(.c) u32 {
+            assert(state.frame.height_px != 0);
+            return state.frame.height_px;
+        }
+
+        /// Pointer moved. `(x, y)` are CSS pixels, the logical pixels of layout.
         /// Returns the dirty flag.
         fn pointer_move(x: f32, y: f32) callconv(.c) u32 {
             assert(state.frame.running);
@@ -156,21 +181,21 @@ fn WebApp(comptime App: type) type {
             return note_event(.{ .pointer_move = .{ .x = x, .y = y } });
         }
 
-        /// Primary button pressed at device-pixel `(x, y)`.
+        /// Primary button pressed at CSS-pixel `(x, y)`.
         fn pointer_down(x: f32, y: f32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
             return note_event(.{ .pointer_down = .{ .x = x, .y = y } });
         }
 
-        /// Primary button released at device-pixel `(x, y)`.
+        /// Primary button released at CSS-pixel `(x, y)`.
         fn pointer_up(x: f32, y: f32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
             return note_event(.{ .pointer_up = .{ .x = x, .y = y } });
         }
 
-        /// Wheel at device-pixel `(x, y)`. `dy` is in the same unit as the pointer coordinates;
+        /// Wheel at CSS-pixel `(x, y)`. `dy` is in the same unit as the pointer coordinates;
         /// positive `dy` scrolls content downward.
         fn pointer_wheel(x: f32, y: f32, dy: f32) callconv(.c) u32 {
             assert(state.frame.running);
@@ -205,9 +230,9 @@ fn WebApp(comptime App: type) type {
             return dirty_flag();
         }
 
-        /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1 only
-        /// while an animator is live so `shell.js` chains another rAF. The first sample after
-        /// idle has dt 0 (see `animator.Clock.advance`).
+        /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1 while
+        /// an animator is live or a redraw is still owed, so `shell.js` chains another rAF.
+        /// The first sample after idle has dt 0 (see `animator.Clock.advance`).
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             const dt_ms = state.clock.advance(now_ms);
@@ -218,7 +243,7 @@ fn WebApp(comptime App: type) type {
             if (!app.live()) {
                 state.clock.reset();
                 assert(!app.live());
-                return 0;
+                return dirty_flag();
             }
             assert(app.live());
             return 1;
@@ -247,11 +272,14 @@ fn WebApp(comptime App: type) type {
                 state.frame.mark_laid_out();
             }
             assert(!state.frame.relayout);
-            if (app.dirty()) {
+            const scale_120 = state.frame.scale_120;
+            if (app.dirty() or context.text.owes_draw(scale_120)) {
+                context.text.scale_120 = scale_120;
                 context.reset();
                 app.draw(&context);
             }
             assert(!app.dirty());
+            assert(context.text.drawn_scale_120 == scale_120);
             // Spans must outlive the host call; module guide section 3 explains why static
             // storage is enough.
             state.commands.reset();
@@ -260,12 +288,17 @@ fn WebApp(comptime App: type) type {
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,
                 .height_px = state.frame.height_px,
+                .scale_120 = scale_120,
             });
             var unused: gpu.Gpu = .{};
             gpu.submit(&unused, &state.commands) catch unreachable;
             state.frame.mark_presented();
             assert(!state.frame.redraw);
             assert(!app.dirty());
+            // Glyphs skipped for the budget or a full atlas finish on the next frame.
+            if (context.text.owes_draw(scale_120)) {
+                state.frame.request_redraw();
+            }
         }
 
         /// 1 when a redraw is owed and the canvas has a nonzero size, else 0. A zero-size

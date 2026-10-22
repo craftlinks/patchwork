@@ -18,8 +18,11 @@
 //!   `down` are mix weights toward the theme's `lighten` and then `darken`.
 //! - `Arc` (64 bytes): `color`, then `thickness`, `sweep` (a fraction of `theme.arc_sweep`),
 //!   `hover`, and a zero pad. An arc lightens on hover and never darkens.
-//! - `Glyph` (64 bytes): `uv` (u0, v0, u1, v1, half-texel inset by the baker) and `color`;
-//!   samples the `r8` atlas, and coverage scales `color.a`.
+//! - `Glyph` (64 bytes): `uv` (u0, v0, u1, v1) and `color`; samples the `r8` glyph atlas, and
+//!   coverage scales `color.a`. The UVs sit on the exact texel edges of the glyph's bitmap,
+//!   with no half-texel inset: `text.place` snaps every quad edge to a device pixel edge and
+//!   the bitmap is rasterized at device size, so each fragment center samples one texel center
+//!   and bilinear filtering returns that texel unchanged (`text/layout.zig`, section 3).
 //! - `Image` (64 bytes): `uv` and `tint`; samples an `rgba8` texture, multiplied by `tint`.
 //!
 //! ## 3. Hover, Down, and Theme Colors
@@ -103,7 +106,7 @@ pub const Arc = extern struct {
     ;
 };
 
-/// One glyph quad sampled from the font atlas (texture 0).
+/// One glyph quad sampled from the glyph atlas (texture 0), written by `text.place`.
 pub const Glyph = extern struct {
     rect: [4]f32,
     clip: [4]f32,

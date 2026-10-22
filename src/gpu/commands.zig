@@ -154,7 +154,7 @@ pub const Blend = enum(u8) {
     alpha,
 };
 
-/// `r8unorm` is single-channel coverage (the font atlas); `rgba8unorm` is straight-alpha
+/// `r8unorm` is single-channel coverage (the glyph atlas); `rgba8unorm` is straight-alpha
 /// color (images). Both sample as filterable float, so one bind group layout serves both.
 pub const TextureFormat = enum(u8) {
     r8unorm,
