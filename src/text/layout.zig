@@ -252,7 +252,7 @@ fn emit(
 ) f32 {
     const id = ttf.glyph_id(font, codepoint);
     const advance = units_to_logical(ttf.advance(font, id), style.size, font.units_per_em);
-    const face: u8 = @intFromEnum(style.face);
+    const face: u8 = @backingInt(style.face);
     const entry = cx.text.glyph(face, font, id, size_q) orelse return advance;
     if (entry.width == 0) {
         return advance;

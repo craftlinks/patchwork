@@ -94,11 +94,11 @@ comptime {
     assert(slot_count == 12);
     // WGSL lays each vec4<f32> out at 16 bytes, so slot i must start at byte 16 * i. Checking
     // every field catches a reordered or retyped field that the total size alone would miss.
-    const fields = @typeInfo(Theme).@"struct".fields;
-    assert(fields.len == slot_count);
-    for (fields, 0..) |field, slot| {
-        assert(field.type == [4]f32);
-        assert(@offsetOf(Theme, field.name) == 16 * slot);
+    const info = @typeInfo(Theme).@"struct";
+    assert(info.field_names.len == slot_count);
+    for (info.field_names, info.field_types, 0..) |field_name, field_type, slot| {
+        assert(field_type == [4]f32);
+        assert(@offsetOf(Theme, field_name) == 16 * slot);
     }
     assert(chrome.arc[0] == arc_start);
     assert(chrome.arc[1] == arc_sweep);

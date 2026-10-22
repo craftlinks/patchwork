@@ -82,19 +82,20 @@ pub fn check(comptime T: type) ?[]const u8 {
             return name ++ ": @sizeOf must be a multiple of 16 (one vec4 per 16 bytes)";
         }
         if (@sizeOf(T) / 16 > group_cap) return name ++ ": at most 8 vec4 groups";
-        const fields = info.@"struct".fields;
-        if (fields.len < 2) return name ++ ": the first fields must be `rect` and `clip`";
-        if (!std.mem.eql(u8, fields[0].name, "rect")) {
+        const field_names = info.@"struct".field_names;
+        const field_types = info.@"struct".field_types;
+        if (field_names.len < 2) return name ++ ": the first fields must be `rect` and `clip`";
+        if (!std.mem.eql(u8, field_names[0], "rect")) {
             return name ++ ": the first field must be `rect: [4]f32`";
         }
-        if (!std.mem.eql(u8, fields[1].name, "clip")) {
+        if (!std.mem.eql(u8, field_names[1], "clip")) {
             return name ++ ": the second field must be `clip: [4]f32`";
         }
-        if (fields[0].type != [4]f32) return name ++ ": `rect` must be [4]f32";
-        if (fields[1].type != [4]f32) return name ++ ": `clip` must be [4]f32";
-        for (fields) |field| {
-            if (field_problem(T, field.name, field.type)) |problem| {
-                return name ++ ": field `" ++ field.name ++ "` " ++ problem;
+        if (field_types[0] != [4]f32) return name ++ ": `rect` must be [4]f32";
+        if (field_types[1] != [4]f32) return name ++ ": `clip` must be [4]f32";
+        for (field_names, field_types) |field_name, field_type| {
+            if (field_problem(T, field_name, field_type)) |problem| {
+                return name ++ ": field `" ++ field_name ++ "` " ++ problem;
             }
         }
         if (!@hasDecl(T, "pixel")) return name ++ ": missing `pub const pixel: []const u8`";
@@ -233,9 +234,10 @@ pub fn source(comptime T: type) []const u8 {
 fn theme_wgsl() []const u8 {
     comptime {
         var out: []const u8 = "struct Theme {\n";
-        for (@typeInfo(theme.Theme).@"struct".fields) |field| {
-            assert(field.type == [4]f32);
-            out = out ++ "    " ++ field.name ++ ": vec4<f32>,\n";
+        const info = @typeInfo(theme.Theme).@"struct";
+        for (info.field_names, info.field_types) |field_name, field_type| {
+            assert(field_type == [4]f32);
+            out = out ++ "    " ++ field_name ++ ": vec4<f32>,\n";
         }
         return out ++ "}\n";
     }
@@ -275,16 +277,17 @@ fn io_wgsl(comptime T: type) []const u8 {
         var unpack: []const u8 = "fn unpack(v: Varyings) -> Pixel {\n" ++
             "    var px: Pixel;\n    px.local = v.local;\n    px.size = v.g0.zw;\n" ++
             "    px.pos = v.g0.xy + v.local;\n";
-        for (@typeInfo(T).@"struct".fields) |field| {
-            const offset = @offsetOf(T, field.name);
+        const info = @typeInfo(T).@"struct";
+        for (info.field_names, info.field_types) |field_name, field_type| {
+            const offset = @offsetOf(T, field_name);
             const g = std.fmt.comptimePrint("v.g{d}", .{offset / 16});
-            if (field.type == [4]f32) {
-                pixel = pixel ++ "    " ++ field.name ++ ": vec4<f32>,\n";
-                unpack = unpack ++ "    px." ++ field.name ++ " = " ++ g ++ ";\n";
+            if (field_type == [4]f32) {
+                pixel = pixel ++ "    " ++ field_name ++ ": vec4<f32>,\n";
+                unpack = unpack ++ "    px." ++ field_name ++ " = " ++ g ++ ";\n";
             } else {
                 const lane = "xyzw"[(offset % 16) / 4 ..][0..1];
-                pixel = pixel ++ "    " ++ field.name ++ ": f32,\n";
-                unpack = unpack ++ "    px." ++ field.name ++ " = " ++ g ++ "." ++ lane ++ ";\n";
+                pixel = pixel ++ "    " ++ field_name ++ ": f32,\n";
+                unpack = unpack ++ "    px." ++ field_name ++ " = " ++ g ++ "." ++ lane ++ ";\n";
             }
         }
         return instance ++ "}\n\n" ++ varyings ++ "}\n\n" ++ pixel ++ "}\n\n" ++ carry ++
@@ -346,20 +349,20 @@ const NoClip = extern struct {
 // bindings on an untextured type.
 test "source declares locations 1 to N and names every field" {
     const text = comptime source(Probe);
-    try testing.expect(std.mem.indexOf(u8, text, "@location(1) g0: vec4<f32>") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "@location(4) g3: vec4<f32>") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "@location(5) g4") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "@location(3) @interpolate(flat) g2") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "px.tint = v.g2;") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "px.weight = v.g3.x;") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "px.spread = v.g3.y;") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "px.clip = v.g1;") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "bound_texture") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "fn vs_main") != null);
-    var cursor: usize = std.mem.indexOf(u8, text, "struct Theme {").?;
-    inline for (@typeInfo(theme.Theme).@"struct".fields) |field| {
-        const needle = field.name ++ ": vec4<f32>";
-        cursor = std.mem.indexOfPos(u8, text, cursor, needle).? + needle.len;
+    try testing.expect(std.mem.find(u8, text, "@location(1) g0: vec4<f32>") != null);
+    try testing.expect(std.mem.find(u8, text, "@location(4) g3: vec4<f32>") != null);
+    try testing.expect(std.mem.find(u8, text, "@location(5) g4") == null);
+    try testing.expect(std.mem.find(u8, text, "@location(3) @interpolate(flat) g2") != null);
+    try testing.expect(std.mem.find(u8, text, "px.tint = v.g2;") != null);
+    try testing.expect(std.mem.find(u8, text, "px.weight = v.g3.x;") != null);
+    try testing.expect(std.mem.find(u8, text, "px.spread = v.g3.y;") != null);
+    try testing.expect(std.mem.find(u8, text, "px.clip = v.g1;") != null);
+    try testing.expect(std.mem.find(u8, text, "bound_texture") == null);
+    try testing.expect(std.mem.find(u8, text, "fn vs_main") != null);
+    var cursor: usize = std.mem.find(u8, text, "struct Theme {").?;
+    inline for (@typeInfo(theme.Theme).@"struct".field_names) |field_name| {
+        const needle = field_name ++ ": vec4<f32>";
+        cursor = std.mem.findPos(u8, text, cursor, needle).? + needle.len;
     }
     const layout = comptime instance_layout(Probe);
     try testing.expectEqual(@as(u8, 4), layout.attribute_count);
@@ -371,21 +374,21 @@ test "source declares locations 1 to N and names every field" {
 test "check names the type and the violation" {
     try testing.expect(comptime check(Probe) == null);
     const unaligned = comptime check(Unaligned).?;
-    try testing.expect(std.mem.indexOf(u8, unaligned, "Unaligned") != null);
-    try testing.expect(std.mem.indexOf(u8, unaligned, "multiple of 16") != null);
+    try testing.expect(std.mem.find(u8, unaligned, "Unaligned") != null);
+    try testing.expect(std.mem.find(u8, unaligned, "multiple of 16") != null);
     const straddle = comptime check(Straddle).?;
-    try testing.expect(std.mem.indexOf(u8, straddle, "`tint`") != null);
+    try testing.expect(std.mem.find(u8, straddle, "`tint`") != null);
     const no_clip = comptime check(NoClip).?;
-    try testing.expect(std.mem.indexOf(u8, no_clip, "clip") != null);
+    try testing.expect(std.mem.find(u8, no_clip, "clip") != null);
     const empty = comptime validate(&.{});
     try testing.expect(empty != null);
     const twice = comptime validate(&.{
         .{ .type = Probe, .cap = 4 },
         .{ .type = Probe, .cap = 4 },
     });
-    try testing.expect(std.mem.indexOf(u8, twice.?, "twice") != null);
+    try testing.expect(std.mem.find(u8, twice.?, "twice") != null);
     const zero = comptime validate(&.{.{ .type = Probe, .cap = 0 }});
-    try testing.expect(std.mem.indexOf(u8, zero.?, "cap") != null);
+    try testing.expect(std.mem.find(u8, zero.?, "cap") != null);
 }
 
 comptime {

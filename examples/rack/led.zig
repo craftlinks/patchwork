@@ -88,10 +88,10 @@ comptime {
 // `brightness` unpacked from the first lane of the fourth group.
 test "led assembles against the prelude" {
     const text = comptime draw.type_source(Led);
-    try std.testing.expect(std.mem.indexOf(u8, text, "@location(4) g3: vec4<f32>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "@location(5) g4") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "px.brightness = v.g3.x;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "fn pixel(px: Pixel)") != null);
+    try std.testing.expect(std.mem.find(u8, text, "@location(4) g3: vec4<f32>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "@location(5) g4") == null);
+    try std.testing.expect(std.mem.find(u8, text, "px.brightness = v.g3.x;") != null);
+    try std.testing.expect(std.mem.find(u8, text, "fn pixel(px: Pixel)") != null);
     const led = at(100, 50, .{ 0.4, 0.8, 0.4, 1 }, 0.5, .{ 0, 0, 200, 200 });
     try std.testing.expectEqual(@as(f32, 90), led.rect[0]);
     try std.testing.expectEqual(@as(f32, 40), led.rect[1]);

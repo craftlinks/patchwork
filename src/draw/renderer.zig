@@ -332,7 +332,7 @@ pub fn Renderer(comptime Cx: type) type {
             }
             for (table.writes[0..table.write_count]) |write| {
                 buffer.push(.{ .texture_write = .{
-                    .id = r.textures[@intFromEnum(write.id)],
+                    .id = r.textures[@backingInt(write.id)],
                     .x = write.region.x,
                     .y = write.region.y,
                     .width = write.region.width,
@@ -463,7 +463,7 @@ pub fn Renderer(comptime Cx: type) type {
                     type_bound = batch.type_id;
                 }
                 if (R.textured[batch.type_id]) {
-                    const group = r.texture_groups[@intFromEnum(batch.texture)];
+                    const group = r.texture_groups[@backingInt(batch.texture)];
                     if (group_bound != group) {
                         buffer.push(.{ .bind_group_set = .{ .slot = 1, .id = group } });
                         group_bound = group;

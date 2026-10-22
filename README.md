@@ -1,6 +1,6 @@
 # Patchwork
 
-A Zig 0.16.0 library copying Makepad's drawing model: a retained widget tree that
+A Zig 0.17.0 library copying Makepad's drawing model: a retained widget tree that
 lays itself out with a turtle and paints with instanced signed-distance shaders.
 Patchwork provides a compile-time application contract that compiles to both native
 Linux (Wayland + wgpu-native) and the browser (`wasm32-freestanding` + WebGPU) from
@@ -81,6 +81,7 @@ patchwork/
 │   ├── theme.zig               # Theme uniform record packed behind the projection matrix
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
+│   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
 │   └── serve.zig               # Built-in static HTTP server for browser testing
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native executable entry point: runs linux_window.run(app.App)
@@ -111,7 +112,7 @@ patchwork/
 
 ## Build Steps
 
-Use the distro `zig` (`/usr/bin/zig` on this machine; Zig 0.16.0).
+Use the distro `zig` (`/usr/bin/zig` on this machine; Zig 0.17.0).
 
 ```bash
 # Examples (Rack)
@@ -135,6 +136,19 @@ custom unpack directory or local build of `wgpu-native`:
 ```bash
 zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```
+
+`zig build` installs into `zig-out/`:
+
+```text
+zig-out/
+├── bin/rack, bin/column        # native executables, RUNPATH $ORIGIN/../lib
+├── bin/rack.wasm, column.wasm  # from `zig build wasm` and `zig build wasm-column`
+└── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
+```
+
+The executables find `libwgpu_native.so` through `$ORIGIN/../lib`, so they start from any
+working directory as long as `bin/` and `lib/` stay siblings. `zig build run` runs the
+installed copy, not the one in `.zig-cache`.
 
 ## Use Patchwork From Another Project
 
@@ -191,6 +205,10 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(steps.install);
 }
 ```
+
+`steps.install` puts `<name>` in the consumer's `<prefix>/bin` and `libwgpu_native.so` in
+`<prefix>/lib`; `steps.run` depends on both and runs the installed executable. Keep the two
+directories together when shipping the native build.
 
 ### 3. `src/app.zig`
 
@@ -413,8 +431,9 @@ Each op is an 8-byte header `{ code, size, pad }` followed by an `extern struct`
 submit. Resources are `u16` ids that Zig allocates and each host maps to its own handle table.
 The op table (codes, names, sizes, and every field's offset and type) is generated at compile
 time as `commands.table_json`. The wasm module exports it, so `shell.js` decodes payloads by
-name and cannot drift from the Zig layouts. Load the page with `?trace=1` to log the op names
-of every submitted stream.
+name and cannot drift from the Zig layouts. A test pins its bytes to
+`src/gpu/table.golden.json`, so a toolchain upgrade that changed the table would fail
+`zig build test`. Load the page with `?trace=1` to log the op names of every submitted stream.
 
 The renderer keeps a shadow of each pool's last upload. The uniform (projection from the device
 size and scale, see `draw.ortho_y_down`) is written only when those change. A pool whose
@@ -518,7 +537,8 @@ worked numbers (the rasterizer is checked against a polygon-clipping reference).
 
 GPU code links **wgpu-native v29.0.1.1**. The official Linux x86_64 release archive
 is declared as a package dependency in `build.zig.zon`, downloaded automatically by
-Zig's package manager, and cached in `~/.cache/zig/p/`.
+Zig's package manager, cached in `~/.cache/zig/p/`, and copied into the project's `zig-pkg/`
+(gitignored). `addApp` installs the library into `<prefix>/lib` next to the executables.
 
 The event loop in `src/host/linux_window.zig` (`Host(App)`) implements the libwayland
 multi-thread reader protocol integrated with an optional Linux `timerfd`:

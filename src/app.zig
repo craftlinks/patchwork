@@ -301,7 +301,7 @@ test "a complete app satisfies the contract" {
 // path of `check` itself is locked by `zig build test-contract`.
 test "a missing declaration is reported by name" {
     const missing = comptime conformance(NoDraw).?;
-    try std.testing.expect(std.mem.indexOf(u8, missing, "draw") != null);
+    try std.testing.expect(std.mem.find(u8, missing, "draw") != null);
     try std.testing.expect(!@hasDecl(NoDraw, "draw"));
     try std.testing.expect(@hasDecl(NoDraw, "dirty"));
 }
@@ -310,22 +310,22 @@ test "a missing declaration is reported by name" {
 // mismatch (the message names both the member and the expected `*const` type).
 test "a missing config, a slow timer, and a mistyped live are rejected" {
     const no_config = comptime conformance(NoConfig).?;
-    try std.testing.expect(std.mem.indexOf(u8, no_config, "config") != null);
+    try std.testing.expect(std.mem.find(u8, no_config, "config") != null);
     const slow = comptime conformance(SlowTimer).?;
-    try std.testing.expect(std.mem.indexOf(u8, slow, "1000") != null);
+    try std.testing.expect(std.mem.find(u8, slow, "1000") != null);
     const wrong = comptime conformance(WrongLive).?;
-    try std.testing.expect(std.mem.indexOf(u8, wrong, "live") != null);
-    try std.testing.expect(std.mem.indexOf(u8, wrong, "*const") != null);
+    try std.testing.expect(std.mem.find(u8, wrong, "live") != null);
+    try std.testing.expect(std.mem.find(u8, wrong, "*const") != null);
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and
 // a batch cap whose worst frame overflows the command buffer is refused.
 test "a ragged draw type and an oversized batch cap are rejected" {
     const ragged = comptime conformance(RaggedApp).?;
-    try std.testing.expect(std.mem.indexOf(u8, ragged, "Ragged") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ragged, "multiple of 16") != null);
+    try std.testing.expect(std.mem.find(u8, ragged, "Ragged") != null);
+    try std.testing.expect(std.mem.find(u8, ragged, "multiple of 16") != null);
     const huge = comptime conformance(HugeBatches).?;
-    try std.testing.expect(std.mem.indexOf(u8, huge, "batch_cap") != null);
+    try std.testing.expect(std.mem.find(u8, huge, "batch_cap") != null);
 }
 
 comptime {

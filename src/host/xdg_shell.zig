@@ -340,9 +340,9 @@ pub fn assert_interface_tables() void {
         assert(xdg_toplevel_interface.event_count == toplevel_events.len);
 
         // Listeners are indexed by event opcode, so slot counts must equal event counts.
-        assert(@typeInfo(XdgWmBaseListener).@"struct".fields.len == wm_base_events.len);
-        assert(@typeInfo(XdgSurfaceListener).@"struct".fields.len == surface_events.len);
-        assert(@typeInfo(XdgToplevelListener).@"struct".fields.len == toplevel_events.len);
+        assert(@typeInfo(XdgWmBaseListener).@"struct".field_names.len == wm_base_events.len);
+        assert(@typeInfo(XdgSurfaceListener).@"struct".field_names.len == surface_events.len);
+        assert(@typeInfo(XdgToplevelListener).@"struct".field_names.len == toplevel_events.len);
 
         // The wrappers pass opcodes as literals; these asserts tie them to the tables.
         assert(opcode_of(&wm_base_requests, "get_xdg_surface") == 2);

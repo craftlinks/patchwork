@@ -31,8 +31,23 @@
 //! target, or the types in the contract would be distinct. `addApp` creates one for the
 //! native target and one for wasm, and gives each to both of its users.
 //!
-//! ## 4. Steps
-//! - `run` builds and runs the native executable (Wayland and wgpu-native).
+//! ## 4. Install Layout and RUNPATH
+//! The Zig 0.17 build runner hands the compiler paths relative to the build root, so a RUNPATH
+//! taken from the `wgpu_native` package would be `zig-pkg/<hash>/lib`, which the loader
+//! resolves against the working directory. `addApp` therefore installs the library with the
+//! executable and points RUNPATH at it:
+//!
+//! ```text
+//!   <prefix>/bin/<name>              RUNPATH $ORIGIN/../lib  (each_lib_rpath off)
+//!   <prefix>/lib/libwgpu_native.so   from the package, or from `wgpu_lib_dir`
+//!   <prefix>/bin/<name>.wasm         from the wasm step
+//! ```
+//!
+//! A consumer's `install` step gets the same layout under its own prefix, and its `run` step
+//! starts the installed executable, never the copy in the cache.
+//!
+//! ## 5. Steps
+//! - `run` installs, then runs the installed native executable (Wayland and wgpu-native).
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
 //! - `serve` serves the page, `shell.js`, and the wasm through `src/serve.zig`, which owns
 //!   the address and port.
@@ -53,16 +68,17 @@ pub const AppOptions = struct {
     /// The file that declares `pub const App`.
     root_source_file: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     /// Directory holding `libwgpu_native.so`. Null uses the `wgpu_native` package.
     wgpu_lib_dir: ?[]const u8 = null,
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
 pub const AppSteps = struct {
-    /// Installs the native executable into the prefix.
+    /// Installs the native executable into `<prefix>/bin` and `libwgpu_native.so` into
+    /// `<prefix>/lib`.
     install: *std.Build.Step,
-    /// Runs the native executable. Depends on its install step.
+    /// Runs the installed native executable. Depends on its install step.
     run: *std.Build.Step,
     /// Installs `<name>.wasm`.
     wasm: *std.Build.Step,
@@ -85,16 +101,15 @@ pub fn addApp(
     const native_app = add_app_module(b, options, options.target, native_library);
     const wasm_app = add_app_module(b, options, wasm_target, wasm_library);
 
-    const exe = add_native(b, patchwork_builder, options, .{
+    const wgpu_lib = wgpu_lib_path(patchwork_builder, options);
+    const exe = add_native(b, patchwork_builder, options, wgpu_lib, .{
         .library = native_library,
         .app = native_app,
     });
     const install = b.addInstallArtifact(exe, .{});
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(&install.step);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    // The executable finds the library through `$ORIGIN/../lib`, so it is installed with it.
+    const wgpu_install = b.addInstallLibFile(wgpu_lib.path(b, wgpu_lib_name), wgpu_lib_name);
+    install.step.dependOn(&wgpu_install.step);
 
     const wasm = add_wasm(b, patchwork_builder, options, .{
         .library = wasm_library,
@@ -105,7 +120,7 @@ pub fn addApp(
     const tests = b.addTest(.{ .root_module = native_app });
     return .{
         .install = &install.step,
-        .run = &run_cmd.step,
+        .run = add_run(b, options, &install.step),
         .wasm = &wasm_install.step,
         .serve = add_serve(b, patchwork_builder, options, wasm, &wasm_install.step),
         .tests = &b.addRunArtifact(tests).step,
@@ -123,7 +138,7 @@ const Modules = struct {
 fn add_library_module(
     patchwork_builder: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return patchwork_builder.createModule(.{
         .root_source_file = patchwork_builder.path("src/root.zig"),
@@ -148,21 +163,39 @@ fn add_app_module(
     return module;
 }
 
+/// The file name `addApp` links against and installs into `<prefix>/lib`.
+const wgpu_lib_name = "libwgpu_native.so";
+
+/// The directory holding `libwgpu_native.so`: `options.wgpu_lib_dir` when set, otherwise the
+/// `wgpu_native` package of the Patchwork builder.
+fn wgpu_lib_path(patchwork_builder: *std.Build, options: AppOptions) std.Build.LazyPath {
+    if (options.wgpu_lib_dir) |dir| return patchwork_builder.graph.cwdRelativePath(dir);
+    return patchwork_builder.dependency("wgpu_native", .{}).path("lib");
+}
+
+/// Runs the installed executable rather than the cached one, because its RUNPATH
+/// (`$ORIGIN/../lib`) resolves only next to the installed library.
+fn add_run(b: *std.Build, options: AppOptions, install: *std.Build.Step) *std.Build.Step {
+    const run_cmd = std.Build.Step.Run.create(b, b.fmt("run {s}", .{options.name}));
+    run_cmd.addFileArg(b.graph.path(.install_bin, options.name));
+    run_cmd.addPassthruArgs();
+    run_cmd.step.dependOn(install);
+    return &run_cmd.step;
+}
+
 /// Native Wayland + WebGPU executable.
-/// - Resolves `libwgpu_native.so` and its runtime linker path (RPATH) from the `wgpu_native`
-///   package of the Patchwork builder, or from `options.wgpu_lib_dir` when set.
+/// - Links `libwgpu_native.so` from `lib_path` and sets RUNPATH to `$ORIGIN/../lib`, where
+///   `addApp` installs the library. The 0.17 build runner hands the compiler paths relative to
+///   the build root, so a RUNPATH taken from `lib_path` would resolve against the working
+///   directory of whoever starts the executable.
 /// - Dynamically links `libwayland-client.so` and `libwgpu_native.so`.
 fn add_native(
     b: *std.Build,
     patchwork_builder: *std.Build,
     options: AppOptions,
+    lib_path: std.Build.LazyPath,
     modules: Modules,
 ) *std.Build.Step.Compile {
-    const lib_path: std.Build.LazyPath = if (options.wgpu_lib_dir) |dir|
-        .{ .cwd_relative = dir }
-    else
-        patchwork_builder.dependency("wgpu_native", .{}).path("lib");
-
     const root = b.createModule(.{
         .root_source_file = patchwork_builder.path("src/host/native_main.zig"),
         .target = options.target,
@@ -173,7 +206,8 @@ fn add_native(
     root.addImport("app", modules.app);
     const exe = b.addExecutable(.{ .name = options.name, .root_module = root });
     exe.root_module.addLibraryPath(lib_path);
-    exe.root_module.addRPath(lib_path);
+    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    exe.each_lib_rpath = false;
     exe.root_module.linkSystemLibrary("wayland-client", .{
         .needed = true,
         .weak = false,

@@ -45,7 +45,9 @@
 //! payload sizes, every field's offset and type, the payload enums, the caps, and the entry
 //! point names. The wasm module exports it, and `web/shell.js` decodes payloads by field name
 //! from that table, so a payload edit cannot desynchronize the browser decoder. The test
-//! "table json matches the payload layouts" parses it back and checks it against `@offsetOf`.
+//! "table json matches the payload layouts" parses it back and checks it against `@offsetOf`,
+//! and "table json equals the golden copy" pins its bytes to `gpu/table.golden.json`, so a
+//! toolchain upgrade cannot change the table unnoticed.
 //!
 //! ## 6. TigerStyle Invariants
 //! - `CommandBuffer` is a fixed array of `capacity` bytes. Overflow is a panic that names the
@@ -419,7 +421,7 @@ pub const CommandBuffer = struct {
                 @tagName(code), total, self.len, capacity,
             });
         }
-        const header: Header = .{ .code = @intFromEnum(code), .size = @intCast(size) };
+        const header: Header = .{ .code = @backingInt(code), .size = @intCast(size) };
         const start = self.len;
         @memcpy(self.bytes[start..][0..header_bytes], std.mem.asBytes(&header));
         if (size != 0) {
@@ -521,21 +523,22 @@ fn json_table() []const u8 {
         for (payload_enums, 0..) |E, i| {
             if (i != 0) out = out ++ ",";
             out = out ++ "\"" ++ short_name(E) ++ "\":[";
-            for (@typeInfo(E).@"enum".fields, 0..) |field, j| {
+            for (@typeInfo(E).@"enum".field_names, 0..) |field_name, j| {
                 if (j != 0) out = out ++ ",";
-                out = out ++ "\"" ++ field.name ++ "\"";
+                out = out ++ "\"" ++ field_name ++ "\"";
             }
             out = out ++ "]";
         }
         out = out ++ "},\"ops\":[";
-        for (@typeInfo(Op).@"union".fields, 0..) |field, i| {
+        const op_info = @typeInfo(Op).@"union";
+        for (op_info.field_names, op_info.field_types, 0..) |field_name, field_type, i| {
             if (i != 0) out = out ++ ",";
-            const code = @field(Code, field.name);
+            const code = @field(Code, field_name);
             out = out ++ std.fmt.comptimePrint(
                 "{{\"code\":{d},\"name\":\"{s}\",\"size\":{d},\"type\":",
-                .{ @intFromEnum(code), field.name, @sizeOf(field.type) },
+                .{ @backingInt(code), field_name, @sizeOf(field_type) },
             );
-            out = out ++ type_json(field.type) ++ "}";
+            out = out ++ type_json(field_type) ++ "}";
         }
         out = out ++ "]}";
         return out;
@@ -558,15 +561,15 @@ fn type_json(comptime T: type) []const u8 {
             .@"struct" => |info| {
                 var out: []const u8 = "{\"fields\":[";
                 var first = true;
-                for (info.fields) |field| {
-                    if (std.mem.startsWith(u8, field.name, "pad")) continue;
+                for (info.field_names, info.field_types) |field_name, field_type| {
+                    if (std.mem.startsWith(u8, field_name, "pad")) continue;
                     if (!first) out = out ++ ",";
                     first = false;
                     out = out ++ std.fmt.comptimePrint(
                         "{{\"name\":\"{s}\",\"offset\":{d},\"type\":",
-                        .{ field.name, @offsetOf(T, field.name) },
+                        .{ field_name, @offsetOf(T, field_name) },
                     );
-                    out = out ++ type_json(field.type) ++ "}";
+                    out = out ++ type_json(field_type) ++ "}";
                 }
                 return out ++ "]}";
             },
@@ -577,7 +580,7 @@ fn type_json(comptime T: type) []const u8 {
 
 fn short_name(comptime T: type) []const u8 {
     const full = @typeName(T);
-    const dot = std.mem.lastIndexOfScalar(u8, full, '.') orelse return full;
+    const dot = std.mem.findScalarLast(u8, full, '.') orelse return full;
     return full[dot + 1 ..];
 }
 
@@ -589,9 +592,9 @@ fn dense(comptime T: type) bool {
         .array => |info| return dense(info.child),
         .@"struct" => |info| {
             var sum: usize = 0;
-            for (info.fields) |field| {
-                if (!dense(field.type)) return false;
-                sum += @sizeOf(field.type);
+            for (info.field_types) |field_type| {
+                if (!dense(field_type)) return false;
+                sum += @sizeOf(field_type);
             }
             return sum == @sizeOf(T);
         },
@@ -606,15 +609,15 @@ comptime {
     assert(capacity % op_align == 0);
     // Every payload fits a u16 size, is dense, and is at most 8-byte aligned so a payload at
     // `header_bytes` past an aligned header is aligned.
-    for (@typeInfo(Op).@"union".fields) |field| {
-        assert(@sizeOf(field.type) <= std.math.maxInt(u16));
-        assert(@alignOf(field.type) <= op_align);
-        assert(dense(field.type));
-        assert(@typeInfo(field.type).@"struct".layout == .@"extern");
+    for (@typeInfo(Op).@"union".field_types) |field_type| {
+        assert(@sizeOf(field_type) <= std.math.maxInt(u16));
+        assert(@alignOf(field_type) <= op_align);
+        assert(dense(field_type));
+        assert(@typeInfo(field_type).@"struct".layout == .@"extern");
     }
     for (payload_enums) |E| {
-        for (@typeInfo(E).@"enum".fields, 0..) |field, i| {
-            assert(field.value == i);
+        for (@typeInfo(E).@"enum".field_values, 0..) |value, i| {
+            assert(value == i);
         }
     }
     assert(@sizeOf(ShaderCreate) == 40);
@@ -633,7 +636,7 @@ fn attribute(location: u8, format: VertexFormat, offset: u16) VertexAttribute {
 }
 
 /// One op per code with distinct, nonzero field values, in code order.
-fn samples() [@typeInfo(Op).@"union".fields.len]Op {
+fn samples() [@typeInfo(Op).@"union".field_names.len]Op {
     var attributes = std.mem.zeroes([attribute_cap]VertexAttribute);
     attributes[0] = attribute(1, .float32x4, 0);
     attributes[1] = attribute(2, .float32x4, 16);
@@ -730,7 +733,7 @@ test "a header carries the code and the payload size" {
     buffer.push(.{ .pipeline_set = .{ .id = 5 } });
     try testing.expectEqual(@as(u32, 16), buffer.len);
     const header = std.mem.bytesToValue(Header, buffer.bytes[0..8]);
-    try testing.expectEqual(@intFromEnum(Code.pipeline_set), header.code);
+    try testing.expectEqual(@backingInt(Code.pipeline_set), header.code);
     try testing.expectEqual(@as(u16, 4), header.size);
     try testing.expectEqual(@as(u16, 5), std.mem.bytesToValue(u16, buffer.bytes[8..10]));
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0 }, buffer.bytes[10..16]);
@@ -778,27 +781,28 @@ test "table json matches the payload layouts" {
     try testing.expectEqualStrings(vertex_entry, root.get("entry").?.object.get("vertex").?.string);
     try testing.expectEqual(@as(i64, 64), root.get("caps").?.object.get("buffer").?.integer);
     const formats = root.get("enums").?.object.get("VertexFormat").?.array;
-    const float32x4 = formats.items[@intFromEnum(VertexFormat.float32x4)];
+    const float32x4 = formats.items[@backingInt(VertexFormat.float32x4)];
     try testing.expectEqualStrings("float32x4", float32x4.string);
     const ops = root.get("ops").?.array;
-    try testing.expectEqual(@typeInfo(Op).@"union".fields.len, ops.items.len);
-    inline for (@typeInfo(Op).@"union".fields, 0..) |field, i| {
+    const op_info = @typeInfo(Op).@"union";
+    try testing.expectEqual(op_info.field_names.len, ops.items.len);
+    inline for (op_info.field_names, op_info.field_types, 0..) |field_name, field_type, i| {
         const op = ops.items[i].object;
-        try testing.expectEqualStrings(field.name, op.get("name").?.string);
-        const code: i64 = @intFromEnum(@field(Code, field.name));
+        try testing.expectEqualStrings(field_name, op.get("name").?.string);
+        const code: i64 = @backingInt(@field(Code, field_name));
         try testing.expectEqual(code, op.get("code").?.integer);
-        try testing.expectEqual(@as(i64, @sizeOf(field.type)), op.get("size").?.integer);
+        try testing.expectEqual(@as(i64, @sizeOf(field_type)), op.get("size").?.integer);
         const fields = op.get("type").?.object.get("fields").?.array;
-        inline for (@typeInfo(field.type).@"struct".fields) |member| {
-            if (comptime std.mem.startsWith(u8, member.name, "pad")) {
-                try testing.expectError(error.FieldMissing, expect_field(fields, member.name, 0));
+        inline for (@typeInfo(field_type).@"struct".field_names) |member_name| {
+            if (comptime std.mem.startsWith(u8, member_name, "pad")) {
+                try testing.expectError(error.FieldMissing, expect_field(fields, member_name, 0));
             } else {
-                _ = try expect_field(fields, member.name, @offsetOf(field.type, member.name));
+                _ = try expect_field(fields, member_name, @offsetOf(field_type, member_name));
             }
         }
     }
     // Nested: pipeline_create.vertex is an array of VertexBuffer whose attributes nest again.
-    const pipeline = ops.items[@intFromEnum(Code.pipeline_create) - 1].object;
+    const pipeline = ops.items[@backingInt(Code.pipeline_create) - 1].object;
     const vertex = try expect_field(
         pipeline.get("type").?.object.get("fields").?.array,
         "vertex",
@@ -815,4 +819,17 @@ test "table json matches the payload layouts" {
     const format_offset = @offsetOf(VertexAttribute, "format");
     const format = try expect_field(attribute_fields, "format", format_offset);
     try testing.expectEqualStrings("VertexFormat", format.object.get("enum").?.string);
+}
+
+/// `table_json` as committed in `table.golden.json`, first generated by Zig 0.16.0 from
+/// `d3ef853`. The file has no trailing newline because the comparison is byte for byte.
+const table_golden = @embedFile("table.golden.json");
+
+// Locks `table_json` byte for byte against the committed golden copy, so a toolchain upgrade
+// or a reflection edit that changes what `web/shell.js` decodes fails here, not in a browser.
+// A deliberate payload change rewrites the golden file in the same commit.
+test "table json equals the golden copy" {
+    try testing.expect(table_golden.len >= 1);
+    try testing.expectEqual(table_golden.len, table_json.len);
+    try testing.expectEqualStrings(table_golden, table_json);
 }

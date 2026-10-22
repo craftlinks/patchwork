@@ -212,8 +212,8 @@ comptime {
     // libwayland indexes listeners by opcode, so slot counts must equal the event counts of
     // the bound version. The remaining asserts pin protocol-defined constants.
     assert(seat_version == 1);
-    assert(@typeInfo(SeatListener).@"struct".fields.len == 1);
-    assert(@typeInfo(PointerListener).@"struct".fields.len == 5);
+    assert(@typeInfo(SeatListener).@"struct".field_names.len == 1);
+    assert(@typeInfo(PointerListener).@"struct".field_names.len == 5);
     assert(pointer_capability == 1);
     assert(button_code_left == 0x110);
     assert(button_state_pressed == 1);
