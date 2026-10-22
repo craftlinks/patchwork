@@ -3,9 +3,9 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Why Compile-Time Dispatch
-//! The backend is chosen by `builtin.cpu.arch`, not by a vtable or an abstraction library. On
-//! native targets `host/gpu_wgpu.zig` is imported and `Gpu` is its state type. On `wasm32`
-//! the import resolves to `void`, so no native binding code is compiled and `Gpu` is a
+//! The backend is chosen by `builtin.target.cpu.arch`, not by a vtable or an abstraction
+//! library. On native targets `host/gpu_wgpu.zig` is imported and `Gpu` is its state type. On
+//! `wasm32` the import resolves to `void`, so no native binding code is compiled and `Gpu` is a
 //! zero-sized struct because JavaScript (`web/shell.js`) owns the WebGPU objects. Callers see
 //! one `create` / `submit` pair with no dynamic dispatch.
 //!
@@ -26,18 +26,18 @@ const assert = std.debug.assert;
 const commands = @import("gpu/commands.zig");
 
 /// Conditionally import native wgpu bindings only when compiling for non-Wasm targets.
-const gpu_wgpu = if (builtin.cpu.arch == .wasm32) void else @import("host/gpu_wgpu.zig");
+const gpu_wgpu = if (builtin.target.cpu.arch == .wasm32) void else @import("host/gpu_wgpu.zig");
 
 /// Backend state. Native: wgpu-native handles and resource tables. Wasm: zero-sized, because
 /// JavaScript owns the WebGPU objects.
-pub const Gpu = if (builtin.cpu.arch == .wasm32) struct {} else gpu_wgpu.Gpu;
+pub const Gpu = if (builtin.target.cpu.arch == .wasm32) struct {} else gpu_wgpu.Gpu;
 
 /// Replays one recorded stream. The buffer and everything its spans name must stay valid for
 /// the duration of the call (see the module guide for the Wasm rule).
 pub fn submit(gpu: *Gpu, buffer: *const commands.CommandBuffer) !void {
     assert(buffer.len != 0);
     assert(buffer.len % commands.op_align == 0);
-    if (builtin.cpu.arch == .wasm32) {
+    if (builtin.target.cpu.arch == .wasm32) {
         const js = struct {
             extern "env" fn submit_js(ptr: u32, len: u32) void;
         };
@@ -56,7 +56,7 @@ pub fn create(
 ) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(surface) != 0);
-    if (builtin.cpu.arch == .wasm32) {
+    if (builtin.target.cpu.arch == .wasm32) {
         return .{};
     }
     return gpu_wgpu.create(display, surface);

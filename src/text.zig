@@ -104,7 +104,7 @@ pub const place_runs = layout.place_runs;
 
 /// The face record of `face`.
 pub fn font_of(face: Face) *const ttf.Font {
-    return &fonts[@intFromEnum(face)];
+    return &fonts[@backingInt(face)];
 }
 
 /// The cache size key of an em of `size` logical pixels at `scale_120`: quarter device px.
@@ -119,7 +119,7 @@ pub fn size_key(size: f32, scale_120: u32) u32 {
 }
 
 comptime {
-    assert(fonts.len == @typeInfo(Face).@"enum".fields.len);
+    assert(fonts.len == @typeInfo(Face).@"enum".field_names.len);
     assert(byte_cap == 4096);
     assert(size_max * 1920 / 30 <= cache.size_q_max);
     for (fonts) |font| {

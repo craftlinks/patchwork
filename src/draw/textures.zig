@@ -104,14 +104,14 @@ pub const Textures = struct {
         self.heights[index] = height;
         self.count += 1;
         assert(self.count == index + 1);
-        return @enumFromInt(index);
+        return @fromBackingInt(@intCast(index));
     }
 
     /// Queues `data` for `region` of texture `id`. Rows are tightly packed, so `data` holds
     /// exactly `region.width * bytes_per_texel(format) * region.height` bytes. See the module
     /// guide for how long `data` must stay valid.
     pub fn write(self: *Textures, id: TextureId, region: Region, data: []const u8) void {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         assert(index < self.count);
         assert(self.write_count < write_cap);
         assert(region.width != 0);
@@ -139,7 +139,7 @@ pub const Textures = struct {
         bytes_per_row: u32,
         data: []const u8,
     ) void {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         assert(index < self.count);
         assert(self.write_count < write_cap);
         assert(region.width != 0);
@@ -161,7 +161,7 @@ pub const Textures = struct {
 
     /// The format `id` was created with.
     pub fn format_of(self: *const Textures, id: TextureId) Format {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         assert(index < self.count);
         return self.formats[index];
     }
@@ -169,7 +169,7 @@ pub const Textures = struct {
     /// True when `id` names a created (possibly still pending) texture.
     pub fn exists(self: *const Textures, id: TextureId) bool {
         assert(self.count <= texture_cap);
-        return @intFromEnum(id) < self.count;
+        return @backingInt(id) < self.count;
     }
 };
 
@@ -193,7 +193,7 @@ comptime {
     // One bind group per texture plus the frame group.
     assert(texture_cap + 1 <= commands.caps.get(.bind_group));
     assert(write_cap >= 1);
-    assert(@intFromEnum(TextureId.atlas) == 0);
+    assert(@backingInt(TextureId.atlas) == 0);
 }
 
 // Locks id assignment in creation order, the per-format row size of a write, and the queue.
@@ -203,14 +203,14 @@ test "create assigns ids in order and write queues packed rows" {
     const atlas = textures.create(.r8, 512, 256);
     const badge = textures.create(.rgba8, 32, 32);
     try std.testing.expectEqual(TextureId.atlas, atlas);
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(badge));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(badge));
     try std.testing.expectEqual(Format.rgba8, textures.format_of(badge));
-    const pixels = [_]u8{0} ** (32 * 4 * 2);
+    const pixels: [32 * 4 * 2]u8 = @splat(0);
     textures.write(badge, .{ .x = 0, .y = 30, .width = 32, .height = 2 }, &pixels);
     try std.testing.expectEqual(@as(u32, 1), textures.write_count);
     try std.testing.expectEqual(@as(u32, 128), textures.writes[0].bytes_per_row);
     try std.testing.expect(textures.exists(badge));
-    try std.testing.expect(!textures.exists(@enumFromInt(2)));
+    try std.testing.expect(!textures.exists(@fromBackingInt(2)));
     try std.testing.expectEqual(@as(u32, 0), textures.created);
 }
 
@@ -219,7 +219,7 @@ test "write_strided keeps the row stride of a sub-rectangle" {
     var textures: Textures = undefined;
     textures.init();
     const atlas = textures.create(.r8, 16, 8);
-    const image = [_]u8{0} ** (16 * 8);
+    const image: [16 * 8]u8 = @splat(0);
     const first = 2 * 16 + 3;
     const region: Region = .{ .x = 3, .y = 2, .width = 5, .height = 4 };
     textures.write_strided(atlas, region, 16, image[first..][0 .. 3 * 16 + 5]);

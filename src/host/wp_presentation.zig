@@ -293,8 +293,10 @@ pub fn assert_interface_tables() void {
         assert(wp_presentation_interface.version == presentation_version);
         assert(wp_presentation_feedback_interface.version == presentation_version);
         // Listener slots must equal the event counts of the interface they serve.
-        assert(@typeInfo(PresentationListener).@"struct".fields.len == presentation_events.len);
-        assert(@typeInfo(FeedbackListener).@"struct".fields.len == feedback_events.len);
+        const presentation_listener = @typeInfo(PresentationListener).@"struct";
+        const feedback_listener = @typeInfo(FeedbackListener).@"struct";
+        assert(presentation_listener.field_names.len == presentation_events.len);
+        assert(feedback_listener.field_names.len == feedback_events.len);
     }
 }
 
@@ -304,9 +306,9 @@ comptime {
     assert(flag_hw_clock == 0x2);
     assert(flag_hw_completion == 0x4);
     assert(flag_zero_copy == 0x8);
-    assert(@typeInfo(PresentationListener).@"struct".fields.len == 1);
+    assert(@typeInfo(PresentationListener).@"struct".field_names.len == 1);
     assert(@sizeOf(PresentationListener) == 8);
-    assert(@typeInfo(FeedbackListener).@"struct".fields.len == 3);
+    assert(@typeInfo(FeedbackListener).@"struct".field_names.len == 3);
     assert(@sizeOf(FeedbackListener) == 24);
     assert(clock_monotonic == 1);
     assert(flag_vsync | flag_hw_clock | flag_hw_completion | flag_zero_copy == 0xF);

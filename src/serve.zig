@@ -203,7 +203,7 @@ fn open_path(io: std.Io, path: []const u8) !std.Io.File {
 
 fn strip_query(target: []const u8) []const u8 {
     assert(target.len != 0);
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return target;
+    const q = std.mem.findScalar(u8, target, '?') orelse return target;
     assert(q <= target.len);
     return target[0..q];
 }

@@ -215,7 +215,8 @@ pub fn assert_interface_tables() void {
         assert(wp_fractional_scale_manager_interface.method_count == manager_requests.len);
         assert(wp_fractional_scale_interface.method_count == fractional_requests.len);
         assert(wp_fractional_scale_interface.event_count == fractional_events.len);
-        assert(@typeInfo(FractionalScaleListener).@"struct".fields.len == fractional_events.len);
+        const listener = @typeInfo(FractionalScaleListener).@"struct";
+        assert(listener.field_names.len == fractional_events.len);
     }
 }
 

@@ -394,9 +394,9 @@ comptime {
     // libwayland indexes listener tables by event opcode, so a table must have exactly one
     // pointer slot per event: `wl_registry` has 2 events and `wl_surface` has 4 at the
     // versions bound here.
-    assert(@typeInfo(RegistryListener).@"struct".fields.len == 2);
+    assert(@typeInfo(RegistryListener).@"struct".field_names.len == 2);
     assert(@sizeOf(RegistryListener) == 2 * @sizeOf(*const anyopaque));
-    assert(@typeInfo(SurfaceListener).@"struct".fields.len == 4);
+    assert(@typeInfo(SurfaceListener).@"struct".field_names.len == 4);
     assert(@sizeOf(SurfaceListener) == 4 * @sizeOf(*const anyopaque));
     // These checks read the hand-written interface tables, so they run only in builds that
     // link `wayland-client`.

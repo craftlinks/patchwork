@@ -191,7 +191,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
         /// Sets the layer later appends go to and returns the previous one, so a widget can
         /// restore it with `defer _ = cx.layer(previous);`.
         pub fn layer(self: *Self, next: Layer) Layer {
-            assert(@intFromEnum(next) < layer_count);
+            assert(@backingInt(next) < layer_count);
             const previous = self.layer_now;
             self.layer_now = next;
             assert(self.layer_now == next);
@@ -219,7 +219,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
                 self.overflow_count += 1;
                 return error.PoolFull;
             }
-            const layer_index: u8 = @intFromEnum(self.layer_now);
+            const layer_index: u8 = @backingInt(self.layer_now);
             const key: u8 = @intCast(layer_index * P.texture_slots + slot);
             if (pool.histogram[key] == 0) {
                 if (self.appearance_count == batch_cap) {
@@ -253,7 +253,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
                 const id = texture.?;
                 assert(self.textures.exists(id));
                 assert(self.textures.format_of(id) == format);
-                return @intFromEnum(id);
+                return @backingInt(id);
             }
             assert(texture == null);
             return 0;
@@ -277,7 +277,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
             const pool = &self.pools[comptime R.id(T)];
             const P = @TypeOf(pool.*);
             assert(index < pool.count);
-            return @enumFromInt(pool.keys[index] / P.texture_slots);
+            return @fromBackingInt(@intCast(pool.keys[index] / P.texture_slots));
         }
 
         /// The batches `finalize` formed, in draw order.
@@ -306,7 +306,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
         }
 
         fn form_batches(self: *Self) void {
-            var layer_starts = [_]u32{0} ** layer_count;
+            var layer_starts: [layer_count]u32 = @splat(0);
             for (self.appearance[0..self.appearance_count]) |entry| {
                 layer_starts[entry.layer] += 1;
             }
@@ -334,7 +334,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
                         .type_id = entry.type_id,
                         .key = entry.key,
                         .layer = entry.layer,
-                        .texture = @enumFromInt(entry.key % P.texture_slots),
+                        .texture = @fromBackingInt(@intCast(entry.key % P.texture_slots)),
                         .first = pool.starts[entry.key],
                         .count = pool.histogram[entry.key],
                     };
@@ -399,7 +399,7 @@ fn clip_ordered(clip: [4]f32) bool {
 
 comptime {
     assert(layer_count == 8);
-    assert(@intFromEnum(Layer.overlay) < layer_count);
+    assert(@backingInt(Layer.overlay) < layer_count);
     // The sort key of a textured type must fit a u8.
     assert(layer_count * textures.texture_cap <= 256);
 }
@@ -535,10 +535,10 @@ test "a full pool and a full batch list are counted and skipped" {
     cx.reset();
     var level: u8 = 0;
     while (level < 6) : (level += 1) {
-        _ = cx.layer(@enumFromInt(level));
+        _ = cx.layer(@fromBackingInt(@intCast(level)));
         try cx.append(types.Box, null, test_box(0));
     }
-    _ = cx.layer(@enumFromInt(7));
+    _ = cx.layer(@fromBackingInt(7));
     try testing.expectError(error.BatchFull, cx.append(types.Box, null, test_box(0)));
     try testing.expectEqual(@as(u32, 1), cx.overflow_count);
     try testing.expectEqual(@as(u32, 6), cx.items(types.Box).len);

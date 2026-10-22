@@ -1421,7 +1421,7 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     }
     try std.testing.expect(covered >= 1);
     const batches = cx.batch_list();
-    const overlay: u8 = @intFromEnum(quads.Layer.overlay);
+    const overlay: u8 = @backingInt(quads.Layer.overlay);
     try std.testing.expectEqual(overlay, batches[batches.len - 2].layer);
     try std.testing.expectEqual(@as(u8, 0), batches[batches.len - 2].type_id);
     try std.testing.expectEqual(overlay, batches[batches.len - 1].layer);

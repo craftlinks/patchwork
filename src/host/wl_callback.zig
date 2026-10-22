@@ -132,6 +132,6 @@ pub fn destroy_callback(callback: *WlCallback) void {
 
 comptime {
     // One slot per `wl_callback` v1 event; a wider table would be indexed past its end.
-    assert(@typeInfo(CallbackListener).@"struct".fields.len == 1);
+    assert(@typeInfo(CallbackListener).@"struct".field_names.len == 1);
     assert(@sizeOf(CallbackListener) == 8);
 }
