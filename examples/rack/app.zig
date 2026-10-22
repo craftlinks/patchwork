@@ -17,9 +17,12 @@
 //! outside it, so no GPU scissor state is involved.
 //!
 //! ## 2. Coordinate Spaces and Layout
-//! All measurements are UI logical pixels, top-left origin, `+Y` down. `turtle.place_column`
-//! stacks the panels, each with `width = fill`, `height = fill`, and a top margin of
-//! `panel_gap_px` except the first, inside a column inset by `column_padding`.
+//! All measurements are UI logical pixels, top-left origin, `+Y` down. The header bar is
+//! `header_px` tall at the top of the window, inset by `column_padding`, and omitted when the
+//! window cannot hold it. `turtle.place_column` stacks the panels below it, in a column that
+//! starts `header_px + header_gap_px` from the top, each with `width = fill`,
+//! `height = fill`, and a top margin of `panel_gap_px` except the first, inside a column inset
+//! by `column_padding`.
 //!
 //! Per panel, with `inner = panel.rect inset by panel.padding`:
 //! ```text
@@ -49,6 +52,14 @@
 //! over the meter track whose brightness is that panel's meter level; the title text is
 //! centered between them. Everything is on the base layer except the tooltip.
 //!
+//! ## 3c. Header and Text Styles
+//! `App.draw` draws the header bar directly, not as a scene widget, so the slot math above is
+//! unchanged and the bar never hit-tests. It holds the tempo readout (`tempo_runs`: "121.00"
+//! in 32 px mono and " BPM" in 14 px bold, one baseline through `text.place_runs`) at its
+//! left and `patch_author` (non-ASCII, with composite glyphs) right-aligned in the rest, cut
+//! with an ellipsis when it does not fit. Panel titles use `title_style` (bold 14 px); knob
+//! names and values use `widgets.name_style` and the monospace `widgets.value_style`.
+//!
 //! ## 3b. Tooltip
 //! Hovering a knob for `tooltip_delay_ms` shows its name and value in a bordered box beside
 //! the ring. The box overlaps the neighbouring knob's name, so it goes on the overlay layer,
@@ -76,7 +87,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
 const animator = patchwork.animator;
-const font = patchwork.font;
+const text = patchwork.text;
 const quads = patchwork.draw;
 const input = patchwork.input;
 const theme = patchwork.theme;
@@ -115,6 +126,38 @@ const knob_cell_px: f32 = 144;
 const panel_radius: f32 = 8;
 
 const panel_names = [_][]const u8{ "osc", "filter", "amp" };
+
+/// Header bar above the panels: its height, and the gap between it and the first panel.
+const header_px: f32 = 52;
+const header_gap_px: f32 = 8;
+/// Horizontal inset of the header text from the bar's edges.
+const header_inset_px: f32 = 16;
+const header_radius: f32 = 8;
+
+/// The header's tempo readout: a 32 px monospace value and a bold unit, sharing a baseline.
+const tempo_value = "121.00";
+const tempo_unit = " BPM";
+const tempo_runs = [_]text.Run{
+    .{
+        .style = .{ .face = .mono, .size = 32, .color = theme.chrome.text },
+        .bytes = tempo_value,
+    },
+    .{
+        .style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text },
+        .bytes = tempo_unit,
+    },
+};
+
+/// A non-ASCII label (composite glyphs: u and o with diaeresis, e acute, middle dot),
+/// right-aligned in the header and cut with an ellipsis when the bar is narrow.
+const patch_author = "J\u{fc}rgen K\u{f6}hler \u{b7} Caf\u{e9}";
+const author_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.chrome.text };
+
+/// Panel titles: bold 14 px.
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
+
+/// Inked glyphs the header draws at most: the tempo runs and the author label.
+const header_glyph_cap: u32 = 32;
 
 /// Hover time before a knob's tooltip appears.
 pub const tooltip_delay_ms: f32 = 500;
@@ -286,17 +329,19 @@ pub const App = struct {
         return app.scene.dirty;
     }
 
-    /// Draws every widget into the freshly reset context, each panel's badge and LED after
-    /// the panel, then the tooltip on the overlay layer. The window clip is the full frame.
+    /// Draws the header bar, every widget into the freshly reset context, each panel's
+    /// badge and LED after the panel, then the tooltip on the overlay layer. The window clip
+    /// is the full frame.
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         assert(app.scene.width_logical != 0);
         assert(app.scene.height_logical != 0);
-        const clip: font.Clip = .{
+        const clip: quads.Clip = .{
             .x0 = 0,
             .y0 = 0,
             .x1 = @floatFromInt(app.scene.width_logical),
             .y1 = @floatFromInt(app.scene.height_logical),
         };
+        draw_header(cx, app.scene.width_logical, app.scene.height_logical, clip);
         var index: u32 = 0;
         while (index < app.scene.count) : (index += 1) {
             const face_clip = clip_for(&app.scene, index, clip);
@@ -351,7 +396,7 @@ pub const App = struct {
 
     /// The badge at the band's left end and the LED over the meter track, both clipped to
     /// the panel. A band too short or too narrow for them omits them.
-    fn draw_title_marks(app: *const App, cx: anytype, panel_index: u32, clip: font.Clip) void {
+    fn draw_title_marks(app: *const App, cx: anytype, panel_index: u32, clip: quads.Clip) void {
         assert(panel_index < panel_count);
         const band = app.scene.widgets[panel_slot(panel_index)].panel.label.rect;
         if (band.height < badge_px) {
@@ -380,7 +425,7 @@ pub const App = struct {
 
     /// The hovered knob's name and value in a bordered box on the overlay layer, so it
     /// covers the neighbouring knob's text. See the module guide, section 3b.
-    fn draw_tooltip(app: *const App, cx: anytype, window: font.Clip) void {
+    fn draw_tooltip(app: *const App, cx: anytype, window: quads.Clip) void {
         if (!app.tooltip_visible()) {
             return;
         }
@@ -400,18 +445,78 @@ pub const App = struct {
             .hover = 0,
             .down = 0,
         });
-        var text: [tooltip_text_cap]u8 = undefined;
-        const label = tooltip_text(&text, knob);
-        font.place(cx, label, .{
-            .x = box.x,
-            .y = box.y,
-            .width = box.width,
-            .height = box.height,
-        }, .{ .r = text_color[0], .g = text_color[1], .b = text_color[2], .a = 1 }, window);
+        var bytes: [tooltip_text_cap]u8 = undefined;
+        const label = tooltip_text(&bytes, knob);
+        text.place(cx, widgets.name_style, label, box, window, widgets.centered);
     }
 };
 
-fn widget_draw(widget: *const Widget, cx: anytype, clip: font.Clip) void {
+/// The header bar's rect, or null when the window is too small to hold it.
+fn header_rect(width_logical: u32, height_logical: u32) ?turtle.Rect {
+    const width: f32 = @floatFromInt(width_logical);
+    const height: f32 = @floatFromInt(height_logical);
+    const rect: turtle.Rect = .{
+        .x = column_padding.left,
+        .y = column_padding.top,
+        .width = width - column_padding.left - column_padding.right,
+        .height = header_px,
+    };
+    if (rect.width <= 2 * header_inset_px) {
+        return null;
+    }
+    if (rect.y + rect.height > height) {
+        return null;
+    }
+    assert(rect.width > 0);
+    return rect;
+}
+
+/// The header bar: a face, the tempo readout at its left, and the author label at its right.
+fn draw_header(cx: anytype, width_logical: u32, height_logical: u32, window: quads.Clip) void {
+    const bar = header_rect(width_logical, height_logical) orelse return;
+    const color = theme.chrome.panel;
+    append_or_skip(cx, quads.Box, null, .{
+        .rect = .{ bar.x, bar.y, bar.width, bar.height },
+        .clip = .{ window.x0, window.y0, window.x1, window.y1 },
+        .fill = color,
+        .border_color = .{ 0, 0, 0, 0 },
+        .radius = header_radius,
+        .border_width = 0,
+        .hover = 0,
+        .down = 0,
+    });
+    const inner: turtle.Rect = .{
+        .x = bar.x + header_inset_px,
+        .y = bar.y,
+        .width = bar.width - 2 * header_inset_px,
+        .height = bar.height,
+    };
+    const bar_clip = rect_clip(bar);
+    text.place_runs(cx, &tempo_runs, inner, bar_clip, .{
+        .align_x = .start,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+    // The author takes the space right of the tempo readout and is cut when it does not fit.
+    const tempo_width = text.measure(tempo_runs[0].style, tempo_value) +
+        text.measure(tempo_runs[1].style, tempo_unit) + header_inset_px;
+    if (inner.width <= tempo_width) {
+        return;
+    }
+    const author: turtle.Rect = .{
+        .x = inner.x + tempo_width,
+        .y = inner.y,
+        .width = inner.width - tempo_width,
+        .height = inner.height,
+    };
+    text.place(cx, author_style, patch_author, author, bar_clip, .{
+        .align_x = .end,
+        .align_y = .center,
+        .ellipsis = true,
+    });
+}
+
+fn widget_draw(widget: *const Widget, cx: anytype, clip: quads.Clip) void {
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
     switch (widget.*) {
@@ -505,12 +610,14 @@ fn place_panels(scene: *Scene, width_logical: u32, height_logical: u32) void {
         walks[index] = scene.widgets[panel_slot(index)].panel.walk;
     }
     assert(index == panel_count);
+    // The panels' column starts below the header bar and its gap (module guide, section 2).
+    const top = header_px + header_gap_px;
     const column: turtle.Column = .{
         .rect = .{
             .x = 0,
-            .y = 0,
+            .y = top,
             .width = @floatFromInt(width_logical),
-            .height = @floatFromInt(height_logical),
+            .height = @max(0, @as(f32, @floatFromInt(height_logical)) - top),
         },
         .padding = column_padding,
     };
@@ -674,7 +781,6 @@ fn rack_panel(panel_index: u32, gap: f32) widgets.Panel {
     assert(panel_index < panel_count);
     assert(gap >= 0);
     const color = theme.chrome.panel;
-    const text = theme.chrome.text;
     const panel: widgets.Panel = .{
         .id = panel_index + 1,
         .rect = empty_rect,
@@ -688,10 +794,7 @@ fn rack_panel(panel_index: u32, gap: f32) widgets.Panel {
         .label = .{
             .text = panel_names[panel_index],
             .rect = empty_rect,
-            .r = text[0],
-            .g = text[1],
-            .b = text[2],
-            .a = text[3],
+            .style = title_style,
         },
         .paint = .{
             .r = color[0],
@@ -795,7 +898,7 @@ fn band_height(inner_h: f32) f32 {
     return 0;
 }
 
-fn clip_for(scene: *const Scene, index: u32, window: font.Clip) font.Clip {
+fn clip_for(scene: *const Scene, index: u32, window: quads.Clip) quads.Clip {
     assert(index < scene.count);
     assert(window.x1 > window.x0);
     switch (scene.widgets[index]) {
@@ -816,7 +919,7 @@ fn clip_for(scene: *const Scene, index: u32, window: font.Clip) font.Clip {
 
 /// Knob faces clip to the panel. A degenerate panel has no exclusive rect, so
 /// those faces use the window clip instead of aborting the frame.
-fn panel_clip(rect: turtle.Rect, window: font.Clip) font.Clip {
+fn panel_clip(rect: turtle.Rect, window: quads.Clip) quads.Clip {
     assert(window.x1 > window.x0);
     if (rect.width <= 0) {
         assert(rect.width <= 0);
@@ -829,10 +932,10 @@ fn panel_clip(rect: turtle.Rect, window: font.Clip) font.Clip {
     return rect_clip(rect);
 }
 
-fn rect_clip(rect: turtle.Rect) font.Clip {
+fn rect_clip(rect: turtle.Rect) quads.Clip {
     assert(rect.width > 0);
     assert(rect.height > 0);
-    const clip: font.Clip = .{
+    const clip: quads.Clip = .{
         .x0 = rect.x,
         .y0 = rect.y,
         .x1 = rect.x + rect.width,
@@ -845,7 +948,7 @@ fn rect_clip(rect: turtle.Rect) font.Clip {
 
 /// The meter track has a fixed height even when the cell is shorter. Clipping to the cell
 /// keeps that bar off the title and off the knobs beside it.
-fn meter_face_clip(rect: turtle.Rect, panel: font.Clip) font.Clip {
+fn meter_face_clip(rect: turtle.Rect, panel: quads.Clip) quads.Clip {
     assert(panel.x1 > panel.x0);
     assert(panel.y1 > panel.y0);
     if (rect.width <= 0) {
@@ -869,14 +972,17 @@ comptime {
     assert(demo_count <= widget_cap);
     assert(levels.meter_count == panel_count);
     assert(panel_stride == 1 + knobs_per_panel + 1);
-    // Worst-case boxes: one per panel, two per meter, and the tooltip.
-    assert(panel_count + panel_count * 2 + 1 <= box_cap);
+    // Worst-case boxes: one per panel, two per meter, the tooltip, and the header bar.
+    assert(panel_count + panel_count * 2 + 1 + 1 <= box_cap);
     // Worst-case arcs: two per knob (track and value arc).
     assert(panel_count * knobs_per_panel * 2 <= arc_cap);
     // Worst-case glyphs: a label of up to 8 per panel, up to 8 for each knob name and 4 for
-    // each value text, and the tooltip text.
-    assert(panel_count * 8 + panel_count * knobs_per_panel * (8 + 4) + tooltip_text_cap <=
-        glyph_cap);
+    // each value text, the tooltip text, and the header; 43 of 256 to spare.
+    assert(panel_count * 8 + panel_count * knobs_per_panel * (8 + 4) + tooltip_text_cap +
+        header_glyph_cap + 43 == glyph_cap);
+    // Every codepoint of the header draws at most one glyph.
+    const author_codepoints = std.unicode.utf8CountCodepoints(patch_author) catch unreachable;
+    assert(tempo_value.len + tempo_unit.len + author_codepoints <= header_glyph_cap);
     // One badge and one LED per panel.
     assert(panel_count <= image_cap);
     assert(panel_count <= led_cap);
@@ -950,30 +1056,34 @@ fn meter_at(app: *App, panel_index: u32) *widgets.Meter {
 test "rack layout at 1280 by 720" {
     const app = new_app();
     app.layout(1280, 720);
-    // Panel height = (720 - 2 * 16 padding - 2 * 8 gap) / 3; the panels start 8 below each other.
-    try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 16, 1248, 224);
-    try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 248, 1248, 224);
-    try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 480, 1248, 224);
-    // First knob: x = 16 panel + 8 padding + 8 cell margin, y = 16 + 8 + 24 title band.
-    try expect_rect(knob_at(app, 0, 0).rect, 32, 48, 144, 72);
-    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 56, 56, 56);
-    // Meter: right edge of the inner rect, 80 wide, body height 224 - 16 - 24.
-    try expect_rect(meter_at(app, 0).rect, 1176, 48, 80, 184);
+    // The column starts below the 52 px header and its 8 px gap, at y = 60. Panel height =
+    // (720 - 60 - 2 * 16 padding - 2 * 8 gap) / 3; the panels start 8 below each other.
+    try expect_rect(header_rect(1280, 720).?, 16, 16, 1248, 52);
+    try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 76, 1248, 204);
+    try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 288, 1248, 204);
+    try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 500, 1248, 204);
+    // First knob: x = 16 panel + 8 padding + 8 cell margin, y = 76 + 8 + 24 title band.
+    try expect_rect(knob_at(app, 0, 0).rect, 32, 108, 144, 72);
+    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 116, 56, 56);
+    // Meter: right edge of the inner rect, 80 wide, body height 204 - 16 - 24.
+    try expect_rect(meter_at(app, 0).rect, 1176, 108, 80, 164);
     const title = app.scene.widgets[panel_slot(0)].panel.label.rect;
     try std.testing.expectEqual(@as(f32, 24), title.height);
     const cx = draw_frame(app);
-    // 3 panels + 3 meters * 2 faces; 12 knobs * 2 arcs minus the zero-valued knob's arc.
-    try std.testing.expectEqual(@as(usize, 9), cx.items(quads.Box).len);
+    // The header + 3 panels + 3 meters * 2 faces; 12 knobs * 2 arcs minus the zero-valued
+    // knob's arc. Glyphs: titles 3 + 6 + 3, knob names 40, values 12 * 4, the tempo 6 + 3,
+    // and the author 17 (its two spaces have no ink).
+    try std.testing.expectEqual(@as(usize, 10), cx.items(quads.Box).len);
     try std.testing.expectEqual(@as(usize, 23), cx.items(quads.Arc).len);
-    try std.testing.expectEqual(@as(usize, 100), cx.items(quads.Glyph).len);
+    try std.testing.expectEqual(@as(usize, 126), cx.items(quads.Glyph).len);
     try std.testing.expectEqual(@as(usize, 3), cx.items(quads.Image).len);
     try std.testing.expectEqual(@as(usize, 3), cx.items(led.Led).len);
     const ring = widgets.ring_of(knob_at(app, 0, 3).rect);
     var arcs: u32 = 0;
     for (cx.items(quads.Arc)) |arc| {
         // The first ring clips to its panel rect.
-        if (arc.rect[0] == 40 and arc.rect[1] == 56) {
-            try std.testing.expectEqualSlices(f32, &.{ 16, 16, 1264, 240 }, &arc.clip);
+        if (arc.rect[0] == 40 and arc.rect[1] == 116) {
+            try std.testing.expectEqualSlices(f32, &.{ 16, 76, 1264, 280 }, &arc.clip);
         }
         if (arc.rect[0] == ring.x and arc.rect[1] == ring.y) {
             arcs += 1;
@@ -987,11 +1097,11 @@ test "rack layout at 1280 by 720" {
 test "rack layout at 800 by 600" {
     const app = new_app();
     app.layout(800, 600);
-    try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 16, 768, 184);
-    try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 208, 768, 184);
-    try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 400, 768, 184);
-    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 56, 56, 56);
-    try expect_rect(meter_at(app, 0).rect, 696, 48, 80, 144);
+    try expect_rect(app.scene.widgets[panel_slot(0)].panel.rect, 16, 76, 768, 164);
+    try expect_rect(app.scene.widgets[panel_slot(1)].panel.rect, 16, 248, 768, 164);
+    try expect_rect(app.scene.widgets[panel_slot(2)].panel.rect, 16, 420, 768, 164);
+    try expect_rect(widgets.ring_of(knob_at(app, 0, 0).rect), 40, 116, 56, 56);
+    try expect_rect(meter_at(app, 0).rect, 696, 108, 80, 124);
 }
 
 // Locks that `timer` writes meters only when a sample changes and knob drags never do.
@@ -1052,7 +1162,7 @@ test "dragging mix off zero adds the value arc" {
     try std.testing.expectEqual(@as(f32, 0.5), knob_at(app, 0, 3).value);
     const drawn = draw_frame(app);
     try std.testing.expectEqual(@as(usize, 24), drawn.items(quads.Arc).len);
-    try std.testing.expectEqual(@as(usize, 100), drawn.items(quads.Glyph).len);
+    try std.testing.expectEqual(@as(usize, 126), drawn.items(quads.Glyph).len);
 }
 
 // Locks hover easing and that a settled scene stays clean across frames.
@@ -1124,7 +1234,8 @@ test "a narrow window keeps only knobs that clear the meter" {
 // next panel.
 test "a short window hides knobs that would leave the panel" {
     const app = new_app();
-    app.layout(1280, 200);
+    // 260 leaves the panels' column the 200 px a 200 px window gave before the header.
+    app.layout(1280, 260);
     try std.testing.expectEqual(@as(f32, 0), knob_at(app, 0, 0).rect.height);
     try std.testing.expect(meter_at(app, 0).rect.height > 0);
     try std.testing.expect(meter_at(app, 0).rect.height < widgets.knob_height);
@@ -1157,20 +1268,40 @@ fn setup_renderer() void {
     fixture_gpu.renderer.setup(&fixture_gpu.buffer, &fixture.context);
 }
 
-/// Draws the app if it is dirty, then records one 1280 by 720 logical frame.
-fn record(app: *App, width_px: u32) void {
-    if (app.dirty()) {
-        fixture.context.reset();
-        app.draw(&fixture.context);
-        assert(fixture.context.overflow_count == 0);
+/// Draws the app when it is dirty or the glyph cache owes a draw, the way a host does, then
+/// records one 1280 by 720 logical frame at `scale_120`.
+fn record(app: *App, scale_120: u32) void {
+    const cx = &fixture.context;
+    if (app.dirty() or cx.text.owes_draw(scale_120)) {
+        cx.text.scale_120 = scale_120;
+        cx.reset();
+        app.draw(cx);
+        assert(cx.overflow_count == 0);
     }
     fixture_gpu.buffer.reset();
-    fixture_gpu.renderer.frame(&fixture_gpu.buffer, &fixture.context, .{
+    fixture_gpu.renderer.frame(&fixture_gpu.buffer, cx, .{
         .width_logical = 1280,
         .height_logical = 720,
-        .width_px = width_px,
-        .height_px = width_px * 720 / 1280,
+        .width_px = patchwork.frame.pixel_size(1280, scale_120),
+        .height_px = patchwork.frame.pixel_size(720, scale_120),
+        .scale_120 = scale_120,
     });
+}
+
+/// The `texture_write` ops of the last recorded stream.
+fn texture_writes(out: []patchwork.commands.TextureWrite) []patchwork.commands.TextureWrite {
+    var reader = fixture_gpu.buffer.reader();
+    var count: usize = 0;
+    while (reader.next()) |op| {
+        switch (op) {
+            .texture_write => |write| {
+                out[count] = write;
+                count += 1;
+            },
+            else => {},
+        }
+    }
+    return out[0..count];
 }
 
 /// Hovers the center of `knob`'s ring.
@@ -1183,11 +1314,13 @@ fn hover_knob(app: *App, knob: *const widgets.Knob) !void {
 }
 
 // Locks the rack's command streams. Setup creates five pipelines and both textures (the atlas
-// and the badge). The first frame writes the uniform and the five pools, binds the frame group
-// and unit quad once, and draws one call per batch in first-appearance order: boxes, glyphs
-// (atlas), the badge, LEDs, arcs. A scale-only frame writes nothing, and a hover frame writes
-// only the changed arc records, because every other rebuilt pool is identical.
-test "rack frames record the step 12 op sequences" {
+// and the badge). The first frame writes the uniform, the atlas rectangle the glyph cache
+// rasterized, and the five pools, binds the frame group and unit quad once, and draws one call
+// per batch in first-appearance order: boxes, glyphs (atlas), the badge, LEDs, arcs. A scale
+// change redraws: it writes the uniform, a new atlas rectangle, and the glyph pool, and no box
+// or arc record. A present with nothing owed writes nothing, and a hover frame writes only the
+// changed arc records, because every other rebuilt pool is identical.
+test "rack frames record the step 13 op sequences" {
     const Code = patchwork.commands.Code;
     const app = new_app();
     app.layout(1280, 720);
@@ -1204,18 +1337,22 @@ test "rack frames record the step 12 op sequences" {
     try std.testing.expectEqual(@as(u32, 5), pipelines);
     var writes: [8]patchwork.commands.BufferWrite = undefined;
 
-    record(app, 1280);
+    record(app, 120);
     const first = [_]Code{
+        .buffer_write,      .texture_write,     .buffer_write,
         .buffer_write,      .buffer_write,      .buffer_write,
-        .buffer_write,      .buffer_write,      .buffer_write,
-        .pass_begin,        .bind_group_set,    .vertex_buffer_set,
-        .pipeline_set,      .vertex_buffer_set, .draw,
-        .pipeline_set,      .vertex_buffer_set, .bind_group_set,
+        .buffer_write,      .pass_begin,        .bind_group_set,
+        .vertex_buffer_set, .pipeline_set,      .vertex_buffer_set,
         .draw,              .pipeline_set,      .vertex_buffer_set,
         .bind_group_set,    .draw,              .pipeline_set,
-        .vertex_buffer_set, .draw,              .pipeline_set,
-        .vertex_buffer_set, .draw,              .pass_end_present,
+        .vertex_buffer_set, .bind_group_set,    .draw,
+        .pipeline_set,      .vertex_buffer_set, .draw,
+        .pipeline_set,      .vertex_buffer_set, .draw,
+        .pass_end_present,
     };
+    var atlas: [4]patchwork.commands.TextureWrite = undefined;
+    try std.testing.expectEqual(@as(usize, 1), texture_writes(&atlas).len);
+    try std.testing.expectEqual(@as(u32, 1024), atlas[0].bytes_per_row);
     const first_codes = patchwork.renderer.codes(&fixture_gpu.buffer, &codes);
     try std.testing.expectEqualSlices(Code, &first, first_codes);
     const batches = fixture.context.batch_list();
@@ -1227,15 +1364,24 @@ test "rack frames record the step 12 op sequences" {
     try std.testing.expectEqual(@as(u8, 4), batches[3].type_id);
     try std.testing.expectEqual(@as(u8, 1), batches[4].type_id);
 
-    record(app, 2560);
+    record(app, 240);
+    const rescaled = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
+    const resources = &fixture_gpu.renderer.resources;
+    try std.testing.expectEqual(@as(usize, 2), rescaled.len);
+    try std.testing.expectEqual(resources.uniform_buffer, rescaled[0].id);
+    try std.testing.expectEqual(resources.instance_buffers[2], rescaled[1].id);
+    try std.testing.expectEqual(@as(usize, 1), texture_writes(&atlas).len);
+
+    record(app, 240);
     try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(
         &fixture_gpu.buffer,
         &writes,
     ).len);
+    try std.testing.expectEqual(@as(usize, 0), texture_writes(&atlas).len);
 
     try hover_knob(app, knob_at(app, 0, 0));
     try std.testing.expect(app.event(.{ .frame = 50 }));
-    record(app, 2560);
+    record(app, 240);
     const hover = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
     try std.testing.expectEqual(@as(usize, 1), hover.len);
     const arc_buffer = fixture_gpu.renderer.resources.instance_buffers[1];

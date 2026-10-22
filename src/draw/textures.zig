@@ -11,16 +11,24 @@
 //! pass that samples them. Nothing here touches a GPU, so it is unit tested directly.
 //!
 //! ## 2. Ids and Formats
-//! `TextureId` is the index into this table, `0 .. texture_cap`. Id 0 is the font atlas
-//! (`TextureId.atlas`): `draw.Context.init` creates it before anything else and queues the
-//! upload of `font.atlas_bytes`. `Format.r8` is single-channel coverage (`r8unorm`), and
-//! `Format.rgba8` is straight-alpha color (`rgba8unorm`). Both sample as filterable float, so
-//! one bind group layout and one clamping linear sampler serve every texture.
+//! `TextureId` is the index into this table, `0 .. texture_cap`. Id 0 is the glyph atlas
+//! (`TextureId.atlas`): `draw.Context.init` creates it before anything else, empty, and the
+//! glyph cache (`text/cache.zig`) queues the regions it rasterizes into. `Format.r8` is
+//! single-channel coverage (`r8unorm`), and `Format.rgba8` is straight-alpha color
+//! (`rgba8unorm`). Both sample as filterable float, so one bind group layout and one clamping
+//! linear sampler serve every texture.
 //!
-//! ## 3. Lifetime of Written Bytes
-//! `write` stores a slice, not a copy. The bytes must stay valid and unchanged until the
-//! stream that carries the write has been submitted, which is the next present. App-owned
-//! storage (the app lives for the whole program) and static data both qualify.
+//! ## 3. Lifetime of Written Bytes and Row Strides
+//! `write` and `write_strided` store a slice, not a copy. The bytes must stay valid and
+//! unchanged until the stream that carries the write has been submitted, which is the next
+//! present. App-owned storage (the app lives for the whole program), static data, and the
+//! glyph cache's mirror inside the context all qualify.
+//!
+//! `write` takes tightly packed rows. `write_strided` takes rows `bytes_per_row` apart, so a
+//! sub-rectangle of a larger CPU image uploads in place: `data` starts at the region's first
+//! texel and holds `bytes_per_row * (height - 1) + width * bytes_per_texel` bytes, the exact
+//! length WebGPU's `writeTexture` requires. Neither host needs `bytes_per_row` aligned to
+//! 256: that rule applies to buffer-to-texture copies, not to `queue.writeTexture`.
 //!
 //! ## 4. TigerStyle Invariants
 //! - `texture_cap` bounds the table and `write_cap` bounds the queued writes per stream; both
@@ -31,7 +39,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const commands = @import("../gpu/commands.zig");
 
-/// Textures one app may create, the font atlas included.
+/// Textures one app may create, the glyph atlas included.
 pub const texture_cap: u32 = 32;
 
 /// Writes that may be queued between two recorded streams.
@@ -57,7 +65,7 @@ pub const Region = struct {
     height: u32,
 };
 
-/// One queued upload. `data` holds `region.height` rows of `bytes_per_row` bytes.
+/// One queued upload. Rows of `data` are `bytes_per_row` apart; the last may be short.
 pub const Write = struct {
     id: TextureId,
     region: Region,
@@ -122,6 +130,35 @@ pub const Textures = struct {
         assert(self.write_count <= write_cap);
     }
 
+    /// Queues `data` for `region` of texture `id`, with rows `bytes_per_row` apart. `data`
+    /// starts at the region's first texel; see the module guide, section 3.
+    pub fn write_strided(
+        self: *Textures,
+        id: TextureId,
+        region: Region,
+        bytes_per_row: u32,
+        data: []const u8,
+    ) void {
+        const index = @intFromEnum(id);
+        assert(index < self.count);
+        assert(self.write_count < write_cap);
+        assert(region.width != 0);
+        assert(region.height != 0);
+        assert(region.x + region.width <= self.widths[index]);
+        assert(region.y + region.height <= self.heights[index]);
+        const row_bytes = region.width * bytes_per_texel(self.formats[index]);
+        assert(bytes_per_row >= row_bytes);
+        assert(data.len == bytes_per_row * (region.height - 1) + row_bytes);
+        self.writes[self.write_count] = .{
+            .id = id,
+            .region = region,
+            .bytes_per_row = bytes_per_row,
+            .data = data,
+        };
+        self.write_count += 1;
+        assert(self.write_count <= write_cap);
+    }
+
     /// The format `id` was created with.
     pub fn format_of(self: *const Textures, id: TextureId) Format {
         const index = @intFromEnum(id);
@@ -175,4 +212,17 @@ test "create assigns ids in order and write queues packed rows" {
     try std.testing.expect(textures.exists(badge));
     try std.testing.expect(!textures.exists(@enumFromInt(2)));
     try std.testing.expectEqual(@as(u32, 0), textures.created);
+}
+
+// Locks a strided write: the row stride is kept and the data ends at the last row's width.
+test "write_strided keeps the row stride of a sub-rectangle" {
+    var textures: Textures = undefined;
+    textures.init();
+    const atlas = textures.create(.r8, 16, 8);
+    const image = [_]u8{0} ** (16 * 8);
+    const first = 2 * 16 + 3;
+    const region: Region = .{ .x = 3, .y = 2, .width = 5, .height = 4 };
+    textures.write_strided(atlas, region, 16, image[first..][0 .. 3 * 16 + 5]);
+    try std.testing.expectEqual(@as(u32, 16), textures.writes[0].bytes_per_row);
+    try std.testing.expectEqual(@as(usize, 53), textures.writes[0].data.len);
 }

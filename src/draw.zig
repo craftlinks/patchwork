@@ -29,6 +29,13 @@
 //! - **WebGPU NDC:** `X` in `[-1, +1]` left to right, `Y` in `[-1, +1]` bottom to top (Y-up),
 //!   `Z` in `[0, 1]` near to far.
 //!
+//! `w` and `h` are the device extent in logical pixels, `w = width_px * 120 / scale_120`, not
+//! the integer logical window size. The framebuffer is `width_px = round(width_logical * s)`
+//! device pixels, so with `s = scale_120 / 120` the projection maps logical `x` to device
+//! pixel `x * s` exactly, and a quad whose logical edges are multiples of `1 / s` (snapped
+//! glyphs, `text/layout.zig`) lands on device pixel edges even when the rounding of
+//! `width_px` makes `width_px / width_logical` differ from `s`.
+//!
 //! The linear maps are fixed by the corner constraints `f(0) = -1, f(w) = +1` for X and
 //! `g(0) = +1, g(h) = -1` for Y (the flip), with depth pinned at `z = 0`:
 //! ```text
@@ -41,7 +48,8 @@
 //! col 0: [ 2/w,   0, 0, 0 ]      col 2: [  0, 0, 1, 0 ]
 //! col 1: [   0, -2/h, 0, 0 ]     col 3: [ -1, 1, 0, 1 ]
 //! ```
-//! Worked values: see test "ortho maps the four corners and the center".
+//! Worked values: see tests "ortho maps the four corners and the center" and "ortho maps
+//! logical pixels to device pixels at a fractional scale".
 //!
 //! ## 4. Uniform Size
 //! The frame uniform holds the projection matrix followed by `theme.Theme`; `uniform_bytes`
@@ -69,6 +77,15 @@ const registry = @import("draw/registry.zig");
 const pools = @import("draw/pools.zig");
 const textures_module = @import("draw/textures.zig");
 const types = @import("draw/types.zig");
+
+/// Exclusive-max clip in logical pixels, copied into every instance's `clip`. `x1 > x0` and
+/// `y1 > y0`, all finite.
+pub const Clip = struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+};
 
 pub const DrawType = registry.DrawType;
 pub const Registry = registry.Registry;
@@ -159,13 +176,16 @@ fn same_record(comptime T: type, a: *const T, b: *const T) bool {
     return std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b));
 }
 
-/// Writes the column-major projection from top-left, Y-down logical pixels to WebGPU NDC.
-/// The derivation is in the module guide; `width` and `height` are nonzero logical pixels.
-pub fn ortho_y_down(out: *[16]f32, width: u32, height: u32) void {
-    assert(width != 0);
-    assert(height != 0);
-    const w: f32 = @floatFromInt(width);
-    const h: f32 = @floatFromInt(height);
+/// Writes the column-major projection from top-left, Y-down logical pixels to WebGPU NDC for
+/// a `width_px` by `height_px` framebuffer at `scale_120`. The derivation, including why the
+/// extent comes from the device size, is in the module guide.
+pub fn ortho_y_down(out: *[16]f32, width_px: u32, height_px: u32, scale_120: u32) void {
+    assert(width_px != 0);
+    assert(height_px != 0);
+    assert(scale_120 != 0);
+    const scale = @as(f32, @floatFromInt(scale_120)) / 120;
+    const w = @as(f32, @floatFromInt(width_px)) / scale;
+    const h = @as(f32, @floatFromInt(height_px)) / scale;
     out.* = .{
         2.0 / w, 0.0,      0.0, 0.0,
         0.0,     -2.0 / h, 0.0, 0.0,
@@ -207,7 +227,7 @@ fn project(matrix: [16]f32, x: f32, y: f32) [2]f32 {
 // center maps to the origin.
 test "ortho maps the four corners and the center" {
     var matrix: [16]f32 = undefined;
-    ortho_y_down(&matrix, 200, 100);
+    ortho_y_down(&matrix, 200, 100, 120);
     const top_left = project(matrix, 0, 0);
     const top_right = project(matrix, 200, 0);
     const bottom_left = project(matrix, 0, 100);
@@ -223,6 +243,20 @@ test "ortho maps the four corners and the center" {
     try std.testing.expectApproxEqAbs(@as(f32, -1), bottom_right[1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0), center[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0), center[1], 0.0001);
+}
+
+// Locks the device extent: at scale 1.5 a 1601 px framebuffer (the rounding of 1067.33
+// logical) puts logical x = 2 at device pixel 3 and the right edge at NDC +1, so a quad edge
+// at a multiple of 1 / 1.5 logical pixels lands on a device pixel edge.
+test "ortho maps logical pixels to device pixels at a fractional scale" {
+    var matrix: [16]f32 = undefined;
+    ortho_y_down(&matrix, 1601, 900, 180);
+    const two = project(matrix, 2, 0);
+    const device_x = (two[0] + 1) * 0.5 * 1601;
+    try std.testing.expectApproxEqAbs(@as(f32, 3), device_x, 0.001);
+    const right = project(matrix, 1601.0 / 1.5, 600);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), right[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), right[1], 0.0001);
 }
 
 const Record = extern struct {

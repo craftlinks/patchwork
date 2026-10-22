@@ -69,7 +69,12 @@ patchwork/
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId
 │   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
 │   ├── turtle.zig              # 2D turtle layout engine (place_column, place_row, Walk, Size)
-│   ├── font.zig                # Embedded font atlas, metrics, glyph placement
+│   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
+│   ├── text/ttf.zig            # Comptime TrueType reader: cmap 12/4, hmtx, glyf, composites
+│   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
+│   ├── text/cache.zig          # Glyph cache: hash table, shelf-packed atlas, CPU mirror, budget
+│   ├── text/layout.zig         # UTF-8, alignment, ellipsis, device-pixel snapping
+│   ├── text/fonts/             # Noto Sans Regular and Bold, Noto Sans Mono (SIL OFL, OFL.txt)
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Pointer events and bounded EventQueue
@@ -86,6 +91,7 @@ patchwork/
 │   ├── wl_seat.zig             # Wayland seat and pointer listener
 │   ├── wl_callback.zig         # Wayland frame completion callback
 │   ├── wp_presentation.zig     # Wayland presentation-time feedback listener
+│   ├── wp_fractional_scale.zig # wp_fractional_scale_v1 and wp_viewporter bindings
 │   └── xdg_shell.zig           # XDG shell surface and toplevel protocol
 ├── examples/                   # Example applications
 │   ├── rack/                   # Modular synthesizer rack
@@ -225,7 +231,11 @@ pub const App = struct {
             .rect = none,
             .padding = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 },
             .walk = .{ .margin = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, .width = .fill, .height = .fill, .align_x = 0 },
-            .label = .{ .text = "synth", .rect = none, .r = 1, .g = 1, .b = 1, .a = 1 },
+            .label = .{
+                .text = "synth",
+                .rect = none,
+                .style = .{ .face = .sans_bold, .size = 14, .color = .{ 1, 1, 1, 1 } },
+            },
             .paint = .{ .r = c[0], .g = c[1], .b = c[2], .a = c[3], .radius = 8 },
             .hover = animator.Animator.init(widgets.hover_rate_per_ms),
             .down = animator.Animator.init(widgets.down_rate_per_ms),
@@ -271,7 +281,7 @@ pub const App = struct {
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
         const w: f32 = @floatFromInt(app.scene.width_logical);
         const h: f32 = @floatFromInt(app.scene.height_logical);
-        const clip: patchwork.font.Clip = .{ .x0 = 0, .y0 = 0, .x1 = w, .y1 = h };
+        const clip: patchwork.draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = w, .y1 = h };
         app.scene.widgets[0].panel.draw(cx, clip);
         app.scene.widgets[1].knob.draw(cx, clip);
         app.scene.finish_draw();
@@ -312,8 +322,9 @@ widgets skip it and `draw.Context.append` rejects it to protect the GPU from deg
 
 Layout executes in two bounded passes with zero heap allocation, bounded by `turtle.child_cap`.
 Window resize sets `Frame.relayout`, rebuilding the draw pools. A display scale change leaves
-`Frame.relayout` false, presenting the new physical framebuffer without re-walking the column
-or bumping pool revisions.
+`Frame.relayout` false: the column is not re-walked. The hosts still redraw the scene once,
+because glyphs are rasterized and snapped at the device scale, and only the glyph records
+change (see Text below).
 
 ## Example Applications
 
@@ -322,8 +333,12 @@ here, so they cannot drift. Run `zig build test` for the checked numbers.
 
 ### 1. Synthesizer Rack (`examples/rack/app.zig`)
 
-A modular rack in a full-window column: a stack of panels, each holding a row of knobs and a
-level meter. It demonstrates:
+A modular rack in a full-window column under a header bar: a stack of panels, each holding a
+row of knobs and a level meter. It demonstrates:
+- **Text.** The header shows a 32 px monospace "121.00" and a bold "BPM" sharing one baseline
+  (`text.place_runs`) and the label "Jürgen Köhler · Café" (composite and non-ASCII glyphs),
+  right-aligned and cut with an ellipsis when the bar is narrow. Panel titles are bold 14 px,
+  and knob values are monospace (`widgets.value_style`).
 - **Flat widget list.** One `Scene` array holds panels, knobs, and meters. Hit testing scans
   back to front and later slots win, so a knob or meter wins over its backing panel without
   nested containers. The slot and per-pool budgets are `comptime` asserts in `app.zig`.
@@ -383,9 +398,11 @@ Renderer.setup  (once, after device creation)
   layout_create  buffer_create  sampler_create  bind_group_create (frame)
   per draw type: shader_create (labelled with the type)  buffer_create  pipeline_create
   buffer_write (unit quad)  per queued texture: texture_create  bind_group_create
-  texture_write* (the atlas, then the app's images)
+  texture_write* (the app's images; the glyph atlas starts empty)
 Renderer.frame  (every presented frame)
-  buffer_write (uniform, if the size changed)  queued texture ops  buffer_write* (pools)
+  buffer_write (uniform, if the device size or scale changed)
+  queued texture ops (the glyph cache's dirty atlas rectangle, one strided texture_write)
+  buffer_write* (pools)
   pass_begin  bind_group_set 0  vertex_buffer_set 0
   per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
   pass_end_present
@@ -399,19 +416,22 @@ time as `commands.table_json`. The wasm module exports it, so `shell.js` decodes
 name and cannot drift from the Zig layouts. Load the page with `?trace=1` to log the op names
 of every submitted stream.
 
-The renderer keeps a shadow of each pool's last upload. The uniform is written only when the
-logical size changes. A pool whose revision moved is compared record by record with its
-shadow, and only the changed range is written. A scale-only frame writes nothing, an identical
-rebuild writes nothing, and a hover writes the changed arc records only. Pipeline, vertex
+The renderer keeps a shadow of each pool's last upload. The uniform (projection from the device
+size and scale, see `draw.ortho_y_down`) is written only when those change. A pool whose
+revision moved is compared record by record with its shadow, and only the changed range is
+written. A frame the host did not draw writes nothing, an identical rebuild writes nothing, a
+hover writes the changed arc records only, and a scale change writes the uniform, the new atlas
+rectangle, and the glyph range, but no box or arc record. Pipeline, vertex
 buffer, and texture bind group sets are skipped when the previous batch already set them. The
 exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack frames record
-the step 12 op sequences" in `examples/rack/app.zig`.
+the step 13 op sequences" in `examples/rack/app.zig`.
 
 ## Draw Types, Layers, and Batches
 
 A draw type is an `extern struct` plus a WGSL `fn pixel(px: Pixel) -> vec4<f32>`. The app
 lists its types and pool capacities in `config.draw`; the library provides `draw.Box` (fill,
-border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (atlas text), and
+border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
+`text.place`), and
 `draw.Image` (an `rgba8` texture), and an app adds its own (the rack's `Led`).
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
@@ -433,8 +453,9 @@ border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (atlas text),
   run is one draw call. Layers draw in order; within a layer, batches draw in order of first
   appearance. Box, glyph, box, glyph in one layer is two draw calls, not four.
 - **Textures.** `textures.create(.r8 | .rgba8, width, height)` returns a `TextureId` and
-  `textures.write(id, region, bytes)` queues pixels; both are recorded into the next stream,
-  each texture with its own bind group. The font atlas is texture 0.
+  `textures.write(id, region, bytes)` queues pixels (`write_strided` takes a row stride, for a
+  sub-rectangle of a larger image); both are recorded into the next stream, each texture with
+  its own bind group. The glyph atlas is texture 0.
 - **Clip mask.** Shaders evaluate an analytic hard clip mask instead of scissor state:
 
 ```text
@@ -452,8 +473,44 @@ Colors live in instances and in the theme's lighten, darken, and arc slots, neve
 literals.
 
 Memory: each pool holds `cap` records plus a renderer shadow of the same size, and one scratch
-buffer of the largest pool backs the counting sort. The hosts keep the context and renderer in
-static memory (BSS on wasm), so the linker sizes the wasm initial memory to cover them.
+buffer of the largest pool backs the counting sort. The context also holds the glyph cache
+(about 1.25 MiB: the 1 MiB atlas mirror, the table, and raster scratch). The hosts keep the
+context and renderer in static memory (BSS on wasm), so the linker sizes the wasm initial
+memory to cover them.
+
+## Text
+
+`patchwork.text` draws three embedded faces: `.sans` (Noto Sans Regular), `.sans_bold` (Noto
+Sans Bold), and `.mono` (Noto Sans Mono Regular), all SIL OFL 1.1 (`src/text/fonts/OFL.txt`).
+Both targets `@embedFile` them, so the browser fetches no font files and a project using
+`addApp` gets them with the library. The TrueType tables are parsed at compile time.
+
+```zig
+const style: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 } };
+const width = text.measure(style, "0.50");                    // logical px, pure
+const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
+text.place(cx, style, "0.50", rect, clip, options);
+text.place_runs(cx, &runs, rect, clip, options);              // one baseline for mixed styles
+```
+
+- **UTF-8** with U+FFFD for each invalid byte; at most `text.byte_cap` (4096) bytes per call.
+  A codepoint a face does not map draws its `.notdef` box. No kerning, shaping, ligatures,
+  right-to-left, colour fonts, fallback chains, hinting, or subpixel antialiasing.
+- **Rasterized on demand at device size.** The draw context's glyph cache rasterizes each
+  (face, glyph, size in quarter device pixels) the first time a frame draws it, with exact
+  signed-area coverage, into a 1024 by 1024 `r8` atlas (texture 0), and uploads the new region
+  as one strided `texture_write` per frame. Glyph origins snap to the device pixel grid and
+  UVs sit on exact texel edges, so text is crisp at every scale, fractional ones included.
+- **Bounded frames.** At most `text.cache.budget` (256) new glyphs are rasterized per frame;
+  the rest are skipped and the host draws again on the next frame. A full atlas resets at the
+  start of the next frame; a frame that starts on an empty atlas and still overflows counts
+  the overflow instead of resetting again. A settled frame calls no draw, rasterizes nothing,
+  and writes nothing.
+- **Hosts draw when the cache owes it:** `App.draw` runs when `app.dirty()` or
+  `context.text.owes_draw(scale_120)` (the scale changed, or glyphs are pending).
+
+Module guides in `src/text.zig` and `src/text/*.zig` hold the algebra; the tests hold the
+worked numbers (the rasterizer is checked against a polygon-clipping reference).
 
 ## Platform Hosts
 
@@ -478,6 +535,12 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   when the surface offers it. The rationale, the Mesa/compositor behavior behind it, and the
   conditions for removing the workaround are in `src/host/linux_window.zig`,
   `src/host/gpu_wgpu.zig`, and `src/host/wp_presentation.zig`.
+- Display scale: with both `wp_fractional_scale_manager_v1` and `wp_viewporter` the host is
+  in fractional mode. `preferred_scale` arrives in 1/120 units (`Frame.scale_120`), the
+  buffer is `round(logical * scale_120 / 120)` device pixels, the buffer scale stays 1, and
+  `wp_viewport.set_destination` maps it onto the logical surface size. Without them the
+  integer `wl_surface.preferred_buffer_scale` is used (`scale_120 = factor * 120`). The active
+  mode is logged once at startup. Pointer coordinates are logical in both modes.
 - GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
   stream. The device's uncaptured-error callback is installed, so a validation error fails the
   frame with the op index, the op name (with the draw type's label for a shader), and the
@@ -492,11 +555,15 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   is set. When non-zero, it runs a `setInterval` calling `wasm.timer(now_ms)`. If `timer` returns
   1, `shell.js` schedules a single `requestAnimationFrame`.
 - When rAF runs, `wasm.tick(now_ms)` advances continuous animators and presents dirty frames.
-  `wasm.tick()` returns 1 only while an interactive animator is moving (`App.live()`). Once
-  hover/down animators settle, `tick()` returns 0 and rAF stops. A resting pointer does not
-  chain animation frames.
-- Pointer coordinates from DOM events are scaled by `window.devicePixelRatio` before calling
-  `wasm.pointer_move`, `pointer_down`, `pointer_up`, and `pointer_wheel`.
+  `wasm.tick()` returns 1 while an interactive animator is moving (`App.live()`) or a redraw
+  is still owed (glyphs the cache skipped). Once hover/down animators settle, `tick()` returns
+  0 and rAF stops. A resting pointer does not chain animation frames.
+- CSS pixels are logical pixels. `fit_canvas` calls `wasm.resize(css_width, css_height,
+  round(devicePixelRatio * 120))`, then sizes the canvas backing store from `wasm.width_px()`
+  and `wasm.height_px()`, so the device size has one source of truth (`Frame`). A
+  `matchMedia` resolution query re-fits the canvas when the ratio changes. Pointer
+  coordinates and wheel deltas reach `wasm.pointer_*` in CSS pixels, unscaled, so the layout
+  is the same logical size at every device pixel ratio.
 - `start()` submits the renderer's setup stream; `shell.js` runs each setup op in a
   `pushErrorScope("validation")` and reports a failure with its op index and name.
 - `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.

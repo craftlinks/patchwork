@@ -13,12 +13,17 @@
 //! - Logical pixels (`width_logical`, `height_logical`) are the space of UI layout and app
 //!   logic.
 //! - Physical pixels (`width_px`, `height_px`) are the GPU framebuffer size:
-//!   `size_px = min(size_logical * scale, edge_max)`.
-//! - `scale` is an integer multiplier from the display server.
+//!   `size_px = min(round(size_logical * scale_120 / 120), edge_max)`, rounding half up in
+//!   integers as `(size_logical * scale_120 + 60) / 120`, the rounding
+//!   `wp_fractional_scale_v1` prescribes.
+//! - `scale_120` is the display scale in 1/120 units, the unit of `wp_fractional_scale_v1`:
+//!   120 is 1.0, 150 is 1.25, 180 is 1.5. Integer scales arrive as `factor * 120`, and the
+//!   browser sends `round(devicePixelRatio * 120)`.
 //!
 //! Out-of-range input is bounded instead of rejected, except a zero scale. A zero configure
 //! size selects `width_default` and `height_default`, configure sizes clamp to `edge_max`,
-//! and scale clamps to `scale_max`. A zero scale returns `ScaleError.ScaleZero`.
+//! and `scale_120` clamps to `[scale_120_min, scale_120_max]`. A zero scale returns
+//! `ScaleError.ScaleZero`.
 //! Tests: "a zero configure is replaced by the default size", "scale zero is rejected",
 //! "oversized inputs are clamped".
 //!
@@ -26,9 +31,10 @@
 //! Presenting costs power, so an idle app must present nothing. `Frame` separates
 //! `redraw` (the framebuffer must be presented) from `relayout` (logical bounds changed and
 //! `App.layout` must run). A scale change alters only the framebuffer size, so it sets
-//! `redraw` and never `relayout`: logical geometry is unchanged and rebuilding the instance
-//! list would be wasted work. A pointer-driven `request_redraw` likewise leaves `relayout`
-//! alone.
+//! `redraw` and never `relayout`: logical geometry is unchanged. The hosts still redraw the
+//! scene on that present, because glyphs are rasterized and snapped at the device scale
+//! (`text/cache.zig`, `Cache.owes_draw`); only the glyph records change. A pointer-driven
+//! `request_redraw` likewise leaves `relayout` alone.
 //!
 //! ```text
 //! Event                       redraw   relayout
@@ -100,8 +106,14 @@ pub const height_default: u32 = 720;
 /// driver texture limits against absurd compositor requests.
 pub const edge_max: u32 = 16384;
 
-/// Upper bound on the integer display scale. Clamps abnormal scale events.
-pub const scale_max: u32 = 16;
+/// Upper bound on `scale_120`: 16.0, the old integer bound. It covers every compositor scale
+/// and browser zoom on a high-density display (a device pixel ratio of 10 at 500% zoom over
+/// 2.0), and keeps `text.size_key` within the cache key for every `text.size_max`.
+pub const scale_120_max: u32 = 16 * 120;
+
+/// Lower bound on `scale_120`: 0.25, a browser zoomed out to 25% on a 1.0 display. Smaller
+/// values come only from broken input and would rasterize text below a pixel.
+pub const scale_120_min: u32 = 30;
 
 /// Starting refresh period estimate, in nanoseconds, before any callback gap is measured.
 pub const refresh_ns_initial: u64 = 16_666_667;
@@ -153,11 +165,11 @@ pub const Frame = struct {
     width_logical: u32,
     /// Window height in UI logical pixels. Zero until the first configure.
     height_logical: u32,
-    /// Integer display scale, in `[1, scale_max]`.
-    scale: u32,
-    /// Framebuffer width in device pixels: `min(width_logical * scale, edge_max)`.
+    /// Display scale in 1/120 units, in `[scale_120_min, scale_120_max]`.
+    scale_120: u32,
+    /// Framebuffer width in device pixels; see the module guide, section 2.
     width_px: u32,
-    /// Framebuffer height in device pixels: `min(height_logical * scale, edge_max)`.
+    /// Framebuffer height in device pixels; see the module guide, section 2.
     height_px: u32,
 
     /// Returned by `apply_scale` for a zero scale, which no display server should send.
@@ -171,7 +183,7 @@ pub const Frame = struct {
             .relayout = true,
             .width_logical = 0,
             .height_logical = 0,
-            .scale = 1,
+            .scale_120 = 120,
             .width_px = 0,
             .height_px = 0,
         };
@@ -206,33 +218,34 @@ pub const Frame = struct {
         assert(self.relayout);
     }
 
-    /// Updates the integer display scale, clamped to `scale_max`. A zero scale is rejected.
-    /// A changed scale after the first configure recomputes the physical size and sets
-    /// `redraw` so the framebuffer is resized. Before the first configure only `scale` is
-    /// stored. `relayout` is never touched because logical geometry does not change.
-    pub fn apply_scale(self: *Frame, scale: u32) ScaleError!void {
+    /// Updates the display scale (1/120 units), clamped to `[scale_120_min, scale_120_max]`.
+    /// A zero scale is rejected. A changed scale after the first configure recomputes the
+    /// physical size and sets `redraw` so the framebuffer is resized. Before the first
+    /// configure only `scale_120` is stored. `relayout` is never touched because logical
+    /// geometry does not change.
+    pub fn apply_scale(self: *Frame, scale_120: u32) ScaleError!void {
         assert(self.running);
-        if (scale == 0) {
+        if (scale_120 == 0) {
             return error.ScaleZero;
         }
-        const clamped = if (scale > scale_max) scale_max else scale;
-        if (clamped == self.scale) {
-            assert(self.scale >= 1);
+        const clamped = std.math.clamp(scale_120, scale_120_min, scale_120_max);
+        if (clamped == self.scale_120) {
+            assert(self.scale_120 >= scale_120_min);
             return;
         }
-        self.scale = clamped;
+        self.scale_120 = clamped;
         if (self.width_logical == 0) {
             assert(self.height_logical == 0);
             return;
         }
         self.refresh_pixels();
         self.redraw = true;
-        assert(self.scale >= 1);
+        assert(self.scale_120 >= scale_120_min);
         assert(self.width_px != 0);
     }
 
     /// Clears `relayout` once the app has laid out for the current logical size.
-    /// Asserts `relayout` was set, so a scale-only present cannot call it.
+    /// Asserts `relayout` was set, so a present after a scale change alone cannot call it.
     pub fn mark_laid_out(self: *Frame) void {
         assert(self.running);
         assert(self.relayout);
@@ -268,10 +281,10 @@ pub const Frame = struct {
 
     /// Recomputes the physical size from the logical size and scale.
     fn refresh_pixels(self: *Frame) void {
-        assert(self.scale >= 1);
+        assert(self.scale_120 >= scale_120_min);
         assert(self.width_logical != 0);
-        self.width_px = pixel_size(self.width_logical, self.scale);
-        self.height_px = pixel_size(self.height_logical, self.scale);
+        self.width_px = pixel_size(self.width_logical, self.scale_120);
+        self.height_px = pixel_size(self.height_logical, self.scale_120);
         assert(self.width_px >= 1);
         assert(self.height_px >= 1);
     }
@@ -307,15 +320,16 @@ fn clamp_edge(edge: u32) u32 {
     return edge;
 }
 
-/// Multiplies in `u64` so the product cannot overflow, then clamps to `edge_max`.
-fn pixel_size(logical: u32, scale: u32) u32 {
+/// `round(logical * scale_120 / 120)` in `u64` so the product cannot overflow, then clamps
+/// to `edge_max`. Rounds half up, as `wp_fractional_scale_v1` prescribes for buffer sizes.
+pub fn pixel_size(logical: u32, scale_120: u32) u32 {
     assert(logical != 0);
-    assert(scale >= 1);
-    const product: u64 = @as(u64, logical) * @as(u64, scale);
-    if (product > edge_max) {
+    assert(scale_120 >= scale_120_min);
+    const rounded: u64 = (@as(u64, logical) * @as(u64, scale_120) + 60) / 120;
+    if (rounded > edge_max) {
         return edge_max;
     }
-    const pixels: u32 = @intCast(product);
+    const pixels: u32 = @intCast(rounded);
     assert(pixels >= 1);
     return pixels;
 }
@@ -416,6 +430,9 @@ pub fn anchor_is_fresh(anchor_ns: u64, now_ns: u64) bool {
 }
 
 comptime {
+    assert(scale_120_min < 120);
+    assert(scale_120_max > 120);
+    assert(@as(u64, edge_max) * scale_120_max + 60 < std.math.maxInt(u32));
     assert(refresh_ns_initial >= refresh_ns_min);
     assert(refresh_ns_initial <= refresh_ns_max);
     assert(refresh_ns_initial == 16_666_667);
@@ -471,9 +488,21 @@ test "a new scale dirties the frame" {
     var frame = Frame.init();
     frame.apply_configure(800, 600);
     frame.mark_presented();
-    try frame.apply_scale(2);
+    try frame.apply_scale(240);
     try std.testing.expect(frame.redraw);
     try std.testing.expectEqual(@as(u32, 1600), frame.width_px);
+}
+
+// Locks the fractional size rule: 1280 logical at 1.25 is 1600 device pixels, and an odd
+// 1281 at 1.5 rounds 1921.5 half up to 1922.
+test "1280 logical at scale_120 150 is 1600 device pixels" {
+    var frame = Frame.init();
+    frame.apply_configure(1280, 720);
+    try frame.apply_scale(150);
+    try std.testing.expectEqual(@as(u32, 1600), frame.width_px);
+    try std.testing.expectEqual(@as(u32, 900), frame.height_px);
+    try std.testing.expectEqual(@as(u32, 1922), pixel_size(1281, 180));
+    try std.testing.expectEqual(@as(u32, 1281), pixel_size(1281, 120));
 }
 
 // Locks the changed-configure row of the flag matrix for both flags.
@@ -493,7 +522,7 @@ test "a scale change does not request layout" {
     frame.apply_configure(800, 600);
     frame.mark_laid_out();
     frame.mark_presented();
-    try frame.apply_scale(2);
+    try frame.apply_scale(240);
     try std.testing.expect(frame.redraw);
     try std.testing.expect(!frame.relayout);
 }
@@ -542,7 +571,7 @@ test "a zero configure is replaced by the default size" {
 test "scale zero is rejected" {
     var frame = Frame.init();
     try std.testing.expectError(error.ScaleZero, frame.apply_scale(0));
-    try std.testing.expectEqual(@as(u32, 1), frame.scale);
+    try std.testing.expectEqual(@as(u32, 120), frame.scale_120);
 }
 
 // Locks snapping: callback jitter around a known rate keeps that rate, because adopting a
@@ -625,18 +654,20 @@ test "anchor_is_fresh bounds the projection age" {
 }
 
 // Locks the bounding rules: oversized configure sizes clamp to `edge_max`, physical size clamps
-// to `edge_max` after scaling, and scale clamps to `scale_max`.
+// to `edge_max` after scaling, and the scale clamps to `[scale_120_min, scale_120_max]`.
 test "oversized inputs are clamped" {
     var frame = Frame.init();
     frame.apply_configure(edge_max + 1, edge_max * 2);
     try std.testing.expectEqual(edge_max, frame.width_logical);
     try std.testing.expectEqual(edge_max, frame.height_logical);
     frame.apply_configure(edge_max / 2 + 1, 100);
-    try frame.apply_scale(scale_max + 1);
-    try std.testing.expectEqual(scale_max, frame.scale);
-    // 100 * scale_max is within `edge_max`, but the width product exceeds it.
+    try frame.apply_scale(scale_120_max + 1);
+    try std.testing.expectEqual(scale_120_max, frame.scale_120);
+    // 100 at 16.0 is within `edge_max`, but the width product exceeds it.
     try std.testing.expectEqual(edge_max, frame.width_px);
-    try std.testing.expectEqual(@as(u32, 100) * scale_max, frame.height_px);
+    try std.testing.expectEqual(@as(u32, 1600), frame.height_px);
+    try frame.apply_scale(1);
+    try std.testing.expectEqual(scale_120_min, frame.scale_120);
 }
 
 // Locks that a scale applied before the first configure is stored without dirtying, so the
@@ -644,9 +675,9 @@ test "oversized inputs are clamped" {
 test "scale before the first configure is stored without a redraw" {
     var frame = Frame.init();
     frame.mark_presented();
-    try frame.apply_scale(2);
+    try frame.apply_scale(240);
     try std.testing.expect(!frame.redraw);
-    try std.testing.expectEqual(@as(u32, 2), frame.scale);
+    try std.testing.expectEqual(@as(u32, 240), frame.scale_120);
     frame.apply_configure(800, 600);
     try std.testing.expectEqual(@as(u32, 1600), frame.width_px);
 }

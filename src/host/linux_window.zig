@@ -26,10 +26,17 @@
 //!
 //! ## 2. Coordinate Spaces
 //! - UI logical pixels: origin at the top-left, +X right, +Y down. Pointer coordinates and
-//!   layout use this frame. Wayland surface coordinates are independent of
-//!   `wl_surface.set_buffer_scale`, so no scale conversion is applied to input.
-//! - Physical device pixels: `width_px = width_logical * scale`, and likewise for height.
-//!   Only the swapchain and the present header use them.
+//!   layout use this frame. Wayland surface coordinates are independent of the buffer scale
+//!   and of the viewport, so no scale conversion is applied to input.
+//! - Physical device pixels: `width_px = round(width_logical * scale_120 / 120)`, and likewise
+//!   for height (`frame.pixel_size`). Only the swapchain and the present header use them.
+//! - Scale source, chosen once in `create_toplevel` and logged: when the compositor offers
+//!   both `wp_fractional_scale_manager_v1` and `wp_viewporter` the host is in fractional
+//!   mode: `preferred_scale` (1/120 units) drives `frame.apply_scale`, the buffer scale stays
+//!   1, and `wp_viewport.set_destination(logical size)` is sent whenever the logical size
+//!   changed (`apply_surface_scale`, before each commit). Otherwise the integer
+//!   `wl_surface.preferred_buffer_scale` arrives as `factor * 120` and is set with
+//!   `wl_surface.set_buffer_scale`. See `wp_fractional_scale.zig`.
 //! - `wl_pointer` coordinates arrive as signed 24.8 fixed point and are converted by
 //!   `input.fixed_to_logical` (test "fixed_to_logical converts 24.8" in `input.zig`).
 //!
@@ -49,6 +56,10 @@
 //! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_clock`,
 //! `present_if_dirty`, `wait_for_events`. Callbacks only write `State`; all app calls happen
 //! in this order on the main thread.
+//! - Draw rule (`prepare_app`): `App.draw` runs when `app.dirty()` or when the glyph cache
+//!   owes a draw (`Cache.owes_draw`: the scale moved since the last draw, or glyphs were
+//!   skipped for the per-frame budget or a full atlas). After the commit, a cache that still
+//!   owes a draw requests another redraw, which the next `done` schedules.
 //! - `ack_if_needed`: answers a pending `xdg_surface.configure` with `ack_configure` and
 //!   applies the pending size through `frame.apply_configure`. A configure carries no size
 //!   guarantee, so a zero dimension is replaced by `Frame`.
@@ -104,6 +115,7 @@ const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
 const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
+const wp_fractional_scale = @import("wp_fractional_scale.zig");
 const wp_presentation = @import("wp_presentation.zig");
 const xdg = @import("xdg_shell.zig");
 
@@ -193,6 +205,14 @@ pub const State = struct {
     seat: ?*wl_seat.WlSeat,
     /// Active Wayland pointer proxy (`wl_pointer` version 1) instantiated from `seat`.
     pointer_proxy: ?*wl_seat.WlPointer,
+    /// Bound `wp_viewporter` and `wp_fractional_scale_manager_v1` globals; null when absent.
+    viewporter: ?*wp_fractional_scale.Viewporter,
+    fractional_manager: ?*wp_fractional_scale.FractionalScaleManager,
+    /// The surface's viewport; non-null exactly in fractional mode.
+    viewport: ?*wp_fractional_scale.Viewport,
+    /// Logical size last sent with `wp_viewport.set_destination`; 0 before the first.
+    destination_width: u32,
+    destination_height: u32,
     configure_serial: u32,
     ack_pending: bool,
     pending_width: u32,
@@ -360,6 +380,10 @@ const presentation_listener: wp_presentation.PresentationListener = .{
     .clock_id = presentation_clock_id,
 };
 
+const fractional_listener: wp_fractional_scale.FractionalScaleListener = .{
+    .preferred_scale = fractional_preferred_scale,
+};
+
 const feedback_listener: wp_presentation.FeedbackListener = .{
     .sync_output = feedback_sync_output,
     .presented = feedback_presented,
@@ -378,6 +402,7 @@ comptime {
     // link `wayland-client`.
     xdg.assert_interface_tables();
     wp_presentation.assert_interface_tables();
+    wp_fractional_scale.assert_interface_tables();
 }
 
 /// Orchestrates the entire Wayland application lifecycle for one app type:
@@ -425,6 +450,11 @@ pub fn run(comptime App: type) !void {
         .feedback_in_flight = 0,
         .seat = null,
         .pointer_proxy = null,
+        .viewporter = null,
+        .fractional_manager = null,
+        .viewport = null,
+        .destination_width = 0,
+        .destination_height = 0,
         .configure_serial = 0,
         .ack_pending = false,
         .pending_width = 0,
@@ -499,10 +529,15 @@ fn Host(comptime App: type) type {
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,
                 .height_px = state.frame.height_px,
+                .scale_120 = state.frame.scale_120,
             });
             try gpu.submit(&state.gpu, &state.commands);
             state.frame.mark_presented();
             assert(!state.frame.redraw);
+            // Glyphs skipped for the budget or a full atlas finish on the next frame.
+            if (context.text.owes_draw(state.frame.scale_120)) {
+                state.frame.request_redraw();
+            }
         }
 
         /// Blocking loop. Callbacks only write the queue and the frame-done flag.
@@ -572,8 +607,8 @@ fn Host(comptime App: type) type {
         /// late-latch deadline has arrived. A callback already in flight, or a deadline
         /// still in the future, leaves `redraw` set so pointer motion during the wait
         /// is in the queue when the commit runs. Layout and the instance rebuild run
-        /// only on that commit. A scale-only present uploads nothing. Every commit
-        /// arms `wl_surface.frame`.
+        /// only on that commit; a scale change rebuilds only the glyph records (module
+        /// guide, section 4). Every commit arms `wl_surface.frame`.
         fn present_if_dirty(self: *Self) !void {
             const state = self.state;
             if (!state.frame.redraw) {
@@ -598,7 +633,7 @@ fn Host(comptime App: type) type {
             }
             state.present_at_ns = 0;
             self.prepare_app();
-            set_buffer_scale(state);
+            apply_surface_scale(state);
             // Both requests attach to the next commit, and `gpu.submit` is that commit.
             arm_frame(state);
             arm_feedback(state);
@@ -608,7 +643,8 @@ fn Host(comptime App: type) type {
 
         /// Prepares app layout and draw pools before presentation.
         /// Runs layout if `relayout` is set, and resets and repopulates the draw context if
-        /// the app reports `dirty`. `draw` must leave the app clean.
+        /// the app reports `dirty` or the glyph cache owes a draw (module guide, section 4).
+        /// `draw` must leave the app clean.
         fn prepare_app(self: *Self) void {
             const state = self.state;
             if (state.frame.relayout) {
@@ -616,11 +652,14 @@ fn Host(comptime App: type) type {
                 state.frame.mark_laid_out();
             }
             assert(!state.frame.relayout);
-            if (self.app.dirty()) {
+            const scale_120 = state.frame.scale_120;
+            if (self.app.dirty() or context.text.owes_draw(scale_120)) {
+                context.text.scale_120 = scale_120;
                 context.reset();
                 self.app.draw(&context);
             }
             assert(!self.app.dirty());
+            assert(context.text.drawn_scale_120 == scale_120);
         }
 
         /// Blocks until the compositor writes, the app timer fires, or the latched
@@ -764,9 +803,27 @@ fn create_toplevel(state: *State, title: [:0]const u8) !void {
     xdg.add_toplevel_listener(toplevel, &toplevel_listener, state);
     xdg.set_title(toplevel, title.ptr);
     xdg.set_app_id(toplevel, "patchwork");
+    choose_scale_mode(state, surface);
     commit_surface(surface);
     assert(state.surface != null);
     assert(state.toplevel != null);
+}
+
+/// Enters fractional mode when both `wp_fractional_scale_manager_v1` and `wp_viewporter` are
+/// bound, else stays on the integer `preferred_buffer_scale`; logs the mode once.
+fn choose_scale_mode(state: *State, surface: *WlSurface) void {
+    assert(state.viewport == null);
+    const manager = state.fractional_manager orelse return log_integer_mode();
+    const viewporter = state.viewporter orelse return log_integer_mode();
+    state.viewport = wp_fractional_scale.get_viewport(viewporter, surface);
+    const fractional = wp_fractional_scale.get_fractional_scale(manager, surface);
+    wp_fractional_scale.add_fractional_listener(fractional, &fractional_listener, state);
+    std.log.info("scale: fractional (wp_fractional_scale_v1 and wp_viewporter)", .{});
+    assert(state.viewport != null);
+}
+
+fn log_integer_mode() void {
+    std.log.info("scale: integer (wl_surface.preferred_buffer_scale)", .{});
 }
 
 /// Initializes the hardware WebGPU device. `Host.setup` then records the renderer's setup
@@ -839,12 +896,30 @@ fn arm_feedback(state: *State) void {
     assert(state.feedback_in_flight <= feedback_in_flight_max);
 }
 
-/// Informs the compositor of our buffer scale factor (HiDPI scaling).
+/// Tells the compositor how the next buffer maps onto the surface (module guide, section 2):
+/// the viewport destination in fractional mode, the integer buffer scale otherwise.
+fn apply_surface_scale(state: *State) void {
+    if (state.viewport) |viewport| {
+        const width = state.frame.width_logical;
+        const height = state.frame.height_logical;
+        assert(width != 0);
+        if (width != state.destination_width or height != state.destination_height) {
+            wp_fractional_scale.set_destination(viewport, width, height);
+            state.destination_width = width;
+            state.destination_height = height;
+        }
+        return;
+    }
+    set_buffer_scale(state);
+}
+
+/// Informs the compositor of our integer buffer scale factor (HiDPI fallback mode).
 fn set_buffer_scale(state: *State) void {
     const surface = state.surface orelse return;
-    const scale = state.frame.scale;
+    assert(state.viewport == null);
+    assert(state.frame.scale_120 % 120 == 0);
+    const scale = state.frame.scale_120 / 120;
     assert(scale >= 1);
-    assert(scale <= frame.scale_max);
     const proxy: *WlProxy = @ptrCast(surface);
     const version = wl_proxy_get_version(proxy);
     if (version < 3) {
@@ -1109,6 +1184,9 @@ fn registry_global(
         assert(state.presentation != null);
         return;
     }
+    if (bind_scale_global(state, live_registry, name, iface)) {
+        return;
+    }
     if (std.mem.eql(u8, iface, "wl_seat")) {
         if (state.seat != null) {
             return;
@@ -1127,6 +1205,38 @@ fn registry_global(
         state.seat = seat;
         assert(state.seat != null);
     }
+}
+
+/// Binds `wp_viewporter` or `wp_fractional_scale_manager_v1` (version 1) when `iface` names
+/// one that is not bound yet. True when `iface` was one of them.
+fn bind_scale_global(state: *State, registry: *Registry, name: u32, iface: []const u8) bool {
+    if (std.mem.eql(u8, iface, "wp_viewporter")) {
+        if (state.viewporter == null) {
+            const bound = bind_global(
+                registry,
+                name,
+                &wp_fractional_scale.wp_viewporter_interface,
+                wp_fractional_scale.version,
+            );
+            state.viewporter = @ptrCast(bound);
+        }
+        assert(state.viewporter != null);
+        return true;
+    }
+    if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
+        if (state.fractional_manager == null) {
+            const bound = bind_global(
+                registry,
+                name,
+                &wp_fractional_scale.wp_fractional_scale_manager_interface,
+                wp_fractional_scale.version,
+            );
+            state.fractional_manager = @ptrCast(bound);
+        }
+        assert(state.fractional_manager != null);
+        return true;
+    }
+    return false;
 }
 
 fn registry_global_remove(data: ?*anyopaque, registry: ?*Registry, name: u32) callconv(.c) void {
@@ -1152,10 +1262,32 @@ fn surface_preferred_scale(data: ?*anyopaque, surface: ?*WlSurface, factor: i32)
     _ = surface;
     assert(data != null);
     const state: *State = @ptrCast(@alignCast(data.?));
+    if (state.viewport != null) {
+        // Fractional mode: `preferred_scale` is the source of truth (module guide, 2).
+        return;
+    }
     if (factor <= 0) {
         return;
     }
-    state.frame.apply_scale(@intCast(factor)) catch return;
+    if (factor > frame.scale_120_max / 120) {
+        state.frame.apply_scale(frame.scale_120_max) catch unreachable;
+        return;
+    }
+    const scale_120: u32 = @as(u32, @intCast(factor)) * 120;
+    state.frame.apply_scale(scale_120) catch unreachable;
+}
+
+/// `wp_fractional_scale_v1.preferred_scale`: the scale in 1/120 units.
+fn fractional_preferred_scale(
+    data: ?*anyopaque,
+    fractional: ?*wp_fractional_scale.FractionalScale,
+    scale_120: u32,
+) callconv(.c) void {
+    _ = fractional;
+    assert(data != null);
+    const state: *State = @ptrCast(@alignCast(data.?));
+    assert(state.viewport != null);
+    state.frame.apply_scale(scale_120) catch return;
 }
 
 fn surface_preferred_transform(

@@ -38,19 +38,23 @@
 // There is no unconditional `requestAnimationFrame` loop; an idle UI should not burn power.
 // - Every Wasm entry point that can dirty the frame returns a flag, and `schedule()` runs
 //   only when it is 1.
-// - `tick` (the rAF callback) returns 1 only while an animator is live, so the rAF chain
-//   ends when the scene settles and is restarted by input or the app timer.
+// - `tick` (the rAF callback) returns 1 while an animator is live or a redraw is still owed
+//   (the glyph cache finishes skipped glyphs on the next frame), so the rAF chain ends when
+//   the scene settles and is restarted by input or the app timer.
 // - `arm_timer` creates one permanent interval only when `wasm.timer_period_ms()` is
 //   nonzero. The timer requests a frame when the app reports a change; it never steps
 //   animators.
 //
 // ## 6. Pointer and DPI Handling
-// `resize` receives physical canvas pixels (CSS size times `devicePixelRatio`), so pointer
-// positions, which the DOM reports in CSS pixels, are multiplied by the same ratio before
-// crossing into Wasm. Pointer capture keeps a drag that leaves the canvas deliverable;
-// `pointerleave` and `pointercancel` call `wasm.pointer_leave()` so the scene can release
-// any press in progress. Wheel deltas in line mode are converted to pixels before scaling.
-// `pass_begin` asserts that the recorded size equals the canvas backing size.
+// CSS pixels are the app's logical pixels. `fit_canvas` passes the canvas's CSS size and
+// `round(devicePixelRatio * 120)` to `wasm.resize`, then sizes the backing store from
+// `wasm.width_px()` and `wasm.height_px()`: Zig computes the device size (`Frame`), so the
+// canvas always matches what `pass_begin` records, which `pass_begin` asserts. Pointer
+// positions and wheel deltas cross into Wasm in CSS pixels, unscaled; line-mode wheel deltas
+// are converted to pixels first. A `matchMedia` resolution query re-fits the canvas when
+// the ratio changes without a window resize (dragging to another monitor). Pointer capture
+// keeps a drag that leaves the canvas deliverable; `pointerleave` and `pointercancel` call
+// `wasm.pointer_leave()` so the scene can release any press in progress.
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
@@ -273,10 +277,12 @@ const OPS = {
         device.queue.writeBuffer(lookup("buffer", p.id, "buffer_write"), p.offset, span_bytes(p.data));
     },
     texture_write(p) {
+        // The span starts at the region's first texel and rows are `bytes_per_row` apart, so
+        // a sub-rectangle of a larger image (the glyph atlas mirror) uploads in place.
         device.queue.writeTexture(
             { texture: lookup("texture", p.id, "texture_write"), origin: { x: p.x, y: p.y } },
             span_bytes(p.data),
-            { bytesPerRow: p.bytes_per_row, rowsPerImage: p.height },
+            { offset: 0, bytesPerRow: p.bytes_per_row, rowsPerImage: p.height },
             { width: p.width, height: p.height },
         );
     },
@@ -407,7 +413,7 @@ function schedule() {
     }
     raf = requestAnimationFrame((now) => {
         raf = 0;
-        // `tick` returns 1 only while an animator is live (guide, section 5).
+        // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5).
         if (wasm.tick(Math.floor(now)) === 1) {
             schedule();
         }
@@ -432,41 +438,52 @@ function arm_timer() {
 }
 
 /**
- * Sizes the canvas backing store to physical device pixels and tells Zig the new size.
+ * Tells Zig the canvas's CSS size and device pixel ratio, then sizes the backing store to the
+ * device size Zig derived (guide, section 6). Assigning `canvas.width` clears the canvas, so
+ * it is assigned only when the size changed.
  */
 function fit_canvas() {
-    const dpr = window.devicePixelRatio || 1;
-    const width = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-    const height = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-    canvas.width = width;
-    canvas.height = height;
-
-    if (wasm.resize(width, height) === 1) {
+    const width = Math.max(1, canvas.clientWidth);
+    const height = Math.max(1, canvas.clientHeight);
+    const scale_120 = Math.max(1, Math.round((window.devicePixelRatio || 1) * 120));
+    const dirty = wasm.resize(width, height, scale_120);
+    const width_px = wasm.width_px();
+    const height_px = wasm.height_px();
+    if (canvas.width !== width_px) {
+        canvas.width = width_px;
+    }
+    if (canvas.height !== height_px) {
+        canvas.height = height_px;
+    }
+    if (dirty === 1) {
         schedule();
     }
 }
 
 /**
- * Multiplier from CSS pixels to canvas backing-store pixels.
- * @returns {number}
+ * Re-fits the canvas when the device pixel ratio changes. A resolution query matches only
+ * the ratio it was made for, so each change re-arms a query for the new ratio.
  */
-function pointer_scale() {
-    return window.devicePixelRatio || 1;
+function watch_ratio() {
+    const query = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    query.addEventListener("change", () => {
+        fit_canvas();
+        watch_ratio();
+    }, { once: true });
 }
 
 /**
- * Forwards `pointermove` in device pixels.
+ * Forwards `pointermove` in CSS (logical) pixels.
  * @param {PointerEvent} event
  */
 function on_pointer_move(event) {
-    const scale = pointer_scale();
-    if (wasm.pointer_move(event.offsetX * scale, event.offsetY * scale) === 1) {
+    if (wasm.pointer_move(event.offsetX, event.offsetY) === 1) {
         schedule();
     }
 }
 
 /**
- * Forwards a primary-button press in device pixels and captures the pointer.
+ * Forwards a primary-button press in CSS pixels and captures the pointer.
  * @param {PointerEvent} event
  */
 function on_pointer_down(event) {
@@ -474,40 +491,36 @@ function on_pointer_down(event) {
         return;
     }
     canvas.setPointerCapture(event.pointerId);
-    const scale = pointer_scale();
-    if (wasm.pointer_down(event.offsetX * scale, event.offsetY * scale) === 1) {
+    if (wasm.pointer_down(event.offsetX, event.offsetY) === 1) {
         schedule();
     }
 }
 
 /**
- * Forwards a primary-button release in device pixels.
+ * Forwards a primary-button release in CSS pixels.
  * @param {PointerEvent} event
  */
 function on_pointer_up(event) {
     if (event.button !== 0) {
         return;
     }
-    const scale = pointer_scale();
-    if (wasm.pointer_up(event.offsetX * scale, event.offsetY * scale) === 1) {
+    if (wasm.pointer_up(event.offsetX, event.offsetY) === 1) {
         schedule();
     }
 }
 
 /**
- * Forwards a wheel event in device pixels. Line-mode deltas are converted to pixels first;
- * the conversion factor is a host heuristic, not a browser-defined value.
+ * Forwards a wheel event in CSS pixels. Line-mode deltas are converted to pixels first; the
+ * conversion factor is a host heuristic, not a browser-defined value.
  * @param {WheelEvent} event
  */
 function on_wheel(event) {
     event.preventDefault();
-    const scale = pointer_scale();
     let dy = event.deltaY;
     if (event.deltaMode === 1) {
         dy *= 16;
     }
-    dy *= scale;
-    if (wasm.pointer_wheel(event.offsetX * scale, event.offsetY * scale, dy) === 1) {
+    if (wasm.pointer_wheel(event.offsetX, event.offsetY, dy) === 1) {
         schedule();
     }
 }
@@ -567,6 +580,7 @@ async function main() {
     arm_timer();
 
     window.addEventListener("resize", fit_canvas);
+    watch_ratio();
     canvas.addEventListener("pointermove", on_pointer_move);
     canvas.addEventListener("pointerdown", on_pointer_down);
     canvas.addEventListener("pointerup", on_pointer_up);

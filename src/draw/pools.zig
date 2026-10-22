@@ -13,7 +13,8 @@
 //!
 //! ## 2. Data Flow
 //! ```text
-//! reset                 empty every pool, layer = base       (the host, before App.draw)
+//! reset                 empty every pool, layer = base, and   (the host, before App.draw)
+//!                       start the glyph cache's frame (`text.begin_frame`)
 //! append(T, tex, inst)  pool[T] gets inst and key = layer * texture_slots(T) + texture
 //!                       first use of (layer, T, texture) appends to `appearance`
 //! finalize              per pool: prefix sums of the key histogram -> starts;
@@ -44,11 +45,14 @@
 //! ## 6. TigerStyle Invariants
 //! - All storage is fixed arrays sized at compile time from `App.config.draw` and
 //!   `batch_cap`; the hosts keep the context in static memory (BSS on wasm).
+//! - The context also owns the glyph cache (`text: text.Cache`, about 1.25 MiB: the 1 MiB
+//!   atlas mirror, the table, and raster scratch), so `text.place` reaches it through `cx`
+//!   and every test context gets its own. `init` creates its atlas as texture 0.
 //! - Every loop is bounded by a pool count, a key count, or `batch_cap`.
 
 const std = @import("std");
 const assert = std.debug.assert;
-const font = @import("../font.zig");
+const cache = @import("../text/cache.zig");
 const registry = @import("registry.zig");
 const textures = @import("textures.zig");
 const types = @import("types.zig");
@@ -129,6 +133,8 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
 
         pools: @Tuple(&pool_types),
         textures: textures.Textures,
+        /// The glyph cache and atlas mirror `text.place` draws through; see `text/cache.zig`.
+        text: cache.Cache,
         layer_now: Layer,
         /// Instances refused for `PoolFull` or `BatchFull` since the last `reset`.
         overflow_count: u32,
@@ -143,28 +149,28 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
 
-        /// Empties every pool, creates the font atlas as texture 0, and queues its upload.
+        /// Empties every pool and the glyph cache and creates the glyph atlas as texture 0.
+        /// The atlas starts empty (WebGPU zero-fills it); the cache uploads what it draws.
         /// Out-pointer init so a static context needs no stack copy.
         pub fn init(self: *Self) void {
             self.textures.init();
-            const atlas = self.textures.create(.r8, font.atlas_width, font.atlas_height);
+            const atlas = self.textures.create(.r8, cache.atlas_side, cache.atlas_side);
             assert(atlas == .atlas);
-            self.textures.write(atlas, .{
-                .x = 0,
-                .y = 0,
-                .width = font.atlas_width,
-                .height = font.atlas_height,
-            }, font.atlas_bytes);
+            self.text.init();
             inline for (0..R.count) |index| {
                 self.pools[index].revision = 0;
             }
             self.reset();
             assert(self.textures.count == 1);
             assert(self.batch_count == 0);
+            assert(self.text.entry_count == 0);
         }
 
-        /// Empties every pool and returns to the base layer. Bumps every pool revision.
+        /// Empties every pool, returns to the base layer, and starts the glyph cache's frame
+        /// (`Cache.begin_frame`). Bumps every pool revision. The host sets
+        /// `text.scale_120` first.
         pub fn reset(self: *Self) void {
+            self.text.begin_frame();
             inline for (0..R.count) |index| {
                 const pool = &self.pools[index];
                 pool.count = 0;
