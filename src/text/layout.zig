@@ -274,33 +274,66 @@ fn emit(
     if (entry.width == 0) {
         return advance;
     }
+    append_glyph(cx, instance_of(entry, size_q, pen.x, pen.baseline_px, pen.scale, .{
+        .clip = clip,
+        .color = style.color,
+    }));
+    return advance;
+}
+
+/// What a glyph instance carries besides its cache entry and pen.
+pub const Paint = struct {
+    clip: draw.Clip,
+    color: [4]f32,
+};
+
+/// The instance of an inked cache `entry` at `size_q` with its pen at `pen_x` logical pixels
+/// on the device row `baseline_px`, at `scale` device pixels per logical pixel. The snapping
+/// of the module guide, section 3; `text/mono.zig` shares it, so both paths write the same
+/// records.
+pub fn instance_of(
+    entry: cache.Entry,
+    size_q: u32,
+    pen_x: f32,
+    baseline_px: f32,
+    scale: f32,
+    paint: Paint,
+) types.Glyph {
+    assert(entry.width != 0);
+    assert(scale > 0);
     const stretch = @as(f32, @floatFromInt(size_q)) / @as(f32, @floatFromInt(entry.raster_q));
     const left: f32 = @floatFromInt(entry.left);
     const top: f32 = @floatFromInt(entry.top);
     const width: f32 = @floatFromInt(entry.width);
     const height: f32 = @floatFromInt(entry.height);
-    const x_px = @round(pen.x * pen.scale) + left * stretch;
-    const y_px = pen.baseline_px - top * stretch;
+    const x_px = @round(pen_x * scale) + left * stretch;
+    const y_px = baseline_px - top * stretch;
     const atlas: f32 = @floatFromInt(cache.atlas_side);
     const u_left = @as(f32, @floatFromInt(entry.x)) / atlas;
     const v_top = @as(f32, @floatFromInt(entry.y)) / atlas;
     const glyph: types.Glyph = .{
         .rect = .{
-            x_px / pen.scale,
-            y_px / pen.scale,
-            width * stretch / pen.scale,
-            height * stretch / pen.scale,
+            x_px / scale,
+            y_px / scale,
+            width * stretch / scale,
+            height * stretch / scale,
         },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+        .clip = .{ paint.clip.x0, paint.clip.y0, paint.clip.x1, paint.clip.y1 },
         .uv = .{ u_left, v_top, u_left + width / atlas, v_top + height / atlas },
-        .color = style.color,
+        .color = paint.color,
     };
+    assert(glyph.rect[2] > 0);
+    return glyph;
+}
+
+/// Appends `glyph`; a full pool or batch list skips it and counts it in `overflow_count`.
+pub fn append_glyph(cx: anytype, glyph: types.Glyph) void {
+    assert(glyph.rect[2] > 0);
+    assert(glyph.rect[3] > 0);
     cx.append(types.Glyph, .atlas, glyph) catch |err| switch (err) {
-        // Counted in the context's `overflow_count`; the glyph is skipped.
         error.PoolFull, error.BatchFull => {},
         error.EdgeNotPositive, error.ClipUnordered => unreachable,
     };
-    return advance;
 }
 
 fn offset(alignment: text.Align, gap: f32) f32 {

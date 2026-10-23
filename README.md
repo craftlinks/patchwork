@@ -53,7 +53,8 @@ clear `@compileError` naming the exact problem. `point_cap` (default 65,536) siz
 point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
-`Toggle`, `Slider`, `Knob`, `Meter`, and `TextField`. Each draws with `draw(cx, walk)` and,
+`Toggle`, `Slider`, `Knob`, `Meter`, and `TextField`; the code editor
+(`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
 when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
 Events resolve once per event against the areas of the last frame, so `handle` is O(1) per
 widget; the app routes every event to every widget it owns.
@@ -91,9 +92,13 @@ patchwork/
 │   ├── ui/areas.zig            # Id, Area, the hit resolve scan, duplicate-id stamps
 │   ├── ui/cx.zig               # UI Context: draw context, turtle stack, areas, hover, capture
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
-│   ├── ui/edit.zig             # Single-line editing core: bounded UTF-8 buffer, caret, words
+│   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
 │   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle,
 │   │                           #   TextField)
+│   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
+│   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
+│   ├── editor/tokenizer.zig    # Patch language tokenizer: per-line states, seven classes
+│   ├── editor/editor.zig       # The editor widget: grid, view, keys, selection, rows
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
 │   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
@@ -107,6 +112,7 @@ patchwork/
 │   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
 │   ├── text/cache.zig          # Glyph cache: hash table, shelf-packed atlas, CPU mirror, budget
 │   ├── text/layout.zig         # UTF-8, alignment, ellipsis, device-pixel snapping
+│   ├── text/mono.zig           # Monospace grid: per-frame ASCII table, direct glyph appends
 │   ├── text/fonts/             # Noto Sans Regular and Bold, Noto Sans Mono (SIL OFL, OFL.txt)
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
@@ -138,8 +144,11 @@ patchwork/
 │   │   ├── levels.zig          # Procedural triangle-wave meter sampling
 │   │   ├── led.zig             # The rack's own draw type: a glowing LED
 │   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
-│   └── column/                 # Scrolling view regression app
-│       └── app.zig             # Column App (config.timer_period_ms = 0)
+│   ├── column/                 # Scrolling view regression app
+│   │   └── app.zig             # Column App (config.timer_period_ms = 0)
+│   └── live/                   # Code editor app
+│       ├── app.zig             # Live App: header bar, editor, number decorations, stress text
+│       └── patch.lpg           # The embedded patch the editor opens
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
@@ -166,8 +175,13 @@ zig build run-column      # Build and run the scroll column natively
 zig build wasm-column     # Compile the scroll column to zig-out/bin/column.wasm
 zig build serve-column    # Serve the scroll column WebGPU application on localhost (prints the address)
 
+# Examples (Live Editor)
+zig build run-live        # Build and run the code editor natively
+zig build wasm-live       # Compile the code editor to zig-out/bin/live.wasm
+zig build serve-live      # Serve the code editor WebGPU application on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and both examples
+zig build test            # Run unit tests across the library and the three examples
 zig build test-contract   # Verify compile errors for a missing `draw` and a ragged draw type
 ```
 
@@ -182,8 +196,9 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 
 ```text
 zig-out/
-├── bin/rack, bin/column        # native executables, RUNPATH $ORIGIN/../lib
-├── bin/rack.wasm, column.wasm  # from `zig build wasm` and `zig build wasm-column`
+├── bin/rack, column, live      # native executables, RUNPATH $ORIGIN/../lib
+├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
+│   live.wasm                   #   and `zig build wasm-live`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -363,7 +378,8 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   instead of scrolling. After a draw that moved things under a resting pointer, hover is
   re-resolved and lands one frame late.
 - **Flags.** `cx.area`'s `Flags` carry `wheel`, `focusable` (a left press focuses the area
-  and Tab visits focusable areas in draw order), and `cursor` (the pointer shape over the
+  and Tab visits focusable areas in draw order), `tab` (while the area is focused, Tab and
+  Shift+Tab go to its widget instead of moving focus; the editor indents), and `cursor` (the pointer shape over the
   area: `default`, `pointer`, `text`, `grab`, `grabbing`, `ew_resize`, `ns_resize`). A right
   press on the hot area is `Hit.secondary` and never captures.
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
@@ -381,8 +397,9 @@ the device scale, and only the glyph records change (see Text below).
 
 - **Focus.** `cx.focus` is the id that gets keys and pastes; widgets ask `cx.focused(id)`.
   A left press focuses a focusable hot area or clears focus; Tab and Shift+Tab cycle the
-  focusable areas of the last frame in draw order (the only O(areas) key path); Escape
-  clears focus after the widgets saw it; a press elsewhere or Tab shows as
+  focusable areas of the last frame in draw order (the only O(areas) key path), unless the
+  focused area is flagged `tab`; Escape clears focus after the widgets saw it, which is also
+  how the keyboard leaves the editor; a press elsewhere or Tab shows as
   `cx.focus_lost(id)` during that event. A focused id that is not drawn stays focused.
 - **TextField.** A single-line field of at most 256 bytes: caret, selection, Ctrl or Meta
   with arrows for word jumps, Shift selection, Home and End, double press for a word, triple
@@ -474,6 +491,24 @@ demonstrates:
 
 The docked panel's coordinates at specific window sizes are locked by the layout tests in
 `examples/column/app.zig`.
+
+### 3. Live Editor (`examples/live/app.zig`)
+
+The code editor filling the window under a header bar that shows the file name, the caret's
+line:col, and refusal messages ("paste refused: buffer full"). It opens the embedded
+`examples/live/patch.lpg`, a patch in the language step 18 binds knobs to
+(`k(lo~value~hi, "name")`, `shape(gain, slope, twice, asymmetry)`, `:=`, method calls,
+`//` and `/* */` comments). It demonstrates:
+- **Syntax colours** from the per-line tokenizer, written into the glyph instances.
+- **Decorations.** A box around every number literal in view, rebuilt when the revision or
+  the first visible line changes, from the lines a draw can show.
+- **Stress text.** F2 loads a generated 2,000-line text (50 lines of 120 columns in the
+  middle), F1 reloads the patch. Only visible lines draw, so scrolling it costs what
+  scrolling the patch costs.
+- **No timer** and a steady caret: an idle editor sleeps.
+- **Uploads.** The header draws after the editor, so a typed key writes the glyph records
+  from the edited line on, not the whole pool; test "uploads of a scrolled frame and a typed
+  key" locks the byte counts.
 
 ## GPU Command Stream
 
@@ -573,8 +608,9 @@ literals.
 Memory: each pool holds `cap` records plus a renderer shadow of the same size, and one scratch
 buffer of the largest pool backs the counting sort. The context also holds the glyph cache
 (about 1.25 MiB: the 1 MiB atlas mirror, the table, and raster scratch). The hosts keep the
-context and renderer in static memory (BSS on wasm), so the linker sizes the wasm initial
-memory to cover them. A registry with `draw.Path` adds `point_cap` 8-byte points and a
+app, the context, and the renderer in static memory (BSS on wasm), so the linker sizes the
+wasm initial memory to cover them and a large app (the editor is about 300 KiB) never grows
+the native stack. A registry with `draw.Path` adds `point_cap` 8-byte points and a
 shadow of the same size. The UI context around the draw context adds `area_cap` 56-byte hit
 areas, 32 turtle entries, and, in safe builds only, a duplicate-id table of 12 bytes per slot
 (`2 * area_cap` rounded up to a power of two).
@@ -612,6 +648,49 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 The CPU twins (`distance_to_polyline`, `chunk_alpha`, `draw.sdf_segment`) check the shader's
 math, the chunk rects, and the seam blending without a GPU.
 
+## Code Editor
+
+`patchwork.editor.Editor` is a widget like `TextField` over a 64 KiB text
+(`src/editor.zig` and `src/editor/*.zig`):
+
+```zig
+app.editor.init(ui.id("editor", 0), editor.default_style);   // out-pointer: about 300 KiB
+_ = app.editor.load(patchwork_source);                       // sanitized; history cleared
+switch (app.editor.handle(cx, event)) { .changed, .refused, .none => {} }
+app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row iterator below
+```
+
+- **Buffer.** One contiguous `[65536]u8` edited with `@memmove` (about 0.8 microseconds for
+  64 KiB even in Debug), a `[4096]u32` line index shifted on edit, and a cached tokenizer
+  start state per line, recomputed from the edited line until one matches.
+  `replace(range, utf8)` is the only edit; an edit past 64 KiB or 4,096 lines is refused
+  whole and the action is `refused`.
+- **Undo.** 256 entries over a linear 128 KiB byte arena, oldest dropped first, the newest
+  always undoable. Typing coalesces per word, Backspace runs coalesce, everything else is one
+  entry, and `gesture_begin`/`gesture_end` merge any edits into one. Undo and redo restore
+  the selection; `history_mark()` drives a dirty marker that undo can clear.
+- **Grid.** 15 px Noto Sans Mono: a 9 px column and a 21 px line, one column per codepoint.
+  Tabs never reach the text (Tab inserts spaces to the next multiple of four, pastes expand
+  them, `ui.edit.sanitize_text`). `text/mono.zig` builds a per-frame table of the ASCII
+  glyph entries (which also pre-warms them) and appends glyphs directly, with the same
+  instances `text.place` writes.
+- **Keys.** Arrows, words with Ctrl, goal column on Up and Down, Home, End, Page Up and
+  Down, Ctrl+Home and End, Shift selection, Backspace and Delete (words with Ctrl), Enter
+  with the line's indent, Tab and Shift+Tab (several selected lines indent and outdent as
+  one entry), Ctrl+A, C, X, V, Z, Shift+Z, and Y. Clicks 1, 2, and 3 place the caret, select
+  a word, and select a line; a drag extends without scrolling past an edge.
+- **Scrolling.** Vertical in a step 14 view (thumb, wheel `dy`); horizontal is the editor's
+  own `scroll_x` (wheel `dx`, or `dy` with Shift), clamped by the longest line. Every edit
+  and caret move keeps the caret visible.
+- **Bounds.** At most `editor.lines_max` (128, which fills a 2,688 px viewport) lines of
+  `editor.columns_max` (200) columns draw, so a draw appends at most `editor.glyph_max`
+  (26,112) glyphs; an app asserts that against its glyph pool.
+- **Decorations and rows.** The app sets up to 2,048 `Decoration{start, end, kind}` (`box`,
+  `strike` over the text on layer 1, `error`) and 32 `InlineRow{after_line, height}`, and
+  rebuilds them on a new `revision()`. Rows are filled through
+  `draw_begin` / `while (next_row(cx)) |slot|` / `draw_end`; `rect_of(byte)` is the
+  character's unclamped logical rect for anchors and `viewport()` the box to clamp against.
+
 ## Text
 
 `patchwork.text` draws three embedded faces: `.sans` (Noto Sans Regular), `.sans_bold` (Noto
@@ -642,6 +721,9 @@ text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline fo
   and writes nothing.
 - **Hosts draw when the cache owes it:** `App.draw` runs when `cx.dirty` or
   `cx.draw.text.owes_draw(scale_120)` (the scale changed, or glyphs are pending).
+- **Monospace grid.** `text.Mono` (`src/text/mono.zig`) is the editor's path: `prepare`
+  looks up the 94 inked ASCII glyphs once per frame, `emit` appends a glyph at a column with
+  no measuring, and both share `place`'s snapping, so their records are byte for byte equal.
 
 Module guides in `src/text.zig` and `src/text/*.zig` hold the algebra; the tests hold the
 worked numbers (the rasterizer is checked against a polygon-clipping reference).

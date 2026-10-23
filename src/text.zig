@@ -12,7 +12,9 @@
 //!                 append one draw.Glyph per inked glyph with the entry's atlas UVs
 //! ```
 //! The module map: `text/ttf.zig` reads the fonts, `text/raster.zig` scan-converts,
-//! `text/cache.zig` owns the atlas, and `text/layout.zig` measures and places.
+//! `text/cache.zig` owns the atlas, `text/layout.zig` measures and places, and
+//! `text/mono.zig` is the monospace grid a code editor draws through (one column per
+//! codepoint, a per-frame ASCII entry table, the same instances as `place`).
 //!
 //! ## 2. Faces
 //! `Face.sans` is Noto Sans Regular, `Face.sans_bold` Noto Sans Bold, and `Face.mono` Noto
@@ -40,7 +42,9 @@ const layout = @import("text/layout.zig");
 pub const ttf = @import("text/ttf.zig");
 pub const raster = @import("text/raster.zig");
 pub const cache = @import("text/cache.zig");
+pub const mono = @import("text/mono.zig");
 pub const Cache = cache.Cache;
+pub const Mono = mono.Mono;
 
 /// Bytes of UTF-8 one `place` or `place_runs` call may lay out.
 pub const byte_cap: u32 = 4096;
@@ -133,6 +137,7 @@ comptime {
 
 test {
     _ = ttf;
+    _ = mono;
     _ = raster;
     _ = cache;
     _ = layout;

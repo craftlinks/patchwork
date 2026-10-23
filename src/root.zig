@@ -16,6 +16,7 @@ pub const input = @import("input.zig");
 pub const animator = @import("animator.zig");
 pub const theme = @import("theme.zig");
 pub const widgets = @import("widgets.zig");
+pub const editor = @import("editor.zig");
 pub const ui = @import("ui.zig");
 pub const app = @import("app.zig");
 pub const gpu = @import("gpu.zig");
@@ -51,6 +52,7 @@ test {
     _ = animator;
     _ = theme;
     _ = widgets;
+    _ = editor;
     _ = ui;
     _ = app;
     _ = commands;

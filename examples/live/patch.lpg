@@ -1,0 +1,79 @@
+/* live patch: a drum loop through a flanger, a compressor, and a waveshaper.
+   Values written k(lo~value~hi, "name") become knobs bound to the text;
+   dragging a knob rewrites the value literal in place. */
+
+bpm := 121
+swing := k(0~0.12~0.5, "swing")
+
+// Drums: a kick on every beat, a snare on two and four, hats in between.
+fn drums(step) {
+    kick := sample("kick.wav").gate(step % 4 == 0)
+    snare := sample("snare.wav").gate(step % 8 == 4) * k(0~0.8~1, "snare")
+    hats := sample("hat.wav").gate(step % 2 == 1).pan(-0.3)
+    return kick + snare + hats * 0.45
+}
+
+let loop = sequencer(bpm, 16).swing(swing)
+played := drums(loop.step) * k(0~0.023~0.05, "again")
+
+// A flanger: a short delay swept by a slow triangle, fed back.
+sweep := lfo("triangle", 0.25).range(0.001, 0.007)
+hot := played.delay(sweep) * k(-0.98~0.445~0.98, "flange")
+hot = hot + played
+hot = hot * hot.compressor(-18, 4.0, 0.003, 0.120)
+
+/* The shaper: gain drives the curve, slope bends it, twice folds it,
+   and asymmetry tilts it so even harmonics come through. */
+curve := shape(gain, slope, twice, asymmetry)
+gain := k(0~1.5~8, "gain")
+slope := k(-1~0.25~1, "slope")
+twice := k(0~0~1, "twice")
+asymmetry := k(-0.5~0.1~0.5, "asymmetry")
+
+shaped := hot.through(curve)
+
+// Bass: a saw an octave down, filtered, side-chained to the kick.
+fn bass(note) {
+    let saw = oscillator("saw", note.hz() / 2)
+    let cut = k(80~420~4000, "cutoff")
+    let q = k(0.5~2.2~12, "resonance")
+    if note.accent {
+        return saw.lowpass(cut * 1.5, q) * 0.9
+    } else {
+        return saw.lowpass(cut, q) * 0.6
+    }
+}
+
+notes := [36, 36, 43, 36, 39, 36, 46, 43]
+line := loop.pick(notes).map(bass)
+ducked := line * (1 - loop.envelope("kick", 0.002, 0.180) * k(0~0.65~1, "duck"))
+
+// Space: a plate reverb on a send, with the wet signal high-passed.
+fn plate(input, size) {
+    let wet = input.reverb(size, 0.5e1, 2.5e-3)
+    return wet.highpass(250)
+}
+
+send := shaped * k(0~0.2~1, "send")
+room := plate(send, k(0.1~0.6~0.99, "size"))
+
+// Meters and the mix.
+mix := shaped + ducked + room
+for channel in mix.channels() {
+    channel.meter("out " + channel.name)
+}
+
+limit := true
+if limit {
+    mix = mix.limiter(-1.0, 0.050)
+}
+
+out(mix * k(0~0.8~1, "master"))
+
+/* Notes:
+   - Numbers: 0, 0.5, .25, 1e3, 2.5e-3; a sign is an operator: -0.98.
+   - A string may hold a comment opener without opening a comment. */
+note := "/* not a comment */ and a \"quoted\" name"
+label := "Jürgen Köhler · Café"
+version := "0.17"
+done := false

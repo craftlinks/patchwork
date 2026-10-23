@@ -71,6 +71,9 @@
 //! - A left press focuses the hot area when it is focusable and clears focus otherwise.
 //! - Tab and Shift+Tab move to the next or previous focusable area, wrapping, with one scan of
 //!   the areas: the only O(areas) keyboard path. A focus that was not drawn starts the cycle.
+//!   When the focused area is flagged `tab` (an editor that indents), Tab and Shift+Tab stay
+//!   with its widget and focus does not move; Escape still clears focus, which is how the
+//!   keyboard leaves such a widget.
 //! - Escape clears focus in `event_end`, after the widgets saw the key, so a field reads it as
 //!   cancel; a move away by a press or Tab is visible during that event as `focus_lost(id)`,
 //!   which a field reads as commit.
@@ -151,9 +154,14 @@ pub const Hit = union(enum) {
 };
 
 /// No hover, press, or wheel interest beyond the default.
-pub const plain: Flags = .{ .wheel = false, .focusable = false, .cursor = .default };
+pub const plain: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default };
 /// Takes wheel input.
-pub const wheel_flag: Flags = .{ .wheel = true, .focusable = false, .cursor = .default };
+pub const wheel_flag: Flags = .{
+    .wheel = true,
+    .focusable = false,
+    .tab = false,
+    .cursor = .default,
+};
 
 /// The layout of the root turtle: the window, flowing down, clipped to the window.
 pub const root_layout: turtle.Layout = .{
@@ -852,13 +860,23 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.keys_held |= press.key.bit();
             self.escaping = press.key == .escape;
             if (press.key == .tab and !press.mods.shortcut() and !press.mods.alt) {
-                self.cycle_focus(press.mods.shift);
+                if (!self.focus_keeps_tab()) self.cycle_focus(press.mods.shift);
             }
             const clipboard_key = press.key == .c or press.key == .x or press.key == .v;
             const shortcut = press.mods.shortcut() and clipboard_key;
             const routed = self.focus_prev != .none or self.focus != .none;
             self.key_consumed = routed and !shortcut;
             if (shortcut) assert(!self.key_consumed);
+        }
+
+        /// True when the focused area of the last draw is flagged `tab`, so Tab goes to its
+        /// widget. One scan of the areas, on the Tab path only (section 7).
+        fn focus_keeps_tab(self: *const Self) bool {
+            assert(self.phase == .event);
+            if (self.focus == .none) return false;
+            const focused_area = self.find(self.focus) orelse return false;
+            assert(focused_area.flags.focusable);
+            return focused_area.flags.tab;
         }
 
         /// Moves focus to the next focusable area in draw order, or the previous one when
@@ -1336,7 +1354,7 @@ fn button_event(x: f32, y: f32, which: input.MouseButton, down: bool) input.Even
     return .{ .pointer_up = sample };
 }
 
-const focusable_text: Flags = .{ .wheel = false, .focusable = true, .cursor = .text };
+const focusable_text: Flags = .{ .wheel = false, .focusable = true, .tab = false, .cursor = .text };
 
 /// Draws three focusable fields at x = 0, 100, 200 and one plain area at x = 300.
 fn draw_fields(context: *TestContext) void {
@@ -1395,6 +1413,40 @@ test "focus follows presses, Tab cycles in draw order, and Escape clears after r
     try testing.expectEqual(areas.id("gone", 0), context.focus);
     send(context, press_key(.tab, .none), &.{first}, &out);
     try testing.expect(context.focused(first));
+}
+
+// Locks the `tab` flag: a focused area flagged `tab` keeps focus on Tab and Shift+Tab (its
+// widget reads the key, which is consumed), Escape still clears it, and from there Tab cycles
+// into the focusable areas again.
+test "a tab-flagged focus keeps Tab and Escape still clears it" {
+    const context = new_context();
+    var editor_flags = focusable_text;
+    editor_flags.tab = true;
+    const editor = areas.id("editor", 0);
+    const field = areas.id("field", 0);
+    context.begin_frame(400, 300, 120);
+    context.area(field, rect_at(0, 0, 80, 20), 0, focusable_text);
+    context.area(editor, rect_at(100, 0, 200, 200), 0, editor_flags);
+    _ = context.end_frame();
+    var out: [1]Hit = undefined;
+    send(context, button_event(150, 50, .left, true), &.{editor}, &out);
+    send(context, button_event(150, 50, .left, false), &.{editor}, &out);
+    try testing.expect(context.focused(editor));
+    context.event_begin(press_key(.tab, .none));
+    try testing.expect(!context.focus_lost(editor));
+    context.event_end();
+    try testing.expect(context.focused(editor));
+    try testing.expect(context.consumed());
+    var shift = input.Mods.none;
+    shift.shift = true;
+    send(context, press_key(.tab, shift), &.{editor}, &out);
+    try testing.expect(context.focused(editor));
+    send(context, press_key(.escape, .none), &.{editor}, &out);
+    try testing.expectEqual(Id.none, context.focus);
+    send(context, press_key(.tab, .none), &.{editor}, &out);
+    try testing.expect(context.focused(field));
+    send(context, press_key(.tab, .none), &.{editor}, &out);
+    try testing.expect(context.focused(editor));
 }
 
 // Locks the browser key verdict: with nothing focusable a Tab is not consumed (the page may
@@ -1480,7 +1532,7 @@ test "the cursor follows the hot area and a held grab reads grabbing" {
     const context = new_context();
     const knob = areas.id("knob", 0);
     const field = areas.id("field", 0);
-    const grab: Flags = .{ .wheel = true, .focusable = false, .cursor = .grab };
+    const grab: Flags = .{ .wheel = true, .focusable = false, .tab = false, .cursor = .grab };
     context.begin_frame(400, 300, 120);
     context.area(knob, rect_at(0, 0, 50, 50), 0, grab);
     context.area(field, rect_at(100, 0, 50, 50), 0, focusable_text);

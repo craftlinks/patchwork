@@ -323,11 +323,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .wgpu_lib_dir = wgpu_lib_dir,
     });
+    const live = addApp(b, b, .{
+        .name = "live",
+        .root_source_file = b.path("examples/live/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
     b.getInstallStep().dependOn(rack.install);
     b.getInstallStep().dependOn(column.install);
+    b.getInstallStep().dependOn(live.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
-    add_test_steps(b, library, .{ rack, column });
+    add_example_steps(b, "-live", "the live editor", live);
+    add_test_steps(b, library, .{ rack, column, live });
 }
 
 /// Names the steps of one example. The rack owns the plain names.
@@ -360,7 +369,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [2]AppSteps,
+    examples: [3]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
