@@ -22,6 +22,12 @@
 //! violation as a message that starts with the type's name, so `app.check` can fail the build
 //! naming it (`zig build test-contract` locks one case).
 //!
+//! All geometry is relative to `rect`: a type's parameters (radii, sweeps, UVs, the LED's
+//! glow) are expressed in the quad's local space, never as absolute positions. The UI layer
+//! aligns a container after its children drew by adding a delta to `rect.xy` alone
+//! (`Context.shift` in `draw/pools.zig`); a type that stored an absolute coordinate elsewhere
+//! would be left behind.
+//!
 //! ## 3. WGSL Assembly (`source`)
 //! ```text
 //! prelude.wgsl                         Frame, vs_main, fs_main, coverage, sdf_*, clip_mask

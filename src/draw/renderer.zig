@@ -508,7 +508,6 @@ comptime {
 
 const testing = std.testing;
 const text = @import("../text.zig");
-const turtle = @import("../turtle.zig");
 
 /// The op codes recorded in `buffer`, in order.
 pub fn codes(buffer: *const commands.CommandBuffer, out: []commands.Code) []commands.Code {
@@ -726,7 +725,7 @@ fn text_scene(scale_120: u32) void {
     cx.append(types.Box, null, face(20)) catch unreachable;
     cx.append(types.Arc, null, ring(0, 0)) catch unreachable;
     const style: text.Style = .{ .face = .sans, .size = 16, .color = .{ 1, 1, 1, 1 } };
-    const rect: turtle.Rect = .{ .x = 3, .y = 50, .width = 90, .height = 24 };
+    const rect: draw.Rect = .{ .x = 3, .y = 50, .width = 90, .height = 24 };
     const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
     text.place(cx, style, "Hi", rect, clip, .{
         .align_x = .start,

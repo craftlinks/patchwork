@@ -12,7 +12,6 @@
 pub const frame = @import("frame.zig");
 pub const text = @import("text.zig");
 pub const draw = @import("draw.zig");
-pub const turtle = @import("turtle.zig");
 pub const input = @import("input.zig");
 pub const animator = @import("animator.zig");
 pub const theme = @import("theme.zig");
@@ -41,7 +40,6 @@ test {
     _ = frame;
     _ = text;
     _ = draw;
-    _ = turtle;
     _ = input;
     _ = animator;
     _ = theme;

@@ -56,22 +56,24 @@
 //! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_clock`,
 //! `present_if_dirty`, `wait_for_events`. Callbacks only write `State`; all app calls happen
 //! in this order on the main thread.
-//! - Draw rule (`prepare_app`): `App.draw` runs when `app.dirty()` or when the glyph cache
-//!   owes a draw (`Cache.owes_draw`: the scale moved since the last draw, or glyphs were
-//!   skipped for the per-frame budget or a full atlas). After the commit, a cache that still
-//!   owes a draw requests another redraw, which the next `done` schedules.
+//! - Draw rule (`prepare_app`): `ui.draw_frame` runs `App.draw` when the UI context is dirty
+//!   or when the glyph cache owes a draw (`Cache.owes_draw`: the scale moved since the last
+//!   draw, or glyphs were skipped for the per-frame budget or a full atlas). After the
+//!   commit, a cache that still owes a draw, or a context dirtied again by the hover that
+//!   the draw re-resolved, requests another redraw, which the next `done` schedules.
 //! - `ack_if_needed`: answers a pending `xdg_surface.configure` with `ack_configure` and
 //!   applies the pending size through `frame.apply_configure`. A configure carries no size
 //!   guarantee, so a zero dimension is replaced by `Frame`.
-//! - `sync_input`: drains `State.queue` once per wake, bounded by `input.queue_cap`. Motion
-//!   is coalesced by the queue, and a press and release stay separate events.
+//! - `sync_input`: drains `State.queue` once per wake, bounded by `input.queue_cap`, through
+//!   `ui.dispatch`. Motion is coalesced by the queue, and a press and release stay separate
+//!   events.
 //! - `sync_clock`: runs only after a `wl_callback.done`. It steps animators from the callback
-//!   timestamp, requests a redraw while the app is live, resets the clock when settled, and
-//!   calls `schedule_present`.
+//!   timestamp through `ui.animate`, requests a redraw while a widget keeps animating, resets
+//!   the clock when settled, and calls `schedule_present`.
 //! - `present_if_dirty`: presents only when a redraw is owed, the surface is configured, no
 //!   frame callback is in flight, and the latched deadline has passed. Otherwise it leaves
 //!   `redraw` set so pointer motion that arrives during the wait is drawn by the commit.
-//!   Layout and instance rebuild run only on that commit. Each commit requests
+//!   The draw (layout included) runs only on that commit. Each commit requests
 //!   `wl_surface.frame` and (bounded) `wp_presentation.feedback` before `gpu.submit`, because
 //!   both requests attach to the next `wl_surface.commit`.
 //! - `schedule_present`: the deadline is `frame.present_deadline` applied to an anchor, the
@@ -113,6 +115,7 @@ const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
+const ui = @import("../ui.zig");
 const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
 const wp_fractional_scale = @import("wp_fractional_scale.zig");
@@ -417,9 +420,9 @@ comptime {
 /// 6. Arms the host timer only when `App.config.timer_period_ms` is not zero.
 /// 7. Enters the blocking event loop (`Host(App).loop`).
 ///
-/// The window state and the app live on this stack frame. The draw context and the renderer,
-/// whose pools and shadows are sized by `App.config.draw`, are static (`Host(App)`), so a
-/// large configuration never grows the stack.
+/// The window state and the app live on this stack frame. The UI context (with the draw
+/// context inside it) and the renderer, whose pools and shadows are sized by `App.config`,
+/// are static (`Host(App)`), so a large configuration never grows the stack.
 pub fn run(comptime App: type) !void {
     comptime app_contract.check(App);
     const AppHost = Host(App);
@@ -464,14 +467,14 @@ pub fn run(comptime App: type) !void {
     AppHost.context.init();
     AppHost.render.init();
     var app: App = undefined;
-    App.init(&app, &AppHost.context.textures);
+    App.init(&app, &AppHost.context.draw.textures);
     try connect(&state);
     try bind_globals(&state);
     try create_toplevel(&state, App.config.title);
     try create_device(&state);
     var host: AppHost = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
     try host.setup();
-    assert(AppHost.context.batch_count == 0);
+    assert(AppHost.context.draw.batch_count == 0);
     assert(state.frame.relayout);
     if (App.config.timer_period_ms != 0) {
         host.timer_fd = try arm_timer(App.config.timer_period_ms);
@@ -495,14 +498,15 @@ fn Host(comptime App: type) type {
     return struct {
         const Self = @This();
         const Context = app_contract.Context(App);
-        const Renderer = renderer.Renderer(Context);
+        const Renderer = renderer.Renderer(Context.DrawContext);
 
         state: *State,
         app: *App,
         timer_fd: i32,
 
-        /// The app's draw context and renderer. Static so pools and shadows sized by
-        /// `App.config.draw` stay off the stack; `run` initializes both in place.
+        /// The app's UI context (pools, areas, pointer state) and renderer. Static so pools
+        /// and shadows sized by `App.config` stay off the stack; `run` initializes both in
+        /// place.
         var context: Context = undefined;
         var render: Renderer = undefined;
 
@@ -511,10 +515,10 @@ fn Host(comptime App: type) type {
         fn setup(self: *Self) !void {
             const state = self.state;
             state.commands.reset();
-            render.setup(&state.commands, &context);
+            render.setup(&state.commands, &context.draw);
             try gpu.submit(&state.gpu, &state.commands);
             assert(render.ready);
-            assert(context.textures.created == context.textures.count);
+            assert(context.draw.textures.created == context.draw.textures.count);
         }
 
         /// Records one frame of the draw context and submits it to the GPU, then marks the
@@ -524,7 +528,7 @@ fn Host(comptime App: type) type {
             assert(state.frame.redraw);
             assert(state.frame.width_px != 0);
             state.commands.reset();
-            render.frame(&state.commands, &context, .{
+            render.frame(&state.commands, &context.draw, .{
                 .width_logical = state.frame.width_logical,
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,
@@ -534,8 +538,12 @@ fn Host(comptime App: type) type {
             try gpu.submit(&state.gpu, &state.commands);
             state.frame.mark_presented();
             assert(!state.frame.redraw);
-            // Glyphs skipped for the budget or a full atlas finish on the next frame.
-            if (context.text.owes_draw(state.frame.scale_120)) {
+            // Glyphs skipped for the budget or a full atlas finish on the next frame, and a
+            // hover that the redraw moved (`ui.draw_frame`) may have owed another draw.
+            if (context.draw.text.owes_draw(state.frame.scale_120)) {
+                state.frame.request_redraw();
+            }
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
         }
@@ -566,7 +574,8 @@ fn Host(comptime App: type) type {
             var guard: u32 = 0;
             while (guard < input.queue_cap) : (guard += 1) {
                 const event = state.queue.pop() orelse break;
-                if (self.app.event(event)) {
+                ui.dispatch(App, self.app, &context, event);
+                if (context.dirty) {
                     state.frame.request_redraw();
                 }
             }
@@ -588,14 +597,13 @@ fn Host(comptime App: type) type {
             state.frame_done = false;
             note_refresh(state);
             const dt_ms = state.clock.advance(state.frame_time_ms);
-            const changed = self.app.event(.{ .frame = dt_ms });
-            if (changed) {
+            const animating = ui.animate(App, self.app, &context, dt_ms);
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
-            if (self.app.live()) {
+            if (animating) {
                 state.frame.request_redraw();
-            }
-            if (!self.app.live()) {
+            } else {
                 state.clock.reset();
             }
             schedule_present(state);
@@ -606,8 +614,8 @@ fn Host(comptime App: type) type {
         /// Presents when `redraw` is set, no frame callback is in flight, and the
         /// late-latch deadline has arrived. A callback already in flight, or a deadline
         /// still in the future, leaves `redraw` set so pointer motion during the wait
-        /// is in the queue when the commit runs. Layout and the instance rebuild run
-        /// only on that commit; a scale change rebuilds only the glyph records (module
+        /// is in the queue when the commit runs. The draw, layout included, runs only
+        /// on that commit; a scale change rebuilds only the glyph records (module
         /// guide, section 4). Every commit arms `wl_surface.frame`.
         fn present_if_dirty(self: *Self) !void {
             const state = self.state;
@@ -638,28 +646,28 @@ fn Host(comptime App: type) type {
             arm_frame(state);
             arm_feedback(state);
             try self.submit_frame();
-            assert(!self.app.dirty());
         }
 
-        /// Prepares app layout and draw pools before presentation.
-        /// Runs layout if `relayout` is set, and resets and repopulates the draw context if
-        /// the app reports `dirty` or the glyph cache owes a draw (module guide, section 4).
-        /// `draw` must leave the app clean.
+        /// Draws the app into the context before presentation. A changed logical size only
+        /// owes a draw, because layout happens while drawing. `ui.draw_frame` draws when the
+        /// context is dirty or the glyph cache owes a draw (module guide, section 4).
         fn prepare_app(self: *Self) void {
             const state = self.state;
             if (state.frame.relayout) {
-                self.app.layout(state.frame.width_logical, state.frame.height_logical);
                 state.frame.mark_laid_out();
+                context.redraw();
             }
             assert(!state.frame.relayout);
             const scale_120 = state.frame.scale_120;
-            if (self.app.dirty() or context.text.owes_draw(scale_120)) {
-                context.text.scale_120 = scale_120;
-                context.reset();
-                self.app.draw(&context);
-            }
-            assert(!self.app.dirty());
-            assert(context.text.drawn_scale_120 == scale_120);
+            _ = ui.draw_frame(
+                App,
+                self.app,
+                &context,
+                state.frame.width_logical,
+                state.frame.height_logical,
+                scale_120,
+            );
+            assert(context.draw.text.drawn_scale_120 == scale_120);
         }
 
         /// Blocks until the compositor writes, the app timer fires, or the latched
@@ -745,7 +753,8 @@ fn Host(comptime App: type) type {
             assert(read_n == 8);
             assert(expirations >= 1);
             const now_ms = monotonic_ns() / 1_000_000;
-            if (self.app.timer(now_ms)) {
+            App.timer(self.app, &context, now_ms);
+            if (context.dirty) {
                 if (state.frame.running) {
                     assert(state.frame.running);
                     state.frame.request_redraw();

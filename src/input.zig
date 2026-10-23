@@ -39,7 +39,7 @@
 //!
 //! ## 3. Ownership
 //! `input.zig` only records and buffers input. Hit testing, widget dispatch, and pointer capture
-//! belong to `ui.Scene` and the apps.
+//! belong to the UI context (`ui/cx.zig`) and the widgets.
 //!
 //! ## 4. TigerStyle Invariants
 //! - Capacity is fixed by `queue_cap`; there is no allocation.
@@ -79,7 +79,7 @@ pub const Event = union(enum) {
     wheel: Wheel,
 };
 
-/// Latest pointer sample. `ui.Scene` stores this so a relayout can re-hit the same point.
+/// Latest pointer sample. The UI context stores this so a redraw can re-hit the same point.
 /// Wayland button callbacks carry no coordinates, so the window keeps the last position
 /// separately and copies it into the down and up events.
 pub const Pointer = struct {

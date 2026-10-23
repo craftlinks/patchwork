@@ -20,7 +20,9 @@
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
 //! This file re-exports the public names so apps and widgets write `draw.Box`,
-//! `draw.Context`, and so on.
+//! `draw.Context`, and so on. It also owns the plain geometry types `Rect` and `Inset`,
+//! which layout (`ui/turtle.zig`), text placement, and hit areas share, so text depends on
+//! drawing only and never on the UI layer.
 //!
 //! ## 3. Y-Down Orthographic Projection
 //! Coordinate spaces:
@@ -85,6 +87,23 @@ pub const Clip = struct {
     y0: f32,
     x1: f32,
     y1: f32,
+};
+
+/// Axis-aligned box in UI logical pixels. `(x, y)` is the top-left corner. Layout
+/// (`ui/turtle.zig`), text placement, hit areas, and widgets share it.
+pub const Rect = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+};
+
+/// Independent insets in UI logical pixels: container padding and child margins.
+pub const Inset = struct {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
 };
 
 pub const DrawType = registry.DrawType;
@@ -208,6 +227,10 @@ comptime {
     assert(vertex_count == 6);
     assert(matrix_bytes == 64);
     assert(uniform_bytes == 256);
+    // Layout geometry is four packed `f32`s, so a `Rect` copies like one instance field.
+    assert(@sizeOf(Rect) == 16);
+    assert(@sizeOf(Inset) == 16);
+    assert(@alignOf(Rect) == 4);
 }
 
 test {

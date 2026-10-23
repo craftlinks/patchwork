@@ -36,32 +36,25 @@ const RaggedApp = struct {
         _ = textures;
     }
 
-    pub fn layout(app: *RaggedApp, width_logical: u32, height_logical: u32) void {
+    pub fn event(
+        app: *RaggedApp,
+        cx: *patchwork.app.Context(RaggedApp),
+        event_value: patchwork.input.Event,
+    ) void {
         _ = app;
-        _ = width_logical;
-        _ = height_logical;
-    }
-
-    pub fn event(app: *RaggedApp, event_value: patchwork.input.Event) bool {
-        _ = app;
+        _ = cx;
         _ = event_value;
-        return false;
     }
 
-    pub fn timer(app: *RaggedApp, now_ms: u64) bool {
+    pub fn timer(app: *RaggedApp, cx: *patchwork.app.Context(RaggedApp), now_ms: u64) void {
         _ = app;
+        _ = cx;
         _ = now_ms;
-        return false;
     }
 
-    pub fn live(app: *const RaggedApp) bool {
+    pub fn draw(app: *RaggedApp, cx: *patchwork.app.Context(RaggedApp)) void {
         _ = app;
-        return false;
-    }
-
-    pub fn dirty(app: *const RaggedApp) bool {
-        _ = app;
-        return false;
+        _ = cx;
     }
 };
 

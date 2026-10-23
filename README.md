@@ -1,7 +1,8 @@
 # Patchwork
 
-A Zig 0.17.0 library copying Makepad's drawing model: a retained widget tree that
-lays itself out with a turtle and paints with instanced signed-distance shaders.
+A Zig 0.17.0 library copying Makepad's drawing model: plain widget structs that lay
+themselves out with a turtle while they draw, record hit areas as they go, and paint with
+instanced signed-distance shaders.
 Patchwork provides a compile-time application contract that compiles to both native
 Linux (Wayland + wgpu-native) and the browser (`wasm32-freestanding` + WebGPU) from
 a single Zig app definition without dynamic dispatch or vtables.
@@ -21,11 +22,8 @@ pub const App = struct {
         },
     };
     pub fn init(app: *App, textures: *patchwork.draw.Textures) void
-    pub fn layout(app: *App, width_logical: u32, height_logical: u32) void
-    pub fn event(app: *App, event: patchwork.input.Event) bool      // true: dirty
-    pub fn timer(app: *App, now_ms: u64) bool                      // true: dirty
-    pub fn live(app: *const App) bool
-    pub fn dirty(app: *const App) bool
+    pub fn event(app: *App, cx: *patchwork.app.Context(App), event: patchwork.input.Event) void
+    pub fn timer(app: *App, cx: *patchwork.app.Context(App), now_ms: u64) void
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 };
 ```
@@ -34,23 +32,30 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`. |
+| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`, `area_cap`. |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
-| `layout` | `fn (*App, u32, u32) void` | Positions widgets for logical `(w, h)` on size change. |
-| `event` | `fn (*App, Event) bool` | Applies pointer/frame events; returns true if dirty. |
-| `timer` | `fn (*App, u64) bool` | Called on host timer expiration; returns true if dirty. |
-| `live` | `fn (*const App) bool` | True while an animator is moving; gates frame callbacks. |
-| `dirty` | `fn (*const App) bool` | True when `draw` is owed; cleared by `draw`. |
-| `draw` | `fn (*App, *app.Context(App)) void` | Appends every instance to the reset draw context. |
+| `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, and `frame` events to the app's widgets. |
+| `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration. |
+| `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
+
+`Context(App)` is the UI context (`patchwork.ui.Context`): the draw context (`cx.draw`), the
+turtle stack, the hit areas of the last frame, and pointer, hover, and capture state. There
+is no layout call and no dirty or live query: `cx.redraw()` marks a draw as owed, and
+`cx.keep_animating()` (called by a widget whose animator is still moving) keeps frame
+callbacks coming. A window resize only marks a draw as owed, because layout happens while
+drawing.
 
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
-the type), a zero capacity, and a `batch_cap` whose worst frame would not fit one command
-buffer produce a clear `@compileError` naming the exact problem.
+the type), a zero capacity, a `batch_cap` whose worst frame would not fit one command
+buffer, and an `area_cap` outside 1 to 65536 produce a clear `@compileError` naming the
+exact problem.
 
-Applications manage widget collections using `patchwork.ui.Scene(Widget, widget_cap)`,
-a generic dispatcher that implements back-to-front hit testing, hover tracking, and
-press capture over an app-defined tagged union of widgets without dynamic memory allocation.
+Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
+`Toggle`, `Slider`, `Knob`, and `Meter`. Each draws with `draw(cx, walk)` and, when
+interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
+Events resolve once per event against the areas of the last frame, so `handle` is O(1) per
+widget; the app routes every event to every widget it owns.
 
 ## Repository Layout
 
@@ -59,8 +64,12 @@ patchwork/
 ├── src/                        # Core library module ("patchwork")
 │   ├── root.zig                # Library entry point; re-exports modules and host
 │   ├── app.zig                 # App contract definitions and comptime check
-│   ├── ui.zig                  # Generic Scene(Widget, widget_cap) dispatcher
-│   ├── widgets.zig             # Retained widgets (Panel, Button, Slider, Knob, Meter, Toggle, Scroll)
+│   ├── ui.zig                  # UI namespace: dispatch, animate, draw_frame, re-exports
+│   ├── ui/turtle.zig           # Pure layout math: Walk, Size, Layout, Flow, fit, alignment
+│   ├── ui/areas.zig            # Id, Area, the hit resolve scan, duplicate-id stamps
+│   ├── ui/cx.zig               # UI Context: draw context, turtle stack, areas, hover, capture
+│   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
+│   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle)
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
 │   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
@@ -68,7 +77,6 @@ patchwork/
 │   ├── draw/pools.zig          # Context: per-type pools, layers, counting sort, sticky batches
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId
 │   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
-│   ├── turtle.zig              # 2D turtle layout engine (place_column, place_row, Walk, Size)
 │   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
 │   ├── text/ttf.zig            # Comptime TrueType reader: cmap 12/4, hmtx, glyf, composites
 │   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
@@ -100,7 +108,7 @@ patchwork/
 │   │   ├── levels.zig          # Procedural triangle-wave meter sampling
 │   │   ├── led.zig             # The rack's own draw type: a glowing LED
 │   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
-│   └── column/                 # Scroll column regression app
+│   └── column/                 # Scrolling view regression app
 │       └── app.zig             # Column App (config.timer_period_ms = 0)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
@@ -217,18 +225,17 @@ The consumer's app root satisfies the contract:
 ```zig
 const std = @import("std");
 const patchwork = @import("patchwork");
+const ui = patchwork.ui;
 const widgets = patchwork.widgets;
-const turtle = patchwork.turtle;
-const animator = patchwork.animator;
 const theme = patchwork.theme;
 const quads = patchwork.draw;
 
-const Widget = union(enum) { panel: widgets.Panel, knob: widgets.Knob };
-const Scene = patchwork.ui.Scene(Widget, 2);
-const none: turtle.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+const Context = patchwork.app.Context(App);
 
 pub const App = struct {
-    scene: Scene,
+    gain: widgets.Knob,
+    /// Times the knob reported a new value.
+    changes: u32,
 
     pub const config: patchwork.app.Config = .{
         .title = "synth",
@@ -238,111 +245,97 @@ pub const App = struct {
             .{ .type = quads.Arc, .cap = 8 },
             .{ .type = quads.Glyph, .cap = 64 },
         },
+        .area_cap = 8,
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
         _ = textures;
-        app.scene = Scene.init(2);
-        const c = theme.chrome.panel;
-        app.scene.widgets[0] = .{ .panel = .{
-            .id = 1,
-            .rect = none,
-            .padding = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 },
-            .walk = .{ .margin = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, .width = .fill, .height = .fill, .align_x = 0 },
-            .label = .{
-                .text = "synth",
-                .rect = none,
-                .style = .{ .face = .sans_bold, .size = 14, .color = .{ 1, 1, 1, 1 } },
-            },
-            .paint = .{ .r = c[0], .g = c[1], .b = c[2], .a = c[3], .radius = 8 },
-            .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-            .down = animator.Animator.init(widgets.down_rate_per_ms),
-        } };
-        var knob: widgets.Knob = .{
-            .id = 2,
-            .rect = none,
-            .name = "gain",
-            .value_text = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .walk = .{ .margin = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, .width = .{ .fixed = 144 }, .height = .{ .fixed = 72 }, .align_x = 0 },
-            .value = 0.5,
-            .accent = widgets.accents[0],
-            .hover = animator.Animator.init(widgets.hover_rate_per_ms),
-            .drag_y = 0,
-        };
-        knob.set_value(0.5);
-        app.scene.widgets[1] = .{ .knob = knob };
+        app.gain = widgets.Knob.init(ui.id("gain", 0), "gain", 0.5, widgets.accents[0]);
+        app.changes = 0;
     }
 
-    pub fn layout(app: *App, w: u32, h: u32) void {
-        const panel = &app.scene.widgets[0].panel;
-        panel.rect = .{ .x = 16, .y = 16, .width = @floatFromInt(w - 32), .height = @floatFromInt(h - 32) };
-        widgets.place_label(&panel.label, panel.rect, panel.padding);
-        app.scene.widgets[1].knob.rect = .{ .x = 32, .y = 56, .width = 144, .height = 72 };
-        app.scene.finish_layout(w, h);
+    pub fn event(app: *App, cx: *Context, input: patchwork.input.Event) void {
+        switch (app.gain.handle(cx, input)) {
+            .changed => app.changes += 1,
+            .none, .released => {},
+        }
     }
 
-    pub fn event(app: *App, e: patchwork.input.Event) bool {
-        return app.scene.handle_event(e);
-    }
-    pub fn timer(app: *App, now_ms: u64) bool {
+    pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
         _ = app;
+        _ = cx;
         _ = now_ms;
-        return false;
-    }
-    pub fn live(app: *const App) bool {
-        return app.scene.live();
-    }
-    pub fn dirty(app: *const App) bool {
-        return app.scene.dirty;
     }
 
-    pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void {
-        const w: f32 = @floatFromInt(app.scene.width_logical);
-        const h: f32 = @floatFromInt(app.scene.height_logical);
-        const clip: patchwork.draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = w, .y1 = h };
-        app.scene.widgets[0].panel.draw(cx, clip);
-        app.scene.widgets[1].knob.draw(cx, clip);
-        app.scene.finish_draw();
+    pub fn draw(app: *App, cx: *Context) void {
+        const panel: widgets.Panel = .{ .paint = widgets.paint_of(theme.chrome.panel, 8) };
+        var layout = ui.flow_of(.down);
+        layout.padding = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
+        _ = panel.begin(cx, ui.sized(.fill, .fill), layout);
+        app.gain.draw(cx, ui.sized(.{ .fixed = 144 }, .{ .fixed = widgets.knob_height }));
+        _ = cx.end();
     }
 };
 
 // Static, like the hosts' context, so the pools stay off the stack.
-var context: patchwork.app.Context(App) = undefined;
+var context: Context = undefined;
 
-test "layout then draw is clean" {
+test "a draw records the knob and a wheel turns it" {
     context.init();
     var app: App = undefined;
-    App.init(&app, &context.textures);
-    app.layout(400, 300);
-    try std.testing.expect(app.dirty());
-    context.reset();
-    app.draw(&context);
-    try std.testing.expect(!app.dirty());
-    try std.testing.expectEqual(@as(u32, 0), context.overflow_count);
-    try std.testing.expect(context.items(quads.Arc).len >= 1);
+    App.init(&app, &context.draw.textures);
+    try std.testing.expect(ui.draw_frame(App, &app, &context, 400, 300, 120));
+    try std.testing.expect(!context.dirty);
+    try std.testing.expect(context.draw.items(quads.Arc).len >= 1);
+    const ring = context.find(app.gain.id).?.rect;
+    const wheel: patchwork.input.Wheel = .{ .x = ring[0] + 28, .y = ring[1] + 28, .dy = -60 };
+    ui.dispatch(App, &app, &context, .{ .wheel = wheel });
+    try std.testing.expectEqual(@as(f32, 1), app.gain.value);
+    try std.testing.expectEqual(@as(u32, 1), app.changes);
+    try std.testing.expect(context.dirty);
+}
+
+comptime {
+    patchwork.app.check(App);
 }
 ```
 
-## Turtle Layout Architecture
+## Layout While Drawing
 
-Flow is downward in columns and left-to-right in rows (`turtle.place_column` and
-`turtle.place_row`). Sizing is `fixed`, `fill`, or `fit`. Padding lives on the
-container, while `margin`, `width`, `height`, and `align_x` live on each child's `Walk`.
-Container padding insets the inner rectangle where children walk. The turtle advances a
-cursor along the main axis and writes border-box instance rectangles (margins excluded).
-Children with `fill` height in a column share leftover main-axis space equally. In a row,
-`place_row` is the horizontal transpose: width `fill` shares leftover width, while height
-`fill` takes the row height minus that child's vertical margins (it does not split height
-among siblings). `align_x` is checked and does not move a row child; rows have no cross-axis
-alignment. Oversized fixed dimensions are not clamped. If a child resolves to a non-positive
-edge, it is still placed and still advances the cursor so siblings keep their positions, but
-widgets skip it and `draw.Context.append` rejects it to protect the GPU from degenerate quads.
+`App.draw` lays out as it draws (`src/ui.zig`, `src/ui/cx.zig`): `cx.begin(walk, layout)`
+opens a container, children place themselves with `cx.walk(walk)`, and `cx.end()` closes it.
+Nesting is the call structure; the stack holds at most 32 open containers.
 
-Layout executes in two bounded passes with zero heap allocation, bounded by `turtle.child_cap`.
-Window resize sets `Frame.relayout`, rebuilding the draw pools. A display scale change leaves
-`Frame.relayout` false: the column is not re-walked. The hosts still redraw the scene once,
-because glyphs are rasterized and snapped at the device scale, and only the glyph records
-change (see Text below).
+- **Layout** (on the container): `flow` (`.right`, `.down`, or `.overlay`), `spacing`,
+  `padding`, `alignment` per axis, and `clip`, which intersects everything inside with the
+  container's box.
+- **Walk** (on the child): `width`, `height`, and `margin`. A `Size` is `fixed`, `fill` (on
+  the main axis, what remains at placement, so a second fill gets 0), `share(n)` (one n-th of
+  the inner span minus spacing: `n` siblings tile it exactly), or `fit` (containers only:
+  resolved at `end` from the children's extent).
+- **Alignment after the fact.** A container records each draw pool's count and the area
+  count when it opens. At `end`, main-axis alignment and a fit child's own alignment each
+  yield one delta, snapped to the device pixel grid so glyphs stay crisp, added to `rect.xy`
+  of exactly the instances and areas drawn since. A zero delta does nothing; clips never
+  move, so a shifted container may not contain a clipping one (asserted).
+- **Hit areas.** Widgets record `cx.area(id, rect, radius, flags)` while drawing. Ids are
+  `ui.id("name", index)`: a compile-time FNV-1a hash mixed with the index. Each event
+  resolves the topmost area once (highest layer, then last drawn; clip and rounded rect must
+  contain the point); `cx.hit(id, event)` is then an O(1) compare yielding `hover_in`,
+  `hover_out`, `down`, `drag`, `up`, or `wheel`. A press captures until release, across
+  frames. The wheel goes to the topmost wheel-flagged area, so a knob inside a view turns
+  instead of scrolling. After a draw that moved things under a resting pointer, hover is
+  re-resolved and lands one frame late.
+- **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
+  the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
+  and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
+  offset into the rows under the viewport; the app skips the others with `cx.skip`, so a
+  1,000-row list costs only its visible rows.
+
+All of it is fixed storage with no allocation; per-frame work is proportional to the
+instances, areas, and nesting depth drawn, never to capacities. A display scale change does
+not change layout; the hosts still redraw once because glyphs are rasterized and snapped at
+the device scale, and only the glyph records change (see Text below).
 
 ## Example Applications
 
@@ -351,18 +344,22 @@ here, so they cannot drift. Run `zig build test` for the checked numbers.
 
 ### 1. Synthesizer Rack (`examples/rack/app.zig`)
 
-A modular rack in a full-window column under a header bar: a stack of panels, each holding a
-row of knobs and a level meter. It demonstrates:
+A modular rack under a header bar: a column of panels, each holding a row of knobs and a
+level meter, beside a scrolling list of 1,000 presets and a status line. It demonstrates:
+- **Layout while drawing.** Nested `begin` and `end` with `share(3)` panels; the knob and
+  meter omission rules are a few lines against `cx.remaining()` and `cx.fits()`. The worked
+  layouts are locked by the tests in `examples/rack/app.zig`.
+- **Actions.** Knobs return `changed`, which the rack writes to its status line
+  ("filter.cut changed 0.42"); clicking a preset row selects and highlights it ("preset 412
+  selected").
+- **Virtual list.** The preset list draws only the rows under its viewport; the view's
+  height is capped so the pools hold the worst case at any window size.
 - **Text.** The header shows a 32 px monospace "121.00" and a bold "BPM" sharing one baseline
   (`text.place_runs`) and the label "Jürgen Köhler · Café" (composite and non-ASCII glyphs),
   right-aligned and cut with an ellipsis when the bar is narrow. Panel titles are bold 14 px,
   and knob values are monospace (`widgets.value_style`).
-- **Flat widget list.** One `Scene` array holds panels, knobs, and meters. Hit testing scans
-  back to front and later slots win, so a knob or meter wins over its backing panel without
-  nested containers. The slot and per-pool budgets are `comptime` asserts in `app.zig`.
-- **Clipping.** Knob faces clip to the parent panel and meter faces clip to the meter cell,
-  so a track cannot cover the title. A knob or meter whose box does not fit is omitted rather
-  than drawn over its neighbor. Panel faces carry the window clip.
+- **Clipping.** Panels are clipping containers, so knob faces and titles clip to their panel;
+  the meter sits in its own clipping cell so its fixed-height track cannot cover the title.
 - **Per-instance accents.** Knob accents are per-instance colors (`draw.Arc.color`), not theme
   slots. The palette is `widgets.accents`.
 - **An app-defined draw type** (`examples/rack/led.zig`). `Led` is an `extern struct` plus a
@@ -371,8 +368,9 @@ row of knobs and a level meter. It demonstrates:
 - **An image texture** (`examples/rack/badge.zig`). `init` generates a 32 by 32 RGBA badge,
   creates a texture for it, and queues its pixels; each title band draws it as a `draw.Image`.
 - **Layers.** Hovering a knob for `tooltip_delay_ms` (500 ms) shows a tooltip that covers the
-  neighbouring knob's name. It is drawn on the overlay layer, so it covers the base layer's
-  text batch; test "the tooltip box covers the neighbour's text on the overlay layer" locks it.
+  neighbouring knob's name. It is drawn on the overlay layer and records no hit area, so it
+  never takes the hover from the knob; test "the tooltip box covers the neighbour's text on
+  the overlay layer" locks it.
 - **Procedural meters** (`examples/rack/levels.zig`). Integer-period triangle waves sampled
   from the clock: no trigonometry, no `f64`. Sampling never reads knobs, and dragging a knob
   never changes a bar. Sample values are locked by the test in `levels.zig`.
@@ -387,22 +385,20 @@ false when the value is unchanged, and drawing only reads `value`. The scale fac
 
 ### 2. Scroll Column (`examples/column/app.zig`)
 
-A regression app for a single docked `Scroll` container beside a root column. It demonstrates:
+A regression app for one scrolling view in a panel docked on the right of the window. It
+demonstrates:
 - **No timer.** `config.timer_period_ms = 0`, so the native host sleeps in `poll` with the
   timer descriptor disabled and the browser host arms no `setInterval`. An idle app uses no CPU.
-- **Scroll ownership.** `Scroll` owns up to `widgets.scroll_child_cap` controls. The scene
-  captures the scroll container, and the scroll arbitrates `press` between no target, a child
-  index, and the thumb.
-- **Unscrolled storage.** Child rects are stored unscrolled; drawing and hit testing subtract
-  `scroll_y`. Children outside the viewport are culled from the draw pools, and children that
-  cross the viewport edge carry the viewport clip rect.
+- **A view of mixed rows.** Knobs, a meter, and toggles flow down in `cx.begin_view`. Rows
+  outside the viewport are culled from the draw pools and record no area; rows that cross
+  its edge carry the viewport clip.
 - **Thumb.** Its height is the viewport-to-content ratio of the viewport height, floored at
-  `widgets.thumb_min_px`, and hidden when nothing can scroll. Thumb drag maps absolute pointer
-  travel onto the scroll range. Wheel elsewhere in the viewport adds `dy` to `scroll_y`;
-  horizontal wheel is ignored.
+  `ui.view.thumb_min_px`, and hidden when nothing can scroll. Thumb drag maps absolute
+  pointer travel onto the scroll range. A wheel elsewhere in the viewport scrolls; a wheel on
+  a knob ring turns the knob.
 
-The docked rectangle's coordinates at specific window sizes are locked by the layout tests
-in `examples/column/app.zig`.
+The docked panel's coordinates at specific window sizes are locked by the layout tests in
+`examples/column/app.zig`.
 
 ## GPU Command Stream
 
@@ -465,8 +461,8 @@ border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas 
   `pixel`. Derivatives and `textureSample` must stay in uniform control flow, so `pixel`
   must not call them inside branches on instance data; the prelude guide explains.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
-  layer (`cx.layer(.overlay)` returns the previous layer for restoring). A full pool or batch
-  list refuses the instance and counts it in `cx.overflow_count`.
+  layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
+  batch list refuses the instance and counts it in `cx.draw.overflow_count`.
 - **Sticky batches.** At frame end each pool is stably sorted by (layer, texture) with a
   counting sort, skipped when appends were already in order, and each (layer, type, texture)
   run is one draw call. Layers draw in order; within a layer, batches draw in order of first
@@ -495,7 +491,9 @@ Memory: each pool holds `cap` records plus a renderer shadow of the same size, a
 buffer of the largest pool backs the counting sort. The context also holds the glyph cache
 (about 1.25 MiB: the 1 MiB atlas mirror, the table, and raster scratch). The hosts keep the
 context and renderer in static memory (BSS on wasm), so the linker sizes the wasm initial
-memory to cover them.
+memory to cover them. The UI context around the draw context adds `area_cap` 48-byte hit
+areas, 32 turtle entries, and, in safe builds only, a duplicate-id table of 12 bytes per slot
+(`2 * area_cap` rounded up to a power of two).
 
 ## Text
 
@@ -508,8 +506,8 @@ Both targets `@embedFile` them, so the browser fetches no font files and a proje
 const style: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 } };
 const width = text.measure(style, "0.50");                    // logical px, pure
 const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
-text.place(cx, style, "0.50", rect, clip, options);
-text.place_runs(cx, &runs, rect, clip, options);              // one baseline for mixed styles
+text.place(cx.drawing(), style, "0.50", rect, clip, options);  // during App.draw
+text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline for mixed styles
 ```
 
 - **UTF-8** with U+FFFD for each invalid byte; at most `text.byte_cap` (4096) bytes per call.
@@ -525,8 +523,8 @@ text.place_runs(cx, &runs, rect, clip, options);              // one baseline fo
   start of the next frame; a frame that starts on an empty atlas and still overflows counts
   the overflow instead of resetting again. A settled frame calls no draw, rasterizes nothing,
   and writes nothing.
-- **Hosts draw when the cache owes it:** `App.draw` runs when `app.dirty()` or
-  `context.text.owes_draw(scale_120)` (the scale changed, or glyphs are pending).
+- **Hosts draw when the cache owes it:** `App.draw` runs when `cx.dirty` or
+  `cx.draw.text.owes_draw(scale_120)` (the scale changed, or glyphs are pending).
 
 Module guides in `src/text.zig` and `src/text/*.zig` hold the algebra; the tests hold the
 worked numbers (the rasterizer is checked against a polygon-clipping reference).
@@ -575,7 +573,7 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   is set. When non-zero, it runs a `setInterval` calling `wasm.timer(now_ms)`. If `timer` returns
   1, `shell.js` schedules a single `requestAnimationFrame`.
 - When rAF runs, `wasm.tick(now_ms)` advances continuous animators and presents dirty frames.
-  `wasm.tick()` returns 1 while an interactive animator is moving (`App.live()`) or a redraw
+  `wasm.tick()` returns 1 while a widget keeps animating (`cx.keep_animating()`) or a redraw
   is still owed (glyphs the cache skipped). Once hover/down animators settle, `tick()` returns
   0 and rAF stops. A resting pointer does not chain animation frames.
 - CSS pixels are logical pixels. `fit_canvas` calls `wasm.resize(css_width, css_height,
