@@ -14,8 +14,9 @@
 //! ```text
 //! draw/registry.zig   DrawType, the instance convention check, WGSL assembly, layouts
 //! draw/prelude.wgsl   vs_main, fs_main, coverage, clip_mask, sdf_* shared by every type
-//! draw/types.zig      Box, Arc, Glyph, Image, AppendError, and the CPU distance twins
-//! draw/pools.zig      Context: per-type pools, layers, the counting sort, sticky batches
+//! draw/types.zig      Box, Arc, Glyph, Image, Path, AppendError, and the CPU distance twins
+//! draw/pools.zig      Context: per-type pools, the point pool, layers, sort, sticky batches
+//! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
 //! draw/textures.zig   Textures: queued creates and writes, TextureId, Format
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
@@ -80,6 +81,9 @@ const pools = @import("draw/pools.zig");
 const textures_module = @import("draw/textures.zig");
 const types = @import("draw/types.zig");
 
+/// Stroked paths: `path.cubic`, `path.polyline`, `path.plot`, and their CPU twins.
+pub const path = @import("draw/path.zig");
+
 /// Exclusive-max clip in logical pixels, copied into every instance's `clip`. `x1 > x0` and
 /// `y1 > y0`, all finite.
 pub const Clip = struct {
@@ -121,7 +125,11 @@ pub const Box = types.Box;
 pub const Arc = types.Arc;
 pub const Glyph = types.Glyph;
 pub const Image = types.Image;
+pub const Path = types.Path;
+pub const Point = pools.Point;
+pub const point_cap_max = pools.point_cap_max;
 pub const sdf_box = types.sdf_box;
+pub const sdf_segment = types.sdf_segment;
 pub const sdf_arc = types.sdf_arc;
 pub const contains_box = types.contains_box;
 /// Null when a type satisfies the draw type convention, else a message naming it.
@@ -238,6 +246,7 @@ test {
     _ = pools;
     _ = textures_module;
     _ = types;
+    _ = path;
 }
 
 fn project(matrix: [16]f32, x: f32, y: f32) [2]f32 {

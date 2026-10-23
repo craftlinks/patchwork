@@ -46,11 +46,14 @@
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
 //! type's id is its index. `config.batch_cap` (default 256) bounds the batches per frame and
-//! `config.area_cap` (default 1024) the hit areas. `Context(App)` is the UI context built
-//! from them (`ui.Context`, which embeds the draw context as `cx.draw`). `check` rejects an
-//! empty or oversized list, a type that breaks the instance convention (the message names
+//! `config.area_cap` (default 1024) the hit areas. `config.point_cap` (default 65536) sizes the
+//! point pool that `draw.Path` strokes read; it is allocated only when a registered type
+//! declares `reads_points` (`draw/pools.zig`, section 5b). `Context(App)` is the UI context
+//! built from them (`ui.Context`, which embeds the draw context as `cx.draw`). `check` rejects
+//! an empty or oversized list, a type that breaks the instance convention (the message names
 //! the type; see `draw/registry.zig`), a zero cap, a `batch_cap` whose worst frame would not
-//! fit one command buffer, and an `area_cap` outside `1 .. areas.area_cap_max`.
+//! fit one command buffer, an `area_cap` outside `1 .. areas.area_cap_max`, and a
+//! `point_cap` outside `1 .. pools.point_cap_max`.
 //!
 //! ## 3. Host Order Per Wake
 //! Drain queued events through `ui.dispatch`. When a frame callback completes, call
@@ -78,6 +81,7 @@ const registry = @import("draw/registry.zig");
 const renderer = @import("draw/renderer.zig");
 const ui = @import("ui.zig");
 const areas = @import("ui/areas.zig");
+const pools = @import("draw/pools.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
 pub const Config = struct {
@@ -91,12 +95,14 @@ pub const Config = struct {
     batch_cap: u32 = 256,
     /// Upper bound on hit areas per frame; the rest are counted and not hittable.
     area_cap: u32 = 1024,
+    /// Upper bound on path points per frame, when a registered type reads points.
+    point_cap: u32 = 65536,
 };
 
 /// The UI context type `App.event`, `App.timer`, and `App.draw` receive, built from
 /// `App.config`.
 pub fn Context(comptime App: type) type {
-    const Draw = quads.Context(App.config.draw, App.config.batch_cap);
+    const Draw = quads.Context(App.config.draw, App.config.batch_cap, App.config.point_cap);
     return ui.Context(Draw, App.config.area_cap);
 }
 
@@ -137,6 +143,12 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     }
     if (App.config.area_cap > areas.area_cap_max) {
         return "App.config.area_cap must be at most 65536";
+    }
+    if (App.config.point_cap == 0) {
+        return "App.config.point_cap must be at least 1";
+    }
+    if (App.config.point_cap > pools.point_cap_max) {
+        return "App.config.point_cap must be at most 65536";
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
     const expected = [_]type{
@@ -266,6 +278,24 @@ const HugeAreas = struct {
     };
 };
 
+const HugePoints = struct {
+    pub const config: Config = .{
+        .title = "huge points",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .point_cap = 65537,
+    };
+};
+
+const NoPoints = struct {
+    pub const config: Config = .{
+        .title = "no points",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .point_cap = 0,
+    };
+};
+
 const OldEvent = struct {
     pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
     pub fn init(app: *OldEvent, textures: *quads.Textures) void {
@@ -314,6 +344,15 @@ test "an area cap of zero or above the maximum is rejected" {
     const huge = comptime conformance(HugeAreas).?;
     try std.testing.expect(std.mem.find(u8, huge, "65536") != null);
     try std.testing.expectEqual(@as(u32, 65536), areas.area_cap_max);
+}
+
+// Locks the point capacity bounds: zero and one past `point_cap_max` are rejected by name.
+test "a point cap of zero or above the maximum is rejected" {
+    const none = comptime conformance(NoPoints).?;
+    try std.testing.expect(std.mem.find(u8, none, "point_cap") != null);
+    const huge = comptime conformance(HugePoints).?;
+    try std.testing.expect(std.mem.find(u8, huge, "65536") != null);
+    try std.testing.expectEqual(@as(u32, 65536), pools.point_cap_max);
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and

@@ -22,6 +22,12 @@
 //! violation as a message that starts with the type's name, so `app.check` can fail the build
 //! naming it (`zig build test-contract` locks one case).
 //!
+//! A type may also declare `pub const reads_points: bool`. When it is true the type's module
+//! declares the context's point buffer (`@group(0) @binding(1)`, read-only storage, fragment
+//! stage) as `points: array<vec2<f32>>`, and the renderer creates that buffer and binds it in
+//! the frame group, once per pass for every pipeline. A registry without such a type has no
+//! point buffer at all (`uses_points`), so its apps pay nothing for paths (`draw.Path`).
+//!
 //! All geometry is relative to `rect`: a type's parameters (radii, sweeps, UVs, the LED's
 //! glow) are expressed in the quad's local space, never as absolute positions. The UI layer
 //! aligns a container after its children drew by adding a delta to `rect.xy` alone
@@ -33,6 +39,7 @@
 //! prelude.wgsl                         Frame, vs_main, fs_main, coverage, sdf_*, clip_mask
 //! struct Theme { ... }                 one vec4 per `theme.Theme` field, in order
 //! bound_texture, bound_sampler         @group(1), textured types only, with sample_texture
+//! points                               @group(0) @binding(1), `reads_points` types only
 //! struct Instance { g0 .. gN-1 }       @location(1 .. N) vec4<f32>
 //! struct Varyings                      position, local, and every group @interpolate(flat)
 //! struct Pixel                         local, size, pos, and every Zig field by name
@@ -112,6 +119,9 @@ pub fn check(comptime T: type) ?[]const u8 {
         if (@TypeOf(T.texture) != ?textures.Format) {
             return name ++ ": `texture` must be ?draw.TextureFormat";
         }
+        if (@hasDecl(T, "reads_points")) {
+            if (@TypeOf(T.reads_points) != bool) return name ++ ": `reads_points` must be bool";
+        }
         return null;
     }
 }
@@ -126,6 +136,12 @@ fn field_problem(comptime T: type, comptime name: []const u8, comptime F: type) 
         return null;
     }
     return "must be f32 or [4]f32";
+}
+
+/// True when `T` declares `reads_points = true` (module guide, section 2).
+pub fn reads_points(comptime T: type) bool {
+    if (comptime !@hasDecl(T, "reads_points")) return false;
+    return comptime T.reads_points;
 }
 
 /// Null when `entries` is a valid registry, otherwise the first problem. Pure, so `app.zig`
@@ -171,6 +187,13 @@ pub fn Registry(comptime entries: []const DrawType) type {
         pub const textured: [count]bool = blk: {
             var out: [count]bool = undefined;
             for (entries, 0..) |entry, index| out[index] = entry.type.texture != null;
+            break :blk out;
+        };
+
+        /// True when some registered type reads the point buffer (module guide, section 2).
+        pub const uses_points: bool = blk: {
+            var out = false;
+            for (entries) |entry| out = out or reads_points(entry.type);
             break :blk out;
         };
 
@@ -231,6 +254,7 @@ pub fn source(comptime T: type) []const u8 {
         assert(check(T) == null);
         var text: []const u8 = prelude ++ "\n" ++ theme_wgsl();
         if (T.texture != null) text = text ++ texture_wgsl;
+        if (reads_points(T)) text = text ++ points_wgsl;
         text = text ++ io_wgsl(T) ++ "\n" ++ T.pixel;
         const copy = text[0..text.len].*;
         return &copy;
@@ -258,6 +282,13 @@ const texture_wgsl: []const u8 =
     \\fn sample_texture(uv: vec2<f32>) -> vec4<f32> {
     \\    return textureSample(bound_texture, bound_sampler, uv);
     \\}
+    \\
+;
+
+const points_wgsl: []const u8 =
+    \\
+    \\// The draw context's points, read by `reads_points` types (module guide, section 2).
+    \\@group(0) @binding(1) var<storage, read> points: array<vec2<f32>>;
     \\
 ;
 
@@ -364,6 +395,8 @@ test "source declares locations 1 to N and names every field" {
     try testing.expect(std.mem.find(u8, text, "px.spread = v.g3.y;") != null);
     try testing.expect(std.mem.find(u8, text, "px.clip = v.g1;") != null);
     try testing.expect(std.mem.find(u8, text, "bound_texture") == null);
+    try testing.expect(std.mem.find(u8, text, "var<storage, read> points") == null);
+    try testing.expect(comptime !reads_points(Probe));
     try testing.expect(std.mem.find(u8, text, "fn vs_main") != null);
     var cursor: usize = std.mem.find(u8, text, "struct Theme {").?;
     inline for (@typeInfo(theme.Theme).@"struct".field_names) |field_name| {
@@ -402,6 +435,6 @@ comptime {
     assert(group_cap <= commands.attribute_cap);
     assert(type_cap <= commands.caps.get(.shader));
     assert(type_cap <= commands.caps.get(.pipeline));
-    // Unit quad, uniform, and one instance buffer per type.
-    assert(type_cap + 2 <= commands.caps.get(.buffer));
+    // Unit quad, uniform, the point buffer, and one instance buffer per type.
+    assert(type_cap + 3 <= commands.caps.get(.buffer));
 }

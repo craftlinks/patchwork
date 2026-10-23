@@ -1,4 +1,4 @@
-//! The library draw types (`Box`, `Arc`, `Glyph`, `Image`) and their CPU distance twins.
+//! The library draw types (`Box`, `Arc`, `Glyph`, `Image`, `Path`) and their CPU twins.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -24,6 +24,10 @@
 //!   the bitmap is rasterized at device size, so each fragment center samples one texel center
 //!   and bilinear filtering returns that texel unchanged (`text/layout.zig`, section 3).
 //! - `Image` (64 bytes): `uv` and `tint`; samples an `rgba8` texture, multiplied by `tint`.
+//! - `Path` (80 bytes): one chunk of a stroked polyline whose points live in the context's
+//!   point buffer (`reads_points`). `color`, then `anchor_x`, `anchor_y`, `width`, `hover`,
+//!   then `first_point`, `point_count`, `prev`, `next`. `draw/path.zig` writes these records
+//!   and its guide explains the fields, the seam rule, and the fragment loop.
 //!
 //! ## 3. Hover, Down, and Theme Colors
 //! ```text
@@ -35,10 +39,10 @@
 //! WGSL literals.
 //!
 //! ## 4. CPU Twins
-//! `sdf_box` and `sdf_arc` are the CPU twins of the prelude functions of the same names, so
-//! layout and hit testing are verified without a GPU. `contains_box` is the one rounded-box
-//! point test that widget hit testing uses. The tests at the end of this file hold the worked
-//! values.
+//! `sdf_box`, `sdf_arc`, and `sdf_segment` are the CPU twins of the prelude functions of the
+//! same names, so layout and hit testing are verified without a GPU. `contains_box` is the one
+//! rounded-box point test that widget hit testing uses. The tests at the end of this file hold
+//! the worked values.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -141,6 +145,84 @@ pub const Image = extern struct {
         \\
     ;
 };
+
+/// One chunk of a stroked path: at most `path.chunk_points_max` points of the context's point
+/// buffer, drawn with round caps. Every field is an `f32`, so the index fields carry
+/// integer values (exact below 2^24), never bit patterns: a small integer's bits are a
+/// denormal float, which a GPU may flush to zero. See `draw/path.zig`.
+pub const Path = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+    color: [4]f32,
+    /// The path origin minus `rect.xy`: points are stored relative to that origin, so a shift
+    /// of `rect.xy` moves the stroke with it.
+    anchor_x: f32,
+    anchor_y: f32,
+    width: f32,
+    /// Mix weight toward `theme.lighten`.
+    hover: f32,
+    first_point: f32,
+    point_count: f32,
+    /// 1 when an earlier chunk shares this chunk's first point, else 0.
+    prev: f32,
+    /// 1 when a later chunk shares this chunk's last point, else 0.
+    next: f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const reads_points: bool = true;
+    // `fwidth` runs before the loop, whose bound is instance data, so the derivative stays in
+    // uniform control flow (prelude, section 3). For an exact distance it is one device pixel
+    // in logical pixels. A fragment that a neighbouring chunk's seam segment is nearer to
+    // belongs to that chunk; ties go to the earlier chunk (`draw/path.zig`, section 4).
+    pub const pixel: []const u8 =
+        \\fn pixel(px: Pixel) -> vec4<f32> {
+        \\    let pixel_size = max(fwidth(px.local.x), 1.0e-5);
+        \\    let q = px.local - vec2<f32>(px.anchor_x, px.anchor_y);
+        \\    let head = u32(px.first_point);
+        \\    let tail = head + u32(px.point_count) - 1u;
+        \\    var own = 3.0e38;
+        \\    for (var i = head; i < tail; i = i + 1u) {
+        \\        own = min(own, sdf_segment(q, points[i], points[i + 1u]));
+        \\    }
+        \\    var before = 3.0e38;
+        \\    if (px.prev > 0.5) {
+        \\        before = sdf_segment(q, points[head - 1u], points[head]);
+        \\    }
+        \\    var after = 3.0e38;
+        \\    if (px.next > 0.5) {
+        \\        after = sdf_segment(q, points[tail], points[tail + 1u]);
+        \\    }
+        \\    let owned = select(0.0, 1.0, own < before && own <= after);
+        \\    let alpha = clamp(0.5 - (own - 0.5 * px.width) / pixel_size, 0.0, 1.0);
+        \\    let rgb = mix(px.color.rgb, frame.theme.lighten.rgb, px.hover);
+        \\    return vec4<f32>(rgb, px.color.a * alpha * owned);
+        \\}
+        \\
+    ;
+};
+
+/// Distance from `(px, py)` to the segment from `(ax, ay)` to `(bx, by)`. CPU twin of
+/// `sdf_segment` in `prelude.wgsl`:
+/// ```text
+/// h    = clamp(dot(p - a, b - a) / max(dot(b - a, b - a), 1e-12), 0, 1)
+/// dist = length(p - a - (b - a) * h)
+/// ```
+/// A degenerate segment (`a == b`) is the distance to the point.
+pub fn sdf_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) f32 {
+    assert(px == px);
+    assert(py == py);
+    const pax = px - ax;
+    const pay = py - ay;
+    const bax = bx - ax;
+    const bay = by - ay;
+    const along = (pax * bax + pay * bay) / @max(bax * bax + bay * bay, 1.0e-12);
+    const h = std.math.clamp(along, 0, 1);
+    const dx = pax - bax * h;
+    const dy = pay - bay * h;
+    const dist = @sqrt(dx * dx + dy * dy);
+    assert(dist >= 0);
+    return dist;
+}
 
 /// Signed distance of a rounded rectangle, negative inside and positive outside. CPU twin of
 /// `sdf_box` in `prelude.wgsl`.
@@ -289,6 +371,21 @@ comptime {
     assert(@offsetOf(Glyph, "color") == 48);
     assert(@sizeOf(Image) == 64);
     assert(@offsetOf(Image, "tint") == 48);
+    assert(@sizeOf(Path) == 80);
+    assert(@offsetOf(Path, "color") == 32);
+    assert(@offsetOf(Path, "anchor_x") == 48);
+    assert(@offsetOf(Path, "hover") == 60);
+    assert(@offsetOf(Path, "first_point") == 64);
+    assert(@offsetOf(Path, "next") == 76);
+}
+
+// Locks the segment twin: the perpendicular foot, both end caps, and a degenerate segment.
+test "sdf segment measures to the nearest point of the segment" {
+    try std.testing.expectApproxEqAbs(@as(f32, 3), sdf_segment(5, 3, 0, 0, 10, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), sdf_segment(-3, 4, 0, 0, 10, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), sdf_segment(13, -4, 0, 0, 10, 0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), sdf_segment(3, 4, 0, 0, 0, 0), 0.0001);
+    try std.testing.expectEqual(@as(f32, 0), sdf_segment(7, 0, 0, 0, 10, 0));
 }
 
 // Locks the interior: the center of a sharp 20 by 10 box is half the shorter side inside.

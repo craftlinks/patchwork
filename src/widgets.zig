@@ -1148,7 +1148,7 @@ const test_draw = [_]quads.DrawType{
     .{ .type = quads.Glyph, .cap = 64 },
 };
 
-const TestContext = ui.Context(quads.Context(&test_draw, 16), 16);
+const TestContext = ui.Context(quads.Context(&test_draw, 16, 0), 16);
 
 /// A freshly initialized static context, so tests keep the pools off the stack.
 fn test_context() *TestContext {

@@ -47,7 +47,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Bars on the rack, one per panel; the rack asserts the two counts match.
+/// Bars on the rack, one per voice panel; the rack asserts the two counts match.
 pub const meter_count: u32 = 3;
 
 /// Host wake period. Native `period_ns` is this many milliseconds.

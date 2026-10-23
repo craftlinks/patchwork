@@ -1,4 +1,5 @@
-//! Demo: a synthesizer rack of panels of knobs and meters, beside a list of 1,000 presets.
+//! Demo: a synthesizer rack of panels of knobs, meters, patch cables, and an envelope, beside
+//! a list of 1,000 presets.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -10,11 +11,12 @@
 //!   header       fill by header_px
 //!   body         fill by fill, flow right, spacing 8
 //!     panels     room - preset_column_px - 8 by fill, flow down, spacing 8
-//!       panel    fill by share(3), padding 8, clipped    (Panel.begin draws the face)
+//!       panel    fill by share(4), padding 8, clipped    (Panel.begin draws the face)
 //!         band   fill by min(title_band_px, room)         title, badge, LED (overlay flow)
 //!         body   fill by fill, flow right
-//!           row  knob_row_width(body) by fill             knob cells 144 by 72, gap 8
-//!           cell meter_column_px by fill, clipped         meter
+//!           row  knob_row_width(body) by fill             knob cells 144 by 72, gap 8, hubs
+//!           cell meter_column_px by fill, clipped         meter (voice panels)
+//!           cell fill by fill, margin 8                   envelope display (env panel)
 //!     presets    preset_column_px by fill, flow down, spacing 8
 //!       list     fill by room - status - 8 (capped), padding 8; a view of 1,000 rows
 //!       status   fill by status_px                        the last action
@@ -25,6 +27,8 @@
 //! the meter and the body height (otherwise it is walked but not drawn, so the cells keep
 //! their positions), and the meter is drawn only when the body is at least
 //! `meter_column_px` wide and has positive height; without it the knobs take the full body.
+//! The envelope panel has no meter: its row is at most four cells wide (`env_row_width`) and
+//! the display takes the rest when that is at least `display_min_px`.
 //! The header rect is always walked, so the panels start at the same y whether or not the
 //! window can hold the header's text. Worked layouts: tests "rack layout at 1280 by 720",
 //! "rack layout at 800 by 600", "a narrow window keeps only knobs that clear the meter", and
@@ -41,7 +45,8 @@
 //! against the areas of the last draw; knobs record their ring as a wheel area while drawing.
 //! A `changed` action rewrites the status line ("filter.cut changed 0.42"); a right press on
 //! a knob resets it to its initial value ("filter.cut reset 0.50"); meters are passive. Knob
-//! rings show the grab cursor (grabbing while dragged).
+//! rings show the grab cursor (grabbing while dragged). The ring's center is the knob's jack
+//! hub (section 3c), so a press there patches a cable instead of turning the knob.
 //!
 //! ## 2b. Renaming a Panel
 //! Panel titles are owned bytes (`titles`, at most `title_cap`), each with an area
@@ -64,11 +69,12 @@
 //! longest message fits.
 //!
 //! ## 3. Draw Types, Layers, and the Title Band
-//! `config.draw` registers the library's `Box`, `Arc`, `Glyph`, and `Image` and the rack's
-//! own `Led` (`led.zig`). Each panel's title band carries the procedural badge (`badge.zig`,
-//! an `Image` of the texture `init` creates) at its left end and an LED centered over the
-//! meter track whose brightness is that panel's meter level; the title is centered between
-//! them. Everything is on the base layer except the tooltip.
+//! `config.draw` registers the library's `Box`, `Arc`, `Glyph`, `Image`, and `Path` and the
+//! rack's own `Led` (`led.zig`). Each panel's title band carries the procedural badge
+//! (`badge.zig`, an `Image` of the texture `init` creates) at its left end and, on a voice
+//! panel, an LED centered over the meter track whose brightness is that panel's meter level;
+//! the title is centered between them. Everything is on the base layer except the playhead
+//! and the cables (`cable_layer`, 2) and the tooltip (overlay, 4).
 //!
 //! ## 3a. Header and Text Styles
 //! The header bar holds the tempo readout (`tempo_runs`: "121.00" in 32 px mono and " BPM"
@@ -86,6 +92,44 @@
 //! its own, so it never takes the hover from the knob under it. Test "the tooltip box covers
 //! the neighbour's text on the overlay layer" locks the rule.
 //!
+//! ## 3c. Patch Cables
+//! Each drawn knob gets a jack hub: a `hub_radius` disc at its ring's center with its own
+//! area `knob.id.derive(jack_salt)`, recorded after the ring so it takes presses inside its
+//! radius, with the pointer cursor and no wheel flag, so the wheel still turns the knob.
+//! ```text
+//! hub down    patching = knob, patch_end = pointer           (the hub captures)
+//! hub drag    patch_end = pointer; draw owes a preview cable from the hub to the pointer
+//! hub up      the knob whose ring contains the release (found over the knob areas, since a
+//!             cable may be the hot area there) gets a cable, unless it is the source, the
+//!             pair is already patched either way, or the table is full ("cables full")
+//! cable hover redraw; the cable lightens (`hover_lighten`)
+//! cable right press removes it ("cable removed")
+//! ```
+//! `cables[0..cable_count]` holds at most `cable_cap` pairs of knob indices; two exist at
+//! `init`. A cable is a cubic from hub to hub whose inner control points hang `cable_sag`
+//! below the chord's thirds, drawn with `draw.path.cubic` at alpha `cable_alpha` (so a joint
+//! drawn twice would show) on `cable_layer`, with a path area of `cable_width / 2 + 3`. The
+//! layer puts cables over panels and text and under the tooltip, and makes a cable's area
+//! win over the knobs under it: a right press on a cable over a knob removes the cable, and a
+//! wheel over a cable does not reach the knob beneath (accepted). A cable covers its hubs'
+//! lower halves, so a second cable starts from the hub's top. The preview records no area, so
+//! the knob under the pointer stays hot, and it is drawn last, so earlier points do not move.
+//! Tests: "a hub drag patches a cable and a right press removes it", "the worst patch frame
+//! fits every pool and a full table refuses", and "cables sag by their length".
+//!
+//! ## 3d. Envelope Panel
+//! The fourth panel's knobs are attack, decay, sustain, and release. Its display draws their
+//! envelope as a 64-point `draw.path.polyline` (`envelope_points`): stage lengths
+//! `0.05 + attack`, `0.05 + decay`, a fixed hold, and `0.05 + release`, with cubic ease
+//! curves, 21 attack points, 20 decay points, the hold's end, and 22 release points, so every
+//! corner is a point. The display's area starts the playhead on hover: each `.frame` event
+//! while hovered advances `envelope_phase` by `dt / playhead_loop_ms`, calls
+//! `cx.keep_animating()` and `cx.redraw()`, and the dot is drawn at the envelope's point on the
+//! cable layer. It therefore moves once per displayed frame (the display's refresh rate, 60
+//! Hz on most displays), and leaving the display stops the frames: an unhovered rack asks for
+//! none (the meters' timer still wakes it). Tests: "the playhead runs only while the display
+//! is hovered" and "the envelope polyline follows the four knobs".
+//!
 //! ## 4. Meter Data Flow
 //! The host calls `App.timer(cx, now_ms)` every `config.timer_period_ms`:
 //! ```text
@@ -95,9 +139,12 @@
 //! test "timer writes the sample and a knob drag does not" locks both.
 //!
 //! ## 5. TigerStyle Invariants
-//! - Widget arrays are fixed at `panel_count` and `knob_count`; there is no allocation.
-//! - Every loop is bounded by `panel_count`, `knobs_per_panel`, or `preset_rows_max`.
-//! - The comptime block checks the worst case of every pool, the batch list, and the areas.
+//! - Widget arrays are fixed at `panel_count`, `meter_panel_count`, `knob_count`, and
+//!   `cable_cap`; there is no allocation.
+//! - Every loop is bounded by `panel_count`, `knobs_per_panel`, `knob_count`, `cable_cap`, or
+//!   `preset_rows_max`.
+//! - The comptime block checks the worst case of every pool, the points, the batch list, and
+//!   the areas, and sets the box, arc, glyph, path, and area capacities to it exactly.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -115,8 +162,14 @@ const badge = @import("badge.zig");
 
 const Rect = quads.Rect;
 
-/// Panels in the rack.
-pub const panel_count: u32 = 3;
+/// Panels in the rack: three voice panels, then the envelope panel.
+pub const panel_count: u32 = 4;
+
+/// Panels with a meter and an LED: every panel before the envelope panel.
+pub const meter_panel_count: u32 = 3;
+
+/// The envelope panel; its display cell takes the place of the meter (section 3d).
+pub const env_panel: u32 = 3;
 
 /// Knobs in one panel row.
 pub const knobs_per_panel: u32 = 4;
@@ -133,7 +186,7 @@ const knob_cell_px: f32 = 144;
 const knob_gap_px: f32 = 8;
 const panel_radius: f32 = 8;
 
-const panel_names = [_][]const u8{ "osc", "filter", "amp" };
+const panel_names = [_][]const u8{ "osc", "filter", "amp", "env" };
 
 /// Bytes of a panel title, and the rename field's width in its band.
 pub const title_cap: u32 = 16;
@@ -238,17 +291,62 @@ const preset_glyphs: u32 = preset_name_cap - 1;
 
 /// The status line under the list and its fixed buffer.
 const status_px: f32 = 24;
-const status_cap: u32 = 48;
+const status_cap: u32 = 52;
 const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.chrome.text };
 
-/// Pool, batch, and area capacities. The comptime block checks each against the worst case.
-const box_cap: u32 = 24;
+/// Pool, batch, area, and point capacities. The comptime block checks each against the worst
+/// case.
+const box_cap: u32 = 37;
 const arc_cap: u32 = 32;
-const glyph_cap: u32 = 792;
+const glyph_cap: u32 = 785;
 const image_cap: u32 = 4;
-const led_cap: u32 = 4;
+const led_cap: u32 = 3;
+const path_cap: u32 = 288;
 const batch_cap: u32 = 16;
-const area_cap: u32 = 68;
+const area_cap: u32 = 104;
+const point_cap: u32 = 2048;
+
+/// Cables the rack holds at most (module guide, section 3c).
+pub const cable_cap: u32 = 16;
+
+/// The layer cables draw on: above the panels and their text, below the tooltip's overlay.
+pub const cable_layer: quads.Layer = @fromBackingInt(2);
+
+/// Cable stroke width and alpha. The alpha is below 1 so a joint drawn twice would show.
+pub const cable_width: f32 = 4;
+const cable_alpha: f32 = 0.85;
+
+/// The jack hub at the center of each knob's ring: its radius and its id salt.
+pub const hub_radius: f32 = 8;
+const jack_salt: u64 = 1;
+const hub_border_px: f32 = 2;
+
+/// Hubs and cables show the pointer cursor and take no wheel, so the wheel turns the knob.
+const patch_flags: ui.Flags = .{ .wheel = false, .focusable = false, .cursor = .pointer };
+
+/// A patch cable from knob `from`'s hub to knob `to`'s hub.
+pub const Cable = struct {
+    from: u8,
+    to: u8,
+};
+
+/// The cables at `init`: osc.mix to filter.res and env.attack to amp.tone.
+const default_cables = [_]Cable{ .{ .from = 3, .to = 5 }, .{ .from = 12, .to = 11 } };
+
+/// The envelope display cell: its narrowest width, its plot inset, and its corner radius.
+const display_min_px: f32 = 96;
+const display_inset_px: f32 = 8;
+const display_radius: f32 = 6;
+const display_fill: [4]f32 = .{ 0.11, 0.12, 0.14, 1 };
+const envelope_id = ui.id("envelope", 0);
+const envelope_width: f32 = 2;
+
+/// Points of the envelope polyline (section 3d).
+pub const envelope_point_count: u32 = 64;
+
+/// One loop of the playhead over the whole envelope, and its dot's edge.
+pub const playhead_loop_ms: f32 = 2000;
+const playhead_px: f32 = 8;
 
 /// Bytes of the tooltip text: a name of up to 8, a space, and the 4-byte value.
 const tooltip_text_cap: u32 = 13;
@@ -264,8 +362,12 @@ const knob_table = [_]struct { name: []const u8, value: f32 }{
     .{ .name = "key", .value = 1 },
     .{ .name = "gain", .value = 0.50 },
     .{ .name = "pan", .value = 0.50 },
-    .{ .name = "atk", .value = 0.25 },
-    .{ .name = "rel", .value = 0.75 },
+    .{ .name = "drive", .value = 0.25 },
+    .{ .name = "tone", .value = 0.75 },
+    .{ .name = "attack", .value = 0.20 },
+    .{ .name = "decay", .value = 0.30 },
+    .{ .name = "sustain", .value = 0.60 },
+    .{ .name = "release", .value = 0.40 },
 };
 
 const Context = patchwork.app.Context(App);
@@ -274,7 +376,7 @@ const Context = patchwork.app.Context(App);
 /// the period in `config`.
 pub const App = struct {
     knobs: [knob_count]widgets.Knob,
-    meters: [panel_count]widgets.Meter,
+    meters: [meter_panel_count]widgets.Meter,
     /// Panel titles, the shared rename field, and the panel it renames (section 2b).
     titles: [panel_count]Title,
     rename: widgets.TextField,
@@ -293,6 +395,15 @@ pub const App = struct {
     /// The last action, in `status[0..status_len]`.
     status: [status_cap]u8,
     status_len: u32,
+    /// Patch cables in `cables[0..cable_count]` (section 3c).
+    cables: [cable_cap]Cable,
+    cable_count: u32,
+    /// The knob whose hub a cable is being dragged from, and the pointer it is dragged to.
+    patching: ?u32,
+    patch_end: input.Point,
+    /// The envelope playhead: shown and moving while the display is hovered (section 3d).
+    envelope_hovered: bool,
+    envelope_phase: f32,
 
     pub const config: patchwork.app.Config = .{
         .title = "patchwork",
@@ -303,9 +414,11 @@ pub const App = struct {
             .{ .type = quads.Glyph, .cap = glyph_cap },
             .{ .type = quads.Image, .cap = image_cap },
             .{ .type = led.Led, .cap = led_cap },
+            .{ .type = quads.Path, .cap = path_cap },
         },
         .batch_cap = batch_cap,
         .area_cap = area_cap,
+        .point_cap = point_cap,
     };
 
     /// Builds every widget and generates the badge texture.
@@ -335,6 +448,13 @@ pub const App = struct {
         app.status = @splat(0);
         app.status_len = 0;
         app.set_status(&.{"ready"});
+        app.cables = @splat(.{ .from = 0, .to = 0 });
+        @memcpy(app.cables[0..default_cables.len], &default_cables);
+        app.cable_count = default_cables.len;
+        app.patching = null;
+        app.patch_end = .{ .x = 0, .y = 0 };
+        app.envelope_hovered = false;
+        app.envelope_phase = 0;
         assert(app.knobs[knob_count - 1].value == knob_table[knob_count - 1].value);
         assert(!app.dwell.live());
     }
@@ -361,6 +481,9 @@ pub const App = struct {
                 .none, .released => {},
             }
         }
+        app.route_hubs(cx, event_value);
+        app.route_cables(cx, event_value);
+        app.route_envelope(cx, event_value);
         _ = app.presets.handle(cx, preset_view_id, event_value);
         var row = app.preset_range.first;
         while (row < app.preset_range.end) : (row += 1) {
@@ -384,7 +507,8 @@ pub const App = struct {
         }
     }
 
-    /// Draws the header, the panels, the preset column, and the tooltip on the overlay layer.
+    /// Draws the header, the panels, the preset column, the playhead and cables on the cable
+    /// layer, and the tooltip on the overlay layer.
     pub fn draw(app: *App, cx: *Context) void {
         var frame = ui.flow_of(.down);
         frame.padding = frame_padding;
@@ -407,6 +531,7 @@ pub const App = struct {
         app.draw_presets(cx);
         _ = cx.end();
         _ = cx.end();
+        app.draw_patch_layer(cx);
         app.draw_tooltip(cx);
         // A window smaller than one panel has no positive face, so that frame is empty.
         assert(cx.draw.overflow_count == 0);
@@ -555,7 +680,8 @@ pub const App = struct {
         return app.dwell.value == 1;
     }
 
-    /// One panel: the face, the title band, then the knob row and the meter cell.
+    /// One panel: the face, the title band, then the knob row and the meter cell, or for the
+    /// envelope panel the display cell (section 3d).
     fn draw_panel(app: *const App, cx: *Context, panel_index: u32) void {
         assert(panel_index < panel_count);
         const face: widgets.Panel = .{ .paint = panel_paint };
@@ -565,7 +691,8 @@ pub const App = struct {
         _ = face.begin(cx, ui.sized(.fill, .{ .share = panel_count }), layout);
         const room = cx.remaining();
         const band_h = band_height(room.height);
-        const meter_on = room.width >= meter_column_px and room.height - band_h > 0;
+        const metered = panel_index < meter_panel_count;
+        const meter_on = metered and room.width >= meter_column_px and room.height - band_h > 0;
         const band = cx.begin(ui.sized(.fill, .{ .fixed = band_h }), ui.flow_of(.overlay));
         if (app.renaming == panel_index) {
             app.draw_rename(cx, band);
@@ -576,13 +703,21 @@ pub const App = struct {
         _ = cx.end();
         _ = cx.begin(ui.sized(.fill, .fill), ui.flow_of(.right));
         const body = cx.remaining();
-        _ = cx.begin(ui.sized(.{ .fixed = knob_row_width(body.width) }, .fill), ui.flow_of(.right));
+        const row_w = if (metered) knob_row_width(body.width) else env_row_width(body.width);
+        _ = cx.begin(ui.sized(.{ .fixed = row_w }, .fill), ui.flow_of(.right));
         var knob_index: u32 = 0;
         while (knob_index < knobs_per_panel) : (knob_index += 1) {
             const knob = &app.knobs[panel_index * knobs_per_panel + knob_index];
-            if (cx.fits(knob_cell)) knob.draw(cx, knob_cell) else _ = cx.walk(knob_cell);
+            if (cx.fits(knob_cell)) {
+                const row = cx.peek(knob_cell);
+                knob.draw(cx, knob_cell);
+                draw_hub(cx, knob, row);
+            } else {
+                _ = cx.walk(knob_cell);
+            }
         }
         _ = cx.end();
+        if (!metered) app.draw_display(cx);
         if (meter_on) {
             var cell = ui.flow_of(.down);
             cell.clip = true;
@@ -592,6 +727,193 @@ pub const App = struct {
         }
         _ = cx.end();
         _ = cx.end();
+    }
+
+    /// The envelope display beside the envelope knobs: a face, the 64-point envelope of the
+    /// four knobs, and the area whose hover runs the playhead. Omitted when narrower than
+    /// `display_min_px` or empty (section 3d).
+    fn draw_display(app: *const App, cx: *Context) void {
+        if (cx.remaining().width < display_min_px + knob_gap_px) return;
+        var walk = ui.sized(.fill, .fill);
+        walk.margin.left = knob_gap_px;
+        const cell = cx.walk(walk);
+        if (!(cell.height > 2 * display_inset_px)) return;
+        const clip = cx.visible(cell) orelse return;
+        append_or_skip(cx, quads.Box, null, .{
+            .rect = .{ cell.x, cell.y, cell.width, cell.height },
+            .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+            .fill = display_fill,
+            .border_color = .{ 0, 0, 0, 0 },
+            .radius = display_radius,
+            .border_width = 0,
+            .hover = 0,
+            .down = 0,
+        });
+        cx.area(envelope_id, cell, display_radius, ui.cx.plain);
+        var points: [envelope_point_count]quads.Point = undefined;
+        envelope_points(&points, stages_of(&app.knobs), plot_of(cell));
+        const accent = widgets.accents[3];
+        const stroke: quads.path.Stroke = .{
+            .color = .{ accent.r, accent.g, accent.b, 1 },
+            .width = envelope_width,
+            .hover = 0,
+        };
+        _ = quads.path.polyline(cx.drawing(), &points, stroke, clip);
+    }
+
+    /// The playhead dot and every cable on `cable_layer`, then the cable being dragged, which
+    /// records no area so the drop target stays hot (section 3c).
+    fn draw_patch_layer(app: *const App, cx: *Context) void {
+        assert(app.cable_count <= cable_cap);
+        const window = cx.clip().?;
+        const previous = cx.draw.layer(cable_layer);
+        defer _ = cx.draw.layer(previous);
+        app.draw_playhead(cx);
+        var index: u32 = 0;
+        while (index < app.cable_count) : (index += 1) {
+            const cable = app.cables[index];
+            const from = hub_center(cx, &app.knobs[cable.from]) orelse continue;
+            const to = hub_center(cx, &app.knobs[cable.to]) orelse continue;
+            const id = cable_id(index);
+            const lit = cx.hovered() == id;
+            const stroke = cable_stroke(app.knobs[cable.from].accent, lit);
+            const control = cable_control(from, to);
+            const placed = quads.path.cubic(cx.drawing(), control, stroke, window) orelse continue;
+            cx.path_area(id, placed, cable_width, patch_flags);
+        }
+        const source = app.patching orelse return;
+        const from = hub_center(cx, &app.knobs[source]) orelse return;
+        const to: quads.Point = .{ app.patch_end.x, app.patch_end.y };
+        const stroke = cable_stroke(app.knobs[source].accent, false);
+        _ = quads.path.cubic(cx.drawing(), cable_control(from, to), stroke, window);
+    }
+
+    /// The playhead dot on the envelope at `envelope_phase`, while the display is hovered.
+    fn draw_playhead(app: *const App, cx: *Context) void {
+        if (!app.envelope_hovered) return;
+        const display = cx.find(envelope_id) orelse return;
+        const stages = stages_of(&app.knobs);
+        const plot = plot_of(rect_of(display.rect));
+        const at = point_at(stages, plot, app.envelope_phase * stages.total());
+        const half = playhead_px * 0.5;
+        append_or_skip(cx, quads.Box, null, .{
+            .rect = .{ at[0] - half, at[1] - half, playhead_px, playhead_px },
+            .clip = display.clip,
+            .fill = theme.chrome.text,
+            .border_color = .{ 0, 0, 0, 0 },
+            .radius = half,
+            .border_width = 0,
+            .hover = 0,
+            .down = 0,
+        });
+    }
+
+    /// Hub presses start a cable, drags move its free end, and the release connects it to
+    /// the knob under the pointer, found geometrically because a cable may be hot there.
+    fn route_hubs(app: *App, cx: *Context, event_value: input.Event) void {
+        if (event_value == .frame) return;
+        for (&app.knobs, 0..) |*knob, slot| {
+            const index: u32 = @intCast(slot);
+            switch (cx.hit(hub_id(knob), event_value)) {
+                .down => |press| {
+                    app.patching = index;
+                    app.patch_end = .{ .x = press.x, .y = press.y };
+                    cx.redraw();
+                },
+                .drag => |press| {
+                    assert(app.patching == index);
+                    app.patch_end = .{ .x = press.x, .y = press.y };
+                    cx.redraw();
+                },
+                .up => |up| {
+                    assert(app.patching == index);
+                    app.patching = null;
+                    cx.redraw();
+                    const target = knob_under(app, cx, up.x, up.y) orelse continue;
+                    app.connect(index, target);
+                },
+                .none, .hover_in, .hover_out, .wheel, .secondary => {},
+            }
+        }
+    }
+
+    /// Cable hover lightens it; a right press removes it. Cables are on `cable_layer`, so a
+    /// right press on a cable over a knob removes the cable instead of resetting the knob.
+    fn route_cables(app: *App, cx: *Context, event_value: input.Event) void {
+        if (event_value == .frame) return;
+        var index: u32 = 0;
+        while (index < app.cable_count) : (index += 1) {
+            switch (cx.hit(cable_id(index), event_value)) {
+                .hover_in, .hover_out => cx.redraw(),
+                .secondary => {
+                    app.remove_cable(index);
+                    cx.redraw();
+                    return;
+                },
+                .none, .down, .drag, .up, .wheel => {},
+            }
+        }
+    }
+
+    /// Hovering the display starts the playhead; each frame while hovered advances it, keeps
+    /// the frames coming, and owes a draw. Leaving stops it, so an unhovered rack asks for no
+    /// frames (section 3d).
+    fn route_envelope(app: *App, cx: *Context, event_value: input.Event) void {
+        if (event_value == .frame) {
+            if (!app.envelope_hovered) return;
+            const step = event_value.frame / playhead_loop_ms;
+            app.envelope_phase = @mod(app.envelope_phase + step, 1);
+            cx.keep_animating();
+            cx.redraw();
+            assert(app.envelope_phase < 1);
+            return;
+        }
+        switch (cx.hit(envelope_id, event_value)) {
+            .hover_in => {
+                app.envelope_hovered = true;
+                cx.redraw();
+            },
+            .hover_out => {
+                app.envelope_hovered = false;
+                cx.redraw();
+            },
+            .none, .down, .drag, .up, .wheel, .secondary => {},
+        }
+    }
+
+    /// Adds the cable `from` to `to` and reports it ("osc.mix -> filter.res"). A self link or
+    /// a pair already patched (either way) is ignored; a full table is refused and reported.
+    fn connect(app: *App, from: u32, to: u32) void {
+        assert(from < knob_count);
+        assert(to < knob_count);
+        if (from == to) return;
+        for (app.cables[0..app.cable_count]) |cable| {
+            if (cable.from == from and cable.to == to) return;
+            if (cable.from == to and cable.to == from) return;
+        }
+        if (app.cable_count == cable_cap) {
+            app.set_status(&.{"cables full"});
+            return;
+        }
+        app.cables[app.cable_count] = .{ .from = @intCast(from), .to = @intCast(to) };
+        app.cable_count += 1;
+        const source = &app.knobs[from];
+        const target = &app.knobs[to];
+        app.set_status(&.{
+            app.titles[from / knobs_per_panel].text(), ".", source.name, " -> ",
+            app.titles[to / knobs_per_panel].text(),   ".", target.name,
+        });
+        assert(app.cable_count <= cable_cap);
+    }
+
+    /// Removes cable `index`, keeping the others in order, and reports it.
+    fn remove_cable(app: *App, index: u32) void {
+        assert(index < app.cable_count);
+        const count = app.cable_count;
+        std.mem.copyForwards(Cable, app.cables[index .. count - 1], app.cables[index + 1 .. count]);
+        app.cable_count = count - 1;
+        app.set_status(&.{"cable removed"});
+        assert(app.cable_count + 1 == count);
     }
 
     /// The rename field centered in the title band, as wide as `rename_width_px` allows
@@ -771,6 +1093,192 @@ fn append_or_skip(cx: *Context, comptime T: type, texture: ?quads.TextureId, ins
     };
 }
 
+/// The id of `knob`'s jack hub.
+fn hub_id(knob: *const widgets.Knob) ui.Id {
+    return knob.id.derive(jack_salt);
+}
+
+/// The id of cable `index`.
+fn cable_id(index: u32) ui.Id {
+    assert(index < cable_cap);
+    return ui.id("cable", index);
+}
+
+/// The jack hub at the center of the knob's ring in `row` (the cell the knob drew in): a
+/// disc with the knob's accent as its border and an area recorded after the ring's, so it
+/// wins the press inside its radius. A row the knob did not draw in gets no hub.
+fn draw_hub(cx: *Context, knob: *const widgets.Knob, row: Rect) void {
+    if (row.height < widgets.ring_size) return;
+    const clip = cx.visible(row) orelse return;
+    const ring = widgets.ring_of(row);
+    const hub: Rect = .{
+        .x = ring.x + ring.width * 0.5 - hub_radius,
+        .y = ring.y + ring.height * 0.5 - hub_radius,
+        .width = 2 * hub_radius,
+        .height = 2 * hub_radius,
+    };
+    append_or_skip(cx, quads.Box, null, .{
+        .rect = .{ hub.x, hub.y, hub.width, hub.height },
+        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+        .fill = theme.chrome.panel,
+        .border_color = .{ knob.accent.r, knob.accent.g, knob.accent.b, knob.accent.a },
+        .radius = hub_radius,
+        .border_width = hub_border_px,
+        .hover = 0,
+        .down = 0,
+    });
+    cx.area(hub_id(knob), hub, hub_radius, patch_flags);
+}
+
+/// The center of `knob`'s hub at this frame's draw, or null when it was not drawn.
+fn hub_center(cx: *const Context, knob: *const widgets.Knob) ?quads.Point {
+    const hub = cx.find(hub_id(knob)) orelse return null;
+    return .{ hub.rect[0] + hub.rect[2] * 0.5, hub.rect[1] + hub.rect[3] * 0.5 };
+}
+
+/// The knob whose ring (hub included) contains `(x, y)` at the last draw, or null.
+fn knob_under(app: *const App, cx: *const Context, x: f32, y: f32) ?u32 {
+    for (&app.knobs, 0..) |*knob, index| {
+        const ring = cx.find(knob.id) orelse continue;
+        if (ui.areas.contains(&ring, &.{}, x, y)) return @intCast(index);
+    }
+    return null;
+}
+
+/// How far a cable of `length` sags: `min(24 + 0.2 * length, 160)` logical pixels.
+pub fn cable_sag(length: f32) f32 {
+    assert(length >= 0);
+    const sag = @min(24 + 0.2 * length, 160);
+    assert(sag >= 24);
+    return sag;
+}
+
+/// The cubic of a cable from `from` to `to`: the inner control points sit a third and two
+/// thirds along the chord, both lowered by `cable_sag` (Y down).
+pub fn cable_control(from: quads.Point, to: quads.Point) [4]quads.Point {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const sag = cable_sag(@sqrt(dx * dx + dy * dy));
+    return .{
+        from,
+        .{ from[0] + dx / 3, from[1] + dy / 3 + sag },
+        .{ from[0] + 2 * dx / 3, from[1] + 2 * dy / 3 + sag },
+        to,
+    };
+}
+
+/// A cable's stroke in its source knob's accent, lightened when hovered.
+fn cable_stroke(accent: widgets.Paint, lit: bool) quads.path.Stroke {
+    return .{
+        .color = .{ accent.r, accent.g, accent.b, cable_alpha },
+        .width = cable_width,
+        .hover = if (lit) widgets.hover_lighten else 0,
+    };
+}
+
+/// Envelope stage lengths (attack, decay, a fixed hold, release, in arbitrary time units)
+/// and the sustain level, from the envelope panel's knobs (section 3d).
+pub const Stages = struct {
+    attack: f32,
+    decay: f32,
+    hold: f32,
+    release: f32,
+    sustain: f32,
+
+    pub fn total(self: Stages) f32 {
+        const sum = self.attack + self.decay + self.hold + self.release;
+        assert(sum > 0);
+        return sum;
+    }
+};
+
+/// Shortest stage, so a zero knob still draws a visible slope.
+const stage_floor: f32 = 0.05;
+/// The sustain hold between decay and release.
+const stage_hold: f32 = 0.5;
+
+fn stages_of(knobs: *const [knob_count]widgets.Knob) Stages {
+    const first = env_panel * knobs_per_panel;
+    const stages: Stages = .{
+        .attack = stage_floor + knobs[first].value,
+        .decay = stage_floor + knobs[first + 1].value,
+        .hold = stage_hold,
+        .release = stage_floor + knobs[first + 3].value,
+        .sustain = knobs[first + 2].value,
+    };
+    assert(stages.sustain >= 0);
+    assert(stages.sustain <= 1);
+    return stages;
+}
+
+/// The envelope level at time `t` in `[0, total]`: a cubic ease up to 1 over the attack,
+/// down to the sustain over the decay, held, then down to 0 over the release.
+pub fn envelope_level(stages: Stages, t: f32) f32 {
+    assert(t >= 0);
+    var rest = t;
+    if (rest < stages.attack) return 1 - cube(1 - rest / stages.attack);
+    rest -= stages.attack;
+    if (rest < stages.decay) {
+        return stages.sustain + (1 - stages.sustain) * cube(1 - rest / stages.decay);
+    }
+    rest -= stages.decay;
+    if (rest < stages.hold) return stages.sustain;
+    rest -= stages.hold;
+    const along = std.math.clamp(rest / stages.release, 0, 1);
+    return stages.sustain * cube(1 - along);
+}
+
+fn cube(value: f32) f32 {
+    return value * value * value;
+}
+
+/// The point of the envelope at time `t` in `plot`: time maps to x, level 1 to the top.
+fn point_at(stages: Stages, plot: Rect, t: f32) quads.Point {
+    const level = envelope_level(stages, t);
+    assert(level >= 0);
+    assert(level <= 1.0001);
+    return .{
+        plot.x + plot.width * std.math.clamp(t / stages.total(), 0, 1),
+        plot.y + plot.height * (1 - level),
+    };
+}
+
+/// The 64-point envelope in `plot`: 21 attack points from 0, 20 decay points, the hold's
+/// end, and 22 release points to the total, so every stage corner is a point.
+pub fn envelope_points(out: *[envelope_point_count]quads.Point, stages: Stages, plot: Rect) void {
+    const held = stages.attack + stages.decay;
+    const spans = [_]struct { start: f32, length: f32, steps: u32 }{
+        .{ .start = 0, .length = stages.attack, .steps = 20 },
+        .{ .start = stages.attack, .length = stages.decay, .steps = 20 },
+        .{ .start = held, .length = stages.hold, .steps = 1 },
+        .{ .start = held + stages.hold, .length = stages.release, .steps = 22 },
+    };
+    out[0] = point_at(stages, plot, 0);
+    var count: u32 = 1;
+    for (spans) |span| {
+        var step: u32 = 1;
+        while (step <= span.steps) : (step += 1) {
+            const along = @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(span.steps));
+            out[count] = point_at(stages, plot, span.start + span.length * along);
+            count += 1;
+        }
+    }
+    assert(count == envelope_point_count);
+    assert(out[count - 1][1] == plot.y + plot.height);
+}
+
+/// The envelope plot inside a display cell.
+fn plot_of(cell: Rect) Rect {
+    const plot = ui.cx.inset(cell, .{
+        .left = display_inset_px,
+        .top = display_inset_px,
+        .right = display_inset_px,
+        .bottom = display_inset_px,
+    });
+    assert(plot.width > 0);
+    return plot;
+}
+
 /// The index of the knob whose id is `hovered`, or null.
 fn hovered_knob(app: *const App, hovered: ui.Id) ?u32 {
     if (hovered == .none) return null;
@@ -828,6 +1336,13 @@ fn preset_name(out: *[preset_name_cap]u8, row: u32) []const u8 {
     return out[0 .. prefix.len + count];
 }
 
+/// The envelope panel's knob row: four knob cells, or the whole body when narrower, so the
+/// display takes the rest.
+fn env_row_width(body_w: f32) f32 {
+    const cells = @as(f32, @floatFromInt(knobs_per_panel)) * (knob_cell_px + knob_gap_px);
+    return std.math.clamp(body_w, 0, cells);
+}
+
 /// Width left of the meter. Below `meter_column_px` the meter is dropped and the knobs may
 /// use the whole body width.
 fn knob_row_width(body_w: f32) f32 {
@@ -842,22 +1357,38 @@ fn band_height(inner_h: f32) f32 {
 }
 
 comptime {
-    assert(panel_count == 3);
+    assert(panel_count == 4);
+    assert(meter_panel_count == 3);
+    assert(env_panel == meter_panel_count);
     assert(knobs_per_panel == 4);
-    assert(knob_count == 12);
-    assert(levels.meter_count == panel_count);
-    // Worst-case boxes: one per panel, two per meter, the tooltip, the header bar, the
-    // preset panel, the selected and the hovered row, the thumb, and the rename field's face,
-    // selection, and caret.
-    assert(panel_count + panel_count * 2 + 1 + 1 + 1 + 2 + 1 + 3 <= box_cap);
+    assert(knob_count == 16);
+    assert(levels.meter_count == meter_panel_count);
+    // Worst-case boxes: one face per panel, two per meter, the tooltip, the header bar, the
+    // preset panel, the selected and the hovered row, the thumb, the rename field's face,
+    // selection, and caret, one hub per knob, the display face, and the playhead.
+    assert(panel_count + meter_panel_count * 2 + 1 + 1 + 1 + 2 + 1 + 3 + knob_count + 1 + 1 ==
+        box_cap);
     // Worst-case arcs: two per knob (track and value arc).
-    assert(knob_count * 2 <= arc_cap);
+    assert(knob_count * 2 == arc_cap);
     // Worst-case glyphs: a title of up to `title_cap` per panel (the rename field replaces
     // its panel's title and holds as many), up to 8 for each knob name and 4 for each value
-    // text, the tooltip text, the header, the visible preset rows, and the status line; 75 of
-    // 792 to spare.
+    // text, the tooltip text, the header, the visible preset rows, and the status line.
     assert(panel_count * title_cap + knob_count * (8 + 4) + tooltip_text_cap +
-        header_glyph_cap + preset_rows_max * preset_glyphs + status_cap + 75 == glyph_cap);
+        header_glyph_cap + preset_rows_max * preset_glyphs + status_cap == glyph_cap);
+    for (knob_table) |spec| assert(spec.name.len <= 8);
+    // Worst-case paths: the envelope and every cable plus the one being dragged, each a
+    // polyline of at most 65 points cut into at most `chunks_max` chunks.
+    const cable_paths = cable_cap + 1;
+    const cable_points = quads.path.cubic_points_max;
+    assert(quads.path.chunks_max(envelope_point_count) +
+        cable_paths * quads.path.chunks_max(cable_points) == path_cap);
+    assert(envelope_point_count + cable_paths * cable_points <= point_cap);
+    assert(default_cables.len <= cable_cap);
+    for (default_cables) |cable| {
+        assert(cable.from < knob_count);
+        assert(cable.to < knob_count);
+        assert(cable.from != cable.to);
+    }
     // The largest row index fits the name buffer, and the longest status messages fit theirs.
     assert(preset_count <= 1000);
     assert("preset ".len + 3 == preset_name_cap);
@@ -865,25 +1396,31 @@ comptime {
     for (knob_table) |spec| longest_knob = @max(longest_knob, spec.name.len);
     assert(title_cap + 1 + longest_knob + " changed ".len + 4 <= status_cap);
     assert(title_cap + " renamed ".len + title_cap <= status_cap);
+    assert(2 * (title_cap + 1 + longest_knob) + " -> ".len == status_cap);
     for (panel_names) |name| assert(name.len <= title_cap);
     assert(preset_name_cap + " selected".len <= status_cap);
     // Every codepoint of the header draws at most one glyph.
     const author_codepoints = std.unicode.utf8CountCodepoints(patch_author) catch unreachable;
     assert(tempo_value.len + tempo_unit.len + author_codepoints <= header_glyph_cap);
-    // One badge and one LED per panel.
-    assert(panel_count <= image_cap);
-    assert(panel_count <= led_cap);
-    // Base: box, glyph, image, LED, arc; overlay: box and glyph.
-    assert(5 + 2 <= batch_cap);
-    // Areas: one ring per knob, the preset view and its thumb, the visible rows, one title per
-    // panel, and the rename field; 2 to spare.
-    assert(knob_count + 2 + preset_rows_max + panel_count + 1 + 2 == area_cap);
+    // One badge per panel and one LED per meter.
+    assert(panel_count == image_cap);
+    assert(meter_panel_count == led_cap);
+    // Base: box, glyph, image, LED, arc, path; cable layer: box and path; overlay: box and
+    // glyph.
+    assert(6 + 2 + 2 <= batch_cap);
+    assert(@backingInt(cable_layer) > @backingInt(quads.Layer.base));
+    assert(@backingInt(cable_layer) < @backingInt(quads.Layer.overlay));
+    // Areas: a ring and a hub per knob, the preset view and its thumb, the visible rows, one
+    // title per panel, the rename field, one per cable, and the envelope display.
+    assert(2 * knob_count + 2 + preset_rows_max + panel_count + 1 + cable_cap + 1 == area_cap);
     // At most `preset_rows_max` rows overlap the tallest viewport, partial rows included.
     assert(preset_view_max_px / preset_row_px + 2 <= preset_rows_max);
     // The box covers the neighbouring cell's whole name column.
     assert(tooltip_offset_x + tooltip_width >= knob_cell_px + knob_gap_px + 72 + 72);
     assert(knob_table.len == knob_count);
     assert(panel_names.len == panel_count);
+    // The hub sits inside the ring's hole, so the ring band stays grabbable around it.
+    assert(hub_radius < widgets.ring_size * 0.5 - widgets.ring_thickness);
     assert(title_band_px == 24);
     assert(meter_column_px == 80);
     assert(knob_cell_px == 144);
@@ -939,16 +1476,28 @@ fn rect_of(values: [4]f32) Rect {
     return .{ .x = values[0], .y = values[1], .width = values[2], .height = values[3] };
 }
 
+/// The areas a 1280 by 720 frame records with the presets at the top: a ring and a hub per
+/// knob, the view, 25 rows, the thumb, a title per panel, the default cables, and the
+/// envelope display.
+const areas_at_rest: usize = 2 * knob_count + 1 + 25 + 1 + panel_count + default_cables.len + 1;
+
 /// The ring area knob `index` recorded at the last draw, or null when it was not drawn.
 fn ring_at(cx: *const Context, app: *const App, index: u32) ?Rect {
     const area = cx.find(app.knobs[index].id) orelse return null;
     return rect_of(area.rect);
 }
 
-/// The center of knob `index`'s ring.
-fn ring_center(cx: *const Context, app: *const App, index: u32) input.Point {
+/// The center of knob `index`'s ring, where its jack hub sits.
+fn hub_point(cx: *const Context, app: *const App, index: u32) input.Point {
     const ring = ring_at(cx, app, index).?;
     return .{ .x = ring.x + ring.width * 0.5, .y = ring.y + ring.height * 0.5 };
+}
+
+/// A point on knob `index`'s ring above its hub, where a press turns the knob. Cables leave
+/// a hub downward, so this point stays clear of the knob's own cables.
+fn ring_grip(cx: *const Context, app: *const App, index: u32) input.Point {
+    const center = hub_point(cx, app, index);
+    return .{ .x = center.x, .y = center.y - 18 };
 }
 
 /// The face of panel `panel_index`: the boxes of panel radius after the header bar's.
@@ -956,6 +1505,8 @@ fn panel_face(cx: *const Context, panel_index: u32) Rect {
     var seen: u32 = 0;
     for (cx.draw.items(quads.Box)) |box| {
         if (box.radius != panel_radius) continue;
+        // Hubs share the radius; they are the only boxes as wide as two radii.
+        if (box.rect[2] == 2 * hub_radius) continue;
         if (seen == panel_index + 1) return rect_of(box.rect);
         seen += 1;
     }
@@ -995,41 +1546,44 @@ test "rack layout at 1280 by 720" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     // The frame is inset by 16; the header is 52 tall; panels start 8 below it at y = 76.
-    // Panel height = (720 - 32 - 52 - 8 - 2 * 8 spacing) / 3 = 204 (`share(3)`). Step 14
-    // moved the widths: the preset column takes 240 + 8 of the 1248, leaving 1000 (was 1248).
+    // Step 16 added the envelope panel, so the panel height is now (720 - 32 - 52 - 8 - 3 * 8
+    // spacing) / 4 = 151 (`share(4)`; it was 204 with three panels). The preset column takes
+    // 240 + 8 of the 1248, leaving 1000.
     try expect_rect(rect_of(cx.draw.items(quads.Box)[0].rect), 16, 16, 1248, 52);
-    try expect_rect(panel_face(cx, 0), 16, 76, 1000, 204);
-    try expect_rect(panel_face(cx, 1), 16, 288, 1000, 204);
-    try expect_rect(panel_face(cx, 2), 16, 500, 1000, 204);
+    try expect_rect(panel_face(cx, 0), 16, 76, 1000, 151);
+    try expect_rect(panel_face(cx, 1), 16, 235, 1000, 151);
+    try expect_rect(panel_face(cx, 2), 16, 394, 1000, 151);
+    try expect_rect(panel_face(cx, 3), 16, 553, 1000, 151);
     // First ring: cell x = 16 panel + 8 padding + 8 gap, y = 76 + 8 + 24 band; ring + 8.
     try expect_rect(ring_at(cx, app, 0).?, 40, 116, 56, 56);
-    // Meter: right edge of the inner rect (16 + 1000 - 8), 80 wide (x was 1176 before the
-    // preset column), body height 204 - 16 - 24.
-    try expect_rect(meter_cell(cx, 0).?, 928, 108, 80, 164);
+    // The envelope panel's first ring sits three panel steps (159) lower.
+    try expect_rect(ring_at(cx, app, 12).?, 40, 116 + 3 * 159, 56, 56);
+    // Meter: right edge of the inner rect (16 + 1000 - 8), 80 wide, body height 151 - 16 - 24
+    // (164 with three panels).
+    try expect_rect(meter_cell(cx, 0).?, 928, 108, 80, 111);
+    // The display: after the 608 px row of four 152 px cells (from the inner left edge 24)
+    // and an 8 px gap, to the inner right edge 1008, as tall as the body.
+    try expect_rect(rect_of(cx.find(envelope_id).?.rect), 24 + 608 + 8, 585, 1008 - 640, 111);
     // Presets: x = 16 + 1000 + 8, list 628 - 24 status - 8 = 596 tall, viewport 580 tall.
     try expect_rect(app.presets.viewport, 1032, 84, 224, 580);
     try std.testing.expectEqual(@as(f32, 24000), app.presets.content_h);
     try std.testing.expectEqual(ui.List.Range{ .first = 0, .end = 25 }, app.preset_range);
-    // Boxes: the header, 3 panels, 3 meters * 2 faces, the preset panel, and its thumb.
-    // Arcs: 12 knobs * 2 minus the zero-valued knob's arc. Glyphs: titles 3 + 6 + 3, knob
-    // names 40, values 12 * 4, the tempo 6 + 3, the author 17 (its two spaces have no ink),
-    // 25 preset names (10 * 7 + 15 * 8 = 190), and "ready" (5).
-    try std.testing.expectEqual(@as(usize, 12), cx.draw.items(quads.Box).len);
-    try std.testing.expectEqual(@as(usize, 23), cx.draw.items(quads.Arc).len);
-    try std.testing.expectEqual(@as(usize, 321), cx.draw.items(quads.Glyph).len);
-    try std.testing.expectEqual(@as(usize, 3), cx.draw.items(quads.Image).len);
+    // Boxes: the header, 4 panels, 3 meters * 2 faces, the preset panel, its thumb, 16 hubs,
+    // and the display face. Arcs: 16 knobs * 2 minus the zero-valued knob's arc. Glyphs:
+    // titles 3 + 6 + 3 + 3, knob names 68, values 16 * 4, the tempo 6 + 3, the author 17
+    // (its two spaces have no ink), 25 preset names (10 * 7 + 15 * 8 = 190), and "ready" (5).
+    try std.testing.expectEqual(@as(usize, 30), cx.draw.items(quads.Box).len);
+    try std.testing.expectEqual(@as(usize, 31), cx.draw.items(quads.Arc).len);
+    try std.testing.expectEqual(@as(usize, 368), cx.draw.items(quads.Glyph).len);
+    try std.testing.expectEqual(@as(usize, 4), cx.draw.items(quads.Image).len);
     try std.testing.expectEqual(@as(usize, 3), cx.draw.items(led.Led).len);
-    // Areas: 12 rings, the view, 25 rows, the thumb, and 3 titles.
-    try std.testing.expectEqual(
-        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
-        cx.area_list().len,
-    );
+    try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
     const mix = ring_at(cx, app, 3).?;
     var arcs: u32 = 0;
     for (cx.draw.items(quads.Arc)) |arc| {
         // The first ring clips to its panel rect.
         if (arc.rect[0] == 40 and arc.rect[1] == 116) {
-            try std.testing.expectEqualSlices(f32, &.{ 16, 76, 1016, 280 }, &arc.clip);
+            try std.testing.expectEqualSlices(f32, &.{ 16, 76, 1016, 227 }, &arc.clip);
         }
         if (arc.rect[0] == mix.x and arc.rect[1] == mix.y) arcs += 1;
     }
@@ -1038,18 +1592,24 @@ test "rack layout at 1280 by 720" {
 }
 
 // Locks that a smaller window shrinks panel heights and the meter cell, not the knob cells.
-// The preset column leaves the panels 520 of the 768 (was 768), so the 424 px knob row keeps
-// two knobs and the meter moves to x = 16 + 520 - 8 - 80 (was 696).
+// The preset column leaves the panels 520 of the 768, so the 424 px knob row keeps two knobs
+// and the meter sits at x = 16 + 520 - 8 - 80. Step 16's fourth panel made every panel
+// (600 - 32 - 52 - 8 - 3 * 8) / 4 = 121 tall (was 164). The envelope row has no meter, so
+// its 504 px body keeps three knobs and leaves no room for the display.
 test "rack layout at 800 by 600" {
     const app = new_app();
     const cx = frame_at(app, 800, 600);
-    try expect_rect(panel_face(cx, 0), 16, 76, 520, 164);
-    try expect_rect(panel_face(cx, 1), 16, 248, 520, 164);
-    try expect_rect(panel_face(cx, 2), 16, 420, 520, 164);
+    try expect_rect(panel_face(cx, 0), 16, 76, 520, 121);
+    try expect_rect(panel_face(cx, 1), 16, 205, 520, 121);
+    try expect_rect(panel_face(cx, 2), 16, 334, 520, 121);
+    try expect_rect(panel_face(cx, 3), 16, 463, 520, 121);
     try expect_rect(ring_at(cx, app, 0).?, 40, 116, 56, 56);
     try expect_rect(ring_at(cx, app, 1).?, 192, 116, 56, 56);
     try std.testing.expect(ring_at(cx, app, 2) == null);
-    try expect_rect(meter_cell(cx, 0).?, 448, 108, 80, 124);
+    try expect_rect(ring_at(cx, app, 14).?, 344, 503, 56, 56);
+    try std.testing.expect(ring_at(cx, app, 15) == null);
+    try std.testing.expect(cx.find(envelope_id) == null);
+    try expect_rect(meter_cell(cx, 0).?, 448, 108, 80, 81);
 }
 
 // Locks that `timer` writes meters only when a sample changes and knob drags never do.
@@ -1067,7 +1627,7 @@ test "timer writes the sample and a knob drag does not" {
     try std.testing.expect(sampled[1] != 1);
     for (app.meters, sampled) |meter, value| try std.testing.expectEqual(value, meter.value);
     const amp = app.meters[2].value;
-    const center = ring_center(cx, app, 8);
+    const center = ring_grip(cx, app, 8);
     try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[8].value);
@@ -1081,7 +1641,7 @@ test "timer writes the sample and a knob drag does not" {
 test "a ring drag and a ring wheel change the knob" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
-    const center = ring_center(cx, app, 0);
+    const center = ring_grip(cx, app, 0);
     try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 0.75), app.knobs[0].value);
@@ -1100,15 +1660,15 @@ test "a ring drag and a ring wheel change the knob" {
 // Locks that raising a zero-valued knob adds exactly one face.
 test "dragging mix off zero adds the value arc" {
     const app = new_app();
-    const center = ring_center(frame_at(app, 1280, 720), app, 3);
+    const center = ring_grip(frame_at(app, 1280, 720), app, 3);
     try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 0.5), app.knobs[3].value);
     const drawn = frame_at(app, 1280, 720);
-    try std.testing.expectEqual(@as(usize, 24), drawn.draw.items(quads.Arc).len);
+    try std.testing.expectEqual(@as(usize, 32), drawn.draw.items(quads.Arc).len);
     // The knob's glyphs are unchanged; the status line grew from "ready" (5) to
     // "osc.mix changed 0.50" (18).
-    try std.testing.expectEqual(@as(usize, 321 - 5 + 18), drawn.draw.items(quads.Glyph).len);
+    try std.testing.expectEqual(@as(usize, 368 - 5 + 18), drawn.draw.items(quads.Glyph).len);
     try std.testing.expectEqualStrings("osc.mix changed 0.50", app.status_text());
 }
 
@@ -1116,7 +1676,7 @@ test "dragging mix off zero adds the value arc" {
 test "hover on rate eases and a later frame stays clean" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
-    try std.testing.expect(send(app, .{ .pointer_move = ring_center(cx, app, 0) }));
+    try std.testing.expect(send(app, .{ .pointer_move = ring_grip(cx, app, 0) }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[0].hover.target);
     try std.testing.expect(ui.animate(App, app, cx, 50));
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.knobs[0].hover.value, 0.0001);
@@ -1154,8 +1714,9 @@ test "a narrow window keeps only knobs that clear the meter" {
 // next panel, while the meter keeps a positive cell.
 test "a short window hides knobs that would leave the panel" {
     const app = new_app();
-    // 260 leaves the panels the 168 px a 200 px window gave before the header.
-    const cx = frame_at(app, 1280, 260);
+    // 360 leaves each of the four panels (360 - 32 - 52 - 8 - 24) / 4 = 61 px: a 21 px body
+    // under the title band, shorter than a knob row (the window was 260 with three panels).
+    const cx = frame_at(app, 1280, 360);
     for (0..knob_count) |index| try std.testing.expect(ring_at(cx, app, @intCast(index)) == null);
     const meter = meter_cell(cx, 0).?;
     try std.testing.expect(meter.height > 0);
@@ -1217,14 +1778,15 @@ fn texture_writes(out: []patchwork.commands.TextureWrite) []patchwork.commands.T
     return out[0..count];
 }
 
-// Locks the rack's command streams. Setup creates five pipelines and both textures (the atlas
-// and the badge). The first frame writes the uniform, the atlas rectangle the glyph cache
-// rasterized, and the five pools, binds the frame group and unit quad once, and draws one call
-// per batch in first-appearance order: boxes, glyphs (atlas), the badge, LEDs, arcs. A scale
-// change redraws: it writes the uniform, a new atlas rectangle, and the glyph pool, and no box
-// or arc record. A present with nothing owed writes nothing, and a hover frame writes only the
-// changed arc records, because every other rebuilt pool is identical.
-test "rack frames record the step 13 op sequences" {
+// Locks the rack's command streams. Setup creates six pipelines, both textures (the atlas and
+// the badge), and the point buffer. The first frame writes the uniform, the atlas rectangle
+// the glyph cache rasterized, the six pools, and the points, binds the frame group (uniform
+// and points) and unit quad once, and draws one call per batch in first-appearance order:
+// boxes, glyphs (atlas), the badge, LEDs, arcs, and the envelope path on the base layer, then
+// the cables on the cable layer with no pipeline change. A scale change redraws: it writes the
+// uniform, a new atlas rectangle, and the glyph pool, and no box, arc, path record, or point.
+// A present with nothing owed writes nothing.
+test "rack frames record the step 16 op sequences" {
     const Code = patchwork.commands.Code;
     const app = new_app();
     setup_renderer();
@@ -1237,39 +1799,46 @@ test "rack frames record the step 13 op sequences" {
         if (code == .pipeline_create) pipelines += 1;
     }
     try std.testing.expectEqual(@as(u32, 2), textures);
-    try std.testing.expectEqual(@as(u32, 5), pipelines);
-    var writes: [8]patchwork.commands.BufferWrite = undefined;
+    try std.testing.expectEqual(@as(u32, 6), pipelines);
+    var writes: [16]patchwork.commands.BufferWrite = undefined;
 
     record(app, 120);
     const first = [_]Code{
         .buffer_write,      .texture_write,     .buffer_write,
         .buffer_write,      .buffer_write,      .buffer_write,
-        .buffer_write,      .pass_begin,        .bind_group_set,
-        .vertex_buffer_set, .pipeline_set,      .vertex_buffer_set,
+        .buffer_write,      .buffer_write,      .buffer_write,
+        .pass_begin,        .bind_group_set,    .vertex_buffer_set,
+        .pipeline_set,      .vertex_buffer_set, .draw,
+        .pipeline_set,      .vertex_buffer_set, .bind_group_set,
         .draw,              .pipeline_set,      .vertex_buffer_set,
         .bind_group_set,    .draw,              .pipeline_set,
-        .vertex_buffer_set, .bind_group_set,    .draw,
-        .pipeline_set,      .vertex_buffer_set, .draw,
-        .pipeline_set,      .vertex_buffer_set, .draw,
+        .vertex_buffer_set, .draw,              .pipeline_set,
+        .vertex_buffer_set, .draw,              .pipeline_set,
+        .vertex_buffer_set, .draw,              .draw,
         .pass_end_present,
     };
+    const resources = &fixture_gpu.renderer.resources;
+    const first_writes = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
+    try std.testing.expectEqual(resources.points_buffer, first_writes[7].id);
     var atlas: [4]patchwork.commands.TextureWrite = undefined;
     try std.testing.expectEqual(@as(usize, 1), texture_writes(&atlas).len);
     try std.testing.expectEqual(@as(u32, 1024), atlas[0].bytes_per_row);
     const first_codes = patchwork.renderer.codes(&fixture_gpu.buffer, &codes);
     try std.testing.expectEqualSlices(Code, &first, first_codes);
     const batches = fixture.context.draw.batch_list();
-    try std.testing.expectEqual(@as(usize, 5), batches.len);
+    try std.testing.expectEqual(@as(usize, 7), batches.len);
     try std.testing.expectEqual(@as(u8, 0), batches[0].type_id);
     try std.testing.expectEqual(@as(u8, 2), batches[1].type_id);
     try std.testing.expectEqual(@as(u8, 3), batches[2].type_id);
     try std.testing.expectEqual(app.badge_texture, batches[2].texture);
     try std.testing.expectEqual(@as(u8, 4), batches[3].type_id);
     try std.testing.expectEqual(@as(u8, 1), batches[4].type_id);
+    try std.testing.expectEqual(@as(u8, 5), batches[5].type_id);
+    try std.testing.expectEqual(@as(u8, 5), batches[6].type_id);
+    try std.testing.expectEqual(@backingInt(cable_layer), batches[6].layer);
 
     record(app, 240);
     const rescaled = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
-    const resources = &fixture_gpu.renderer.resources;
     try std.testing.expectEqual(@as(usize, 2), rescaled.len);
     try std.testing.expectEqual(resources.uniform_buffer, rescaled[0].id);
     try std.testing.expectEqual(resources.instance_buffers[2], rescaled[1].id);
@@ -1281,16 +1850,43 @@ test "rack frames record the step 13 op sequences" {
         &writes,
     ).len);
     try std.testing.expectEqual(@as(usize, 0), texture_writes(&atlas).len);
+}
 
-    try std.testing.expect(send(app, .{ .pointer_move = ring_center(&fixture.context, app, 0) }));
+// Locks the hover uploads after the first frame: a cable hover writes only path records (no
+// points), moving to a ring writes the darkened cable and the lit arc, and the ring's next
+// eased frame writes only arc records, fewer than the whole arc pool.
+test "rack hovers write only the records they change" {
+    const app = new_app();
+    setup_renderer();
+    var writes: [16]patchwork.commands.BufferWrite = undefined;
+    const resources = &fixture_gpu.renderer.resources;
+    record(app, 120);
+    record(app, 120);
+    try std.testing.expectEqual(@as(usize, 0), patchwork.renderer.writes(
+        &fixture_gpu.buffer,
+        &writes,
+    ).len);
+    try std.testing.expect(send(app, .{ .pointer_move = cable_point(&fixture.context, 0) }));
+    record(app, 120);
+    const lit = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
+    try std.testing.expectEqual(@as(usize, 1), lit.len);
+    try std.testing.expectEqual(resources.instance_buffers[5], lit[0].id);
+
+    try std.testing.expect(send(app, .{ .pointer_move = ring_grip(&fixture.context, app, 0) }));
     _ = ui.animate(App, app, &fixture.context, 50);
-    record(app, 240);
+    record(app, 120);
     const hover = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
-    try std.testing.expectEqual(@as(usize, 1), hover.len);
+    // The cable went dark again (path records) and the ring lit (arc records).
+    try std.testing.expectEqual(@as(usize, 2), hover.len);
+    try std.testing.expectEqual(resources.instance_buffers[5], hover[1].id);
+    _ = ui.animate(App, app, &fixture.context, 50);
+    record(app, 120);
+    const settled = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
+    try std.testing.expectEqual(@as(usize, 1), settled.len);
     const arc_buffer = fixture_gpu.renderer.resources.instance_buffers[1];
-    try std.testing.expectEqual(arc_buffer, hover[0].id);
+    try std.testing.expectEqual(arc_buffer, settled[0].id);
     const arcs = fixture.context.draw.items(quads.Arc);
-    try std.testing.expect(hover[0].data.len < arcs.len * @sizeOf(quads.Arc));
+    try std.testing.expect(settled[0].data.len < arcs.len * @sizeOf(quads.Arc));
 }
 
 // Locks the layer rule for the tooltip: it appears only after `tooltip_delay_ms` of hover,
@@ -1300,7 +1896,7 @@ test "rack frames record the step 13 op sequences" {
 test "the tooltip box covers the neighbour's text on the overlay layer" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
-    try std.testing.expect(send(app, .{ .pointer_move = ring_center(cx, app, 0) }));
+    try std.testing.expect(send(app, .{ .pointer_move = ring_grip(cx, app, 0) }));
     var waited: u32 = 0;
     while (waited < 4) : (waited += 1) {
         try std.testing.expect(ui.animate(App, app, cx, 100));
@@ -1311,12 +1907,8 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     try std.testing.expect(app.tooltip_visible());
     try std.testing.expect(cx.dirty);
     _ = frame_at(app, 1280, 720);
-    // The same areas as a frame without the tooltip: 12 rings, the view, 25 rows, the thumb,
-    // and 3 titles.
-    try std.testing.expectEqual(
-        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
-        cx.area_list().len,
-    );
+    // The same areas as a frame without the tooltip.
+    try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
     const boxes = cx.draw.items(quads.Box);
     const last = boxes.len - 1;
     try std.testing.expectEqual(quads.Layer.overlay, cx.draw.layer_at(quads.Box, @intCast(last)));
@@ -1336,9 +1928,9 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     try std.testing.expectEqual(overlay, batches[batches.len - 1].layer);
     try std.testing.expectEqual(@as(u8, 2), batches[batches.len - 1].type_id);
     for (batches[0 .. batches.len - 2]) |batch| {
-        try std.testing.expectEqual(@as(u8, 0), batch.layer);
+        try std.testing.expect(batch.layer <= @backingInt(cable_layer));
     }
-    try std.testing.expect(send(app, .{ .pointer_move = ring_center(cx, app, 1) }));
+    try std.testing.expect(send(app, .{ .pointer_move = ring_grip(cx, app, 1) }));
     try std.testing.expect(!app.tooltip_visible());
 }
 
@@ -1357,10 +1949,19 @@ test "badges clear the title and leds follow the meters" {
         }
     }
     const lights = cx.draw.items(led.Led);
-    try std.testing.expectEqual(@as(usize, panel_count), lights.len);
+    try std.testing.expectEqual(@as(usize, meter_panel_count), lights.len);
     for (lights, app.meters) |light, meter| {
         try std.testing.expectEqual(meter.value, light.brightness);
     }
+}
+
+/// The middle point of cable `index`'s polyline at the last draw, on its stroke.
+fn cable_point(cx: *const Context, index: u32) input.Point {
+    const area = cx.find(cable_id(index)).?;
+    const point = cx.draw.point_items()[area.first_point + area.point_count / 2];
+    const origin_x = area.rect[0] + area.radius;
+    const origin_y = area.rect[1] + area.radius;
+    return .{ .x = origin_x + point[0], .y = origin_y + point[1] };
 }
 
 /// The rect of preset `row` at the last draw.
@@ -1408,10 +2009,7 @@ test "the preset list scrolls and draws only its visible rows" {
     try std.testing.expectEqual(ui.List.Range{ .first = 412, .end = 437 }, app.preset_range);
     try std.testing.expect(cx.find(ui.id("preset", 411)) == null);
     try std.testing.expect(cx.find(ui.id("preset", 437)) == null);
-    try std.testing.expectEqual(
-        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
-        cx.area_list().len,
-    );
+    try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
     const first = preset_rect(cx, 412);
     try std.testing.expectEqual(app.presets.viewport.y, first.y);
     const point = center_of(first);
@@ -1427,7 +2025,7 @@ test "a knob change is reported on the status line" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     try std.testing.expectEqualStrings("ready", app.status_text());
-    const cut = ring_center(cx, app, 4);
+    const cut = ring_grip(cx, app, 4);
     try std.testing.expect(send(
         app,
         .{ .wheel = .{ .x = cut.x, .y = cut.y, .dx = 0, .dy = 9.6 } },
@@ -1500,7 +2098,7 @@ test "a double click renames a panel and Escape cancels" {
     try std.testing.expectEqual(@as(?u32, null), app.renaming);
     try std.testing.expectEqual(ui.Id.none, cx.focus);
     _ = frame_at(app, 1280, 720);
-    const rate = ring_center(cx, app, 0);
+    const rate = ring_grip(cx, app, 0);
     _ = send(app, .{ .wheel = .{ .x = rate.x, .y = rate.y, .dx = 0, .dy = -12 } });
     try std.testing.expectEqualStrings("vco.rate changed 0.35", app.status_text());
     _ = double_click_title(app, 0, 5000);
@@ -1521,7 +2119,7 @@ test "a press elsewhere commits a rename and a right click resets a knob" {
     const cx = double_click_title(app, 1, 1000);
     _ = send(app, key(.end, ""));
     _ = send(app, key(.other, "!"));
-    const cut = ring_center(cx, app, 4);
+    const cut = ring_grip(cx, app, 4);
     _ = send(app, press_at(cut, .left, 3000));
     try std.testing.expectEqualStrings("filter!", app.titles[1].text());
     try std.testing.expectEqualStrings("filter renamed filter!", app.status_text());
@@ -1535,4 +2133,156 @@ test "a press elsewhere commits a rename and a right click resets a knob" {
     try std.testing.expectEqual(@as(f32, 0.5), app.knobs[4].value);
     try std.testing.expectEqual(ui.Id.none, cx.capture);
     try std.testing.expectEqualStrings("filter!.cut reset 0.50", app.status_text());
+}
+
+// Locks patching: a press on osc.rate's hub captures it without turning the knob, the drag
+// draws a preview cable with no area, and the release on filter.cut's ring adds the cable and
+// reports "osc.rate -> filter.cut". A drop on the source itself or on a pair already patched
+// adds nothing. A right press on the new cable removes it ("cable removed") and resets no
+// knob, and the hub shows the pointer cursor.
+test "a hub drag patches a cable and a right press removes it" {
+    const app = new_app();
+    var cx = frame_at(app, 1280, 720);
+    const hub = hub_point(cx, app, 0);
+    _ = send(app, .{ .pointer_move = hub });
+    try std.testing.expectEqual(ui.Cursor.pointer, cx.cursor());
+    try std.testing.expect(send(app, press_at(hub, .left, 1000)));
+    const target = ring_grip(cx, app, 4);
+    try std.testing.expect(send(app, .{ .pointer_move = target }));
+    try std.testing.expectEqual(@as(?u32, 0), app.patching);
+    try std.testing.expectEqual(@as(f32, 0.25), app.knobs[0].value);
+    const resting_paths = cx.draw.items(quads.Path).len;
+    cx = frame_at(app, 1280, 720);
+    try std.testing.expect(cx.draw.items(quads.Path).len > resting_paths);
+    try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
+    try std.testing.expect(send(app, release_at(target, .left, 1100)));
+    try std.testing.expectEqual(@as(?u32, null), app.patching);
+    try std.testing.expectEqual(@as(u32, 3), app.cable_count);
+    try std.testing.expectEqual(Cable{ .from = 0, .to = 4 }, app.cables[2]);
+    try std.testing.expectEqualStrings("osc.rate -> filter.cut", app.status_text());
+    cx = frame_at(app, 1280, 720);
+    // Dropping on the source, or patching filter.cut back to osc.rate, adds nothing.
+    for ([_][2]u32{ .{ 0, 0 }, .{ 4, 0 } }) |pair| {
+        const from = hub_point(cx, app, pair[0]);
+        _ = send(app, press_at(from, .left, 2000));
+        _ = send(app, release_at(ring_grip(cx, app, pair[1]), .left, 2100));
+        try std.testing.expectEqual(@as(u32, 3), app.cable_count);
+    }
+    cx = frame_at(app, 1280, 720);
+    try std.testing.expectEqual(areas_at_rest + 1, cx.area_list().len);
+    const on_cable = cable_point(cx, 2);
+    try std.testing.expect(send(app, .{ .pointer_move = on_cable }));
+    try std.testing.expect(send(app, press_at(on_cable, .right, 3000)));
+    try std.testing.expectEqual(@as(u32, 2), app.cable_count);
+    try std.testing.expectEqualStrings("cable removed", app.status_text());
+    try std.testing.expectEqual(ui.Id.none, cx.capture);
+    for (app.knobs, knob_table) |knob, spec| try std.testing.expectEqual(spec.value, knob.value);
+}
+
+// Locks the table bound: with `cable_cap` cables a new drop is refused and reported, and the
+// worst frame (every cable, the drag preview, the playhead, a hovered and a selected row, and
+// the tooltip) overflows no pool, batch list, or area list.
+test "the worst patch frame fits every pool and a full table refuses" {
+    const app = new_app();
+    var cx = frame_at(app, 1280, 720);
+    app.cable_count = 0;
+    var from: u8 = 0;
+    while (app.cable_count < cable_cap) : (from += 1) {
+        app.connect(from, (from + 5) % knob_count);
+    }
+    try std.testing.expectEqual(cable_cap, app.cable_count);
+    cx = frame_at(app, 1280, 720);
+    _ = send(app, press_at(center_of(preset_rect(cx, 2)), .left, 500));
+    _ = send(app, release_at(center_of(preset_rect(cx, 2)), .left, 550));
+    _ = send(app, .{ .pointer_move = center_of(preset_rect(cx, 4)) });
+    _ = send(app, .{ .pointer_move = center_of(rect_of(cx.find(envelope_id).?.rect)) });
+    try std.testing.expect(app.envelope_hovered);
+    _ = send(app, .{ .pointer_move = ring_grip(cx, app, 1) });
+    _ = ui.animate(App, app, cx, 0);
+    _ = ui.animate(App, app, cx, 600);
+    try std.testing.expect(app.tooltip_visible());
+    app.envelope_hovered = true;
+    // Cables leave a hub downward and cover its center, so the press takes the hub's top.
+    const top = hub_point(cx, app, 15);
+    _ = send(app, press_at(.{ .x = top.x, .y = top.y - 6 }, .left, 1000));
+    _ = send(app, .{ .pointer_move = .{ .x = 900, .y = 120 } });
+    try std.testing.expectEqual(@as(?u32, 15), app.patching);
+    cx = frame_at(app, 1280, 720);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), cx.area_overflow);
+    try std.testing.expectEqual(@as(usize, cable_cap), count_cable_areas(cx));
+    _ = send(app, release_at(ring_grip(cx, app, 2), .left, 1100));
+    try std.testing.expectEqual(cable_cap, app.cable_count);
+    try std.testing.expectEqualStrings("cables full", app.status_text());
+}
+
+/// The path areas of the last draw: one per drawn cable.
+fn count_cable_areas(cx: *const Context) usize {
+    var count: usize = 0;
+    for (cx.area_list()) |area| {
+        if (area.point_count != 0) count += 1;
+    }
+    return count;
+}
+
+// Locks the playhead's idle rule: hovering the display owes a draw, each frame while it is
+// hovered advances the phase by `dt / playhead_loop_ms`, keeps the frames coming, and draws
+// the dot on the cable layer; leaving the display stops the frames, so an unhovered rack is
+// not animating.
+test "the playhead runs only while the display is hovered" {
+    const app = new_app();
+    var cx = frame_at(app, 1280, 720);
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    const display = center_of(rect_of(cx.find(envelope_id).?.rect));
+    try std.testing.expect(send(app, .{ .pointer_move = display }));
+    try std.testing.expect(app.envelope_hovered);
+    try std.testing.expect(ui.animate(App, app, cx, 0));
+    try std.testing.expect(ui.animate(App, app, cx, 500));
+    try std.testing.expectEqual(@as(f32, 0.25), app.envelope_phase);
+    try std.testing.expect(cx.dirty);
+    const boxes = cx.draw.items(quads.Box).len;
+    cx = frame_at(app, 1280, 720);
+    const drawn = cx.draw.items(quads.Box);
+    try std.testing.expectEqual(boxes + 1, drawn.len);
+    try std.testing.expectEqual(cable_layer, cx.draw.layer_at(quads.Box, @intCast(drawn.len - 1)));
+    try std.testing.expect(send(app, .{ .pointer_move = .{ .x = 1100, .y = 30 } }));
+    try std.testing.expect(!app.envelope_hovered);
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    try std.testing.expectEqual(@as(f32, 0.25), app.envelope_phase);
+}
+
+// Locks the envelope polyline for the initial knobs (attack 0.20, decay 0.30, sustain 0.60,
+// release 0.40): stages 0.25, 0.35, 0.5, and 0.45 long (total 1.55), so the peak (point 20)
+// is 0.25 / 1.55 across at the top, the decay ends at point 40 on the sustain level, the hold
+// ends at point 41, and the release ends at the bottom right; x never decreases.
+test "the envelope polyline follows the four knobs" {
+    const app = new_app();
+    const plot: Rect = .{ .x = 100, .y = 50, .width = 310, .height = 100 };
+    const stages = stages_of(&app.knobs);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.55), stages.total(), 1.0e-5);
+    var points: [envelope_point_count]quads.Point = undefined;
+    envelope_points(&points, stages, plot);
+    try std.testing.expectEqual(quads.Point{ 100, 150 }, points[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 150), points[20][0], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), points[20][1], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 220), points[40][0], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), points[40][1], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 320), points[41][0], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), points[41][1], 1.0e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 410), points[63][0], 1.0e-3);
+    try std.testing.expectEqual(@as(f32, 150), points[63][1]);
+    for (points[1..], points[0 .. points.len - 1]) |point, before| {
+        try std.testing.expect(point[0] >= before[0]);
+    }
+}
+
+// Locks the cable shape: the sag is `min(24 + 0.2 * length, 160)`, and the inner control
+// points sit a third and two thirds along the chord, lowered by it.
+test "cables sag by their length" {
+    try std.testing.expectEqual(@as(f32, 24), cable_sag(0));
+    try std.testing.expectEqual(@as(f32, 84), cable_sag(300));
+    try std.testing.expectEqual(@as(f32, 160), cable_sag(1000));
+    const control = cable_control(.{ 0, 0 }, .{ 300, 0 });
+    try std.testing.expectEqual(quads.Point{ 100, 84 }, control[1]);
+    try std.testing.expectEqual(quads.Point{ 200, 84 }, control[2]);
 }
