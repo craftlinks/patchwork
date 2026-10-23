@@ -32,7 +32,7 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`, `area_cap`. |
+| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`. |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration. |
@@ -48,8 +48,9 @@ drawing.
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
 the type), a zero capacity, a `batch_cap` whose worst frame would not fit one command
-buffer, and an `area_cap` outside 1 to 65536 produce a clear `@compileError` naming the
-exact problem.
+buffer, an `area_cap` outside 1 to 65536, and a `point_cap` outside 1 to 65536 produce a
+clear `@compileError` naming the exact problem. `point_cap` (default 65,536) sizes the path
+point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
 `Toggle`, `Slider`, `Knob`, `Meter`, and `TextField`. Each draws with `draw(cx, walk)` and,
@@ -96,8 +97,9 @@ patchwork/
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
 │   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
-│   ├── draw/types.zig          # Library draw types (Box, Arc, Glyph, Image) and CPU twins
-│   ├── draw/pools.zig          # Context: per-type pools, layers, counting sort, sticky batches
+│   ├── draw/types.zig          # Library draw types (Box, Arc, Glyph, Image, Path) and CPU twins
+│   ├── draw/pools.zig          # Context: per-type pools, point pool, layers, sort, batches
+│   ├── draw/path.zig           # Stroked paths: flattening, chunking, twins, appenders
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId
 │   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
 │   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
@@ -351,10 +353,11 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   yield one delta, snapped to the device pixel grid so glyphs stay crisp, added to `rect.xy`
   of exactly the instances and areas drawn since. A zero delta does nothing; clips never
   move, so a shifted container may not contain a clipping one (asserted).
-- **Hit areas.** Widgets record `cx.area(id, rect, radius, flags)` while drawing. Ids are
-  `ui.id("name", index)`: a compile-time FNV-1a hash mixed with the index. Each event
-  resolves the topmost area once (highest layer, then last drawn; clip and rounded rect must
-  contain the point); `cx.hit(id, event)` is then an O(1) compare yielding `hover_in`,
+- **Hit areas.** Widgets record `cx.area(id, rect, radius, flags)` while drawing, and a stroked
+  path records `cx.path_area(id, placed, width, flags)`: the points within `width / 2 + 3` of
+  its polyline. Ids are `ui.id("name", index)`: a compile-time FNV-1a hash mixed with the
+  index. Each event resolves the topmost area once (highest layer, then last drawn; clip and
+  rounded rect, or clip, rect, and polyline distance, must contain the point); `cx.hit(id, event)` is then an O(1) compare yielding `hover_in`,
   `hover_out`, `down`, `drag`, `up`, or `wheel`. A press captures until release, across
   frames. The wheel goes to the topmost wheel-flagged area, so a knob inside a view turns
   instead of scrolling. After a draw that moved things under a resting pointer, hover is
@@ -399,9 +402,10 @@ here, so they cannot drift. Run `zig build test` for the checked numbers.
 
 ### 1. Synthesizer Rack (`examples/rack/app.zig`)
 
-A modular rack under a header bar: a column of panels, each holding a row of knobs and a
-level meter, beside a scrolling list of 1,000 presets and a status line. It demonstrates:
-- **Layout while drawing.** Nested `begin` and `end` with `share(3)` panels; the knob and
+A modular rack under a header bar: a column of panels, three holding a row of knobs and a
+level meter and the fourth four envelope knobs and an envelope display, with patch cables
+between knobs, beside a scrolling list of 1,000 presets and a status line. It demonstrates:
+- **Layout while drawing.** Nested `begin` and `end` with `share(4)` panels; the knob and
   meter omission rules are a few lines against `cx.remaining()` and `cx.fits()`. The worked
   layouts are locked by the tests in `examples/rack/app.zig`.
 - **Actions.** Knobs return `changed`, which the rack writes to its status line
@@ -423,10 +427,21 @@ level meter, beside a scrolling list of 1,000 presets and a status line. It demo
 - **Per-instance accents.** Knob accents are per-instance colors (`draw.Arc.color`), not theme
   slots. The palette is `widgets.accents`.
 - **An app-defined draw type** (`examples/rack/led.zig`). `Led` is an `extern struct` plus a
-  WGSL `pixel` function, registered in `config.draw` with no library edit. Each panel's LED
-  sits in the title band over the meter and glows with the meter level.
+  WGSL `pixel` function, registered in `config.draw` with no library edit. Each voice panel's
+  LED sits in the title band over the meter and glows with the meter level.
 - **An image texture** (`examples/rack/badge.zig`). `init` generates a 32 by 32 RGBA badge,
   creates a texture for it, and queues its pixels; each title band draws it as a `draw.Image`.
+- **Patch cables.** The center of each knob's ring is a jack hub. Dragging from a hub draws a
+  preview cable to the pointer; releasing over another knob patches a cable ("osc.rate ->
+  filter.cut"; at most 16, no self links or duplicates). Cables are translucent sagging
+  cubics (`draw.path.cubic`) on layer 2, above the panels and text and below the tooltip;
+  hovering one lightens it and a right press removes it ("cable removed") instead of
+  resetting the knob under it. A cable also keeps the wheel from the knob under its stroke.
+  Two cables exist at start.
+- **Envelope.** The env panel's attack, decay, sustain, and release knobs shape a 64-point
+  envelope drawn with `draw.path.polyline`. Hovering the display runs a playhead dot along
+  it, advanced on every displayed frame (the display's refresh rate) through
+  `cx.keep_animating()`; leaving the display stops the frames.
 - **Layers.** Hovering a knob for `tooltip_delay_ms` (500 ms) shows a tooltip that covers the
   neighbouring knob's name. It is drawn on the overlay layer and records no hit area, so it
   never takes the hover from the knob; test "the tooltip box covers the neighbour's text on
@@ -469,14 +484,15 @@ replay it: native through `gpu_wgpu.execute`, the browser through `submit_js(ptr
 
 ```text
 Renderer.setup  (once, after device creation)
-  layout_create  buffer_create  sampler_create  bind_group_create (frame)
+  layout_create  buffer_create  [buffer_create (points)]  sampler_create
+  bind_group_create (frame: uniform [and points])
   per draw type: shader_create (labelled with the type)  buffer_create  pipeline_create
   buffer_write (unit quad)  per queued texture: texture_create  bind_group_create
   texture_write* (the app's images; the glyph atlas starts empty)
 Renderer.frame  (every presented frame)
   buffer_write (uniform, if the device size or scale changed)
   queued texture ops (the glyph cache's dirty atlas rectangle, one strided texture_write)
-  buffer_write* (pools)
+  buffer_write* (pools)  [buffer_write (points)]
   pass_begin  bind_group_set 0  vertex_buffer_set 0
   per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
   pass_end_present
@@ -499,7 +515,9 @@ hover writes the changed arc records only, and a scale change writes the uniform
 rectangle, and the glyph range, but no box or arc record. Pipeline, vertex
 buffer, and texture bind group sets are skipped when the previous batch already set them. The
 exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack frames record
-the step 13 op sequences" in `examples/rack/app.zig`.
+the step 16 op sequences" in `examples/rack/app.zig`. The path point pool follows the same
+rule with its own shadow: a rebuilt path whose shape is unchanged writes no points, and a
+recolored one writes its `Path` records only.
 
 ## Draw Types, Layers, and Batches
 
@@ -507,7 +525,8 @@ A draw type is an `extern struct` plus a WGSL `fn pixel(px: Pixel) -> vec4<f32>`
 lists its types and pool capacities in `config.draw`; the library provides `draw.Box` (fill,
 border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
 `text.place`), and
-`draw.Image` (an `rgba8` texture), and an app adds its own (the rack's `Led`).
+`draw.Image` (an `rgba8` texture), and `draw.Path` (a stroked polyline, see Paths), and an app
+adds its own (the rack's `Led`).
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
   pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
@@ -520,6 +539,10 @@ border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas 
   `theme.Theme`, the per-type `Instance`, `Varyings`, and `Pixel` structs, and the type's
   `pixel`. Derivatives and `textureSample` must stay in uniform control flow, so `pixel`
   must not call them inside branches on instance data; the prelude guide explains.
+- **Points.** A type that declares `pub const reads_points = true` reads the context's point
+  pool as `points: array<vec2<f32>>` at `@group(0) @binding(1)` (read-only storage, fragment
+  stage). The renderer creates that buffer and binds it with the frame uniform, once per pass;
+  a registry without such a type has no point buffer.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
   layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
   batch list refuses the instance and counts it in `cx.draw.overflow_count`.
@@ -551,9 +574,43 @@ Memory: each pool holds `cap` records plus a renderer shadow of the same size, a
 buffer of the largest pool backs the counting sort. The context also holds the glyph cache
 (about 1.25 MiB: the 1 MiB atlas mirror, the table, and raster scratch). The hosts keep the
 context and renderer in static memory (BSS on wasm), so the linker sizes the wasm initial
-memory to cover them. The UI context around the draw context adds `area_cap` 48-byte hit
+memory to cover them. A registry with `draw.Path` adds `point_cap` 8-byte points and a
+shadow of the same size. The UI context around the draw context adds `area_cap` 56-byte hit
 areas, 32 turtle entries, and, in safe builds only, a duplicate-id table of 12 bytes per slot
 (`2 * area_cap` rounded up to a power of two).
+
+## Paths
+
+`draw.path` strokes polylines with round caps through the `Path` draw type
+(`src/draw/path.zig`):
+
+```zig
+const stroke: draw.path.Stroke = .{ .color = color, .width = 4, .hover = 0 };
+const placed = draw.path.cubic(cx.drawing(), .{ p0, p1, p2, p3 }, stroke, clip);  // ?Placed
+_ = draw.path.polyline(cx.drawing(), &points, stroke, clip);
+_ = draw.path.plot(cx.drawing(), &samples, rect, .{ lo, hi }, stroke, clip);
+if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit within width / 2 + 3
+```
+
+- **Flattening.** A cubic gets `clamp(ceil(((chord + control polygon) / 2) / 6), 4, 64)`
+  segments.
+- **Chunks.** Each `Path` instance (80 bytes) covers a chunk of at most 16 points of the point
+  pool, and its fragment takes the minimum distance over the chunk's segments, so joints
+  inside a chunk blend once. Chunks share their end point by index (no point is stored
+  twice), hold at least four segments, and stop growing past `chunk_area_max` square pixels
+  of padded bounds, which bounds the overdraw of diagonals. At a seam each chunk also
+  measures its neighbour's segment, and a fragment belongs to the chunk with the nearest
+  segment, so a translucent stroke shows no dots at seams. Parts of one path closer than the
+  width, more than a segment apart across a seam, still blend twice; the path tests measure
+  it.
+- **Coordinates.** Points are stored relative to the path's origin, and each chunk carries
+  `anchor = origin - rect.xy`, so a container's alignment shift moves strokes with their
+  rects.
+- **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
+  in `overflow_count`.
+
+The CPU twins (`distance_to_polyline`, `chunk_alpha`, `draw.sdf_segment`) check the shader's
+math, the chunk rects, and the seam blending without a GPU.
 
 ## Text
 

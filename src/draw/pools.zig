@@ -48,6 +48,15 @@
 //! (`ui/cx.zig`). Keys, layers, and append order are untouched, so sorting and batching are
 //! unaffected; the cost is linear in the shifted instances only.
 //!
+//! ## 5b. Points
+//! A registry with a `reads_points` type (`draw.Path`) gives the context a point pool:
+//! `point_cap` (from `App.config.point_cap`) `[2]f32` points, emptied by `reset`, with its own
+//! revision. `draw/path.zig` reserves a path's points with `reserve_points` and appends the
+//! instances that index them; `release_points` takes a reservation back when the first
+//! instance is refused. Instances move in the counting sort and in `shift`; points never
+//! move, so an instance's `first_point` stays valid. Without such a type the pool has no
+//! storage (`point_capacity == 0`).
+//!
 //! ## 6. TigerStyle Invariants
 //! - All storage is fixed arrays sized at compile time from `App.config.draw` and
 //!   `batch_cap`; the hosts keep the context in static memory (BSS on wasm).
@@ -62,6 +71,12 @@ const cache = @import("../text/cache.zig");
 const registry = @import("registry.zig");
 const textures = @import("textures.zig");
 const types = @import("types.zig");
+
+/// One path point in logical pixels, relative to its path's origin (`draw/path.zig`).
+pub const Point = [2]f32;
+
+/// Largest `App.config.point_cap`: point indices stay exact as `f32` instance fields.
+pub const point_cap_max: u32 = 65536;
 
 /// Layers per frame. A layer is drawn entirely after every lower layer.
 pub const layer_count: u32 = 8;
@@ -119,11 +134,21 @@ fn Pool(comptime T: type, comptime cap: u32) type {
 }
 
 /// The draw context for one app: `App.draw` receives a pointer to it. See the module guide.
-pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: u32) type {
+/// `point_cap` sizes the point pool when a registered type reads points (section 5b).
+pub fn Context(
+    comptime entries: []const registry.DrawType,
+    comptime batch_cap: u32,
+    comptime point_cap: u32,
+) type {
     comptime {
         assert(batch_cap >= 1);
+        assert(point_cap <= point_cap_max);
     }
     const R = registry.Registry(entries);
+    const point_total: u32 = if (R.uses_points) point_cap else 0;
+    comptime {
+        if (R.uses_points) assert(point_total >= 1);
+    }
     const pool_types: [R.count]type = blk: {
         var out: [R.count]type = undefined;
         for (0..R.count) |index| out[index] = Pool(R.Type(index), R.caps[index]);
@@ -151,9 +176,15 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
         finalized: bool,
         /// Counting-sort target, sized for the largest pool and shared by all of them.
         scratch: [scratch_bytes]u8 align(16),
+        /// The point pool (section 5b): `points[0..point_count]` are this frame's points.
+        points: [point_total]Point,
+        point_count: u32,
+        /// Moves on every `reset`, `reserve_points`, and `release_points`.
+        point_revision: u64,
 
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
+        pub const point_capacity: u32 = point_total;
 
         /// Empties every pool and the glyph cache and creates the glyph atlas as texture 0.
         /// The atlas starts empty (WebGPU zero-fills it); the cache uploads what it draws.
@@ -166,6 +197,7 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
             inline for (0..R.count) |index| {
                 self.pools[index].revision = 0;
             }
+            self.point_revision = 0;
             self.reset();
             assert(self.textures.count == 1);
             assert(self.batch_count == 0);
@@ -185,6 +217,8 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
                 pool.last_key = 0;
                 pool.ordered = true;
             }
+            self.point_count = 0;
+            self.point_revision += 1;
             self.layer_now = .base;
             self.overflow_count = 0;
             self.appearance_count = 0;
@@ -263,6 +297,55 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
             }
             assert(texture == null);
             return 0;
+        }
+
+        /// Instances `T`'s pool can still take this frame.
+        pub fn room(self: *const Self, comptime T: type) u32 {
+            const pool = &self.pools[comptime R.id(T)];
+            const P = @TypeOf(pool.*);
+            assert(pool.count <= P.capacity);
+            return P.capacity - pool.count;
+        }
+
+        /// Counts an instance a caller refused before appending it, such as a path whose
+        /// chunks would not fit (`draw/path.zig`).
+        pub fn refuse(self: *Self) void {
+            const before = self.overflow_count;
+            self.overflow_count += 1;
+            assert(self.overflow_count == before + 1);
+        }
+
+        /// Reserves `count` points and returns the index of the first, or null (counted in
+        /// `overflow_count`) when the pool cannot hold them. The caller writes
+        /// `points[first..][0..count]` before the frame is recorded.
+        pub fn reserve_points(self: *Self, count: u32) ?u32 {
+            comptime assert(point_total >= 1);
+            assert(count >= 1);
+            assert(self.point_count <= point_total);
+            if (count > point_total - self.point_count) {
+                self.refuse();
+                return null;
+            }
+            const first = self.point_count;
+            self.point_count += count;
+            self.point_revision += 1;
+            assert(self.point_count <= point_total);
+            assert(first + count == self.point_count);
+            return first;
+        }
+
+        /// Takes back the reservation that started at `first`, which must be the last one.
+        pub fn release_points(self: *Self, first: u32) void {
+            assert(first < self.point_count);
+            self.point_count = first;
+            self.point_revision += 1;
+            assert(self.point_count == first);
+        }
+
+        /// This frame's points, in reservation order.
+        pub fn point_items(self: *const Self) []const Point {
+            assert(self.point_count <= point_total);
+            return self.points[0..self.point_count];
         }
 
         /// The live instances of `T`, in pool order (key order after `finalize`).
@@ -461,7 +544,7 @@ const test_draw = [_]registry.DrawType{
     .{ .type = types.Image, .cap = 4 },
 };
 
-const TestContext = Context(&test_draw, 6);
+const TestContext = Context(&test_draw, 6, 0);
 
 fn test_box(x: f32) types.Box {
     return .{

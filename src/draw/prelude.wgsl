@@ -5,7 +5,8 @@
 // ## 1. Assembly
 // `draw/registry.zig` builds one module per registered draw type at compile time:
 //   prelude (this file) ++ Theme (generated from `theme.Theme`) ++ texture bindings (textured
-//   types only) ++ Instance, Varyings, Pixel, carry, unpack (generated from the Zig struct)
+//   types only) ++ the point buffer `points` (`reads_points` types only, @group(0)
+//   @binding(1)) ++ Instance, Varyings, Pixel, carry, unpack (generated from the Zig struct)
 //   ++ the type's own `fn pixel(px: Pixel) -> vec4<f32>`.
 // WGSL module scope is order-free, so this file refers to the generated declarations and to
 // `pixel` before they appear.
@@ -23,8 +24,10 @@
 // by an early return or `discard`. WGSL requires derivatives (`fwidth`, so `coverage`) and
 // implicit-LOD `textureSample` to run in uniform control flow. A `pixel` function must
 // therefore call them outside any branch on instance or position data; compute both sides
-// and choose with `select` or `mix` instead. A violation fails when the host compiles the
-// module, which happens at startup; the error names the draw type through the module label.
+// and choose with `select` or `mix` instead. A loop whose bound is instance data is
+// non-uniform too, so `draw.Path` takes its derivative before its loop. A violation fails
+// when the host compiles the module, which happens at startup; the error names the draw type
+// through the module label.
 //
 // ## 4. Coverage, Clip, and Blend
 // - `coverage(dist)` is a one-pixel linear ramp centered on the outline:

@@ -50,6 +50,8 @@
 //! wheel       the wheel target gets wheel; otherwise as move
 //! keys, paste, window focus, frame: none (section 7)
 //! ```
+//! A path area (`path_area`, for a stroke drawn with `draw.path`) is hit within a distance of
+//! its polyline instead of a rounded rect (`ui/areas.zig`, section 3); the scan is the same.
 //! While a capture is held, hover is frozen on it. `down`, `drag`, and `secondary` carry the
 //! area's rect (`Press.rect`) from the last draw, so widgets keep no rects of their own, and
 //! the press count of the click sequence (`Press.clicks`, `input.count_click`). Only the left
@@ -352,7 +354,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             }
             if (!self.pointer.inside) return false;
             const live = self.areas[0..self.area_count];
-            const found = areas.resolve(live, self.pointer.x, self.pointer.y);
+            const points = self.draw.point_items();
+            const found = areas.resolve(live, points, self.pointer.x, self.pointer.y);
             const next: Id = if (found.hot) |index| self.areas[index].id else .none;
             return next != self.hover;
         }
@@ -592,9 +595,41 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .layer = @backingInt(self.draw.layer_now),
                 .flags = flags,
                 .pad = 0,
+                .first_point = 0,
+                .point_count = 0,
             };
             self.area_count += 1;
             assert(self.area_count <= area_cap);
+        }
+
+        /// Records a path area for `id`: the points within `width / 2 + path.hit_slop` of the
+        /// path `placed` (from `draw.path`, this frame) under the clip in effect, on the
+        /// current layer (`ui/areas.zig`, section 3). One area per id per frame.
+        pub fn path_area(
+            self: *Self,
+            id: Id,
+            placed: draw.path.Placed,
+            width: f32,
+            flags: Flags,
+        ) void {
+            assert(width > 0);
+            assert(placed.count >= 1);
+            assert(placed.first + placed.count <= self.draw.point_count);
+            const radius = width * 0.5 + draw.path.hit_slop;
+            const bounds = placed.bounds;
+            const rect: Rect = .{
+                .x = bounds.x - radius,
+                .y = bounds.y - radius,
+                .width = bounds.width + 2 * radius,
+                .height = bounds.height + 2 * radius,
+            };
+            const before = self.area_count;
+            self.area(id, rect, radius, flags);
+            if (self.area_count == before) return;
+            const recorded = &self.areas[before];
+            recorded.first_point = placed.first;
+            recorded.point_count = placed.count;
+            assert(recorded.id == id);
         }
 
         /// The area recorded for `id` at the last draw, or null. O(areas): for tests and for
@@ -769,7 +804,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(x == x);
             assert(y == y);
             self.pointer.move(x, y);
-            const found = areas.resolve(self.areas[0..self.area_count], x, y);
+            const live = self.areas[0..self.area_count];
+            const found = areas.resolve(live, self.draw.point_items(), x, y);
             self.hot = .none;
             self.hot_focusable = false;
             self.hot_cursor = .default;
@@ -1071,7 +1107,7 @@ const test_draw = [_]draw.DrawType{
     .{ .type = draw.Glyph, .cap = 64 },
 };
 
-const TestContext = Context(draw.Context(&test_draw, 8), 64);
+const TestContext = Context(draw.Context(&test_draw, 8, 0), 64);
 
 /// A freshly initialized static context, so tests keep the pools off the stack.
 fn new_context() *TestContext {
@@ -1487,4 +1523,46 @@ test "copy keeps the bytes for the host and cuts on a codepoint boundary" {
     context.copy(&static.long);
     context.event_end();
     try testing.expectEqual(@as(usize, clipboard_cap - 1), context.copied().len);
+}
+
+const path_test_draw = [_]draw.DrawType{.{ .type = draw.Path, .cap = 16 }};
+
+const PathTestContext = Context(draw.Context(&path_test_draw, 4, 128), 8);
+
+// Locks that a path area follows its container's alignment shift with its stroke: a 100 px
+// row centered in a 400 px window moves by 150, and the pointer resolves to the path near the
+// shifted polyline and to nothing in the empty corner of its rect.
+test "a path area moves with its container's shift" {
+    const static = struct {
+        var context: PathTestContext = undefined;
+    };
+    const context = &static.context;
+    context.init();
+    context.begin_frame(400, 300, 120);
+    var row = flow_of(.right);
+    row.alignment = .{ .x = 0.5, .y = 0 };
+    _ = context.begin(sized(.fill, .{ .fixed = 100 }), row);
+    const cell = context.walk(sized(.{ .fixed = 100 }, .fill));
+    const window = context.clip().?;
+    const stroke: draw.path.Stroke = .{ .color = .{ 1, 1, 1, 1 }, .width = 4, .hover = 0 };
+    const points = [_]draw.Point{
+        .{ cell.x, cell.y + 10 },
+        .{ cell.x + 90, cell.y + 10 },
+        .{ cell.x + 90, cell.y + 90 },
+    };
+    const placed = draw.path.polyline(context.drawing(), &points, stroke, window).?;
+    const cable = areas.id("cable", 0);
+    context.path_area(cable, placed, stroke.width, plain);
+    _ = context.end();
+    _ = context.end_frame();
+    const recorded = context.find(cable).?;
+    try testing.expectEqual(@as(f32, 150 - 5), recorded.rect[0]);
+    try testing.expectEqual(@as(u32, 3), recorded.point_count);
+    try testing.expectEqual(@as(f32, 150), context.draw.items(draw.Path)[0].rect[0] + 3);
+    context.event_begin(.{ .pointer_move = .{ .x = 150 + 45, .y = 13 } });
+    try testing.expectEqual(cable, context.hot);
+    context.event_end();
+    context.event_begin(.{ .pointer_move = .{ .x = 150 + 20, .y = 80 } });
+    try testing.expectEqual(areas.Id.none, context.hot);
+    context.event_end();
 }

@@ -16,19 +16,30 @@
 //! safe builds check it with `Stamps` (section 5).
 //!
 //! ## 3. The Record
-//! `Area` is 48 bytes: `id`, `rect` and `clip` as `[4]f32` (`clip` exclusive-max like an
+//! `Area` is 56 bytes: `id`, `rect` and `clip` as `[4]f32` (`clip` exclusive-max like an
 //! instance's), the corner `radius` of the rounded hit shape, the draw `layer` it was
-//! recorded on, and `flags`: `wheel` (the area takes wheel input), `focusable` (a left press
-//! focuses it and Tab visits it; the area list in draw order is the Tab order), and `cursor`
-//! (the pointer shape over it, resolved with the hot area). A point hits an area when the clip
-//! contains it and `draw.contains_box` accepts it.
+//! recorded on, `flags`, and the point range `first_point`, `point_count` of a path area.
+//! `flags` are `wheel` (the area takes wheel input), `focusable` (a left press focuses it and
+//! Tab visits it; the area list in draw order is the Tab order), and `cursor` (the pointer
+//! shape over it, resolved with the hot area). A point hits a box area (`point_count == 0`)
+//! when the clip contains it and `draw.contains_box` accepts it.
+//!
+//! A path area (`ui.Context.path_area`) is the set of points within `radius` of a stroked
+//! polyline whose points are in the draw context's point pool, relative to the path origin
+//! `rect.xy + radius` (`draw/path.zig`, section 6). Its rect is the path's bounds padded by
+//! `radius`, so a shift of the rect moves the shape with it. A point hits it when the clip
+//! and the rect contain it and `draw.path.distance_to_polyline` is at most `radius`; only
+//! path areas whose rect contains the point measure the polyline. The points are those of
+//! the frame that recorded the area, which is the frame events resolve against.
 //!
 //! ## 4. Resolution
 //! `resolve` scans the areas once from last to first. The hot area is the topmost: the
-//! highest layer, then the last appended. The wheel target is the topmost wheel-flagged area
-//! under the point whose layer is at least the hot area's, so an overlay blocks wheel input
-//! to views beneath it. Both come from the same pass: a candidate replaces the best only on
-//! a strictly higher layer, so the first one met on the winning layer stays.
+//! highest layer, then the last appended, so a path area drawn on a higher layer (a cable)
+//! takes the press and the wheel from the box areas under its stroke. The wheel target is the
+//! topmost wheel-flagged area under the point whose layer is at least the hot area's, so an
+//! overlay blocks wheel input to views beneath it. Both come from the same pass: a candidate
+//! replaces the best only on a strictly higher layer, so the first one met on the winning
+//! layer stays.
 //!
 //! ## 5. Duplicate Check (`Stamps`)
 //! In safe builds a table of `2 * area_cap` slots (rounded up to a power of two) records each
@@ -92,6 +103,9 @@ pub const Area = extern struct {
     layer: u8,
     flags: Flags,
     pad: u16,
+    /// A path area's points in the point pool; `point_count == 0` for a box area.
+    first_point: u32,
+    point_count: u32,
 };
 
 /// What `resolve` found under a point: indices into the area slice, or null.
@@ -105,7 +119,8 @@ const fnv_prime: u64 = 0x100000001b3;
 const golden: u64 = 0x9e3779b97f4a7c15;
 
 comptime {
-    assert(@sizeOf(Area) == 48);
+    assert(@sizeOf(Area) == 56);
+    assert(@offsetOf(Area, "first_point") == 48);
     assert(@offsetOf(Area, "rect") == 8);
     assert(@offsetOf(Area, "clip") == 24);
     assert(@sizeOf(Flags) == 1);
@@ -144,8 +159,9 @@ fn finish(seed: u64) Id {
     return @fromBackingInt(@intCast(z));
 }
 
-/// True when the clip and the rounded rect of `area` both contain `(x, y)`.
-pub fn contains(area: *const Area, x: f32, y: f32) bool {
+/// True when the clip and the shape of `area` both contain `(x, y)`: its rounded rect, or
+/// for a path area the points within `radius` of its polyline in `points` (section 3).
+pub fn contains(area: *const Area, points: []const draw.Point, x: f32, y: f32) bool {
     assert(x == x);
     assert(y == y);
     if (x < area.clip[0]) return false;
@@ -155,11 +171,21 @@ pub fn contains(area: *const Area, x: f32, y: f32) bool {
     const rect = area.rect;
     assert(rect[2] > 0);
     assert(rect[3] > 0);
-    return draw.contains_box(rect[0], rect[1], rect[2], rect[3], area.radius, x, y);
+    if (area.point_count == 0) {
+        return draw.contains_box(rect[0], rect[1], rect[2], rect[3], area.radius, x, y);
+    }
+    if (x < rect[0] or x > rect[0] + rect[2]) return false;
+    if (y < rect[1] or y > rect[1] + rect[3]) return false;
+    assert(area.first_point + area.point_count <= points.len);
+    const shape = points[area.first_point..][0..area.point_count];
+    const origin_x = rect[0] + area.radius;
+    const origin_y = rect[1] + area.radius;
+    return draw.path.distance_to_polyline(shape, x - origin_x, y - origin_y) <= area.radius;
 }
 
-/// The hot area and the wheel target under `(x, y)`. See the module guide, section 4.
-pub fn resolve(areas: []const Area, x: f32, y: f32) Resolved {
+/// The hot area and the wheel target under `(x, y)`; `points` are the point pool path areas
+/// index. See the module guide, section 4.
+pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) Resolved {
     assert(areas.len <= area_cap_max);
     var hot: ?u32 = null;
     var wheel: ?u32 = null;
@@ -167,7 +193,7 @@ pub fn resolve(areas: []const Area, x: f32, y: f32) Resolved {
     while (index > 0) {
         index -= 1;
         const area = &areas[index];
-        if (!contains(area, x, y)) continue;
+        if (!contains(area, points, x, y)) continue;
         if (hot == null or area.layer > areas[hot.?].layer) hot = index;
         if (area.flags.wheel) {
             if (wheel == null or area.layer > areas[wheel.?].layer) wheel = index;
@@ -244,6 +270,8 @@ fn test_area(key: Id, x: f32, layer: u8, wheel: bool) Area {
         .layer = layer,
         .flags = .{ .wheel = wheel, .focusable = false, .cursor = .default },
         .pad = 0,
+        .first_point = 0,
+        .point_count = 0,
     };
 }
 
@@ -266,22 +294,22 @@ test "topmost is the highest layer, then the last appended" {
         test_area(id("c", 0), 0, 4, false),
         test_area(id("d", 0), 0, 0, false),
     };
-    try testing.expectEqual(@as(?u32, 2), resolve(&areas, 50, 50).hot);
+    try testing.expectEqual(@as(?u32, 2), resolve(&areas, &.{}, 50, 50).hot);
     const base_only = [_]Area{ areas[1], areas[3] };
-    try testing.expectEqual(@as(?u32, 1), resolve(&base_only, 50, 50).hot);
-    try testing.expectEqual(@as(?u32, null), resolve(&areas, 500, 50).hot);
+    try testing.expectEqual(@as(?u32, 1), resolve(&base_only, &.{}, 50, 50).hot);
+    try testing.expectEqual(@as(?u32, null), resolve(&areas, &.{}, 500, 50).hot);
 }
 
 // Locks that a clipped part of an area does not hit, and the rounded corner does not either.
 test "clipped areas do not hit" {
     var area = test_area(id("a", 0), 0, 0, false);
     area.clip = .{ 0, 0, 50, 1000 };
-    try testing.expect(contains(&area, 49, 50));
-    try testing.expect(!contains(&area, 50, 50));
+    try testing.expect(contains(&area, &.{}, 49, 50));
+    try testing.expect(!contains(&area, &.{}, 50, 50));
     area.clip = .{ 0, 0, 1000, 1000 };
     area.radius = 50;
-    try testing.expect(contains(&area, 50, 50));
-    try testing.expect(!contains(&area, 2, 2));
+    try testing.expect(contains(&area, &.{}, 50, 50));
+    try testing.expect(!contains(&area, &.{}, 2, 2));
 }
 
 // Locks the wheel rule: the topmost wheel-flagged area under the point wins over a later
@@ -291,11 +319,11 @@ test "the wheel goes to the topmost wheel area not below the hot layer" {
         test_area(id("view", 0), 0, 0, true),
         test_area(id("label", 0), 0, 0, false),
     };
-    const base = resolve(&areas, 50, 50);
+    const base = resolve(&areas, &.{}, 50, 50);
     try testing.expectEqual(@as(?u32, 1), base.hot);
     try testing.expectEqual(@as(?u32, 0), base.wheel);
     areas[1].layer = 4;
-    const covered = resolve(&areas, 50, 50);
+    const covered = resolve(&areas, &.{}, 50, 50);
     try testing.expectEqual(@as(?u32, 1), covered.hot);
     try testing.expectEqual(@as(?u32, null), covered.wheel);
 }
@@ -312,4 +340,32 @@ test "stamps refuse a duplicate id within a frame only" {
     try testing.expect(!stamps.insert(id("knob", 1)));
     stamps.next_frame();
     try testing.expect(stamps.insert(id("knob", 1)));
+}
+
+// Locks the path shape: an L-shaped path area of radius 5 (a 4 px stroke plus the 3 px slop
+// would be 5) hits within 5 px of its polyline and misses the empty corner of its rect, a
+// higher-layer path area takes the hot spot from a box under its stroke only, and the
+// distance is measured from the origin `rect.xy + radius`.
+test "a path area hits near its polyline only" {
+    const points = [_]draw.Point{ .{ 0, 0 }, .{ 100, 0 }, .{ 100, 60 } };
+    const path: Area = .{
+        .id = id("cable", 0),
+        .rect = .{ 15, 15, 110, 70 },
+        .clip = .{ 0, 0, 1000, 1000 },
+        .radius = 5,
+        .layer = 2,
+        .flags = .{ .wheel = false, .focusable = false, .cursor = .default },
+        .pad = 0,
+        .first_point = 0,
+        .point_count = 3,
+    };
+    try testing.expect(contains(&path, &points, 70, 20));
+    try testing.expect(contains(&path, &points, 70, 24.5));
+    try testing.expect(!contains(&path, &points, 70, 25.5));
+    try testing.expect(contains(&path, &points, 124, 60));
+    try testing.expect(!contains(&path, &points, 40, 70));
+    const areas = [_]Area{ test_area(id("knob", 0), 0, 0, true), path };
+    try testing.expectEqual(@as(?u32, 1), resolve(&areas, &points, 70, 21).hot);
+    try testing.expectEqual(@as(?u32, null), resolve(&areas, &points, 70, 21).wheel);
+    try testing.expectEqual(@as(?u32, 0), resolve(&areas, &points, 40, 70).hot);
 }

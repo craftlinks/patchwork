@@ -17,7 +17,10 @@
 //! Buffer 0 is the unit quad stepped per vertex (location 0, `float32x2`); buffer 1 is the
 //! type's pool stepped per instance (`registry.instance_layout`). Group 0 is the frame
 //! uniform, shared by every pipeline; group 1 is a texture and the shared clamping linear
-//! sampler, for textured types only, with one bind group per texture.
+//! sampler, for textured types only, with one bind group per texture. When a registered type
+//! reads points (`registry.reads_points`), group 0 also holds the point buffer at binding 1
+//! (read-only storage, fragment stage), so it is bound once per pass with the uniform and a
+//! pipeline that does not declare it ignores it.
 //!
 //! ## 3. Frame Shape
 //! ```text
@@ -25,6 +28,7 @@
 //! texture_create, bind_group_create, texture_write   whatever `Textures` queued, after the
 //!                                 glyph cache queued its dirty atlas rectangle (one write)
 //! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed
+//! buffer_write points [range]     when the point revision moved and points changed
 //! pass_begin
 //!   bind_group_set 0, vertex_buffer_set 0                   once, when any batch exists
 //!   per batch, in order:
@@ -46,7 +50,9 @@
 //!   record past the shadow's count. An identical rebuild writes nothing, and a hover that
 //!   changes one arc writes one record of the arc pool only.
 //! Only the written range is copied into the shadow, because records outside it are equal by
-//! construction. The counting sort is stable by key and overlays sort last, so content that
+//! construction. The point pool follows the same rule with its own shadow and revision, so a
+//! rebuilt path writes no points when its shape is unchanged, and a recolored path writes its
+//! `Path` records only. The counting sort is stable by key and overlays sort last, so content that
 //! appears on a higher layer lands at the tail of its pool and keeps ranges small.
 //!
 //! A scale change redraws the scene (glyphs are rasterized and snapped per device scale; see
@@ -114,7 +120,9 @@ const batch_op_cap: u32 = 4;
 /// Upper bound on the ops `frame` records; see the module guide's frame shape.
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     const texture_ops = 2 * textures.texture_cap + textures.write_cap;
-    return 1 + texture_ops + type_count + 3 + batch_cap * batch_op_cap + 1;
+    // Uniform, textures, one write per pool and one for the points, the pass prologue (three
+    // ops), the batches, and the present.
+    return 1 + texture_ops + type_count + 1 + 3 + batch_cap * batch_op_cap + 1;
 }
 
 /// Upper bound on the bytes `frame` records, for the same shape as `frame_op_cap`.
@@ -126,7 +134,7 @@ pub fn frame_bytes_max(type_count: u32, batch_cap: u32) u32 {
         op_bytes(commands.VertexBufferSet) + op_bytes(commands.PassEndPresent);
     const per_batch = op_bytes(commands.PipelineSet) + op_bytes(commands.VertexBufferSet) +
         op_bytes(commands.BindGroupSet) + op_bytes(commands.Draw);
-    return (1 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
+    return (2 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
         batch_cap * per_batch;
 }
 
@@ -153,6 +161,8 @@ pub fn Renderer(comptime Cx: type) type {
         ids: commands.Ids,
         resources: Resources,
         shadows: @Tuple(&shadow_types),
+        /// What the GPU last received of the point pool (module guide, section 4).
+        point_shadow: Shadow(pools.Point, Cx.point_capacity),
         uniform: Uniform,
         /// Device size and scale the uploaded uniform was built for; 0 before the first frame.
         width_px: u32,
@@ -163,6 +173,10 @@ pub fn Renderer(comptime Cx: type) type {
         /// Most ops one `frame` records.
         pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity);
 
+        /// True when the frame group carries the point buffer (module guide, section 2).
+        const uses_points: bool = Cx.point_capacity != 0;
+        const frame_entry_count: u16 = if (uses_points) 2 else 1;
+
         /// The ids `setup` allocated.
         pub const Resources = struct {
             shaders: [R.count]u16,
@@ -172,6 +186,8 @@ pub fn Renderer(comptime Cx: type) type {
             texture_layout: u16,
             unit_buffer: u16,
             uniform_buffer: u16,
+            /// The point buffer; meaningful only when `Cx.point_capacity != 0`.
+            points_buffer: u16,
             sampler: u16,
             frame_group: u16,
             textures: [textures.texture_cap]u16,
@@ -190,6 +206,8 @@ pub fn Renderer(comptime Cx: type) type {
                 self.shadows[index].count = 0;
                 self.shadows[index].revision = 0;
             }
+            self.point_shadow.count = 0;
+            self.point_shadow.revision = 0;
             assert(!self.ready);
             assert(self.width_px == 0);
         }
@@ -208,15 +226,26 @@ pub fn Renderer(comptime Cx: type) type {
                 commands.usage_uniform | commands.usage_copy_dst,
                 draw.uniform_bytes,
             );
+            r.points_buffer = 0;
+            if (uses_points) {
+                r.points_buffer = self.create_buffer(
+                    buffer,
+                    commands.usage_storage | commands.usage_copy_dst,
+                    Cx.point_capacity * @sizeOf(pools.Point),
+                );
+            }
             r.sampler = self.ids.take(.sampler);
             buffer.push(.{ .sampler_create = .{ .id = r.sampler, .filter = .linear } });
             r.frame_group = self.ids.take(.bind_group);
             var frame_bindings = std.mem.zeroes(BindGroupEntries);
             frame_bindings[0] = .{ .binding = 0, .resource = r.uniform_buffer };
+            if (uses_points) {
+                frame_bindings[1] = .{ .binding = 1, .resource = r.points_buffer };
+            }
             buffer.push(.{ .bind_group_create = .{
                 .id = r.frame_group,
                 .layout = r.frame_layout,
-                .entry_count = 1,
+                .entry_count = frame_entry_count,
                 .entries = frame_bindings,
             } });
             inline for (0..R.count) |index| {
@@ -242,9 +271,16 @@ pub fn Renderer(comptime Cx: type) type {
                 .visibility = commands.stage_vertex | commands.stage_fragment,
                 .kind = .uniform,
             };
+            if (uses_points) {
+                frame_entries[1] = .{
+                    .binding = 1,
+                    .visibility = commands.stage_fragment,
+                    .kind = .storage_read,
+                };
+            }
             buffer.push(.{ .layout_create = .{
                 .id = r.frame_layout,
-                .entry_count = 1,
+                .entry_count = frame_entry_count,
                 .entries = frame_entries,
             } });
             r.texture_layout = self.ids.take(.layout);
@@ -381,6 +417,7 @@ pub fn Renderer(comptime Cx: type) type {
             inline for (0..R.count) |index| {
                 self.upload_pool(buffer, index, &cx.pools[index]);
             }
+            if (uses_points) self.upload_points(buffer, cx);
             buffer.push(.{ .pass_begin = .{
                 .width_px = size.width_px,
                 .height_px = size.height_px,
@@ -430,6 +467,29 @@ pub fn Renderer(comptime Cx: type) type {
             shadow.count = pool.count;
             shadow.revision = pool.revision;
             assert(shadow.count == pool.count);
+        }
+
+        /// The point pool's upload: the same revision and shadow rule as `upload_pool`.
+        fn upload_points(self: *Self, buffer: *commands.CommandBuffer, cx: *const Cx) void {
+            const shadow = &self.point_shadow;
+            assert(cx.point_count <= Cx.point_capacity);
+            assert(shadow.count <= Cx.point_capacity);
+            if (shadow.revision == cx.point_revision) {
+                return;
+            }
+            const points = cx.points[0..cx.point_count];
+            const old = shadow.items[0..shadow.count];
+            if (draw.dirty_range(pools.Point, old, points)) |range| {
+                buffer.push(.{ .buffer_write = .{
+                    .id = self.resources.points_buffer,
+                    .offset = range.first * @sizeOf(pools.Point),
+                    .data = .of(std.mem.sliceAsBytes(points[range.first..range.end])),
+                } });
+                @memcpy(shadow.items[range.first..range.end], points[range.first..range.end]);
+            }
+            shadow.count = cx.point_count;
+            shadow.revision = cx.point_revision;
+            assert(shadow.count == cx.point_count);
         }
 
         fn draw_batches(
@@ -547,7 +607,7 @@ const test_draw = [_]registry.DrawType{
     .{ .type = types.Glyph, .cap = 16 },
 };
 
-const TestContext = draw.Context(&test_draw, 8);
+const TestContext = draw.Context(&test_draw, 8, 0);
 const TestRenderer = Renderer(TestContext);
 
 const Fixture = struct {
@@ -784,6 +844,126 @@ test "changing one pool writes only that pool" {
 
 // Locks the worst-case bound the comptime check relies on.
 test "the frame op bound covers every batch" {
-    try testing.expect(TestRenderer.op_cap >= 1 + 3 + 3 + 8 * 4 + 1);
+    try testing.expect(TestRenderer.op_cap >= 1 + 3 + 1 + 3 + 8 * 4 + 1);
     try testing.expect(frame_bytes_max(16, 256) <= commands.capacity);
+}
+
+const path_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 8 },
+    .{ .type = types.Path, .cap = 32 },
+};
+
+const PathContext = draw.Context(&path_draw, 8, 256);
+
+const PathFixture = struct {
+    var context: PathContext = undefined;
+    var renderer: Renderer(PathContext) = undefined;
+    var buffer: commands.CommandBuffer = undefined;
+
+    fn record() void {
+        buffer.reset();
+        renderer.frame(&buffer, &context, .{
+            .width_logical = 1280,
+            .height_logical = 720,
+            .width_px = 1280,
+            .height_px = 720,
+            .scale_120 = 120,
+        });
+    }
+
+    /// One sagging cable at `hover`, ending at `end_x`.
+    fn cable(hover: f32, end_x: f32) void {
+        const cx = &context;
+        cx.text.scale_120 = 120;
+        cx.reset();
+        const color: [4]f32 = .{ 1, 0.5, 0, 0.85 };
+        const stroke: draw.path.Stroke = .{ .color = color, .width = 4, .hover = hover };
+        const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+        const control = [4]draw.Point{ .{ 100, 100 }, .{ 300, 260 }, .{ 500, 260 }, .{
+            end_x,
+            100,
+        } };
+        _ = draw.path.cubic(cx, control, stroke, clip).?;
+    }
+};
+
+// Locks the point buffer's setup: a registry with a `reads_points` type creates a storage
+// buffer after the uniform, gives the frame layout a read-only storage entry at binding 1 for
+// the fragment stage, and binds the buffer there, so it is set once per pass with group 0.
+test "a points type adds the point buffer to the frame group" {
+    PathFixture.context.init();
+    PathFixture.renderer.init();
+    PathFixture.buffer = .init();
+    PathFixture.renderer.setup(&PathFixture.buffer, &PathFixture.context);
+    var storage: [64]commands.Code = undefined;
+    const expected = [_]commands.Code{
+        .layout_create,     .layout_create, .buffer_create,
+        .buffer_create,     .buffer_create, .sampler_create,
+        .bind_group_create, .shader_create, .buffer_create,
+        .pipeline_create,   .shader_create, .buffer_create,
+        .pipeline_create,   .buffer_write,  .texture_create,
+        .bind_group_create,
+    };
+    const recorded = codes(&PathFixture.buffer, &storage);
+    try testing.expectEqualSlices(commands.Code, &expected, recorded);
+    const r = &PathFixture.renderer.resources;
+    var reader = PathFixture.buffer.reader();
+    var shaders: u32 = 0;
+    while (reader.next()) |op| {
+        switch (op) {
+            .layout_create => |layout| if (layout.id == r.frame_layout) {
+                try testing.expectEqual(@as(u16, 2), layout.entry_count);
+                try testing.expectEqual(commands.BindingKind.storage_read, layout.entries[1].kind);
+                try testing.expectEqual(commands.stage_fragment, layout.entries[1].visibility);
+            },
+            .buffer_create => |created| if (created.id == r.points_buffer) {
+                const usage = commands.usage_storage | commands.usage_copy_dst;
+                try testing.expectEqual(usage, created.usage);
+                try testing.expectEqual(@as(u32, 256 * 8), created.size);
+            },
+            .bind_group_create => |group| if (group.id == r.frame_group) {
+                try testing.expectEqual(@as(u16, 2), group.entry_count);
+                try testing.expectEqual(r.points_buffer, group.entries[1].resource);
+            },
+            .shader_create => |shader| {
+                const declares = std.mem.find(u8, shader.source.slice(), "var<storage") != null;
+                try testing.expectEqual(shaders == 1, declares);
+                shaders += 1;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), shaders);
+}
+
+// Locks the point uploads: the first frame writes the Path records and the points, an
+// identical rebuild writes nothing, a hover recolor writes Path records only, and a moved end
+// point writes the changed points.
+test "points upload by range and a recolor writes no points" {
+    PathFixture.context.init();
+    PathFixture.renderer.init();
+    PathFixture.buffer = .init();
+    PathFixture.renderer.setup(&PathFixture.buffer, &PathFixture.context);
+    const r = &PathFixture.renderer.resources;
+    var write_storage: [8]commands.BufferWrite = undefined;
+    PathFixture.cable(0, 700);
+    PathFixture.record();
+    const first = writes(&PathFixture.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 3), first.len);
+    try testing.expectEqual(r.instance_buffers[1], first[1].id);
+    try testing.expectEqual(r.points_buffer, first[2].id);
+    const point_bytes = PathFixture.context.point_count * @sizeOf(draw.Point);
+    try testing.expectEqual(point_bytes, first[2].data.len);
+    PathFixture.cable(0, 700);
+    PathFixture.record();
+    try testing.expectEqual(@as(usize, 0), writes(&PathFixture.buffer, &write_storage).len);
+    PathFixture.cable(0.18, 700);
+    PathFixture.record();
+    const hover = writes(&PathFixture.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 1), hover.len);
+    try testing.expectEqual(r.instance_buffers[1], hover[0].id);
+    PathFixture.cable(0.18, 720);
+    PathFixture.record();
+    const moved = writes(&PathFixture.buffer, &write_storage);
+    try testing.expectEqual(r.points_buffer, moved[moved.len - 1].id);
 }

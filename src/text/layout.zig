@@ -341,7 +341,7 @@ const test_draw = [_]registry.DrawType{
     .{ .type = types.Glyph, .cap = 64 },
 };
 
-const TestContext = draw.Context(&test_draw, 4);
+const TestContext = draw.Context(&test_draw, 4, 0);
 
 /// A freshly initialized static context at `scale_120`, so tests keep the pools and the
 /// cache off the stack.
