@@ -44,6 +44,7 @@ pub const default_palette = editor.default_palette;
 pub const flags = editor.flags;
 pub const decoration_cap = editor.decoration_cap;
 pub const row_cap = editor.row_cap;
+pub const row_height_max = editor.row_height_max;
 pub const lines_max = editor.lines_max;
 pub const columns_max = editor.columns_max;
 pub const glyph_max = editor.glyph_max;

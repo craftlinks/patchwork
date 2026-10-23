@@ -42,6 +42,8 @@
 //!   the context's glyph cache owes a draw (`text/cache.zig`: the display scale changed, or
 //!   glyphs were skipped for the per-frame budget or a full atlas), so `draw` must be
 //!   repeatable: unchanged state draws the same instances again. It must not call `redraw`.
+//! - `cx.set_timer(on)` during `event` or `timer` starts or stops the host timer of an app
+//!   that declared a period (section 4).
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
@@ -67,6 +69,11 @@
 //! `timer_period_ms == 0` means no timer. The native host then creates no `timerfd` and
 //! sleeps in `poll` while nothing is live. The browser host arms no `setInterval`.
 //! `timer_period_ms_max` bounds the period so a value in the wrong unit fails the build.
+//! With a period, the timer runs from startup when `timer_armed` is true (the default), and
+//! the app starts and stops it at run time with `cx.set_timer(on)` (`ui/cx.zig`, section 9):
+//! after each call into the app the hosts arm or disarm it to match `cx.timer_on`, so a
+//! stopped timer wakes nothing and calls no `timer`. `start_timer(App, cx)` is the one setup
+//! both hosts (and app tests) run after `cx.init`.
 //!
 //! ## 5. TigerStyle Invariants
 //! The contract is checked at compile time and costs nothing at run time. The app owns all
@@ -89,6 +96,9 @@ pub const Config = struct {
     title: [:0]const u8,
     /// Host timer period in milliseconds. 0 means no timer.
     timer_period_ms: u32,
+    /// Whether the timer runs from startup; `cx.set_timer` starts and stops it later.
+    /// Ignored when `timer_period_ms` is 0.
+    timer_armed: bool = true,
     /// The app's draw types and their pool capacities; a type's id is its index.
     draw: []const quads.DrawType,
     /// Upper bound on batches per frame: distinct (layer, type, texture) runs.
@@ -104,6 +114,13 @@ pub const Config = struct {
 pub fn Context(comptime App: type) type {
     const Draw = quads.Context(App.config.draw, App.config.batch_cap, App.config.point_cap);
     return ui.Context(Draw, App.config.area_cap);
+}
+
+/// Records `App.config`'s timer in a freshly initialized context (section 4). Both hosts call
+/// it after `cx.init`; app tests call it to start where a host starts.
+pub fn start_timer(comptime App: type, cx: *Context(App)) void {
+    cx.timer_setup(App.config.timer_period_ms, App.config.timer_armed);
+    if (App.config.timer_period_ms == 0) assert(!cx.timer_on);
 }
 
 /// Upper bound for `Config.timer_period_ms`, chosen so a period given in the wrong unit is

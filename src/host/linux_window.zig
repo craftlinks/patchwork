@@ -22,6 +22,9 @@
 //!    socket reads. Skipping the cancel leaves libwayland's read lock held.
 //! 5. Timer expirations collapse: `drain_timer` reads one expiration count and calls
 //!    `app.timer` once at the current monotonic time, however many periods were missed.
+//! 6. The app timer is created disarmed when the app declares a period, and `sync_timer`
+//!    arms or disarms it before every sleep to match `cx.timer_on` (`ui/cx.zig`, section 9),
+//!    so an app that stopped its timer (a paused transport) sleeps like one without a timer.
 //!
 //! Hover animators do not chain wakes: a present is followed by one frame callback, and a
 //! `done` that finds nothing dirty arms nothing, which returns the loop to a null timeout.
@@ -102,7 +105,8 @@
 //!   the scheduler falls back to `done`.
 //! - Both `wl_pointer.axis` axes become `Event.wheel` (`dy` vertical, `dx` horizontal); a
 //!   positive `dy` is added to the scroll offset by the widgets. The browser host drives app
-//!   timers with `setInterval` instead of a `timerfd`, arming nothing when the period is zero.
+//!   timers with `setInterval` instead of a `timerfd`, set and cleared to follow
+//!   `cx.timer_on`, and arms nothing when the period is zero.
 //!
 //! ## 5a. Keyboard, Repeat, Cursor, and Clipboard
 //! - `wl_keyboard` events are translated in their callbacks through libxkbcommon
@@ -480,7 +484,8 @@ comptime {
 /// 4. Initializes the native WebGPU rendering context (`gpu.Gpu`).
 /// 5. Records and submits the renderer's setup stream, and confirms the initial state: no
 ///    batches and `state.frame.relayout` true.
-/// 6. Arms the host timer only when `App.config.timer_period_ms` is not zero.
+/// 6. Creates the host timer, disarmed, only when `App.config.timer_period_ms` is not zero;
+///    the loop arms it while `cx.timer_on` (`Host.sync_timer`).
 /// 7. Enters the blocking event loop (`Host(App).loop`).
 ///
 /// The window state lives on this stack frame. The app, the UI context (with the draw context
@@ -491,6 +496,7 @@ pub fn run(comptime App: type) !void {
     const AppHost = Host(App);
     var state = initial_state();
     AppHost.context.init();
+    app_contract.start_timer(App, &AppHost.context);
     AppHost.render.init();
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     try init_input(&state);
@@ -499,12 +505,17 @@ pub fn run(comptime App: type) !void {
     try bind_globals(&state);
     try create_toplevel(&state, App.config.title);
     try create_device(&state);
-    var host: AppHost = .{ .state = &state, .app = &AppHost.app_static, .timer_fd = no_timer_fd };
+    var host: AppHost = .{
+        .state = &state,
+        .app = &AppHost.app_static,
+        .timer_fd = no_timer_fd,
+        .timer_armed = false,
+    };
     try host.setup();
     assert(AppHost.context.draw.batch_count == 0);
     assert(state.frame.relayout);
     if (App.config.timer_period_ms != 0) {
-        host.timer_fd = try arm_timer(App.config.timer_period_ms);
+        host.timer_fd = try create_timer();
     }
     defer {
         if (host.timer_fd >= 0) {
@@ -623,7 +634,8 @@ fn ignore_sigpipe() void {
     std.posix.sigaction(.PIPE, &action, null);
 }
 
-/// A disarmed nonblocking `timerfd` on `CLOCK_MONOTONIC`: the key repeat timer.
+/// A disarmed nonblocking `timerfd` on `CLOCK_MONOTONIC`: the key repeat timer, and the app
+/// timer when the app declares a period.
 fn create_timer() !i32 {
     const flags: std.os.linux.TFD = .{ .NONBLOCK = true, .CLOEXEC = true };
     const created = std.os.linux.timerfd_create(.MONOTONIC, flags);
@@ -637,7 +649,8 @@ fn create_timer() !i32 {
 
 /// The app-facing half of the native loop. Everything that calls the app contract lives
 /// here, so the Wayland and GPU half of this file stays one non-generic compilation.
-/// `timer_fd` is `no_timer_fd` when `App.config.timer_period_ms` is 0.
+/// `timer_fd` is `no_timer_fd` when `App.config.timer_period_ms` is 0; otherwise it is armed
+/// exactly while `timer_armed`, which `sync_timer` keeps equal to `cx.timer_on`.
 fn Host(comptime App: type) type {
     return struct {
         const Self = @This();
@@ -647,6 +660,7 @@ fn Host(comptime App: type) type {
         state: *State,
         app: *App,
         timer_fd: i32,
+        timer_armed: bool,
 
         /// The app, its UI context (pools, areas, pointer state), and the renderer. Static so
         /// app storage and the pools and shadows sized by `App.config` stay off the stack;
@@ -706,6 +720,7 @@ fn Host(comptime App: type) type {
                 self.sync_input();
                 self.sync_clock();
                 try self.present_if_dirty();
+                self.sync_timer();
                 try self.wait_for_events();
             }
             assert(!state.frame.running);
@@ -909,6 +924,22 @@ fn Host(comptime App: type) type {
             assert(state.frame.running);
         }
 
+        /// Arms or disarms the app timer to match `cx.timer_on`, once per wake before the
+        /// sleep, so a change made by any call into the app takes effect before `poll`.
+        /// Disarming also discards an expiration not yet read (`timerfd_settime`).
+        fn sync_timer(self: *Self) void {
+            if (self.timer_fd < 0) {
+                assert(!context.timer_on);
+                assert(!self.timer_armed);
+                return;
+            }
+            if (context.timer_on == self.timer_armed) return;
+            const period_ms: u32 = if (context.timer_on) App.config.timer_period_ms else 0;
+            set_app_timer(self.timer_fd, period_ms);
+            self.timer_armed = context.timer_on;
+            assert(self.timer_armed == context.timer_on);
+        }
+
         /// Reads one expiration count and discards it. Several missed periods become
         /// one call at the current monotonic time. A host without a timer returns at once.
         fn drain_timer(self: *Self) !void {
@@ -925,6 +956,8 @@ fn Host(comptime App: type) type {
             };
             assert(read_n == 8);
             assert(expirations >= 1);
+            // `sync_timer` disarms before every sleep, which discards unread expirations.
+            assert(self.timer_armed);
             const now_ms = monotonic_ns() / 1_000_000;
             App.timer(self.app, &context, now_ms);
             if (context.dirty) {
@@ -1153,18 +1186,10 @@ fn poll_timeout(state: *const State) ?std.posix.timespec {
     };
 }
 
-/// Opens a nonblocking `timerfd` on `CLOCK_MONOTONIC` and arms one period of `period_ms`
-/// milliseconds. The caller closes the returned fd.
-fn arm_timer(period_ms: u32) !i32 {
-    assert(period_ms != 0);
-    assert(period_ms <= app_contract.timer_period_ms_max);
-    const flags: std.os.linux.TFD = .{ .NONBLOCK = true, .CLOEXEC = true };
-    const created = std.os.linux.timerfd_create(.MONOTONIC, flags);
-    const fd: i32 = switch (std.os.linux.errno(created)) {
-        .SUCCESS => @intCast(created),
-        else => return error.TimerCreateFailed,
-    };
+/// Arms `fd` to expire every `period_ms` milliseconds, or disarms it when `period_ms` is 0.
+fn set_app_timer(fd: i32, period_ms: u32) void {
     assert(fd >= 0);
+    assert(period_ms <= app_contract.timer_period_ms_max);
     // Whole seconds go in `tv_sec` so `tv_nsec` stays below one second for any period.
     const period: std.os.linux.timespec = .{
         .sec = @intCast(period_ms / 1000),
@@ -1176,15 +1201,7 @@ fn arm_timer(period_ms: u32) !i32 {
         .it_value = period,
     };
     const armed = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
-    switch (std.os.linux.errno(armed)) {
-        .SUCCESS => {},
-        else => {
-            _ = std.os.linux.close(fd);
-            return error.TimerArmFailed;
-        },
-    }
-    assert(fd >= 0);
-    return fd;
+    assert(std.os.linux.errno(armed) == .SUCCESS);
 }
 
 /// CLOCK_MONOTONIC in nanoseconds. `clock_gettime` of this clock does not fail.

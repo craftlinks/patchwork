@@ -90,7 +90,15 @@
 //! codepoint boundary) in `clipboard` and flags the host; `request_paste` asks the host for
 //! the clipboard text, which arrives as a `paste` event routed to the focused widget.
 //!
-//! ## 9. TigerStyle Invariants
+//! ## 9. The Timer Flag
+//! `timer_setup(period_ms, armed)` (from the hosts, once) stores `App.config.timer_period_ms`
+//! and sets `timer_on` to `period_ms != 0 and armed`. `set_timer(on)` changes the flag during
+//! an event or a timer call; after each call into the app the hosts compare it with what
+//! they armed and arm or disarm the timer (`timerfd_settime` natively, `setInterval` and
+//! `clearInterval` in the browser), so a paused app sleeps. Setting it on an app without a
+//! period is a programming error (asserted).
+//!
+//! ## 10. TigerStyle Invariants
 //! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, the clipboard, and the
 //!   duplicate stamps of safe builds. Per-frame work is proportional to instances, areas, and
 //!   depth; nothing capacity-sized is cleared per frame or per event.
@@ -247,6 +255,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         dirty: bool,
         /// An animator is still moving; see `keep_animating`.
         animating: bool,
+        /// The host timer's period (`App.config.timer_period_ms`), 0 for an app without a
+        /// timer, and whether the app wants it running (section 9). Hosts read `timer_on`.
+        timer_period_ms: u32,
+        timer_on: bool,
 
         pub const DrawContext = Draw;
         pub const capacity: u32 = area_cap;
@@ -290,8 +302,29 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.paste_pending = false;
             self.dirty = true;
             self.animating = false;
+            self.timer_period_ms = 0;
+            self.timer_on = false;
             assert(self.phase == .idle);
             assert(self.dirty);
+        }
+
+        /// Records the app's timer period and whether the timer runs from startup; the hosts
+        /// call it once after `init` (section 9). A period of 0 never runs.
+        pub fn timer_setup(self: *Self, period_ms: u32, armed: bool) void {
+            assert(self.phase == .idle);
+            self.timer_period_ms = period_ms;
+            self.timer_on = period_ms != 0 and armed;
+            if (period_ms == 0) assert(!self.timer_on);
+        }
+
+        /// Starts or stops the host timer. The host applies the change after the current call
+        /// returns; a stopped timer calls no `App.timer` (section 9). Not during a draw, and
+        /// only for an app that declared a timer period.
+        pub fn set_timer(self: *Self, on: bool) void {
+            assert(self.phase != .draw);
+            assert(self.timer_period_ms != 0);
+            self.timer_on = on;
+            assert(self.timer_on == on);
         }
 
         /// Marks a draw as owed. Not during a draw.
@@ -1617,4 +1650,26 @@ test "a path area moves with its container's shift" {
     context.event_begin(.{ .pointer_move = .{ .x = 150 + 20, .y = 80 } });
     try testing.expectEqual(areas.Id.none, context.hot);
     context.event_end();
+}
+
+// Locks the timer flag: a fresh context has no timer, setup with a period and `armed` false
+// starts stopped, `set_timer` flips it during an event, and a zero period never runs even when
+// asked to start armed.
+test "the timer flag starts from setup and follows set_timer" {
+    const cx = new_context();
+    try testing.expectEqual(@as(u32, 0), cx.timer_period_ms);
+    try testing.expect(!cx.timer_on);
+    cx.timer_setup(33, false);
+    try testing.expect(!cx.timer_on);
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_timer(true);
+    try testing.expect(cx.timer_on);
+    cx.set_timer(false);
+    cx.event_end();
+    try testing.expect(!cx.timer_on);
+    cx.timer_setup(33, true);
+    try testing.expect(cx.timer_on);
+    cx.timer_setup(0, true);
+    try testing.expect(!cx.timer_on);
+    try testing.expectEqual(@as(u32, 0), cx.timer_period_ms);
 }

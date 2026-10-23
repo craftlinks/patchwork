@@ -32,10 +32,10 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`. |
+| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`. |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
-| `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration. |
+| `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 
 `Context(App)` is the UI context (`patchwork.ui.Context`): the draw context (`cx.draw`), the
@@ -44,6 +44,12 @@ is no layout call and no dirty or live query: `cx.redraw()` marks a draw as owed
 `cx.keep_animating()` (called by a widget whose animator is still moving) keeps frame
 callbacks coming. A window resize only marks a draw as owed, because layout happens while
 drawing.
+
+**Timer.** With `timer_period_ms` nonzero the host timer runs from startup when
+`timer_armed` is true (the default); `cx.set_timer(on)` starts and stops it from `event` or
+`timer`, and the hosts arm or disarm it after each call (a `timerfd_settime` natively,
+`setInterval` and `clearInterval` in the browser), so a stopped timer wakes nothing. Calling
+`set_timer` on an app without a period is an assertion failure.
 
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
@@ -146,8 +152,13 @@ patchwork/
 │   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
 │   ├── column/                 # Scrolling view regression app
 │   │   └── app.zig             # Column App (config.timer_period_ms = 0)
-│   └── live/                   # Code editor app
-│       ├── app.zig             # Live App: header bar, editor, number decorations, stress text
+│   └── live/                   # Live-coding screen
+│       ├── app.zig             # Live App: header, editor, knob column, curves, lanes, transport
+│       ├── bindings.zig        # Binding parser: k() calls, shape() calls, bpm, fixed point
+│       ├── knob.zig            # The bound knob: any ring size, value text inside the ring
+│       ├── lanes.zig           # Transport and automation lanes: in-place rings, playhead
+│       ├── shaper.zig          # The inline shaper row's transfer curve
+│       ├── icon.zig            # The live app's own draw type: transport and status icons
 │       └── patch.lpg           # The embedded patch the editor opens
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
@@ -175,10 +186,10 @@ zig build run-column      # Build and run the scroll column natively
 zig build wasm-column     # Compile the scroll column to zig-out/bin/column.wasm
 zig build serve-column    # Serve the scroll column WebGPU application on localhost (prints the address)
 
-# Examples (Live Editor)
-zig build run-live        # Build and run the code editor natively
-zig build wasm-live       # Compile the code editor to zig-out/bin/live.wasm
-zig build serve-live      # Serve the code editor WebGPU application on localhost (prints the address)
+# Examples (Live-Coding Screen)
+zig build run-live        # Build and run the live-coding screen natively
+zig build wasm-live       # Compile the live-coding screen to zig-out/bin/live.wasm
+zig build serve-live      # Serve the live-coding screen on localhost (prints the address)
 
 # Validation
 zig build test            # Run unit tests across the library and the three examples
@@ -492,23 +503,38 @@ demonstrates:
 The docked panel's coordinates at specific window sizes are locked by the layout tests in
 `examples/column/app.zig`.
 
-### 3. Live Editor (`examples/live/app.zig`)
+### 3. Live-Coding Screen (`examples/live/app.zig`)
 
-The code editor filling the window under a header bar that shows the file name, the caret's
-line:col, and refusal messages ("paste refused: buffer full"). It opens the embedded
-`examples/live/patch.lpg`, a patch in the language step 18 binds knobs to
-(`k(lo~value~hi, "name")`, `shape(gain, slope, twice, asymmetry)`, `:=`, method calls,
-`//` and `/* */` comments). It demonstrates:
-- **Syntax colours** from the per-line tokenizer, written into the glyph instances.
-- **Decorations.** A box around every number literal in view, rebuilt when the revision or
-  the first visible line changes, from the lines a draw can show.
-- **Stress text.** F2 loads a generated 2,000-line text (50 lines of 120 columns in the
-  middle), F1 reloads the patch. Only visible lines draw, so scrolling it costs what
-  scrolling the patch costs.
-- **No timer** and a steady caret: an idle editor sleeps.
-- **Uploads.** The header draws after the editor, so a typed key writes the glyph records
-  from the edited line on, not the whole pool; test "uploads of a scrolled frame and a typed
-  key" locks the byte counts.
+The code editor on the embedded `examples/live/patch.lpg` beside a column of knobs bound to
+its `k(lo~value~hi, "name")` calls, with curves from each value to its knob, an inline shaper
+row, automation lanes, and a transport. There is no audio engine and no DSL evaluation: the
+values are UI state that lives in the text. It demonstrates:
+- **Two-way binding** (`bindings.zig`). A full pass over the buffer from the editor's cached
+  tokenizer states finds the calls (comments and strings are skipped), at most 64 bind, and a
+  malformed one is an error decoration with a cross in the header. Editing a number moves its
+  knob; dragging a knob rewrites the literal with the same decimals (integer fixed point:
+  9.99 steps to 10.00, -0.01 to 0.00, `.25` to `.30`), one undo entry per gesture, with the
+  original shown struck through in the knob row until release. A drag event is one
+  `Editor.replace` and one range shift, never a full pass; keys are dropped while a knob is
+  held. A right press resets to the value at load.
+- **Curves** on layer 2 from the right edge of each boxed value (`Editor.rect_of`) to its
+  ring, clamped to the editor's or the column's edge when an end scrolls out, dimmed away
+  from the caret's line.
+- **Inline row.** `shape(gain, slope, twice, asymmetry)` gets an inline row (`InlineRow`) of
+  four knobs that mirror the bindings of those names and a 64-point transfer curve
+  (`shaper.zig`).
+- **Lanes and transport** (`lanes.zig`). A 256-sample ring per binding with a sweeping
+  playhead; record writes values at the head; play starts the host timer at 30 Hz with
+  `cx.set_timer` and pause stops it, so a paused screen sleeps. Each lane is anchored at its
+  rect (`path.polyline_at`), so a recorded sample uploads one point.
+- **An app-defined draw type** (`icon.zig`): back, play, pause, record, check, and cross.
+- **Header.** The file name with `*` while modified, the parse status, the bound count past
+  64, a bpm field bound to the `bpm := 121` line, the caret's line:col, and refusals.
+- **Stress text.** F2 loads a generated 2,000-line text (2,100 calls, 50 errors), F1 reloads
+  the patch. Only visible lines and rows draw.
+- **Uploads.** The panel draws before the editor and the header last, so a typed key writes
+  the glyphs from the edited line on; tests "uploads of a scrolled frame and a typed key" and
+  "transport ticks upload the playhead and one recorded point" lock the byte counts.
 
 ## GPU Command Stream
 
@@ -625,6 +651,7 @@ const stroke: draw.path.Stroke = .{ .color = color, .width = 4, .hover = 0 };
 const placed = draw.path.cubic(cx.drawing(), .{ p0, p1, p2, p3 }, stroke, clip);  // ?Placed
 _ = draw.path.polyline(cx.drawing(), &points, stroke, clip);
 _ = draw.path.plot(cx.drawing(), &samples, rect, .{ lo, hi }, stroke, clip);
+_ = draw.path.polyline_at(cx.drawing(), &points, origin, stroke, clip);  // bool, no area
 if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit within width / 2 + 3
 ```
 
@@ -641,7 +668,8 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   it.
 - **Coordinates.** Points are stored relative to the path's origin, and each chunk carries
   `anchor = origin - rect.xy`, so a container's alignment shift moves strokes with their
-  rects.
+  rects. The origin is the bounds' top-left, or the caller's with `polyline_at`, which keeps
+  every unmoved point's stored value when the bounds change (an automation lane).
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
 
@@ -745,8 +773,9 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   exist only during a transfer, so a focused idle text field sleeps.
   When `App.config.timer_period_ms == 0`, `timer_fd` is -1 (`no_timer_fd`), which `poll`
   ignores. The thread sleeps indefinitely while idle.
-- When `timer_period_ms != 0`, the timer wakes the thread to sample values via `drain_timer`
-  calling `App.timer(now_ms)`.
+- When `timer_period_ms != 0`, the timer is created disarmed and `sync_timer` arms or
+  disarms it before every sleep to match `cx.timer_on`; while armed it wakes the thread via
+  `drain_timer` calling `App.timer(now_ms)`.
 - Frame pacing during gestures: each commit requests `wl_surface.frame` and
   `wp_presentation.feedback`. The `presented` event carries the pageflip time and the
   output's refresh period; the next commit is scheduled `present_margin_ns` before the vblank
@@ -781,9 +810,10 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
 In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
 - `start()` initializes static Wasm state (the draw context and renderer live in BSS) without
   heap allocation, then initializes the app before recording the setup stream.
-- `web/shell.js` invokes `arm_timer()`, querying `wasm.timer_period_ms()`. When 0, no interval
-  is set. When non-zero, it runs a `setInterval` calling `wasm.timer(now_ms)`. If `timer` returns
-  1, `shell.js` schedules a single `requestAnimationFrame`.
+- `web/shell.js` calls `sync_timer()` after every Wasm call (where it syncs the cursor), in
+  the interval callback, and after `start`: it keeps one `setInterval` of
+  `wasm.timer_period_ms()` calling `wasm.timer(now_ms)` exactly while `wasm.timer_on()` is 1.
+  If `timer` returns 1, `shell.js` schedules a single `requestAnimationFrame`.
 - When rAF runs, `wasm.tick(now_ms)` advances continuous animators and presents dirty frames.
   `wasm.tick()` returns 1 while a widget keeps animating (`cx.keep_animating()`) or a redraw
   is still owed (glyphs the cache skipped). Once hover/down animators settle, `tick()` returns

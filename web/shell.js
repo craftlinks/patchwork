@@ -41,9 +41,10 @@
 // - `tick` (the rAF callback) returns 1 while an animator is live or a redraw is still owed
 //   (the glyph cache finishes skipped glyphs on the next frame), so the rAF chain ends when
 //   the scene settles and is restarted by input or the app timer.
-// - `arm_timer` creates one permanent interval only when `wasm.timer_period_ms()` is
-//   nonzero. The timer requests a frame when the app reports a change; it never steps
-//   animators.
+// - `sync_timer` keeps one interval of `wasm.timer_period_ms()` set exactly while
+//   `wasm.timer_on()` is 1. It runs wherever `sync_cursor` runs, in the interval callback,
+//   and after `start`, so an app that stops its timer stops waking the page. The timer
+//   requests a frame when the app reports a change; it never steps animators.
 //
 // ## 6. Pointer and DPI Handling
 // CSS pixels are the app's logical pixels. `fit_canvas` passes the canvas's CSS size and
@@ -88,6 +89,8 @@ let lastTrace = "";
 // CSS cursor names by `ui.Cursor` value, read once from Wasm, and the value last applied.
 let cursorNames = null;
 let cursorShown = -1;
+// The app timer's interval id, or 0 while the app's timer is stopped (guide, section 5).
+let timerInterval = 0;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -436,6 +439,7 @@ function schedule() {
         // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5).
         const live = wasm.tick(Math.floor(now));
         sync_cursor();
+        sync_timer();
         if (live === 1) {
             schedule();
         }
@@ -443,20 +447,29 @@ function schedule() {
 }
 
 /**
- * Arms the app timer if `wasm.timer_period_ms()` is nonzero (guide, section 5). The interval
- * stays armed for the life of the page.
+ * Sets the app timer's interval while `wasm.timer_on()` is 1 and clears it otherwise (guide,
+ * section 5). `setInterval` never returns 0, so 0 means no interval.
  */
-function arm_timer() {
-    const period = wasm.timer_period_ms();
-    if (period === 0) {
-        return;
+function sync_timer() {
+    const on = wasm.timer_on() === 1;
+    if (on && timerInterval === 0) {
+        timerInterval = setInterval(on_timer, wasm.timer_period_ms());
+    } else if (!on && timerInterval !== 0) {
+        clearInterval(timerInterval);
+        timerInterval = 0;
     }
-    setInterval(() => {
-        const now = Math.floor(performance.now());
-        if (wasm.timer(now) === 1) {
-            schedule();
-        }
-    }, period);
+}
+
+/**
+ * The interval callback: runs the app's timer, schedules a frame when it owes one, and
+ * applies a start or stop the timer made.
+ */
+function on_timer() {
+    const now = Math.floor(performance.now());
+    if (wasm.timer(now) === 1) {
+        schedule();
+    }
+    sync_timer();
 }
 
 /**
@@ -503,6 +516,7 @@ function after_input(result) {
         schedule();
     }
     sync_cursor();
+    sync_timer();
 }
 
 /**
@@ -701,7 +715,7 @@ async function main() {
     await Promise.all(scopes);
 
     fit_canvas();
-    arm_timer();
+    sync_timer();
 
     window.addEventListener("resize", fit_canvas);
     watch_ratio();

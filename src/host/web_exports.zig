@@ -34,7 +34,9 @@
 //!   frame is owed (`dirty_flag`), 0 otherwise. `shell.js` schedules one rAF only on 1.
 //! - `timer_period_ms` of 0 means the app has no timer and `shell.js` arms no interval.
 //!   Otherwise `timer` runs the app's timer, requests a redraw if it reports a change, and
-//!   never steps animators or chains rAF.
+//!   never steps animators or chains rAF. `timer_on` reports `cx.timer_on`; `shell.js` reads
+//!   it after every call (where it syncs the cursor, in the interval callback, and after
+//!   `start`) and sets or clears its one interval to match, so a stopped timer wakes nothing.
 //! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
 //!   `.frame` through `ui.animate`, presents if dirty, and returns 1 while a widget keeps
 //!   animating (`cx.keep_animating`) or while a redraw is still owed (the glyph cache skipped
@@ -188,6 +190,7 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.window_focus, .{ .name = "window_focus" });
     @export(&Web.cursor, .{ .name = "cursor" });
     @export(&Web.timer_period_ms, .{ .name = "timer_period_ms" });
+    @export(&Web.timer_on, .{ .name = "timer_on" });
     @export(&Web.timer, .{ .name = "timer" });
     @export(&Web.tick, .{ .name = "tick" });
 }
@@ -224,6 +227,7 @@ fn WebApp(comptime App: type) type {
             state.commands.len = 0;
             state.commands.count = 0;
             context.init();
+            app_contract.start_timer(App, &context);
             render.init();
             App.init(&app, &context.draw.textures);
             render.setup(&state.commands, &context.draw);
@@ -393,11 +397,20 @@ fn WebApp(comptime App: type) type {
             return App.config.timer_period_ms;
         }
 
+        /// 1 while the app wants its timer running (`cx.timer_on`), else 0. `shell.js` reads
+        /// it after every call and sets or clears its interval to match (section 4).
+        fn timer_on() callconv(.c) u32 {
+            if (App.config.timer_period_ms == 0) assert(!context.timer_on);
+            return @intFromBool(context.timer_on);
+        }
+
         /// Calls the app's `timer`. Only valid when the app declared a timer period. Returns
-        /// the dirty flag. Does not step animators; the host interval owns the cadence.
+        /// the dirty flag. Does not step animators; the host interval owns the cadence. A
+        /// tick the browser had already queued when the interval was cleared calls nothing.
         fn timer(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(App.config.timer_period_ms != 0);
+            if (!context.timer_on) return dirty_flag();
             App.timer(&app, &context, now_ms);
             if (context.dirty) {
                 state.frame.request_redraw();
