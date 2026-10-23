@@ -54,7 +54,22 @@
 // are converted to pixels first. A `matchMedia` resolution query re-fits the canvas when
 // the ratio changes without a window resize (dragging to another monitor). Pointer capture
 // keeps a drag that leaves the canvas deliverable; `pointerleave` and `pointercancel` call
-// `wasm.pointer_leave()` so the scene can release any press in progress.
+// `wasm.pointer_leave()` so the scene can release any press in progress. Every button is
+// forwarded with the modifiers and `event.timeStamp` (Zig counts clicks); only the left button
+// takes pointer capture, and the context menu is suppressed on the canvas so a right press
+// reaches the app.
+//
+// ## 7. Keyboard, Clipboard, and Cursor
+// This file maps no keys. The canvas is focusable (`tabindex="0"`); `keydown` and `keyup`
+// write `event.key` as UTF-8 into the Wasm input buffer and call `key_down` or `key_up`, and
+// `preventDefault` only when `key_down` reports the key consumed (bit 1), so Tab can leave a
+// canvas with nothing focusable and Ctrl+C, X, and V still raise the page's clipboard events.
+// AltGraph is reported without Ctrl and Alt, so AltGr+Q types "@". Composition (IME) is not
+// handled. Canvas `focus` and `blur` call `window_focus`. The document's `copy` and `cut`
+// events, while the canvas has focus, put the text `copy_take` reports on the clipboard;
+// `paste` writes the clipboard text into the input buffer and calls `paste`. After every Wasm
+// input call and every tick, `sync_cursor` reads `cursor()` and sets `canvas.style.cursor`
+// only when it changed, using the CSS names Wasm exports (`cursor_names_ptr/len`).
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
@@ -70,6 +85,11 @@ let resources = null;
 // Promises of the per-op error scopes opened while the setup stream runs (guide, section 4).
 let setupScopes = null;
 let lastTrace = "";
+// CSS cursor names by `ui.Cursor` value, read once from Wasm, and the value last applied.
+let cursorNames = null;
+let cursorShown = -1;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 // Interpreter state for the stream being replayed.
 let encoder = null;
@@ -414,7 +434,9 @@ function schedule() {
     raf = requestAnimationFrame((now) => {
         raf = 0;
         // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5).
-        if (wasm.tick(Math.floor(now)) === 1) {
+        const live = wasm.tick(Math.floor(now));
+        sync_cursor();
+        if (live === 1) {
             schedule();
         }
     });
@@ -473,40 +495,80 @@ function watch_ratio() {
 }
 
 /**
+ * Schedules a frame when a Wasm input call reports one owed (bit 0), then syncs the cursor.
+ * @param {number} result The call's return value.
+ */
+function after_input(result) {
+    if ((result & 1) === 1) {
+        schedule();
+    }
+    sync_cursor();
+}
+
+/**
+ * Sets `canvas.style.cursor` when the cursor Wasm reports changed (guide, section 7).
+ */
+function sync_cursor() {
+    const value = wasm.cursor();
+    if (value === cursorShown) {
+        return;
+    }
+    cursorShown = value;
+    canvas.style.cursor = cursorNames[value];
+}
+
+/**
+ * The `input.Mods` byte: shift 1, ctrl 2, alt 4, meta 8. AltGraph clears Ctrl and Alt.
+ * @param {KeyboardEvent|PointerEvent|MouseEvent} event
+ */
+function mods_of(event) {
+    const altGraph = event.getModifierState !== undefined && event.getModifierState("AltGraph");
+    const ctrl = event.ctrlKey && !altGraph;
+    const alt = event.altKey && !altGraph;
+    return (event.shiftKey ? 1 : 0) | (ctrl ? 2 : 0) | (alt ? 4 : 0) | (event.metaKey ? 8 : 0);
+}
+
+/**
+ * Writes `text` as UTF-8 into the Wasm input buffer and returns the byte count. `encodeInto`
+ * never splits a codepoint, so a long paste is cut on a boundary.
+ * @param {string} text
+ */
+function write_input(text) {
+    const view = new Uint8Array(wasm.memory.buffer, wasm.input_ptr(), wasm.input_cap());
+    return textEncoder.encodeInto(text, view).written;
+}
+
+/**
  * Forwards `pointermove` in CSS (logical) pixels.
  * @param {PointerEvent} event
  */
 function on_pointer_move(event) {
-    if (wasm.pointer_move(event.offsetX, event.offsetY) === 1) {
-        schedule();
-    }
+    after_input(wasm.pointer_move(event.offsetX, event.offsetY));
 }
 
 /**
- * Forwards a primary-button press in CSS pixels and captures the pointer.
+ * Forwards a press of any button in CSS pixels; a left press captures the pointer.
  * @param {PointerEvent} event
  */
 function on_pointer_down(event) {
-    if (event.button !== 0) {
-        return;
+    if (event.button === 0) {
+        canvas.setPointerCapture(event.pointerId);
     }
-    canvas.setPointerCapture(event.pointerId);
-    if (wasm.pointer_down(event.offsetX, event.offsetY) === 1) {
-        schedule();
-    }
+    const time = Math.floor(event.timeStamp) >>> 0;
+    const x = event.offsetX;
+    const y = event.offsetY;
+    after_input(wasm.pointer_down(x, y, event.button, mods_of(event), time));
 }
 
 /**
- * Forwards a primary-button release in CSS pixels.
+ * Forwards a release of any button in CSS pixels.
  * @param {PointerEvent} event
  */
 function on_pointer_up(event) {
-    if (event.button !== 0) {
-        return;
-    }
-    if (wasm.pointer_up(event.offsetX, event.offsetY) === 1) {
-        schedule();
-    }
+    const time = Math.floor(event.timeStamp) >>> 0;
+    const x = event.offsetX;
+    const y = event.offsetY;
+    after_input(wasm.pointer_up(x, y, event.button, mods_of(event), time));
 }
 
 /**
@@ -516,22 +578,78 @@ function on_pointer_up(event) {
  */
 function on_wheel(event) {
     event.preventDefault();
+    let dx = event.deltaX;
     let dy = event.deltaY;
     if (event.deltaMode === 1) {
+        dx *= 16;
         dy *= 16;
     }
-    if (wasm.pointer_wheel(event.offsetX, event.offsetY, dy) === 1) {
-        schedule();
-    }
+    after_input(wasm.pointer_wheel(event.offsetX, event.offsetY, dx, dy));
 }
 
 /**
  * Forwards `pointerleave` and `pointercancel` so Wasm can clear hover and release any press.
  */
 function on_pointer_leave() {
-    if (wasm.pointer_leave() === 1) {
-        schedule();
+    after_input(wasm.pointer_leave());
+}
+
+/**
+ * Forwards a key press by name; prevents the browser default only when Wasm consumed it.
+ * @param {KeyboardEvent} event
+ */
+function on_key_down(event) {
+    if (event.isComposing || event.key === "Process") {
+        return;
     }
+    const length = write_input(event.key);
+    const result = wasm.key_down(length, mods_of(event), event.repeat ? 1 : 0);
+    if ((result & 2) === 2) {
+        event.preventDefault();
+    }
+    after_input(result);
+}
+
+/**
+ * Forwards a key release by name.
+ * @param {KeyboardEvent} event
+ */
+function on_key_up(event) {
+    if (event.isComposing) {
+        return;
+    }
+    const length = write_input(event.key);
+    after_input(wasm.key_up(length, mods_of(event)));
+}
+
+/**
+ * Puts the text the last key press copied on the clipboard (`copy` and `cut` events).
+ * @param {ClipboardEvent} event
+ */
+function on_copy(event) {
+    if (document.activeElement !== canvas) {
+        return;
+    }
+    const length = wasm.copy_take();
+    if (length === 0) {
+        return;
+    }
+    const bytes = new Uint8Array(wasm.memory.buffer, wasm.copy_ptr(), length);
+    event.clipboardData.setData("text/plain", textDecoder.decode(bytes));
+    event.preventDefault();
+}
+
+/**
+ * Hands the clipboard text to Wasm as a paste.
+ * @param {ClipboardEvent} event
+ */
+function on_paste(event) {
+    if (document.activeElement !== canvas) {
+        return;
+    }
+    const text = event.clipboardData.getData("text/plain");
+    event.preventDefault();
+    after_input(wasm.paste(write_input(text)));
 }
 
 /**
@@ -569,6 +687,12 @@ async function main() {
 
     wasm = imported.instance.exports;
     load_table();
+    const names = new Uint8Array(
+        wasm.memory.buffer,
+        wasm.cursor_names_ptr(),
+        wasm.cursor_names_len(),
+    );
+    cursorNames = JSON.parse(textDecoder.decode(names));
 
     setupScopes = [];
     wasm.start();
@@ -587,6 +711,15 @@ async function main() {
     canvas.addEventListener("pointerleave", on_pointer_leave);
     canvas.addEventListener("pointercancel", on_pointer_leave);
     canvas.addEventListener("wheel", on_wheel, { passive: false });
+    canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+    canvas.addEventListener("keydown", on_key_down);
+    canvas.addEventListener("keyup", on_key_up);
+    canvas.addEventListener("focus", () => after_input(wasm.window_focus(1)));
+    canvas.addEventListener("blur", () => after_input(wasm.window_focus(0)));
+    document.addEventListener("copy", on_copy);
+    document.addEventListener("cut", on_copy);
+    document.addEventListener("paste", on_paste);
+    sync_cursor();
 }
 
 main();

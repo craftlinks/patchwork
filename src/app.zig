@@ -28,9 +28,10 @@
 //! - `init` runs once before any other call. It may create textures and queue their pixels;
 //!   the renderer records them into the next stream, so `init` may run before the GPU device
 //!   exists. Queued bytes must stay valid until then.
-//! - `event` applies one pointer, wheel, or `frame` event; the `frame` event carries the
-//!   animator step in milliseconds. The app routes it to each widget's `handle`, which
-//!   resolves it with `cx.hit` against the areas of the last draw (`ui/cx.zig`). A visible
+//! - `event` applies one pointer, wheel, key, paste, window focus, or `frame` event
+//!   (`input.Event`); the `frame` event carries the animator step in milliseconds. The
+//!   app routes it to each widget's `handle`, which resolves it with `cx.hit` against the
+//!   areas of the last draw (`ui/cx.zig`), or reads keys when `cx.focused(id)`. A visible
 //!   change calls `cx.redraw()`; an animator still moving calls `cx.keep_animating()`, which
 //!   gates frame callbacks, so a settled app costs nothing.
 //! - `timer` runs when the host timer expires and calls `cx.redraw()` when a visible value

@@ -34,7 +34,7 @@ pub const App = struct {
 |---|---|---|
 | `config` | `Config` | `title`, `timer_period_ms`, `draw` (types and capacities), `batch_cap`, `area_cap`. |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
-| `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, and `frame` events to the app's widgets. |
+| `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 
@@ -52,10 +52,31 @@ buffer, and an `area_cap` outside 1 to 65536 produce a clear `@compileError` nam
 exact problem.
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
-`Toggle`, `Slider`, `Knob`, and `Meter`. Each draws with `draw(cx, walk)` and, when
-interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
+`Toggle`, `Slider`, `Knob`, `Meter`, and `TextField`. Each draws with `draw(cx, walk)` and,
+when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
 Events resolve once per event against the areas of the last frame, so `handle` is O(1) per
 widget; the app routes every event to every widget it owns.
+
+### Events
+
+`patchwork.input.Event` is one of:
+
+| Event | Payload |
+|---|---|
+| `pointer_move` | `Point{x, y}` in logical pixels |
+| `pointer_down`, `pointer_up` | `Button{x, y, time_ms, button: .left/.right/.middle, mods}` |
+| `pointer_leave` | none |
+| `wheel` | `Wheel{x, y, dx, dy}` |
+| `key_down`, `key_up` | `KeyPress{key, mods, repeat, len, text: [4]u8}`: the typed text rides on `key_down` |
+| `paste` | `[]const u8`, valid only while it is dispatched |
+| `window_focus` | `bool`: false releases held keys and modifiers |
+| `frame` | the animator step in milliseconds |
+
+`Key` names arrows, Home, End, Page Up and Down, Backspace, Delete, Enter, Tab, Escape, `a`
+to `z`, `0` to `9`, and F1 to F12 after the user's layout; anything else is `other`. `Mods` is
+shift, ctrl, alt, and meta (Command on a Mac); shortcuts use ctrl or meta. Text is dropped
+under ctrl or meta and for control characters. Click counting is the library's: presses of
+one button at most 400 ms and 4 logical pixels apart count up (`Press.clicks`).
 
 ## Repository Layout
 
@@ -69,7 +90,9 @@ patchwork/
 │   ├── ui/areas.zig            # Id, Area, the hit resolve scan, duplicate-id stamps
 │   ├── ui/cx.zig               # UI Context: draw context, turtle stack, areas, hover, capture
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
-│   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle)
+│   ├── ui/edit.zig             # Single-line editing core: bounded UTF-8 buffer, caret, words
+│   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle,
+│   │                           #   TextField)
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
 │   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
@@ -85,19 +108,24 @@ patchwork/
 │   ├── text/fonts/             # Noto Sans Regular and Bold, Noto Sans Mono (SIL OFL, OFL.txt)
 │   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
-│   ├── input.zig               # Pointer events and bounded EventQueue
+│   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
 │   ├── theme.zig               # Theme uniform record packed behind the projection matrix
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
-│   └── serve.zig               # Built-in static HTTP server for browser testing
+│   ├── serve.zig               # Built-in static HTTP server for browser testing
+│   └── native_tests.zig        # Test root of tests that call libxkbcommon (native only)
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native executable entry point: runs linux_window.run(app.App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
 │   ├── linux_window.zig        # Linux Wayland event loop, timerfd, and Host(App)
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
 │   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain
-│   ├── wl_seat.zig             # Wayland seat and pointer listener
+│   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
+│   ├── xkb.zig                 # libxkbcommon: keymap, modifiers, text, compose, repeat
+│   ├── wp_cursor_shape.zig     # wp_cursor_shape_v1 bindings and the cursor shape map
+│   ├── wl_data_device.zig      # Clipboard protocol bindings (wl_data_device_manager 3)
+│   ├── clipboard.zig           # Clipboard state machine: selection, send and receive pipes
 │   ├── wl_callback.zig         # Wayland frame completion callback
 │   ├── wp_presentation.zig     # Wayland presentation-time feedback listener
 │   ├── wp_fractional_scale.zig # wp_fractional_scale_v1 and wp_viewporter bindings
@@ -120,7 +148,10 @@ patchwork/
 
 ## Build Steps
 
-Use the distro `zig` (`/usr/bin/zig` on this machine; Zig 0.17.0).
+Use the distro `zig` (`/usr/bin/zig` on this machine; Zig 0.17.0). Native builds link
+`libwayland-client` and `libxkbcommon` dynamically through pkg-config, so both libraries and
+their `.pc` files must be installed (every Wayland desktop ships the libraries); a system
+without them refuses to start the executable. The wasm build links nothing.
 
 ```bash
 # Examples (Rack)
@@ -214,8 +245,10 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-`steps.install` puts `<name>` in the consumer's `<prefix>/bin` and `libwgpu_native.so` in
-`<prefix>/lib`; `steps.run` depends on both and runs the installed executable. Keep the two
+`addApp` links `libwayland-client` and `libxkbcommon` into the native executable, so a
+consumer's build machine needs both (with their pkg-config files) as described under Build
+Steps. `steps.install` puts `<name>` in the consumer's `<prefix>/bin` and
+`libwgpu_native.so` in `<prefix>/lib`; `steps.run` depends on both and runs the installed executable. Keep the two
 directories together when shipping the native build.
 
 ### 3. `src/app.zig`
@@ -256,7 +289,7 @@ pub const App = struct {
 
     pub fn event(app: *App, cx: *Context, input: patchwork.input.Event) void {
         switch (app.gain.handle(cx, input)) {
-            .changed => app.changes += 1,
+            .changed, .reset => app.changes += 1,
             .none, .released => {},
         }
     }
@@ -288,7 +321,7 @@ test "a draw records the knob and a wheel turns it" {
     try std.testing.expect(!context.dirty);
     try std.testing.expect(context.draw.items(quads.Arc).len >= 1);
     const ring = context.find(app.gain.id).?.rect;
-    const wheel: patchwork.input.Wheel = .{ .x = ring[0] + 28, .y = ring[1] + 28, .dy = -60 };
+    const wheel: patchwork.input.Wheel = .{ .x = ring[0] + 28, .y = ring[1] + 28, .dx = 0, .dy = -60 };
     ui.dispatch(App, &app, &context, .{ .wheel = wheel });
     try std.testing.expectEqual(@as(f32, 1), app.gain.value);
     try std.testing.expectEqual(@as(u32, 1), app.changes);
@@ -326,6 +359,10 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   frames. The wheel goes to the topmost wheel-flagged area, so a knob inside a view turns
   instead of scrolling. After a draw that moved things under a resting pointer, hover is
   re-resolved and lands one frame late.
+- **Flags.** `cx.area`'s `Flags` carry `wheel`, `focusable` (a left press focuses the area
+  and Tab visits focusable areas in draw order), and `cursor` (the pointer shape over the
+  area: `default`, `pointer`, `text`, `grab`, `grabbing`, `ew_resize`, `ns_resize`). A right
+  press on the hot area is `Hit.secondary` and never captures.
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
   the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
   and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
@@ -336,6 +373,24 @@ All of it is fixed storage with no allocation; per-frame work is proportional to
 instances, areas, and nesting depth drawn, never to capacities. A display scale change does
 not change layout; the hosts still redraw once because glyphs are rasterized and snapped at
 the device scale, and only the glyph records change (see Text below).
+
+## Keyboard, Focus, Clipboard, and Cursor
+
+- **Focus.** `cx.focus` is the id that gets keys and pastes; widgets ask `cx.focused(id)`.
+  A left press focuses a focusable hot area or clears focus; Tab and Shift+Tab cycle the
+  focusable areas of the last frame in draw order (the only O(areas) key path); Escape
+  clears focus after the widgets saw it; a press elsewhere or Tab shows as
+  `cx.focus_lost(id)` during that event. A focused id that is not drawn stays focused.
+- **TextField.** A single-line field of at most 256 bytes: caret, selection, Ctrl or Meta
+  with arrows for word jumps, Shift selection, Home and End, double press for a word, triple
+  for everything, drag selection, copy, cut, paste (one line, cut to the limit), and
+  horizontal scroll that follows the caret. Actions are `changed`, `committed` (Enter or
+  losing focus), and `cancelled` (Escape). The caret is steady, so a focused field does not
+  wake the host.
+- **Clipboard.** `cx.copy(bytes)` hands up to 64 KiB to the host and `cx.request_paste()`
+  asks for the clipboard, which arrives as one `paste` event for the focused widget.
+- **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
+- **Repeat.** Hosts repeat keys (`KeyPress.repeat`); the library never does.
 
 ## Example Applications
 
@@ -350,8 +405,13 @@ level meter, beside a scrolling list of 1,000 presets and a status line. It demo
   meter omission rules are a few lines against `cx.remaining()` and `cx.fits()`. The worked
   layouts are locked by the tests in `examples/rack/app.zig`.
 - **Actions.** Knobs return `changed`, which the rack writes to its status line
-  ("filter.cut changed 0.42"); clicking a preset row selects and highlights it ("preset 412
+  ("filter.cut changed 0.42"); a right click resets a knob to its initial value
+  ("filter.cut reset 0.50"); clicking a preset row selects and highlights it ("preset 412
   selected").
+- **Renaming.** A double click on a panel title opens a `TextField` in its place with the
+  name selected; Enter or a click elsewhere commits ("osc renamed vco"), Escape cancels, and
+  copy and paste work with other apps. Knob rings show the grab cursor and the field the
+  I-beam.
 - **Virtual list.** The preset list draws only the rows under its viewport; the view's
   height is capped so the pools hold the worst case at any window size.
 - **Text.** The header shows a 32 px monospace "121.00" and a bold "BPM" sharing one baseline
@@ -540,7 +600,10 @@ Zig's package manager, cached in `~/.cache/zig/p/`, and copied into the project'
 
 The event loop in `src/host/linux_window.zig` (`Host(App)`) implements the libwayland
 multi-thread reader protocol integrated with an optional Linux `timerfd`:
-- `poll` descriptor set: `fds[0]` is the Wayland display socket, and `fds[1]` is `timer_fd`.
+- `poll` descriptor set: five fixed slots, the Wayland display socket, `timer_fd`, the key
+  repeat timerfd, and the clipboard's send and receive pipes; an inactive slot is -1, which
+  `poll` ignores. The repeat timer is armed only while a repeating key is held, and the pipes
+  exist only during a transfer, so a focused idle text field sleeps.
   When `App.config.timer_period_ms == 0`, `timer_fd` is -1 (`no_timer_fd`), which `poll`
   ignores. The thread sleeps indefinitely while idle.
 - When `timer_period_ms != 0`, the timer wakes the thread to sample values via `drain_timer`
@@ -559,6 +622,16 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   `wp_viewport.set_destination` maps it onto the logical surface size. Without them the
   integer `wl_surface.preferred_buffer_scale` is used (`scale_120 = factor * 120`). The active
   mode is logged once at startup. Pointer coordinates are logical in both modes.
+- Input: `wl_seat` is bound at `min(advertised, 8)`. All three buttons and both wheel axes
+  are forwarded. Keys go through libxkbcommon (the compositor's keymap, modifiers, and the
+  locale's compose table for dead keys), and repeat follows `wl_keyboard.repeat_info` (25 Hz
+  after 600 ms when the seat is too old to send it). Keyboard enter and leave are
+  `window_focus`. The cursor is set with `wp_cursor_shape_v1` when the shape changes or the
+  pointer enters; without that protocol the host logs once and leaves the cursor alone.
+- Clipboard: `wl_data_device_manager` (version 3). A copy offers `text/plain;charset=utf-8`,
+  `UTF8_STRING`, and `text/plain`; transfers run through non-blocking pipes in the poll set,
+  a paste reads at most 64 KiB, and `SIGPIPE` is ignored. A stalled peer costs no wakes and
+  is closed when the next copy or paste replaces it.
 - GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
   stream. The device's uncaptured-error callback is installed, so a validation error fails the
   frame with the op index, the op name (with the draw type's label for a shader), and the
@@ -584,6 +657,14 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   is the same logical size at every device pixel ratio.
 - `start()` submits the renderer's setup stream; `shell.js` runs each setup op in a
   `pushErrorScope("validation")` and reports a failure with its op index and name.
+- Keyboard and clipboard: the canvas is focusable (`tabindex="0"`); `keydown` and `keyup`
+  pass `event.key` as UTF-8 through the Wasm input buffer, and Zig names the key, so
+  `shell.js` maps no keys. `preventDefault` runs only when Zig reports the key consumed
+  (focus or Tab), never for Ctrl or Meta with C, X, or V, so the page's `copy`, `cut`, and
+  `paste` events fire and use `clipboardData` synchronously. Canvas focus and blur are
+  `window_focus`, the context menu is suppressed, all buttons are forwarded, and after each
+  call `shell.js` sets `canvas.style.cursor` from `cursor()` and the CSS names Wasm exports.
+  IME composition is not supported.
 - `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.
   JavaScript decodes the stream and its spans in place, with no intermediate copies, and
   asserts that `pass_begin` carries the canvas backing size.

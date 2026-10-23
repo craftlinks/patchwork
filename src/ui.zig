@@ -25,6 +25,7 @@
 //! ui/areas.zig    Id, Area, the resolve scan, the duplicate-id stamps
 //! ui/cx.zig       Context: draw context + turtle stack + areas + pointer, hover, capture
 //! ui/view.zig     ViewState, scrollbar geometry, List
+//! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words
 //! ```
 //!
 //! ## 3. Host Calls
@@ -50,6 +51,7 @@ pub const turtle = @import("ui/turtle.zig");
 pub const areas = @import("ui/areas.zig");
 pub const view = @import("ui/view.zig");
 pub const cx = @import("ui/cx.zig");
+pub const edit = @import("ui/edit.zig");
 
 pub const Context = cx.Context;
 pub const Rect = draw.Rect;
@@ -63,6 +65,7 @@ pub const Id = areas.Id;
 pub const id = areas.id;
 pub const Area = areas.Area;
 pub const Flags = areas.Flags;
+pub const Cursor = areas.Cursor;
 pub const Hit = cx.Hit;
 pub const Press = cx.Press;
 pub const Up = cx.Up;
@@ -136,4 +139,5 @@ test {
     _ = areas;
     _ = view;
     _ = cx;
+    _ = edit;
 }

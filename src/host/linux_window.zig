@@ -10,9 +10,11 @@
 //! 1. `wl_display_prepare_read` claims the socket read. A non-zero return means events are
 //!    already queued: dispatch them, drain the timer so a busy socket cannot starve app
 //!    timers, and skip the sleep.
-//! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on the Wayland fd and the
-//!    optional timer fd. A negative descriptor is ignored by `poll`, so an app without a
-//!    timer passes `no_timer_fd` and never wakes on ticks.
+//! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on a fixed set of five
+//!    descriptors (`Slot`): the Wayland socket, the optional app timer, the key repeat timer,
+//!    and the clipboard's send and receive pipes. A negative descriptor is ignored by `poll`,
+//!    so an app without a timer passes `no_timer_fd` and never wakes on ticks, the repeat
+//!    timer is disarmed unless a repeating key is held, and an idle clipboard has no pipes.
 //! 3. The timeout is null (sleep until the compositor writes) unless a commit is latched in
 //!    `State.present_at_ns`, in which case it is the time remaining until that deadline.
 //! 4. Cancel-read rule: every successful `prepare_read` must end in `wl_display_read_events`
@@ -42,7 +44,7 @@
 //!
 //! ## 3. Protocol Limits and Layout
 //! - Bounds are the named constants `global_cap`, `compositor_version_max`,
-//!   `wl_seat.seat_version`, `wp_presentation.presentation_version` (the host binds
+//!   `wl_seat.seat_version_max`, `wp_presentation.presentation_version` (the host binds
 //!   `min(advertised, version)`), and `feedback_in_flight_max`.
 //! - `present_margin_ns` is how far before the projected vblank a commit is dispatched. It
 //!   must exceed the compositor's latch lead (the point before vblank after which new
@@ -66,7 +68,8 @@
 //!   guarantee, so a zero dimension is replaced by `Frame`.
 //! - `sync_input`: drains `State.queue` once per wake, bounded by `input.queue_cap`, through
 //!   `ui.dispatch`. Motion is coalesced by the queue, and a press and release stay separate
-//!   events.
+//!   events. After each dispatch the clipboard requests are served (section 5a); after the
+//!   queue, a finished paste is dispatched and the cursor is sent.
 //! - `sync_clock`: runs only after a `wl_callback.done`. It steps animators from the callback
 //!   timestamp through `ui.animate`, requests a redraw while a widget keeps animating, resets
 //!   the clock when settled, and calls `schedule_present`.
@@ -84,8 +87,9 @@
 //!   Tests: the `present_deadline` and `anchor_is_fresh` tests in `frame.zig`.
 //!
 //! ## 5. Cross-Platform Seams & FFI
-//! - `libwayland-client.so.0` is linked dynamically. C callbacks recover `*State` from the
-//!   listener user-data pointer and never lay out, draw, or step animators.
+//! - `libwayland-client.so.0` and `libxkbcommon.so.0` are linked dynamically. C callbacks
+//!   recover `*State` from the listener user-data pointer and never lay out, draw, or step
+//!   animators.
 //! - `gpu.create` receives the `wl_display` and `wl_surface` pointers to make the WebGPU
 //!   surface.
 //! - Two clients share one socket: Mesa's Wayland WSI binds its own `wp_presentation`,
@@ -96,9 +100,25 @@
 //! - Presentation timestamps are compared to `CLOCK_MONOTONIC` only after
 //!   `wp_presentation.clock_id` has named it. Any other clock disables the vblank anchor and
 //!   the scheduler falls back to `done`.
-//! - Only the vertical `wl_pointer.axis` becomes `Event.wheel`; a positive `dy` is added to
-//!   the scroll offset by the widgets. The browser host drives app timers with
-//!   `setInterval` instead of a `timerfd`, arming nothing when the period is zero.
+//! - Both `wl_pointer.axis` axes become `Event.wheel` (`dy` vertical, `dx` horizontal); a
+//!   positive `dy` is added to the scroll offset by the widgets. The browser host drives app
+//!   timers with `setInterval` instead of a `timerfd`, arming nothing when the period is zero.
+//!
+//! ## 5a. Keyboard, Repeat, Cursor, and Clipboard
+//! - `wl_keyboard` events are translated in their callbacks through libxkbcommon
+//!   (`xkb.zig`), because the translation depends on the modifier state at that moment, and
+//!   queued as `key_down` (with the typed text) and `key_up`. Keyboard `enter` and `leave`
+//!   queue `window_focus`.
+//! - Key repeat: `input.Repeat` decides, `apply_arming` sets the second timerfd (created once
+//!   in `run`, disarmed at rest). Expirations collapse to one repeat per wake, like the app
+//!   timer: `drain_repeat` queues one `key_down` with `repeat` set and fresh text.
+//! - Cursor: after input is dispatched and after each present, `apply_cursor` sends the UI
+//!   context's `cursor()` through `wp_cursor_shape_v1` when it changed or a pointer `enter`
+//!   made it undefined (`wp_cursor_shape.zig`).
+//! - Clipboard: after each dispatch the host turns `cx.copy` into a selection (`clipboard.zig`)
+//!   with the serial of the latest key or button, and `cx.request_paste` into a receive (or a
+//!   paste from `cx.copied()` while we own the selection). A finished receive is dispatched
+//!   directly as one `paste` event, never queued. `SIGPIPE` is ignored from `run` on.
 //!
 //! ## 6. TigerStyle Invariants
 //! - `State` lives on the stack of `run`; the draw context and renderer are static in
@@ -121,6 +141,10 @@ const wl_seat = @import("wl_seat.zig");
 const wp_fractional_scale = @import("wp_fractional_scale.zig");
 const wp_presentation = @import("wp_presentation.zig");
 const xdg = @import("xdg_shell.zig");
+const xkb = @import("xkb.zig");
+const wp_cursor_shape = @import("wp_cursor_shape.zig");
+const wl_data_device = @import("wl_data_device.zig");
+const clipboard_module = @import("clipboard.zig");
 
 /// First refresh-period guess, re-exported from `frame` for `main`.
 pub const refresh_ns_initial: u64 = frame.refresh_ns_initial;
@@ -204,10 +228,26 @@ pub const State = struct {
     /// Number of `WpPresentationFeedback` proxies awaiting a terminal event. Never exceeds
     /// `feedback_in_flight_max`.
     feedback_in_flight: u32,
-    /// Bound Wayland seat proxy (`wl_seat` version 1) from the compositor registry.
+    /// Bound Wayland seat proxy (`wl_seat`, version `min(advertised, 8)`).
     seat: ?*wl_seat.WlSeat,
-    /// Active Wayland pointer proxy (`wl_pointer` version 1) instantiated from `seat`.
+    /// The seat's pointer and keyboard proxies, while the seat has them.
     pointer_proxy: ?*wl_seat.WlPointer,
+    keyboard_proxy: ?*wl_seat.WlKeyboard,
+    /// The keymap, modifier state, and compose state (`xkb.zig`).
+    keyboard: xkb.Keyboard,
+    /// The repeating key and the repeat timerfd it arms (section 5a).
+    repeat: input.Repeat,
+    repeat_fd: i32,
+    /// Serial of the latest key, button, or keyboard enter: `set_selection` needs one.
+    input_serial: u32,
+    /// `wp_cursor_shape_manager_v1` and the pointer's shape device; null without the protocol.
+    cursor_manager: ?*wp_cursor_shape.Manager,
+    cursor_device: ?*wp_cursor_shape.Device,
+    /// Serial of the latest `wl_pointer.enter`, and the shape sent since; null owes one.
+    enter_serial: u32,
+    cursor_applied: ?ui.Cursor,
+    /// The clipboard state machine (static: it holds the paste buffer).
+    clipboard: *clipboard_module.Clipboard,
     /// Bound `wp_viewporter` and `wp_fractional_scale_manager_v1` globals; null when absent.
     viewporter: ?*wp_fractional_scale.Viewporter,
     fractional_manager: ?*wp_fractional_scale.FractionalScaleManager,
@@ -365,6 +405,7 @@ const toplevel_listener: xdg.XdgToplevelListener = .{
 
 const seat_listener: wl_seat.SeatListener = .{
     .capabilities = seat_capabilities,
+    .name = seat_name,
 };
 
 const pointer_listener: wl_seat.PointerListener = .{
@@ -373,7 +414,27 @@ const pointer_listener: wl_seat.PointerListener = .{
     .motion = pointer_motion,
     .button = pointer_button,
     .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_steps,
+    .axis_value120 = pointer_axis_steps,
 };
+
+const keyboard_listener: wl_seat.KeyboardListener = .{
+    .keymap = keyboard_keymap,
+    .enter = keyboard_enter,
+    .leave = keyboard_leave,
+    .key = keyboard_key,
+    .modifiers = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
+};
+
+/// Largest keymap the host maps; real keymaps are under 100 KiB.
+const keymap_size_max: u32 = 4 * 1024 * 1024;
+
+/// The paste buffer and protocol state of the clipboard; static because of the buffer.
+var clipboard_storage: clipboard_module.Clipboard = undefined;
 
 const callback_listener: wl_callback.CallbackListener = .{
     .done = frame_done_callback,
@@ -406,6 +467,7 @@ comptime {
     xdg.assert_interface_tables();
     wp_presentation.assert_interface_tables();
     wp_fractional_scale.assert_interface_tables();
+    wp_cursor_shape.assert_interface_tables();
 }
 
 /// Orchestrates the entire Wayland application lifecycle for one app type:
@@ -426,7 +488,36 @@ comptime {
 pub fn run(comptime App: type) !void {
     comptime app_contract.check(App);
     const AppHost = Host(App);
-    var state: State = .{
+    var state = initial_state();
+    AppHost.context.init();
+    AppHost.render.init();
+    var app: App = undefined;
+    App.init(&app, &AppHost.context.draw.textures);
+    try init_input(&state);
+    defer _ = std.os.linux.close(state.repeat_fd);
+    try connect(&state);
+    try bind_globals(&state);
+    try create_toplevel(&state, App.config.title);
+    try create_device(&state);
+    var host: AppHost = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
+    try host.setup();
+    assert(AppHost.context.draw.batch_count == 0);
+    assert(state.frame.relayout);
+    if (App.config.timer_period_ms != 0) {
+        host.timer_fd = try arm_timer(App.config.timer_period_ms);
+    }
+    defer {
+        if (host.timer_fd >= 0) {
+            _ = std.os.linux.close(host.timer_fd);
+        }
+    }
+    try host.loop();
+}
+
+/// The window state before the display is connected: nothing bound, nothing owed but the
+/// first draw.
+fn initial_state() State {
+    const state: State = .{
         .frame = .init(),
         .display = undefined,
         .compositor = null,
@@ -453,6 +544,16 @@ pub fn run(comptime App: type) !void {
         .feedback_in_flight = 0,
         .seat = null,
         .pointer_proxy = null,
+        .keyboard_proxy = null,
+        .keyboard = undefined,
+        .repeat = input.Repeat.init(),
+        .repeat_fd = no_timer_fd,
+        .input_serial = 0,
+        .cursor_manager = null,
+        .cursor_device = null,
+        .enter_serial = 0,
+        .cursor_applied = null,
+        .clipboard = &clipboard_storage,
         .viewporter = null,
         .fractional_manager = null,
         .viewport = null,
@@ -464,32 +565,75 @@ pub fn run(comptime App: type) !void {
         .pending_height = 0,
         .global_count = 0,
     };
-    AppHost.context.init();
-    AppHost.render.init();
-    var app: App = undefined;
-    App.init(&app, &AppHost.context.draw.textures);
-    try connect(&state);
-    try bind_globals(&state);
-    try create_toplevel(&state, App.config.title);
-    try create_device(&state);
-    var host: AppHost = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
-    try host.setup();
-    assert(AppHost.context.draw.batch_count == 0);
-    assert(state.frame.relayout);
-    if (App.config.timer_period_ms != 0) {
-        host.timer_fd = try arm_timer(App.config.timer_period_ms);
-    }
-    defer {
-        if (host.timer_fd >= 0) {
-            _ = std.os.linux.close(host.timer_fd);
-        }
-    }
-    try host.loop();
+    assert(state.repeat_fd == no_timer_fd);
+    assert(state.seat == null);
+    return state;
+}
+
+/// Prepares keyboard and clipboard input before the display connects: `SIGPIPE` ignored, the
+/// xkb context and compose table, the clipboard, and the disarmed repeat timerfd.
+fn init_input(state: *State) !void {
+    ignore_sigpipe();
+    state.keyboard.init();
+    clipboard_storage.init();
+    state.repeat_fd = try create_timer();
+    assert(state.repeat_fd >= 0);
+    assert(state.repeat.code == null);
 }
 
 /// `poll` ignores a negative descriptor, so an app without a timer passes this value in the
 /// timer slot of the poll set and the timer is never readable.
 const no_timer_fd: i32 = -1;
+
+/// The fixed slots of the `ppoll` set (module guide, section 1).
+const Slot = enum(u8) {
+    wayland,
+    timer,
+    repeat,
+    send,
+    receive,
+};
+const slot_count: u32 = @typeInfo(Slot).@"enum".field_names.len;
+
+fn poll_entry(fd: i32, events: i16) std.posix.pollfd {
+    assert(events != 0);
+    return .{ .fd = fd, .events = events, .revents = 0 };
+}
+
+/// Reads the repeat timer's expiration count and queues one repeat of the held key, however
+/// many periods passed (section 5a). A key released since queues nothing.
+fn drain_repeat(state: *State) void {
+    var expirations: u64 = 0;
+    const rc = std.os.linux.read(state.repeat_fd, std.mem.asBytes(&expirations), 8);
+    if (std.os.linux.errno(rc) != .SUCCESS) return;
+    assert(rc == 8);
+    const code = state.repeat.code orelse return;
+    push_key(state, code, true);
+    assert(expirations >= 1);
+}
+
+/// Ignores `SIGPIPE`, so writing to a clipboard reader that closed its pipe returns `EPIPE`
+/// instead of ending the process (`clipboard.zig`, section 4).
+fn ignore_sigpipe() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &action, null);
+}
+
+/// A disarmed nonblocking `timerfd` on `CLOCK_MONOTONIC`: the key repeat timer.
+fn create_timer() !i32 {
+    const flags: std.os.linux.TFD = .{ .NONBLOCK = true, .CLOEXEC = true };
+    const created = std.os.linux.timerfd_create(.MONOTONIC, flags);
+    const fd: i32 = switch (std.os.linux.errno(created)) {
+        .SUCCESS => @intCast(created),
+        else => return error.TimerCreateFailed,
+    };
+    assert(fd >= 0);
+    return fd;
+}
 
 /// The app-facing half of the native loop. Everything that calls the app contract lives
 /// here, so the Wayland and GPU half of this file stays one non-generic compilation.
@@ -566,21 +710,46 @@ fn Host(comptime App: type) type {
             assert(!state.frame.running);
         }
 
-        /// Drains the pointer queue once per wake. A press and a release in the same
-        /// Wayland batch stay two events, so a click is not collapsed.
+        /// Drains the input queue once per wake, then dispatches a finished paste, and sends
+        /// the cursor. A press and a release in the same Wayland batch stay two events, so a
+        /// click is not collapsed.
         fn sync_input(self: *Self) void {
             const state = self.state;
             assert(state.frame.running);
             var guard: u32 = 0;
             while (guard < input.queue_cap) : (guard += 1) {
                 const event = state.queue.pop() orelse break;
-                ui.dispatch(App, self.app, &context, event);
-                if (context.dirty) {
-                    state.frame.request_redraw();
-                }
+                self.dispatch(event);
             }
             assert(guard <= input.queue_cap);
+            if (state.clipboard.take_received()) |pasted| self.dispatch(.{ .paste = pasted });
+            apply_cursor(state, context.cursor());
             assert(state.frame.running);
+        }
+
+        /// One dispatch, then the clipboard requests it made (section 5a).
+        fn dispatch(self: *Self, event: input.Event) void {
+            const state = self.state;
+            ui.dispatch(App, self.app, &context, event);
+            if (context.dirty) {
+                state.frame.request_redraw();
+            }
+            if (context.take_copy()) state.clipboard.copy(state.input_serial);
+            if (!context.take_paste_request()) return;
+            if (state.clipboard.owns_selection()) {
+                // Copied into the paste buffer so a widget may `copy` while handling it.
+                const own = context.copied();
+                @memcpy(state.clipboard.buffer[0..own.len], own);
+                ui.dispatch(
+                    App,
+                    self.app,
+                    &context,
+                    .{ .paste = state.clipboard.buffer[0..own.len] },
+                );
+                if (context.dirty) state.frame.request_redraw();
+                return;
+            }
+            _ = state.clipboard.start_receive();
         }
 
         /// Steps animators from the frame-callback timestamp. The first sample after
@@ -646,6 +815,8 @@ fn Host(comptime App: type) type {
             arm_frame(state);
             arm_feedback(state);
             try self.submit_frame();
+            // A draw that moved things under the pointer re-resolved hover, and its cursor.
+            apply_cursor(state, context.cursor());
         }
 
         /// Draws the app into the context before presentation. A changed logical size only
@@ -691,18 +862,16 @@ fn Host(comptime App: type) type {
                 wl_display_cancel_read(display);
                 return error.FlushFailed;
             }
-            var fds = [_]std.posix.pollfd{
-                .{
-                    .fd = wl_display_get_fd(display),
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-                .{
-                    .fd = self.timer_fd,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                },
-            };
+            const clipboard = state.clipboard;
+            var fds: [slot_count]std.posix.pollfd = undefined;
+            fds[@backingInt(Slot.wayland)] = poll_entry(
+                wl_display_get_fd(display),
+                std.posix.POLL.IN,
+            );
+            fds[@backingInt(Slot.timer)] = poll_entry(self.timer_fd, std.posix.POLL.IN);
+            fds[@backingInt(Slot.repeat)] = poll_entry(state.repeat_fd, std.posix.POLL.IN);
+            fds[@backingInt(Slot.send)] = poll_entry(clipboard.send_fd, std.posix.POLL.OUT);
+            fds[@backingInt(Slot.receive)] = poll_entry(clipboard.receive_fd, std.posix.POLL.IN);
             const ready = poll_wayland(state, fds[0..]) catch {
                 wl_display_cancel_read(display);
                 return error.PollFailed;
@@ -712,7 +881,7 @@ fn Host(comptime App: type) type {
                 assert(state.present_at_ns != 0);
                 return;
             }
-            const wayland_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+            const wayland_ready = (fds[@backingInt(Slot.wayland)].revents & std.posix.POLL.IN) != 0;
             if (wayland_ready) {
                 if (wl_display_read_events(display) != 0) {
                     return error.ReadFailed;
@@ -724,10 +893,13 @@ fn Host(comptime App: type) type {
             } else {
                 wl_display_cancel_read(display);
             }
-            const timer_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
+            const timer_ready = (fds[@backingInt(Slot.timer)].revents & std.posix.POLL.IN) != 0;
             if (timer_ready) {
                 try self.drain_timer();
             }
+            if (fds[@backingInt(Slot.repeat)].revents != 0) drain_repeat(state);
+            if (fds[@backingInt(Slot.send)].revents != 0) clipboard.pump_send(context.copied());
+            if (fds[@backingInt(Slot.receive)].revents != 0) clipboard.pump_receive();
             // A close event read above stops the loop. That wake is not a failure.
             if (!state.frame.running) {
                 assert(!state.frame.running);
@@ -792,6 +964,9 @@ fn bind_globals(state: *State) !void {
     }
     if (state.xdg_base == null) {
         return error.MissingXdgWmBase;
+    }
+    if (state.cursor_manager == null) {
+        std.log.info("cursor: no wp_cursor_shape_v1, the compositor's cursor stays", .{});
     }
 }
 
@@ -940,7 +1115,7 @@ fn set_buffer_scale(state: *State) void {
 /// Blocks in `ppoll` until the socket is readable or the latched commit is due.
 /// `EINTR` retries, bounded, without cancelling the prepared read.
 fn poll_wayland(state: *State, fds: []std.posix.pollfd) !usize {
-    assert(fds.len == 2);
+    assert(fds.len == slot_count);
     var guard: u32 = 0;
     while (guard < 8) : (guard += 1) {
         var timeout = poll_timeout(state);
@@ -1196,24 +1371,45 @@ fn registry_global(
     if (bind_scale_global(state, live_registry, name, iface)) {
         return;
     }
+    if (bind_input_global(state, live_registry, name, iface, version)) {
+        return;
+    }
+}
+
+/// Binds `wl_seat`, `wp_cursor_shape_manager_v1`, or `wl_data_device_manager` when `iface`
+/// names one that is not bound yet. True when `iface` was one of them.
+fn bind_input_global(
+    state: *State,
+    registry: *Registry,
+    name: u32,
+    iface: []const u8,
+    version: u32,
+) bool {
     if (std.mem.eql(u8, iface, "wl_seat")) {
-        if (state.seat != null) {
-            return;
-        }
-        if (version < wl_seat.seat_version) {
-            return;
-        }
-        const bound = bind_global(
-            live_registry,
-            name,
-            &wl_seat.wl_seat_interface,
-            wl_seat.seat_version,
-        );
+        if (state.seat != null) return true;
+        const bind_version = wl_seat.bind_version(version);
+        const bound = bind_global(registry, name, &wl_seat.wl_seat_interface, bind_version);
         const seat: *wl_seat.WlSeat = @ptrCast(bound);
         wl_seat.add_seat_listener(seat, &seat_listener, state);
         state.seat = seat;
-        assert(state.seat != null);
+        state.clipboard.attach(seat);
+        return true;
     }
+    if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
+        if (state.cursor_manager != null) return true;
+        const interface = &wp_cursor_shape.wp_cursor_shape_manager_interface;
+        state.cursor_manager = @ptrCast(bind_global(registry, name, interface, 1));
+        return true;
+    }
+    if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+        if (state.clipboard.manager != null) return true;
+        const bind_version = wl_data_device.bind_version(version);
+        const interface = &wl_data_device.wl_data_device_manager_interface;
+        state.clipboard.manager = @ptrCast(bind_global(registry, name, interface, bind_version));
+        if (state.seat) |seat| state.clipboard.attach(seat);
+        return true;
+    }
+    return false;
 }
 
 /// Binds `wp_viewporter` or `wp_fractional_scale_manager_v1` (version 1) when `iface` names
@@ -1345,37 +1541,62 @@ fn toplevel_configure(
     state.pending_height = if (height > 0) @intCast(height) else 0;
 }
 
-/// C ABI callback for `wl_seat.capabilities` (opcode 0).
-/// Dynamically creates or destroys the `wl_pointer` proxy based on `pointer_capability`.
+/// C ABI callback for `wl_seat.capabilities` (opcode 0). Creates or releases the pointer and
+/// keyboard proxies as the capabilities come and go.
 fn seat_capabilities(
     data: ?*anyopaque,
     seat: ?*wl_seat.WlSeat,
     capabilities: u32,
 ) callconv(.c) void {
     _ = seat;
-    assert(data != null);
-    const state: *State = @ptrCast(@alignCast(data.?));
+    const state = state_of(data);
+    const live = state.seat orelse return;
     const has_pointer = (capabilities & wl_seat.pointer_capability) != 0;
-    if (has_pointer) {
-        if (state.pointer_proxy == null) {
-            const live = state.seat orelse return;
-            const pointer = wl_seat.get_pointer(live);
-            wl_seat.add_pointer_listener(pointer, &pointer_listener, state);
-            state.pointer_proxy = pointer;
-        }
-        assert(state.pointer_proxy != null);
-        return;
+    if (has_pointer and state.pointer_proxy == null) {
+        const pointer = wl_seat.get_pointer(live);
+        wl_seat.add_pointer_listener(pointer, &pointer_listener, state);
+        state.pointer_proxy = pointer;
     }
-    const pointer = state.pointer_proxy orelse return;
-    wl_seat.destroy_pointer(pointer);
-    state.pointer_proxy = null;
-    state.queue.push(.pointer_leave);
-    assert(state.pointer_proxy == null);
-    assert(state.queue.count >= 1);
+    if (!has_pointer) {
+        if (state.pointer_proxy) |pointer| {
+            if (state.cursor_device) |device| wp_cursor_shape.destroy_device(device);
+            state.cursor_device = null;
+            wl_seat.release_pointer(pointer);
+            state.pointer_proxy = null;
+            state.queue.push(.pointer_leave);
+        }
+    }
+    const has_keyboard = (capabilities & wl_seat.keyboard_capability) != 0;
+    if (has_keyboard and state.keyboard_proxy == null) {
+        const keyboard = wl_seat.get_keyboard(live);
+        wl_seat.add_keyboard_listener(keyboard, &keyboard_listener, state);
+        state.keyboard_proxy = keyboard;
+    }
+    if (!has_keyboard) {
+        if (state.keyboard_proxy) |keyboard| {
+            wl_seat.release_keyboard(keyboard);
+            state.keyboard_proxy = null;
+            keyboard_lost(state);
+        }
+    }
+    if (has_pointer) assert(state.pointer_proxy != null);
+    if (has_keyboard) assert(state.keyboard_proxy != null);
 }
 
-/// C ABI callback for `wl_pointer.enter` (opcode 0).
-/// Marks pointer as inside the window surface at logical position `(sx, sy)`.
+/// `wl_seat.name` (opcode 1, version 2): unused.
+fn seat_name(data: ?*anyopaque, seat: ?*wl_seat.WlSeat, name: [*:0]const u8) callconv(.c) void {
+    _ = data;
+    _ = seat;
+    _ = name;
+}
+
+fn state_of(data: ?*anyopaque) *State {
+    assert(data != null);
+    return @ptrCast(@alignCast(data.?));
+}
+
+/// C ABI callback for `wl_pointer.enter` (opcode 0). The pointer image is undefined after an
+/// enter, so the shape is sent again with this serial.
 fn pointer_enter(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1385,15 +1606,14 @@ fn pointer_enter(
     sy: i32,
 ) callconv(.c) void {
     _ = pointer;
-    _ = serial;
     _ = surface;
-    assert(data != null);
-    const state: *State = @ptrCast(@alignCast(data.?));
+    const state = state_of(data);
+    state.enter_serial = serial;
+    state.cursor_applied = null;
     push_move(state, sx, sy);
 }
 
-/// C ABI callback for `wl_pointer.leave` (opcode 1).
-/// Marks pointer as outside surface and resets button state to prevent stuck drags.
+/// C ABI callback for `wl_pointer.leave` (opcode 1). Releases any press so a drag cannot stick.
 fn pointer_leave(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1403,14 +1623,13 @@ fn pointer_leave(
     _ = pointer;
     _ = serial;
     _ = surface;
-    assert(data != null);
-    const state: *State = @ptrCast(@alignCast(data.?));
+    const state = state_of(data);
     state.queue.push(.pointer_leave);
     assert(state.queue.count >= 1);
 }
 
-/// C ABI callback for `wl_pointer.motion` (opcode 2).
-/// Queues the raw point. The commit draws the newest coalesced sample.
+/// C ABI callback for `wl_pointer.motion` (opcode 2). The commit draws the newest coalesced
+/// sample.
 fn pointer_motion(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1420,14 +1639,11 @@ fn pointer_motion(
 ) callconv(.c) void {
     _ = pointer;
     _ = time;
-    assert(data != null);
-    const state: *State = @ptrCast(@alignCast(data.?));
-    push_move(state, sx, sy);
+    push_move(state_of(data), sx, sy);
 }
 
-/// C ABI callback for `wl_pointer.button` (opcode 3).
-/// Queues press and release of the primary button (`wl_seat.button_code_left`) at the last
-/// pointer position. Other buttons are ignored.
+/// C ABI callback for `wl_pointer.button` (opcode 3). Queues a press or release of the left,
+/// right, or middle button at the last position, with its time and the keyboard modifiers.
 fn pointer_button(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1437,29 +1653,31 @@ fn pointer_button(
     button_state: u32,
 ) callconv(.c) void {
     _ = pointer;
-    _ = serial;
-    _ = time;
-    assert(data != null);
-    if (button != wl_seat.button_code_left) {
-        assert(button != wl_seat.button_code_left);
-        return;
-    }
-    const state: *State = @ptrCast(@alignCast(data.?));
-    const point: input.Point = .{ .x = state.last_x, .y = state.last_y };
-    const pressed = button_state == wl_seat.button_state_pressed;
-    if (pressed) {
-        state.queue.push(.{ .pointer_down = point });
+    const state = state_of(data);
+    const which: input.MouseButton = switch (button) {
+        wl_seat.button_code_left => .left,
+        wl_seat.button_code_right => .right,
+        wl_seat.button_code_middle => .middle,
+        else => return,
+    };
+    state.input_serial = serial;
+    const sample: input.Button = .{
+        .x = state.last_x,
+        .y = state.last_y,
+        .time_ms = time,
+        .button = which,
+        .mods = state.keyboard.mods(),
+    };
+    if (button_state == wl_seat.button_state_pressed) {
+        state.queue.push(.{ .pointer_down = sample });
     } else {
-        state.queue.push(.{ .pointer_up = point });
+        state.queue.push(.{ .pointer_up = sample });
     }
     assert(state.queue.count >= 1);
-    assert(point.x == state.last_x);
 }
 
-/// Vertical `wl_pointer.axis`. Opcode 4, axis 0. Horizontal axes are ignored.
-/// A zero value is not queued. Positive `dy` increases `scroll_y`.
-const axis_vertical: u32 = 0;
-
+/// C ABI callback for `wl_pointer.axis` (opcode 4). Vertical feeds `dy`, horizontal `dx`; the
+/// queue merges both of one frame into one wheel. A zero value is not queued.
 fn pointer_axis(
     data: ?*anyopaque,
     pointer: ?*wl_seat.WlPointer,
@@ -1469,24 +1687,61 @@ fn pointer_axis(
 ) callconv(.c) void {
     _ = pointer;
     _ = time;
-    assert(data != null);
-    if (axis != axis_vertical) {
-        assert(axis != axis_vertical);
-        return;
+    const delta = input.fixed_to_logical(value);
+    if (delta == 0) return;
+    const state = state_of(data);
+    var wheel: input.Wheel = .{ .x = state.last_x, .y = state.last_y, .dx = 0, .dy = 0 };
+    switch (axis) {
+        wl_seat.axis_vertical => wheel.dy = delta,
+        wl_seat.axis_horizontal => wheel.dx = delta,
+        else => return,
     }
-    const dy = input.fixed_to_logical(value);
-    if (dy == 0) {
-        assert(dy == 0);
-        return;
-    }
-    const state: *State = @ptrCast(@alignCast(data.?));
-    state.queue.push(.{ .wheel = .{
-        .x = state.last_x,
-        .y = state.last_y,
-        .dy = dy,
-    } });
+    state.queue.push(.{ .wheel = wheel });
     assert(state.queue.count >= 1);
-    assert(dy != 0);
+}
+
+/// `wl_pointer.frame` (opcode 5): the queue already groups a frame's axes (wl_seat.zig, 1).
+fn pointer_frame(data: ?*anyopaque, pointer: ?*wl_seat.WlPointer) callconv(.c) void {
+    _ = data;
+    _ = pointer;
+}
+
+/// `wl_pointer.axis_source` (opcode 6): unused.
+fn pointer_axis_source(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    source: u32,
+) callconv(.c) void {
+    _ = data;
+    _ = pointer;
+    _ = source;
+}
+
+/// `wl_pointer.axis_stop` (opcode 7): unused, there is no kinetic scrolling.
+fn pointer_axis_stop(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    time: u32,
+    axis: u32,
+) callconv(.c) void {
+    _ = data;
+    _ = pointer;
+    _ = time;
+    _ = axis;
+}
+
+/// `wl_pointer.axis_discrete` and `axis_value120` (opcodes 8 and 9): the `axis` value already
+/// carries the pixel delta.
+fn pointer_axis_steps(
+    data: ?*anyopaque,
+    pointer: ?*wl_seat.WlPointer,
+    axis: u32,
+    steps: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = pointer;
+    _ = axis;
+    _ = steps;
 }
 
 /// Queues a move in UI logical pixels and remembers the point for button events.
@@ -1498,6 +1753,197 @@ fn push_move(state: *State, sx: i32, sy: i32) void {
     state.queue.push(.{ .pointer_move = .{ .x = x, .y = y } });
     assert(state.last_x == x);
     assert(state.last_y == y);
+}
+
+/// `wl_keyboard.keymap` (opcode 0): maps the keymap read-only and private (required from
+/// version 7), compiles it, and always closes the fd. A keymap that does not compile keeps the
+/// previous one.
+fn keyboard_keymap(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    format: u32,
+    fd: i32,
+    size: u32,
+) callconv(.c) void {
+    _ = keyboard;
+    const state = state_of(data);
+    defer _ = std.os.linux.close(fd);
+    if (format != wl_seat.keymap_format_xkb_v1) return;
+    if (size == 0 or size > keymap_size_max) return;
+    const mapped = std.posix.mmap(
+        null,
+        size,
+        .{ .READ = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ) catch return;
+    defer std.posix.munmap(mapped);
+    // The keymap is NUL-terminated within `size`.
+    const length = std.mem.indexOfScalar(u8, mapped, 0) orelse mapped.len;
+    if (!state.keyboard.load(mapped[0..length])) {
+        std.log.warn("keyboard: the compositor's keymap did not compile", .{});
+        return;
+    }
+    apply_arming(state, state.repeat.stop());
+}
+
+/// `wl_keyboard.enter` (opcode 1): the window has keyboard focus. Keys already held are not
+/// replayed, as the protocol asks.
+fn keyboard_enter(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    serial: u32,
+    surface: ?*xdg.WlSurface,
+    keys: ?*xdg.WlArray,
+) callconv(.c) void {
+    _ = keyboard;
+    _ = surface;
+    _ = keys;
+    const state = state_of(data);
+    state.input_serial = serial;
+    state.queue.push(.{ .window_focus = true });
+}
+
+/// `wl_keyboard.leave` (opcode 2): focus left, so repeat stops and held keys are released.
+fn keyboard_leave(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    serial: u32,
+    surface: ?*xdg.WlSurface,
+) callconv(.c) void {
+    _ = keyboard;
+    _ = serial;
+    _ = surface;
+    keyboard_lost(state_of(data));
+}
+
+fn keyboard_lost(state: *State) void {
+    apply_arming(state, state.repeat.stop());
+    state.queue.push(.{ .window_focus = false });
+    assert(state.repeat.code == null);
+}
+
+/// `wl_keyboard.key` (opcode 3): translates through xkb, queues the key with its text, and
+/// arms or disarms the repeat timer (`input.Repeat`).
+fn keyboard_key(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    serial: u32,
+    time: u32,
+    code: u32,
+    key_state: u32,
+) callconv(.c) void {
+    _ = keyboard;
+    _ = time;
+    const state = state_of(data);
+    state.input_serial = serial;
+    if (key_state != wl_seat.key_state_pressed) {
+        const key = state.keyboard.key_of(code);
+        const mods = state.keyboard.mods();
+        state.queue.push(.{ .key_up = input.key_press(key, mods, false, "") });
+        apply_arming(state, state.repeat.release(code));
+        return;
+    }
+    push_key(state, code, false);
+    apply_arming(state, state.repeat.press(code, state.keyboard.repeats(code)));
+}
+
+/// Queues one press of `code`: its text rides on the key event, and compose output longer
+/// than one event's text follows as `other` presses (`input.next_chunk`).
+fn push_key(state: *State, code: u32, repeat: bool) void {
+    var typed: xkb.Typed = undefined;
+    const key = state.keyboard.press(code, repeat, &typed);
+    const mods = state.keyboard.mods();
+    const text = typed.text();
+    if (text.len == 0) {
+        state.queue.push(.{ .key_down = input.key_press(key, mods, repeat, "") });
+        return;
+    }
+    var offset: u32 = 0;
+    var first = true;
+    var guard: u32 = 0;
+    while (offset < text.len and guard < xkb.typed_cap) : (guard += 1) {
+        const chunk = input.next_chunk(text, &offset);
+        const named: input.Key = if (first) key else .other;
+        state.queue.push(.{ .key_down = input.key_press(named, mods, repeat, chunk) });
+        first = false;
+    }
+    assert(offset == text.len);
+}
+
+/// `wl_keyboard.modifiers` (opcode 4).
+fn keyboard_modifiers(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    serial: u32,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) callconv(.c) void {
+    _ = keyboard;
+    _ = serial;
+    state_of(data).keyboard.update_mask(depressed, latched, locked, group);
+}
+
+/// `wl_keyboard.repeat_info` (opcode 5, version 4). A rate of 0 disables repeat.
+fn keyboard_repeat_info(
+    data: ?*anyopaque,
+    keyboard: ?*wl_seat.WlKeyboard,
+    rate: i32,
+    delay: i32,
+) callconv(.c) void {
+    _ = keyboard;
+    const state = state_of(data);
+    apply_arming(state, state.repeat.configure(rate, delay));
+}
+
+/// Applies an `input.Arming` to the repeat timerfd.
+fn apply_arming(state: *State, arming: input.Arming) void {
+    assert(state.repeat_fd >= 0);
+    const spec: std.os.linux.itimerspec = switch (arming) {
+        .keep => return,
+        .disarm => .{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{ .sec = 0, .nsec = 0 },
+        },
+        .arm => |times| .{
+            .it_interval = timespec_of(times.interval_ns),
+            .it_value = timespec_of(times.delay_ns),
+        },
+    };
+    const rc = std.os.linux.timerfd_settime(state.repeat_fd, .{}, &spec, null);
+    assert(std.os.linux.errno(rc) == .SUCCESS);
+}
+
+fn timespec_of(ns: u64) std.os.linux.timespec {
+    assert(ns >= 1);
+    const spec: std.os.linux.timespec = .{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    assert(spec.nsec < 1_000_000_000);
+    return spec;
+}
+
+/// Sends the cursor shape when it changed or an enter made it undefined. Without the shape
+/// protocol nothing is sent (the startup log says so).
+fn apply_cursor(state: *State, cursor: ui.Cursor) void {
+    if (state.cursor_applied) |applied| {
+        if (applied == cursor) return;
+    }
+    const pointer = state.pointer_proxy orelse return;
+    const manager = state.cursor_manager orelse return;
+    if (state.enter_serial == 0) return;
+    const device = state.cursor_device orelse blk: {
+        const created = wp_cursor_shape.get_device(manager, pointer);
+        state.cursor_device = created;
+        break :blk created;
+    };
+    wp_cursor_shape.set_shape(device, state.enter_serial, cursor);
+    state.cursor_applied = cursor;
+    assert(state.cursor_device != null);
 }
 
 /// Leaf writer for `wl_callback.done`. Destroys the one-shot proxy and stores the
