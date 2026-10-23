@@ -25,7 +25,8 @@
 //! ui/areas.zig    Id, Area, the resolve scan, the duplicate-id stamps
 //! ui/cx.zig       Context: draw context + turtle stack + areas + pointer, hover, capture
 //! ui/view.zig     ViewState, scrollbar geometry, List
-//! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words
+//! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words,
+//!                 and paste sanitizing for one line and the code editor's multi-line text
 //! ```
 //!
 //! ## 3. Host Calls

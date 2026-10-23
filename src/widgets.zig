@@ -167,7 +167,12 @@ pub const label_line_px: f32 = 36;
 pub const accent_count: u32 = 4;
 
 /// A text field's area: focusable, with the I-beam cursor.
-pub const field_flags: ui.Flags = .{ .wheel = false, .focusable = true, .cursor = .text };
+pub const field_flags: ui.Flags = .{
+    .wheel = false,
+    .focusable = true,
+    .tab = false,
+    .cursor = .text,
+};
 /// Text field metrics in logical pixels: the text inset, the face's corner radius and border,
 /// and the caret's inset from the top and bottom.
 pub const field_padding_x: f32 = 6;
@@ -185,7 +190,12 @@ pub const field_text_options: text.Options = .{
 };
 
 /// A knob's ring area: it takes the wheel and shows the grab cursor.
-pub const knob_flags: ui.Flags = .{ .wheel = true, .focusable = false, .cursor = .grab };
+pub const knob_flags: ui.Flags = .{
+    .wheel = true,
+    .focusable = false,
+    .tab = false,
+    .cursor = .grab,
+};
 
 /// Fill and corner radius copied onto each instance a widget appends.
 pub const Paint = struct {

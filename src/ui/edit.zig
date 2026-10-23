@@ -1,5 +1,6 @@
 //! The editing core of a single-line text field: a bounded UTF-8 buffer with a caret and a
-//! selection, codepoint and word movement, and paste sanitizing. Pure: no context, no drawing.
+//! selection, codepoint and word movement, and paste sanitizing (one line, or multi-line for
+//! the code editor). Pure: no context, no drawing.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -27,6 +28,14 @@
 //! `sanitize_line` turns arbitrary pasted bytes into one line: a CR LF pair or a lone CR, LF,
 //! or tab becomes one space, other C0 controls and DEL are dropped, and invalid UTF-8 becomes
 //! U+FFFD. Output stops at the last whole codepoint that fits.
+//!
+//! ## 4a. Multi-Line Text
+//! `sanitize_text` is the code editor's counterpart (`editor.zig`): line breaks survive as LF
+//! (a CR LF pair or a lone CR becomes one LF), a tab expands to spaces up to the next
+//! multiple of `tab_width` from the column the text lands at, other controls are dropped,
+//! and invalid UTF-8 becomes U+FFFD. The editor's buffer therefore never holds a tab or a
+//! CR, so a column is always a codepoint count. The editor's buffer reuses this file's
+//! boundary and word functions directly on its one contiguous slice.
 //!
 //! ## 5. TigerStyle Invariants
 //! - No allocation; every loop is bounded by `field_cap` or the input length.
@@ -289,6 +298,60 @@ pub fn sanitize_line(source: []const u8, out: []u8) u32 {
     return written;
 }
 
+/// Columns between tab stops: a tab becomes spaces up to the next multiple.
+pub const tab_width: u32 = 4;
+
+/// What `sanitize_text` wrote: `len` bytes, and whether all of `source` fit.
+pub const Sanitized = struct {
+    len: u32,
+    complete: bool,
+};
+
+/// Writes `source` into `out` as multi-line valid UTF-8 for the code editor (section 4a): a CR
+/// LF pair or a lone CR becomes LF, a tab becomes spaces up to the next multiple of
+/// `tab_width` counted from `column` (the codepoint column the text lands at), other C0
+/// controls and DEL are dropped, and invalid UTF-8 becomes U+FFFD. Output stops at the last
+/// whole codepoint (or whole tab expansion) that fits, and `complete` is false then.
+pub fn sanitize_text(source: []const u8, column: u32, out: []u8) Sanitized {
+    var written: u32 = 0;
+    var index: u32 = 0;
+    var at_column = column;
+    while (index < source.len) {
+        const start = index;
+        var codepoint = layout.decode(source, &index);
+        if (codepoint == '\r') {
+            if (index < source.len and source[index] == '\n') index += 1;
+            codepoint = '\n';
+        }
+        assert(index > start);
+        if (codepoint == '\n') {
+            if (written + 1 > out.len) return .{ .len = written, .complete = false };
+            out[written] = '\n';
+            written += 1;
+            at_column = 0;
+            continue;
+        }
+        if (codepoint == '\t') {
+            const spaces = tab_width - at_column % tab_width;
+            if (written + spaces > out.len) return .{ .len = written, .complete = false };
+            @memset(out[written..][0..spaces], ' ');
+            written += spaces;
+            at_column += spaces;
+            continue;
+        }
+        if (!input.printable(codepoint)) continue;
+        var encoded: [4]u8 = undefined;
+        const length = std.unicode.utf8Encode(codepoint, &encoded) catch unreachable;
+        if (written + length > out.len) return .{ .len = written, .complete = false };
+        @memcpy(out[written..][0..length], encoded[0..length]);
+        written += length;
+        at_column += 1;
+    }
+    assert(written <= out.len);
+    assert(index == source.len);
+    return .{ .len = written, .complete = true };
+}
+
 const testing = std.testing;
 
 fn edit_of(utf8: []const u8) Edit {
@@ -384,4 +447,26 @@ test "pasted text becomes one valid line" {
     try testing.expectEqualStrings("x\u{fffd}y", repaired);
     var small: [4]u8 = undefined;
     try testing.expectEqual(@as(u32, 2), sanitize_line("ab\u{20ac}", &small));
+}
+
+// Locks multi-line sanitizing: CR LF and lone CR become LF, a tab pads to the next multiple
+// of four from the landing column (and restarts after a line break), controls vanish,
+// invalid bytes become U+FFFD, and a cut output reports itself incomplete on a whole unit.
+test "pasted code keeps its lines and expands tabs" {
+    var out: [64]u8 = undefined;
+    const lines = sanitize_text("a\r\nb\rc\n\td\x07\x7f", 0, &out);
+    try testing.expect(lines.complete);
+    try testing.expectEqualStrings("a\nb\nc\n    d", out[0..lines.len]);
+    const offset = sanitize_text("x\ty\t", 1, &out);
+    try testing.expectEqualStrings("x  y   ", out[0..offset.len]);
+    const wide = sanitize_text("\u{e4}\tz\xff", 0, &out);
+    try testing.expectEqualStrings("\u{e4}   z\u{fffd}", out[0..wide.len]);
+    var tiny: [3]u8 = undefined;
+    const cut = sanitize_text("ab\tc", 0, &tiny);
+    try testing.expect(!cut.complete);
+    try testing.expectEqualStrings("ab", tiny[0..cut.len]);
+    var small: [5]u8 = undefined;
+    const exact = sanitize_text("ab\u{20ac}", 0, &small);
+    try testing.expect(exact.complete);
+    try testing.expectEqual(@as(u32, 5), exact.len);
 }

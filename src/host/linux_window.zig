@@ -121,8 +121,9 @@
 //!   directly as one `paste` event, never queued. `SIGPIPE` is ignored from `run` on.
 //!
 //! ## 6. TigerStyle Invariants
-//! - `State` lives on the stack of `run`; the draw context and renderer are static in
-//!   `Host(App)`, because their size follows `App.config.draw`. The loop allocates nothing.
+//! - `State` lives on the stack of `run`; the app, the draw context, and the renderer are
+//!   static in `Host(App)`, because their sizes follow the app (an editor holds hundreds of
+//!   KiB) and `App.config.draw`. The loop allocates nothing.
 //! - Every loop is bounded: input drain by `input.queue_cap`, `EINTR` retry by a fixed guard.
 //! - Wayland callbacks are leaf writers; all app and GPU work happens in the loop body.
 
@@ -482,24 +483,23 @@ comptime {
 /// 6. Arms the host timer only when `App.config.timer_period_ms` is not zero.
 /// 7. Enters the blocking event loop (`Host(App).loop`).
 ///
-/// The window state and the app live on this stack frame. The UI context (with the draw
-/// context inside it) and the renderer, whose pools and shadows are sized by `App.config`,
-/// are static (`Host(App)`), so a large configuration never grows the stack.
+/// The window state lives on this stack frame. The app, the UI context (with the draw context
+/// inside it), and the renderer, whose pools and shadows are sized by `App.config`, are static
+/// (`Host(App)`), as on the web host, so a large app or configuration never grows the stack.
 pub fn run(comptime App: type) !void {
     comptime app_contract.check(App);
     const AppHost = Host(App);
     var state = initial_state();
     AppHost.context.init();
     AppHost.render.init();
-    var app: App = undefined;
-    App.init(&app, &AppHost.context.draw.textures);
+    App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     try init_input(&state);
     defer _ = std.os.linux.close(state.repeat_fd);
     try connect(&state);
     try bind_globals(&state);
     try create_toplevel(&state, App.config.title);
     try create_device(&state);
-    var host: AppHost = .{ .state = &state, .app = &app, .timer_fd = no_timer_fd };
+    var host: AppHost = .{ .state = &state, .app = &AppHost.app_static, .timer_fd = no_timer_fd };
     try host.setup();
     assert(AppHost.context.draw.batch_count == 0);
     assert(state.frame.relayout);
@@ -648,9 +648,10 @@ fn Host(comptime App: type) type {
         app: *App,
         timer_fd: i32,
 
-        /// The app's UI context (pools, areas, pointer state) and renderer. Static so pools
-        /// and shadows sized by `App.config` stay off the stack; `run` initializes both in
-        /// place.
+        /// The app, its UI context (pools, areas, pointer state), and the renderer. Static so
+        /// app storage and the pools and shadows sized by `App.config` stay off the stack;
+        /// `run` initializes all three in place.
+        var app_static: App = undefined;
         var context: Context = undefined;
         var render: Renderer = undefined;
 

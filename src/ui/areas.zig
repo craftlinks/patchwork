@@ -20,8 +20,9 @@
 //! instance's), the corner `radius` of the rounded hit shape, the draw `layer` it was
 //! recorded on, `flags`, and the point range `first_point`, `point_count` of a path area.
 //! `flags` are `wheel` (the area takes wheel input), `focusable` (a left press focuses it and
-//! Tab visits it; the area list in draw order is the Tab order), and `cursor` (the pointer
-//! shape over it, resolved with the hot area). A point hits a box area (`point_count == 0`)
+//! Tab visits it; the area list in draw order is the Tab order), `tab` (while focused, Tab
+//! and Shift+Tab go to its widget instead of moving focus), and `cursor` (the pointer shape
+//! over it, resolved with the hot area). A point hits a box area (`point_count == 0`)
 //! when the clip contains it and `draw.contains_box` accepts it.
 //!
 //! A path area (`ui.Context.path_area`) is the set of points within `radius` of a stroked
@@ -90,8 +91,11 @@ pub const Flags = packed struct(u8) {
     wheel: bool,
     /// A left press focuses the area, and Tab visits it in draw order.
     focusable: bool,
+    /// While the area is focused, Tab and Shift+Tab go to its widget (an editor indents)
+    /// instead of moving focus. Escape still clears focus, so the keyboard can leave it.
+    tab: bool,
     cursor: Cursor,
-    unused: u3 = 0,
+    unused: u2 = 0,
 };
 
 /// One hit area. See the module guide, section 3.
@@ -268,7 +272,7 @@ fn test_area(key: Id, x: f32, layer: u8, wheel: bool) Area {
         .clip = .{ 0, 0, 1000, 1000 },
         .radius = 0,
         .layer = layer,
-        .flags = .{ .wheel = wheel, .focusable = false, .cursor = .default },
+        .flags = .{ .wheel = wheel, .focusable = false, .tab = false, .cursor = .default },
         .pad = 0,
         .first_point = 0,
         .point_count = 0,
@@ -354,7 +358,7 @@ test "a path area hits near its polyline only" {
         .clip = .{ 0, 0, 1000, 1000 },
         .radius = 5,
         .layer = 2,
-        .flags = .{ .wheel = false, .focusable = false, .cursor = .default },
+        .flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default },
         .pad = 0,
         .first_point = 0,
         .point_count = 3,

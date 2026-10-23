@@ -322,7 +322,12 @@ const jack_salt: u64 = 1;
 const hub_border_px: f32 = 2;
 
 /// Hubs and cables show the pointer cursor and take no wheel, so the wheel turns the knob.
-const patch_flags: ui.Flags = .{ .wheel = false, .focusable = false, .cursor = .pointer };
+const patch_flags: ui.Flags = .{
+    .wheel = false,
+    .focusable = false,
+    .tab = false,
+    .cursor = .pointer,
+};
 
 /// A patch cable from knob `from`'s hub to knob `to`'s hub.
 pub const Cable = struct {
