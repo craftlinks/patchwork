@@ -47,11 +47,13 @@
 //!
 //! ## 5. Coordinates
 //! Points are stored relative to the path's origin, the top-left of its unpadded bounds, and
-//! each chunk carries `anchor = origin - rect.xy`. A container's alignment shift
-//! (`Context.shift`) moves `rect.xy` only and `anchor` is a difference, so the stroke moves
-//! with the rect and the registry rule "geometry is relative to `rect`" holds. A chunk's rect
-//! is its bounds padded by `width / 2 + aa_pad`, which holds every fragment with coverage at
-//! display scales of 1 and above.
+//! each chunk carries `anchor = origin - rect.xy`. `polyline_at` takes the origin from the
+//! caller instead: a lane anchored at its rect keeps the stored value of every point that did
+//! not move when its bounds change, so a changed sample uploads one point. A container's
+//! alignment shift (`Context.shift`) moves `rect.xy` only and `anchor` is a difference, so the
+//! stroke moves with the rect and the registry rule "geometry is relative to `rect`" holds. A
+//! chunk's rect is its bounds padded by `width / 2 + aa_pad`, which holds every fragment with
+//! coverage at display scales of 1 and above.
 //!
 //! ## 6. Hit Testing
 //! `distance_to_polyline` is the CPU twin of the stroke distance. `ui.Context.path_area`
@@ -292,6 +294,39 @@ fn segment_at(points: []const Point, index: u32, x: f32, y: f32) f32 {
 /// pool, or the batch list could not take all of it; nothing is kept then and the refusal is
 /// counted in `cx.overflow_count`.
 pub fn polyline(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?Placed {
+    const bounds = bounds_of(points);
+    const first = append_from(cx, points, .{ bounds.x, bounds.y }, stroke, clip) orelse {
+        return null;
+    };
+    return .{ .first = first, .count = @intCast(points.len), .bounds = bounds };
+}
+
+/// Appends the stroke through `points` like `polyline`, but stores the points relative to
+/// `origin` instead of their bounds' top-left (section 5). With a fixed origin, a path whose
+/// bounds change keeps every unmoved point's stored value, so moving one point uploads one
+/// point (an automation lane). Returns false when refused. A path placed this way has no
+/// `Placed` and cannot take a path area, whose points must be relative to their bounds.
+pub fn polyline_at(
+    cx: anytype,
+    points: []const Point,
+    origin: Point,
+    stroke: Stroke,
+    clip: Clip,
+) bool {
+    assert(origin[0] == origin[0]);
+    assert(origin[1] == origin[1]);
+    return append_from(cx, points, origin, stroke, clip) != null;
+}
+
+/// The appender behind `polyline` and `polyline_at`: the points relative to `origin`, then
+/// one instance per chunk. Returns the first point's pool index, or null when refused.
+fn append_from(
+    cx: anytype,
+    points: []const Point,
+    origin: Point,
+    stroke: Stroke,
+    clip: Clip,
+) ?u32 {
     assert(points.len >= 2);
     assert(stroke.width > 0);
     assert(clip.x1 > clip.x0);
@@ -303,15 +338,14 @@ pub fn polyline(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) 
         return null;
     }
     const first = cx.reserve_points(count) orelse return null;
-    const bounds = bounds_of(points);
     for (cx.points[first..][0..count], points) |*stored, point| {
-        stored.* = .{ point[0] - bounds.x, point[1] - bounds.y };
+        stored.* = .{ point[0] - origin[0], point[1] - origin[1] };
     }
     const last = count - 1;
     var start: u32 = 0;
     while (start < last) {
         const end = chunk_end(points, start, stroke.width);
-        const instance = chunk_of(points, start, end, first, bounds, stroke, clip);
+        const instance = chunk_of(points, start, end, first, origin, stroke, clip);
         cx.append(types.Path, null, instance) catch |err| switch (err) {
             // Only the first chunk can open a batch: the rest share its layer and type.
             error.BatchFull => {
@@ -323,7 +357,7 @@ pub fn polyline(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) 
         };
         start = end;
     }
-    return .{ .first = first, .count = count, .bounds = bounds };
+    return first;
 }
 
 /// Flattens the cubic and appends it as `polyline` does.
@@ -350,13 +384,14 @@ pub fn plot(
     return polyline(cx, points[0..samples.len], stroke, clip);
 }
 
-/// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index.
+/// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index
+/// and `origin` the point its stored points are relative to.
 fn chunk_of(
     points: []const Point,
     start: u32,
     end: u32,
     first: u32,
-    origin: Rect,
+    origin: Point,
     stroke: Stroke,
     clip: Clip,
 ) types.Path {
@@ -370,8 +405,8 @@ fn chunk_of(
         .rect = .{ x, y, box.width + 2 * pad, box.height + 2 * pad },
         .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
         .color = stroke.color,
-        .anchor_x = origin.x - x,
-        .anchor_y = origin.y - y,
+        .anchor_x = origin[0] - x,
+        .anchor_y = origin[1] - y,
         .width = stroke.width,
         .hover = stroke.hover,
         .first_point = @floatFromInt(first + start),
@@ -722,4 +757,33 @@ test "a shift moves the stroke with its rects" {
         try testing.expectApproxEqAbs(before[index], after, 1.0e-5);
     }
     try testing.expect(before[0] > 0.4);
+}
+
+// Locks `polyline_at`: points are stored relative to the given origin (here the lane rect's
+// top-left, 20 and 30), raising one sample above the others changes that one stored point
+// while the bounds' top-left moves, and the stroke draws where `polyline` draws it.
+test "a path anchored at a fixed origin stores points relative to it" {
+    const cx = new_context();
+    var samples: [8]f32 = @splat(0.5);
+    var points: [8]Point = undefined;
+    const lane: Rect = .{ .x = 20, .y = 30, .width = 70, .height = 40 };
+    plot_points(&points, &samples, lane, .{ 0, 1 });
+    try testing.expect(polyline_at(cx, &points, .{ lane.x, lane.y }, cable_stroke, window));
+    var before: [8]Point = undefined;
+    @memcpy(&before, cx.point_items()[0..8]);
+    try testing.expectEqual(Point{ 0, 20 }, before[0]);
+    try testing.expectEqual(Point{ 70, 20 }, before[7]);
+    const flat = composite(cx, 85, 50, 1);
+    cx.reset();
+    samples[3] = 1;
+    plot_points(&points, &samples, lane, .{ 0, 1 });
+    try testing.expect(polyline_at(cx, &points, .{ lane.x, lane.y }, cable_stroke, window));
+    var changed: u32 = 0;
+    for (before, cx.point_items()[0..8]) |old, new| {
+        if (old[0] != new[0] or old[1] != new[1]) changed += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), changed);
+    try testing.expectEqual(Point{ 30, 0 }, cx.point_items()[3]);
+    try testing.expectApproxEqAbs(flat, composite(cx, 85, 50, 1), 1.0e-5);
+    try testing.expect(flat > 0.4);
 }
