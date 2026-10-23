@@ -4,7 +4,7 @@
 //!
 //! ## 1. Why a Comptime Contract, Not a Vtable
 //! Each host is compiled once per app and per target, so the app type is known at compile
-//! time and the hosts call `App.init`, `App.layout`, and the rest as ordinary functions: no
+//! time and the hosts call `App.init`, `App.event`, and the rest as ordinary functions: no
 //! function pointer, no dynamic dispatch, no allocation. `check` turns a missing or mistyped
 //! declaration into a build error that names it.
 //!
@@ -20,47 +20,44 @@
 //!         },
 //!     };
 //!     pub fn init(app: *App, textures: *patchwork.draw.Textures) void
-//!     pub fn layout(app: *App, width_logical: u32, height_logical: u32) void
-//!     pub fn event(app: *App, event: patchwork.input.Event) bool      // true: dirty
-//!     pub fn timer(app: *App, now_ms: u64) bool                      // true: dirty
-//!     pub fn live(app: *const App) bool
-//!     pub fn dirty(app: *const App) bool
+//!     pub fn event(app: *App, cx: *patchwork.app.Context(App), event: patchwork.input.Event) void
+//!     pub fn timer(app: *App, cx: *patchwork.app.Context(App), now_ms: u64) void
 //!     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 //! };
 //! ```
-//! - `init` runs once before any other call and leaves the app ready for `layout`. It may
-//!   create textures and queue their pixels; the renderer records them into the next stream,
-//!   so `init` may run before the GPU device exists. Queued bytes must stay valid until then.
-//! - `layout` places the widgets for a window of `width_logical` by `height_logical` UI
-//!   logical pixels. Hosts call it only when the logical window size changed (see
-//!   `Frame.relayout`). It must leave `dirty()` true so the next `draw` rebuilds the lists.
-//! - `event` applies one pointer, wheel, or `frame` event. The `frame` event carries the
-//!   animator step in milliseconds. It returns true when a visible value changed.
-//! - `timer` runs when the host timer expires. When `config.timer_period_ms` is 0 the hosts
-//!   never call it, and it exists only to satisfy the contract.
-//! - `live` is true while an animator has not settled. It gates frame callbacks, so a
-//!   settled app costs nothing.
-//! - `dirty` is true when `draw` has work to do. The host resets the context, then `draw`
-//!   appends every instance and must leave `dirty()` false. The hosts assert the latter.
-//!   The hosts also call `draw` on a clean app when the context's glyph cache owes a draw
-//!   (`text/cache.zig`: the display scale changed since the last draw, or glyphs were
-//!   skipped for the per-frame budget or a full atlas), so `draw` must be repeatable: a
-//!   clean app draws the same instances again.
+//! - `init` runs once before any other call. It may create textures and queue their pixels;
+//!   the renderer records them into the next stream, so `init` may run before the GPU device
+//!   exists. Queued bytes must stay valid until then.
+//! - `event` applies one pointer, wheel, or `frame` event; the `frame` event carries the
+//!   animator step in milliseconds. The app routes it to each widget's `handle`, which
+//!   resolves it with `cx.hit` against the areas of the last draw (`ui/cx.zig`). A visible
+//!   change calls `cx.redraw()`; an animator still moving calls `cx.keep_animating()`, which
+//!   gates frame callbacks, so a settled app costs nothing.
+//! - `timer` runs when the host timer expires and calls `cx.redraw()` when a visible value
+//!   changed. When `config.timer_period_ms` is 0 the hosts never call it.
+//! - `draw` lays out and appends every instance into the reset context, recording hit areas
+//!   as it goes. There is no separate layout call: the window size is `cx.window`, and a
+//!   resize only marks a draw as owed. The hosts call `draw` when `cx.dirty` is set or when
+//!   the context's glyph cache owes a draw (`text/cache.zig`: the display scale changed, or
+//!   glyphs were skipped for the per-frame budget or a full atlas), so `draw` must be
+//!   repeatable: unchanged state draws the same instances again. It must not call `redraw`.
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
-//! type's id is its index. `config.batch_cap` (default 256) bounds the batches per frame.
-//! `Context(App)` is the draw context type built from them, which `draw` receives. `check`
-//! rejects an empty or oversized list, a type that breaks the instance convention (the
-//! message names the type; see `draw/registry.zig`), a zero cap, and a `batch_cap` whose worst
-//! frame would not fit one command buffer.
+//! type's id is its index. `config.batch_cap` (default 256) bounds the batches per frame and
+//! `config.area_cap` (default 1024) the hit areas. `Context(App)` is the UI context built
+//! from them (`ui.Context`, which embeds the draw context as `cx.draw`). `check` rejects an
+//! empty or oversized list, a type that breaks the instance convention (the message names
+//! the type; see `draw/registry.zig`), a zero cap, a `batch_cap` whose worst frame would not
+//! fit one command buffer, and an `area_cap` outside `1 .. areas.area_cap_max`.
 //!
 //! ## 3. Host Order Per Wake
-//! Drain queued events into `event`. When a frame callback completes, call `event(.frame)`.
-//! When the timer expires, call `timer`. At present time call `layout` if the window
-//! changed, then, if `dirty()` or `context.text.owes_draw(scale_120)`, set
-//! `context.text.scale_120`, reset the context, and call `draw`. After presenting, a cache
-//! that still owes a draw requests another frame.
+//! Drain queued events through `ui.dispatch`. When a frame callback completes, call
+//! `ui.animate`, which dispatches `.frame` and reports whether to keep animating. When the
+//! timer expires, call `timer`. A changed window size calls `cx.redraw()`. At present time
+//! `ui.draw_frame` draws if `cx.dirty` or the glyph cache owes a draw, then re-resolves hover
+//! under the pointer. After presenting, a context that is dirty again or a cache that still
+//! owes a draw requests another frame.
 //!
 //! ## 4. The Optional Timer
 //! `timer_period_ms == 0` means no timer. The native host then creates no `timerfd` and
@@ -78,6 +75,8 @@ const commands = @import("gpu/commands.zig");
 const input = @import("input.zig");
 const registry = @import("draw/registry.zig");
 const renderer = @import("draw/renderer.zig");
+const ui = @import("ui.zig");
+const areas = @import("ui/areas.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
 pub const Config = struct {
@@ -89,11 +88,15 @@ pub const Config = struct {
     draw: []const quads.DrawType,
     /// Upper bound on batches per frame: distinct (layer, type, texture) runs.
     batch_cap: u32 = 256,
+    /// Upper bound on hit areas per frame; the rest are counted and not hittable.
+    area_cap: u32 = 1024,
 };
 
-/// The draw context type `App.draw` receives, built from `App.config`.
+/// The UI context type `App.event`, `App.timer`, and `App.draw` receive, built from
+/// `App.config`.
 pub fn Context(comptime App: type) type {
-    return quads.Context(App.config.draw, App.config.batch_cap);
+    const Draw = quads.Context(App.config.draw, App.config.batch_cap);
+    return ui.Context(Draw, App.config.area_cap);
 }
 
 /// Upper bound for `Config.timer_period_ms`, chosen so a period given in the wrong unit is
@@ -103,8 +106,12 @@ pub const timer_period_ms_max: u32 = 1000;
 
 /// Returns null when `App` satisfies the contract, otherwise a message naming the first
 /// problem. Pure, so tests can check failure cases without a compile error. Signature types
-/// are compared exactly, which is why `live` and `dirty` must take `*const App`.
+/// are compared exactly.
 pub fn conformance(comptime App: type) ?[]const u8 {
+    // Comparing the signatures instantiates `Context(App)`: the draw pools, the registry's
+    // generated tables, and the UI context. That comptime work exceeds the default quota of
+    // 1000 backward branches for an app with several draw types.
+    @setEvalBranchQuota(20_000);
     if (!@hasDecl(App, "config")) {
         return "App must declare `pub const config: patchwork.app.Config`";
     }
@@ -124,14 +131,17 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     if (frame_bytes > commands.capacity) {
         return "App.config.batch_cap is too large: its worst frame exceeds the command buffer";
     }
-    const names = [_][]const u8{ "init", "layout", "event", "timer", "live", "dirty", "draw" };
+    if (App.config.area_cap == 0) {
+        return "App.config.area_cap must be at least 1";
+    }
+    if (App.config.area_cap > areas.area_cap_max) {
+        return "App.config.area_cap must be at most 65536";
+    }
+    const names = [_][]const u8{ "init", "event", "timer", "draw" };
     const expected = [_]type{
         fn (*App, *quads.Textures) void,
-        fn (*App, u32, u32) void,
-        fn (*App, input.Event) bool,
-        fn (*App, u64) bool,
-        fn (*const App) bool,
-        fn (*const App) bool,
+        fn (*App, *Context(App), input.Event) void,
+        fn (*App, *Context(App), u64) void,
         fn (*App, *Context(App)) void,
     };
     inline for (names, expected) |name, signature| {
@@ -193,28 +203,15 @@ const GoodApp = struct {
         _ = app;
         _ = textures;
     }
-    pub fn layout(app: *GoodApp, width_logical: u32, height_logical: u32) void {
+    pub fn event(app: *GoodApp, cx: *Context(GoodApp), event_value: input.Event) void {
         _ = app;
-        _ = width_logical;
-        _ = height_logical;
-    }
-    pub fn event(app: *GoodApp, event_value: input.Event) bool {
-        _ = app;
+        _ = cx;
         _ = event_value;
-        return false;
     }
-    pub fn timer(app: *GoodApp, now_ms: u64) bool {
+    pub fn timer(app: *GoodApp, cx: *Context(GoodApp), now_ms: u64) void {
         _ = app;
+        _ = cx;
         _ = now_ms;
-        return false;
-    }
-    pub fn live(app: *const GoodApp) bool {
-        _ = app;
-        return false;
-    }
-    pub fn dirty(app: *const GoodApp) bool {
-        _ = app;
-        return false;
     }
     pub fn draw(app: *GoodApp, cx: *Context(GoodApp)) void {
         _ = app;
@@ -228,28 +225,15 @@ const NoDraw = struct {
         _ = app;
         _ = textures;
     }
-    pub fn layout(app: *NoDraw, width_logical: u32, height_logical: u32) void {
+    pub fn event(app: *NoDraw, cx: *Context(NoDraw), event_value: input.Event) void {
         _ = app;
-        _ = width_logical;
-        _ = height_logical;
-    }
-    pub fn event(app: *NoDraw, event_value: input.Event) bool {
-        _ = app;
+        _ = cx;
         _ = event_value;
-        return false;
     }
-    pub fn timer(app: *NoDraw, now_ms: u64) bool {
+    pub fn timer(app: *NoDraw, cx: *Context(NoDraw), now_ms: u64) void {
         _ = app;
+        _ = cx;
         _ = now_ms;
-        return false;
-    }
-    pub fn live(app: *const NoDraw) bool {
-        _ = app;
-        return false;
-    }
-    pub fn dirty(app: *const NoDraw) bool {
-        _ = app;
-        return false;
     }
 };
 
@@ -263,30 +247,34 @@ const SlowTimer = struct {
     pub const config: Config = .{ .title = "slow", .timer_period_ms = 5000, .draw = &test_draw };
 };
 
-const WrongLive = struct {
-    pub const config: Config = .{ .title = "wrong", .timer_period_ms = 0, .draw = &test_draw };
-    pub fn init(app: *WrongLive, textures: *quads.Textures) void {
+const NoAreas = struct {
+    pub const config: Config = .{
+        .title = "no areas",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .area_cap = 0,
+    };
+};
+
+const HugeAreas = struct {
+    pub const config: Config = .{
+        .title = "huge areas",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .area_cap = 65537,
+    };
+};
+
+const OldEvent = struct {
+    pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
+    pub fn init(app: *OldEvent, textures: *quads.Textures) void {
         _ = app;
         _ = textures;
     }
-    pub fn layout(app: *WrongLive, width_logical: u32, height_logical: u32) void {
-        _ = app;
-        _ = width_logical;
-        _ = height_logical;
-    }
-    pub fn event(app: *WrongLive, event_value: input.Event) bool {
+    // The step-13 shape: no context, and a dirty flag returned instead of `cx.redraw()`.
+    pub fn event(app: *OldEvent, event_value: input.Event) bool {
         _ = app;
         _ = event_value;
-        return false;
-    }
-    pub fn timer(app: *WrongLive, now_ms: u64) bool {
-        _ = app;
-        _ = now_ms;
-        return false;
-    }
-    // Takes a mutable pointer where the contract demands `*const`.
-    pub fn live(app: *WrongLive) bool {
-        _ = app;
         return false;
     }
 };
@@ -303,19 +291,28 @@ test "a missing declaration is reported by name" {
     const missing = comptime conformance(NoDraw).?;
     try std.testing.expect(std.mem.find(u8, missing, "draw") != null);
     try std.testing.expect(!@hasDecl(NoDraw, "draw"));
-    try std.testing.expect(@hasDecl(NoDraw, "dirty"));
+    try std.testing.expect(@hasDecl(NoDraw, "timer"));
 }
 
 // Locks the remaining rejections: missing config, over-limit timer period, and a signature
-// mismatch (the message names both the member and the expected `*const` type).
-test "a missing config, a slow timer, and a mistyped live are rejected" {
+// mismatch (an `event` of the step-13 shape names the member and the context type).
+test "a missing config, a slow timer, and an old event signature are rejected" {
     const no_config = comptime conformance(NoConfig).?;
     try std.testing.expect(std.mem.find(u8, no_config, "config") != null);
     const slow = comptime conformance(SlowTimer).?;
     try std.testing.expect(std.mem.find(u8, slow, "1000") != null);
-    const wrong = comptime conformance(WrongLive).?;
-    try std.testing.expect(std.mem.find(u8, wrong, "live") != null);
-    try std.testing.expect(std.mem.find(u8, wrong, "*const") != null);
+    const wrong = comptime conformance(OldEvent).?;
+    try std.testing.expect(std.mem.find(u8, wrong, "event") != null);
+    try std.testing.expect(std.mem.find(u8, wrong, "Context") != null);
+}
+
+// Locks the area capacity bounds: zero and one past `area_cap_max` are rejected by name.
+test "an area cap of zero or above the maximum is rejected" {
+    const none = comptime conformance(NoAreas).?;
+    try std.testing.expect(std.mem.find(u8, none, "area_cap") != null);
+    const huge = comptime conformance(HugeAreas).?;
+    try std.testing.expect(std.mem.find(u8, huge, "65536") != null);
+    try std.testing.expectEqual(@as(u32, 65536), areas.area_cap_max);
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and

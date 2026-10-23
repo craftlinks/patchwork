@@ -29,8 +29,9 @@
 //!
 //! ## 3. Damage Flags (Why Two)
 //! Presenting costs power, so an idle app must present nothing. `Frame` separates
-//! `redraw` (the framebuffer must be presented) from `relayout` (logical bounds changed and
-//! `App.layout` must run). A scale change alters only the framebuffer size, so it sets
+//! `redraw` (the framebuffer must be presented) from `relayout` (logical bounds changed, so
+//! the hosts mark the UI context dirty: layout happens while drawing, `ui/cx.zig`, so a new
+//! size only owes a draw). A scale change alters only the framebuffer size, so it sets
 //! `redraw` and never `relayout`: logical geometry is unchanged. The hosts still redraw the
 //! scene on that present, because glyphs are rasterized and snapped at the device scale
 //! (`text/cache.zig`, `Cache.owes_draw`); only the glyph records change. A pointer-driven
@@ -159,7 +160,7 @@ pub const Frame = struct {
     running: bool,
     /// True when the framebuffer must be presented.
     redraw: bool,
-    /// True when logical bounds changed and `App.layout` must run. Scale changes never set it.
+    /// True when logical bounds changed and the app owes a draw. Scale changes never set it.
     relayout: bool,
     /// Window width in UI logical pixels. Zero until the first configure.
     width_logical: u32,
@@ -244,7 +245,7 @@ pub const Frame = struct {
         assert(self.width_px != 0);
     }
 
-    /// Clears `relayout` once the app has laid out for the current logical size.
+    /// Clears `relayout` once the host has marked a draw owed for the current logical size.
     /// Asserts `relayout` was set, so a present after a scale change alone cannot call it.
     pub fn mark_laid_out(self: *Frame) void {
         assert(self.running);

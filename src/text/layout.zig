@@ -46,7 +46,6 @@ const text = @import("../text.zig");
 const ttf = @import("ttf.zig");
 const cache = @import("cache.zig");
 const types = @import("../draw/types.zig");
-const turtle = @import("../turtle.zig");
 const draw = @import("../draw.zig");
 
 /// The codepoint drawn for invalid UTF-8.
@@ -112,7 +111,7 @@ pub fn place(
     cx: anytype,
     style: text.Style,
     utf8: []const u8,
-    rect: turtle.Rect,
+    rect: draw.Rect,
     clip: draw.Clip,
     options: text.Options,
 ) void {
@@ -126,7 +125,7 @@ pub fn place(
 pub fn place_runs(
     cx: anytype,
     runs: []const text.Run,
-    rect: turtle.Rect,
+    rect: draw.Rect,
     clip: draw.Clip,
     options: text.Options,
 ) void {
@@ -377,7 +376,7 @@ test "invalid UTF-8 becomes U+FFFD one byte at a time" {
 // offsets 0, gap / 2, and gap (each snapped to a whole pixel), and vertical centering puts the
 // baseline at round(top + ascent) with top = y + (height - line height) / 2.
 test "alignment offsets the pen by zero, half the gap, and the gap" {
-    const rect: turtle.Rect = .{ .x = 10, .y = 20, .width = 200, .height = 40 };
+    const rect: draw.Rect = .{ .x = 10, .y = 20, .width = 200, .height = 40 };
     var x: [3]f32 = undefined;
     var y: f32 = 0;
     for ([_]text.Align{ .start, .center, .end }, 0..) |alignment, index| {
@@ -410,7 +409,7 @@ test "alignment offsets the pen by zero, half the gap, and the gap" {
 // last glyph is the ellipsis, and a rect narrower than the ellipsis draws nothing.
 test "ellipsis cuts the line so it fits the rect" {
     const long = "Patchwork draws text";
-    const rect: turtle.Rect = .{ .x = 0, .y = 0, .width = 80, .height = 24 };
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 80, .height = 24 };
     const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
     const cut = cut_of(&.{.{ .style = sans_16, .bytes = long }}, rect.width);
     try testing.expect(cut.fits);
@@ -425,7 +424,7 @@ test "ellipsis cuts the line so it fits the rect" {
     try testing.expect(last.rect[0] + last.rect[2] <= rect.x + rect.width);
     // The ellipsis glyph is three dots: wider than tall, sitting on the baseline.
     try testing.expect(last.rect[2] > last.rect[3]);
-    const narrow: turtle.Rect = .{ .x = 0, .y = 0, .width = ellipsis * 0.5, .height = 24 };
+    const narrow: draw.Rect = .{ .x = 0, .y = 0, .width = ellipsis * 0.5, .height = 24 };
     const empty = test_context(120);
     place(empty, sans_16, long, narrow, window, options);
     try testing.expectEqual(@as(usize, 0), empty.items(types.Glyph).len);
@@ -435,7 +434,7 @@ test "ellipsis cuts the line so it fits the rect" {
 // UV rect spans exactly the quad's device size in texels (no half-texel inset).
 test "glyph quads snap to the device grid at a fractional scale" {
     const cx = test_context(180);
-    const rect: turtle.Rect = .{ .x = 10.3, .y = 7.1, .width = 300, .height = 30 };
+    const rect: draw.Rect = .{ .x = 10.3, .y = 7.1, .width = 300, .height = 30 };
     const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
     place(cx, sans_16, "Snap \u{e9}", rect, window, options);
     const glyphs = cx.items(types.Glyph);
@@ -456,7 +455,7 @@ test "runs of different sizes share one baseline" {
     const cx = test_context(120);
     const big: text.Style = .{ .face = .mono, .size = 32, .color = .{ 1, 1, 1, 1 } };
     const small: text.Style = .{ .face = .sans_bold, .size = 14, .color = .{ 1, 1, 1, 1 } };
-    const rect: turtle.Rect = .{ .x = 0, .y = 0, .width = 400, .height = 52 };
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 400, .height = 52 };
     const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
     place_runs(cx, &.{
         .{ .style = big, .bytes = "H" },

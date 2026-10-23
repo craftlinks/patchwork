@@ -21,32 +21,20 @@ const MissingDraw = struct {
         _ = textures;
     }
 
-    pub fn layout(app: *MissingDraw, width_logical: u32, height_logical: u32) void {
+    pub fn event(
+        app: *MissingDraw,
+        cx: *patchwork.app.Context(MissingDraw),
+        event_value: patchwork.input.Event,
+    ) void {
         _ = app;
-        _ = width_logical;
-        _ = height_logical;
-    }
-
-    pub fn event(app: *MissingDraw, event_value: patchwork.input.Event) bool {
-        _ = app;
+        _ = cx;
         _ = event_value;
-        return false;
     }
 
-    pub fn timer(app: *MissingDraw, now_ms: u64) bool {
+    pub fn timer(app: *MissingDraw, cx: *patchwork.app.Context(MissingDraw), now_ms: u64) void {
         _ = app;
+        _ = cx;
         _ = now_ms;
-        return false;
-    }
-
-    pub fn live(app: *const MissingDraw) bool {
-        _ = app;
-        return false;
-    }
-
-    pub fn dirty(app: *const MissingDraw) bool {
-        _ = app;
-        return false;
     }
 };
 

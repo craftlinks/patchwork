@@ -36,14 +36,19 @@
 //!   Otherwise `timer` runs the app's timer, requests a redraw if it reports a change, and
 //!   never steps animators or chains rAF.
 //! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
-//!   `.frame`, presents if dirty, and returns 1 while `app.live()` or while a redraw is still
-//!   owed (the glyph cache skipped glyphs for its per-frame budget or a full atlas, so it
-//!   requested another frame). Returning 0 ends the rAF chain, and `clock.reset` makes the
-//!   next sample after idle report a zero delta.
-//! - `present_frame` calls `App.draw` when `app.dirty()` or when the glyph cache owes a draw
-//!   (`Cache.owes_draw`: the scale changed since the last draw, or glyphs are pending).
+//!   `.frame` through `ui.animate`, presents if dirty, and returns 1 while a widget keeps
+//!   animating (`cx.keep_animating`) or while a redraw is still owed (the glyph cache skipped
+//!   glyphs for its per-frame budget or a full atlas, or the hover a draw re-resolved owes
+//!   another). Returning 0 ends the rAF chain, and `clock.reset` makes the next sample after
+//!   idle report a zero delta.
+//! - Pointer exports dispatch through `ui.dispatch`, and `timer` calls `App.timer`; each
+//!   requests a frame when the UI context is dirty afterwards.
+//! - `present_frame` runs `ui.draw_frame`, which calls `App.draw` when the context is dirty
+//!   or the glyph cache owes a draw (`Cache.owes_draw`: the scale changed since the last
+//!   draw, or glyphs are pending). A changed canvas size only marks the context dirty,
+//!   because layout happens while drawing.
 //! - `start` submits the setup stream, then leaves the draw pools empty and `relayout` set;
-//!   the first layout walk happens in `present_frame` after `resize` has supplied real canvas
+//!   the first draw happens in `present_frame` after `resize` has supplied real canvas
 //!   dimensions.
 //! - `resize(css_width, css_height, scale_120)` receives the canvas size in CSS pixels, which
 //!   are the logical pixels layout uses, and `round(devicePixelRatio * 120)`. `Frame` derives
@@ -72,6 +77,7 @@ const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
+const ui = @import("../ui.zig");
 
 /// Linear-memory address of the op table (`commands.table_json`), UTF-8 JSON.
 fn commands_json_ptr() callconv(.c) [*]const u8 {
@@ -111,7 +117,7 @@ pub fn export_app(comptime App: type) void {
 fn WebApp(comptime App: type) type {
     return struct {
         const Context = app_contract.Context(App);
-        const Renderer = renderer.Renderer(Context);
+        const Renderer = renderer.Renderer(Context.DrawContext);
 
         const State = struct {
             frame: frame.Frame,
@@ -129,7 +135,7 @@ fn WebApp(comptime App: type) type {
         /// the setup stream. Called once by JavaScript after the device exists. The app runs
         /// first, as on native, so the textures it creates are in the setup stream and its
         /// per-op validation scopes. The pools stay empty and `relayout` stays set because the
-        /// first layout needs the canvas size that only `resize` supplies. Returns the dirty
+        /// first draw needs the canvas size that only `resize` supplies. Returns the dirty
         /// flag (see `dirty_flag`).
         fn start() callconv(.c) u32 {
             state.frame = frame.Frame.init();
@@ -138,14 +144,14 @@ fn WebApp(comptime App: type) type {
             state.commands.count = 0;
             context.init();
             render.init();
-            App.init(&app, &context.textures);
-            render.setup(&state.commands, &context);
+            App.init(&app, &context.draw.textures);
+            render.setup(&state.commands, &context.draw);
             var unused: gpu.Gpu = .{};
             gpu.submit(&unused, &state.commands) catch unreachable;
             assert(state.frame.running);
             assert(state.frame.relayout);
-            assert(context.batch_count == 0);
-            assert(!app.live());
+            assert(context.draw.batch_count == 0);
+            assert(context.dirty);
             return dirty_flag();
         }
 
@@ -223,7 +229,8 @@ fn WebApp(comptime App: type) type {
         fn timer(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(App.config.timer_period_ms != 0);
-            if (app.timer(now_ms)) {
+            App.timer(&app, &context, now_ms);
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
             assert(state.frame.running);
@@ -236,21 +243,22 @@ fn WebApp(comptime App: type) type {
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             const dt_ms = state.clock.advance(now_ms);
-            if (app.event(.{ .frame = dt_ms })) {
+            const animating = ui.animate(App, &app, &context, dt_ms);
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
             present_frame();
-            if (!app.live()) {
+            if (!animating) {
                 state.clock.reset();
-                assert(!app.live());
                 return dirty_flag();
             }
-            assert(app.live());
+            assert(animating);
             return 1;
         }
 
         fn note_event(event: input.Event) u32 {
-            if (app.event(event)) {
+            ui.dispatch(App, &app, &context, event);
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
             assert(state.frame.running);
@@ -268,22 +276,24 @@ fn WebApp(comptime App: type) type {
                 return;
             }
             if (state.frame.relayout) {
-                app.layout(state.frame.width_logical, state.frame.height_logical);
                 state.frame.mark_laid_out();
+                context.redraw();
             }
             assert(!state.frame.relayout);
             const scale_120 = state.frame.scale_120;
-            if (app.dirty() or context.text.owes_draw(scale_120)) {
-                context.text.scale_120 = scale_120;
-                context.reset();
-                app.draw(&context);
-            }
-            assert(!app.dirty());
-            assert(context.text.drawn_scale_120 == scale_120);
+            _ = ui.draw_frame(
+                App,
+                &app,
+                &context,
+                state.frame.width_logical,
+                state.frame.height_logical,
+                scale_120,
+            );
+            assert(context.draw.text.drawn_scale_120 == scale_120);
             // Spans must outlive the host call; module guide section 3 explains why static
             // storage is enough.
             state.commands.reset();
-            render.frame(&state.commands, &context, .{
+            render.frame(&state.commands, &context.draw, .{
                 .width_logical = state.frame.width_logical,
                 .height_logical = state.frame.height_logical,
                 .width_px = state.frame.width_px,
@@ -294,9 +304,12 @@ fn WebApp(comptime App: type) type {
             gpu.submit(&unused, &state.commands) catch unreachable;
             state.frame.mark_presented();
             assert(!state.frame.redraw);
-            assert(!app.dirty());
-            // Glyphs skipped for the budget or a full atlas finish on the next frame.
-            if (context.text.owes_draw(scale_120)) {
+            // Glyphs skipped for the budget or a full atlas finish on the next frame, and a
+            // hover that the redraw moved (`ui.draw_frame`) may have owed another draw.
+            if (context.draw.text.owes_draw(scale_120)) {
+                state.frame.request_redraw();
+            }
+            if (context.dirty) {
                 state.frame.request_redraw();
             }
         }

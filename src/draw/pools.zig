@@ -42,6 +42,12 @@
 //! and `append`. The renderer compares it with its shadow to skip unchanged pools without
 //! looking at their records; see `draw/renderer.zig`.
 //!
+//! ## 5a. Shifting a Range
+//! `counts` snapshots every pool's count and `shift` adds a delta to `rect.xy` of everything
+//! appended since. The UI layer uses the pair to align a container after its children drew
+//! (`ui/cx.zig`). Keys, layers, and append order are untouched, so sorting and batching are
+//! unaffected; the cost is linear in the shifted instances only.
+//!
 //! ## 6. TigerStyle Invariants
 //! - All storage is fixed arrays sized at compile time from `App.config.draw` and
 //!   `batch_cap`; the hosts keep the context in static memory (BSS on wasm).
@@ -280,6 +286,38 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
             return @fromBackingInt(@intCast(pool.keys[index] / P.texture_slots));
         }
 
+        /// The instance count of every pool, indexed by type id. The UI layer records it
+        /// when a container begins, so `shift` can move exactly what the container drew.
+        pub fn counts(self: *const Self) [R.count]u32 {
+            var out: [R.count]u32 = undefined;
+            inline for (0..R.count) |index| {
+                out[index] = self.pools[index].count;
+            }
+            assert(out.len == R.count);
+            return out;
+        }
+
+        /// Adds `(dx, dy)` to `rect.xy` of every instance appended since `starts` (from
+        /// `counts`), in every pool and on every layer. Only `rect` moves: every draw type
+        /// expresses its geometry relative to `rect` (`draw/registry.zig`, section 2), and
+        /// clips stay put. Pools are append-only until `finalize`, so `[start, count)` is
+        /// exactly what was drawn since `starts`. Bumps the revision of each moved pool.
+        pub fn shift(self: *Self, starts: [R.count]u32, dx: f32, dy: f32) void {
+            assert(!self.finalized);
+            assert(dx == dx);
+            assert(dy == dy);
+            inline for (0..R.count) |index| {
+                const pool = &self.pools[index];
+                const P = @TypeOf(pool.*);
+                const start = starts[index];
+                assert(start <= pool.count);
+                if (start < pool.count) {
+                    shift_items(P.Item, pool.items[start..pool.count], dx, dy);
+                    pool.revision += 1;
+                }
+            }
+        }
+
         /// The batches `finalize` formed, in draw order.
         pub fn batch_list(self: *const Self) []const Batch {
             assert(self.finalized);
@@ -346,6 +384,17 @@ pub fn Context(comptime entries: []const registry.DrawType, comptime batch_cap: 
             unreachable;
         }
     };
+}
+
+/// The hot loop of `Context.shift`, over one pool's records.
+fn shift_items(comptime T: type, items: []T, dx: f32, dy: f32) void {
+    comptime assert(@offsetOf(T, "rect") == 0);
+    assert(items.len >= 1);
+    for (items) |*item| {
+        item.rect[0] += dx;
+        item.rect[1] += dy;
+    }
+    assert(items[0].rect[2] > 0);
 }
 
 fn prefix_starts(comptime P: type, pool: *P) void {
@@ -513,6 +562,30 @@ test "ordered appends skip the sort and textures split a type" {
     _ = cx.layer(.overlay);
     try cx.append(types.Box, null, test_box(1));
     try testing.expect(cx.pools[0].ordered);
+}
+
+// Locks that `shift` moves only what was appended after the snapshot, in every pool and on
+// every layer, leaves clips alone, and moves the revisions of the pools it touched.
+test "shift moves the instances appended since counts" {
+    const cx = new_context();
+    try cx.append(types.Box, null, test_box(0));
+    const starts = cx.counts();
+    try testing.expectEqual(@as(u32, 1), starts[0]);
+    try testing.expectEqual(@as(u32, 0), starts[1]);
+    try cx.append(types.Box, null, test_box(20));
+    _ = cx.layer(.overlay);
+    try cx.append(types.Glyph, .atlas, test_glyph(30));
+    const box_revision = cx.revision(types.Box);
+    const image_revision = cx.revision(types.Image);
+    cx.shift(starts, 5, -2);
+    const boxes = cx.items(types.Box);
+    try testing.expectEqual(@as(f32, 0), boxes[0].rect[0]);
+    try testing.expectEqual(@as(f32, 25), boxes[1].rect[0]);
+    try testing.expectEqual(@as(f32, -2), boxes[1].rect[1]);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 100, 100 }, &boxes[1].clip);
+    try testing.expectEqual(@as(f32, 35), cx.items(types.Glyph)[0].rect[0]);
+    try testing.expect(cx.revision(types.Box) > box_revision);
+    try testing.expectEqual(image_revision, cx.revision(types.Image));
 }
 
 // Locks the overflow rules: a full pool and a batch beyond `batch_cap` are refused, counted,
