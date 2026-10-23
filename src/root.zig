@@ -34,6 +34,13 @@ pub const host = struct {
     /// Protocol tables for `wp_fractional_scale_v1` and `wp_viewporter`; listed in the test
     /// root for the same reason as `wp_presentation`.
     pub const wp_fractional_scale = @import("host/wp_fractional_scale.zig");
+    /// Seat, cursor-shape, and data-device bindings and the clipboard state machine; listed
+    /// in the test root for the same reason. `host/xkb.zig` calls libxkbcommon from its test,
+    /// so it has its own root (`native_tests.zig`).
+    pub const wl_seat = @import("host/wl_seat.zig");
+    pub const wp_cursor_shape = @import("host/wp_cursor_shape.zig");
+    pub const wl_data_device = @import("host/wl_data_device.zig");
+    pub const clipboard = @import("host/clipboard.zig");
 };
 
 test {
@@ -50,6 +57,10 @@ test {
     _ = renderer;
     _ = host.wp_presentation;
     _ = host.wp_fractional_scale;
+    _ = host.wl_seat;
+    _ = host.wp_cursor_shape;
+    _ = host.wl_data_device;
+    _ = host.clipboard;
     // These two hosts carry layout asserts and tests shared with the web shell and the wgpu
     // pipelines; referencing them here makes those checks part of `zig build test`.
     _ = host.web_exports;

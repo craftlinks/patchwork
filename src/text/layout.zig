@@ -106,6 +106,24 @@ pub fn measure(style: text.Style, utf8: []const u8) f32 {
     return width;
 }
 
+/// The codepoint boundary of `utf8` nearest to `x` logical pixels from the pen start: the
+/// index of the first codepoint whose midpoint lies right of `x`, or the end. O(bytes).
+pub fn index_at(style: text.Style, utf8: []const u8, x: f32) u32 {
+    assert(utf8.len <= text.byte_cap);
+    assert(x == x);
+    const font = text.font_of(style.face);
+    var pen: f32 = 0;
+    var index: u32 = 0;
+    while (index < utf8.len) {
+        const start = index;
+        const width = glyph_width(font, decode(utf8, &index), style.size);
+        if (x < pen + width * 0.5) return start;
+        pen += width;
+    }
+    assert(index == utf8.len);
+    return index;
+}
+
 /// Lays out one run; see `place_runs`.
 pub fn place(
     cx: anytype,
@@ -347,6 +365,20 @@ test "measure of a mono string is count times advance" {
     try testing.expectEqual(@as(f32, 0), measure(mono, ""));
     // Two-byte "u with diaeresis" is one codepoint and one advance.
     try testing.expectEqual(@as(f32, 2 * 9.6), measure(mono, "\u{fc}a"));
+}
+
+// Locks the caret hit: in a 9.6 px monospace run each boundary owns the half advance on
+// either side, the far left is 0, the far right is the end, and a two-byte codepoint is one
+// step.
+test "index_at picks the nearest codepoint boundary" {
+    const mono: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 } };
+    try testing.expectEqual(@as(u32, 0), index_at(mono, "abc", -5));
+    try testing.expectEqual(@as(u32, 0), index_at(mono, "abc", 4.7));
+    try testing.expectEqual(@as(u32, 1), index_at(mono, "abc", 4.9));
+    try testing.expectEqual(@as(u32, 2), index_at(mono, "abc", 14.5));
+    try testing.expectEqual(@as(u32, 3), index_at(mono, "abc", 100));
+    try testing.expectEqual(@as(u32, 3), index_at(mono, "\u{e4}bc", 9.7 + 4.9));
+    try testing.expectEqual(@as(u32, 0), index_at(mono, "", 3));
 }
 
 // Locks the decoder's negative space: a truncated, overlong, surrogate, or stray byte each

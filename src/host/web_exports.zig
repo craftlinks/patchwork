@@ -59,6 +59,31 @@
 //! - Timing is host-driven: no Web Workers, no `SharedArrayBuffer`, and no cross-origin
 //!   isolation headers are required.
 //!
+//! ## 4a. Keyboard, Clipboard, and Cursor
+//! All key mapping lives in Zig, so `shell.js` stays a generic interpreter plus glue:
+//! - `key_down(len, mods, repeat)` and `key_up(len, mods)` read `KeyboardEvent.key` as UTF-8
+//!   from `input_ptr()` (a static `input_cap`-byte buffer that `shell.js` fills with
+//!   `TextEncoder.encodeInto`). `input.key_of_dom` names the key, and a value that is one
+//!   codepoint is the typed text (`input.key_press` filters it). `mods` is the `input.Mods`
+//!   byte: shift 1, ctrl 2, alt 4, meta 8. `key_down` returns bit 0 = a frame is owed and
+//!   bit 1 = consumed (`cx.consumed`): `shell.js` calls `preventDefault` only then, so Tab
+//!   leaves a canvas with nothing focusable and Ctrl+C, X, and V reach the page's clipboard
+//!   events. The browser repeats keys itself (`event.repeat`); Zig never repeats.
+//! - Copy and cut: a focused field handles Ctrl+C or Ctrl+X in `key_down` and calls
+//!   `cx.copy`; the page's `copy` or `cut` event that follows asks `copy_take()`, which returns
+//!   the length of that pending copy (0 for none) at `copy_ptr()`. `key_down` drops a stale
+//!   pending copy first, so a copy event only ever takes the text of its own keystroke.
+//! - Paste: the page's `paste` event writes the text into `input_ptr()` and calls
+//!   `paste(len)`, which dispatches `Event.paste` directly (never queued). A paste request
+//!   from a field is cleared and ignored, because the page event delivers the text anyway.
+//! - `window_focus(focused)` is the canvas `focus` and `blur`; a blur releases held keys.
+//! - `cursor()` is the `ui.Cursor` value to show, and `cursor_names_ptr/len` a JSON array of
+//!   the CSS names by value, generated from the enum at compile time, so `shell.js` holds no
+//!   cursor table.
+//! - Pointer presses and releases carry the button (0 left, 1 middle, 2 right: the DOM
+//!   numbering), the modifiers, and `event.timeStamp` in whole milliseconds, which the
+//!   library's click counting compares.
+//!
 //! ## 5. TigerStyle Invariants
 //! - `state`, the draw context, the renderer, and the app are static globals declared
 //!   `undefined`, so they occupy BSS rather than data: the module does not carry their bytes,
@@ -78,6 +103,49 @@ const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
 const ui = @import("../ui.zig");
+
+/// Bytes `shell.js` may write into the input buffer: a key name or a paste.
+pub const input_cap: u32 = ui.cx.clipboard_cap;
+
+/// The CSS cursor names indexed by `ui.Cursor` value, as a JSON array.
+pub const cursor_names_json: []const u8 = blk: {
+    var json: []const u8 = "[";
+    for (@typeInfo(ui.Cursor).@"enum".field_names, 0..) |name, index| {
+        var css: [name.len]u8 = name[0..name.len].*;
+        for (&css) |*byte| {
+            if (byte.* == '_') byte.* = '-';
+        }
+        const separator = if (index == 0) "" else ",";
+        json = json ++ separator ++ "\"" ++ css ++ "\"";
+    }
+    break :blk json ++ "]";
+};
+
+fn cursor_names_ptr() callconv(.c) [*]const u8 {
+    assert(cursor_names_json.len >= 2);
+    return cursor_names_json.ptr;
+}
+
+fn cursor_names_len() callconv(.c) u32 {
+    assert(cursor_names_json.len >= 2);
+    return @intCast(cursor_names_json.len);
+}
+
+/// The `input.Mods` byte `shell.js` sends; unused bits are dropped.
+fn mods_of(bits: u32) input.Mods {
+    const mods: input.Mods = @bitCast(@as(u8, @truncate(bits & 0x0F)));
+    assert(mods.unused == 0);
+    return mods;
+}
+
+/// The DOM button number: 0 left, 1 middle, 2 right. Others are treated as middle.
+fn button_of(number: u32) input.MouseButton {
+    return switch (number) {
+        0 => .left,
+        2 => .right,
+        else => .middle,
+    };
+}
 
 /// Linear-memory address of the op table (`commands.table_json`), UTF-8 JSON.
 fn commands_json_ptr() callconv(.c) [*]const u8 {
@@ -99,6 +167,8 @@ pub fn export_app(comptime App: type) void {
     const Web = WebApp(App);
     @export(&commands_json_ptr, .{ .name = "commands_json_ptr" });
     @export(&commands_json_len, .{ .name = "commands_json_len" });
+    @export(&cursor_names_ptr, .{ .name = "cursor_names_ptr" });
+    @export(&cursor_names_len, .{ .name = "cursor_names_len" });
     @export(&Web.start, .{ .name = "start" });
     @export(&Web.resize, .{ .name = "resize" });
     @export(&Web.width_px, .{ .name = "width_px" });
@@ -108,6 +178,15 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.pointer_up, .{ .name = "pointer_up" });
     @export(&Web.pointer_wheel, .{ .name = "pointer_wheel" });
     @export(&Web.pointer_leave, .{ .name = "pointer_leave" });
+    @export(&Web.input_ptr, .{ .name = "input_ptr" });
+    @export(&Web.input_capacity, .{ .name = "input_cap" });
+    @export(&Web.key_down, .{ .name = "key_down" });
+    @export(&Web.key_up, .{ .name = "key_up" });
+    @export(&Web.paste, .{ .name = "paste" });
+    @export(&Web.copy_ptr, .{ .name = "copy_ptr" });
+    @export(&Web.copy_take, .{ .name = "copy_take" });
+    @export(&Web.window_focus, .{ .name = "window_focus" });
+    @export(&Web.cursor, .{ .name = "cursor" });
     @export(&Web.timer_period_ms, .{ .name = "timer_period_ms" });
     @export(&Web.timer, .{ .name = "timer" });
     @export(&Web.tick, .{ .name = "tick" });
@@ -130,6 +209,8 @@ fn WebApp(comptime App: type) type {
         var context: Context = undefined;
         var render: Renderer = undefined;
         var app: App = undefined;
+        /// Key names and pastes from `shell.js` (section 4a).
+        var input_buffer: [input_cap]u8 = undefined;
 
         /// Initializes host state, the draw context, the renderer, and the app, then submits
         /// the setup stream. Called once by JavaScript after the device exists. The app runs
@@ -187,27 +268,115 @@ fn WebApp(comptime App: type) type {
             return note_event(.{ .pointer_move = .{ .x = x, .y = y } });
         }
 
-        /// Primary button pressed at CSS-pixel `(x, y)`.
-        fn pointer_down(x: f32, y: f32) callconv(.c) u32 {
+        /// Button `button` (DOM numbering) pressed at CSS-pixel `(x, y)` with `mods` at
+        /// `time_ms` (section 4a).
+        fn pointer_down(x: f32, y: f32, button: u32, mods: u32, time_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
-            return note_event(.{ .pointer_down = .{ .x = x, .y = y } });
+            return note_event(.{ .pointer_down = button_sample(x, y, button, mods, time_ms) });
         }
 
-        /// Primary button released at CSS-pixel `(x, y)`.
-        fn pointer_up(x: f32, y: f32) callconv(.c) u32 {
+        /// Button `button` released at CSS-pixel `(x, y)`.
+        fn pointer_up(x: f32, y: f32, button: u32, mods: u32, time_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             assert(x == x);
-            return note_event(.{ .pointer_up = .{ .x = x, .y = y } });
+            return note_event(.{ .pointer_up = button_sample(x, y, button, mods, time_ms) });
         }
 
-        /// Wheel at CSS-pixel `(x, y)`. `dy` is in the same unit as the pointer coordinates;
-        /// positive `dy` scrolls content downward.
-        fn pointer_wheel(x: f32, y: f32, dy: f32) callconv(.c) u32 {
+        fn button_sample(x: f32, y: f32, button: u32, mods: u32, time_ms: u32) input.Button {
+            assert(y == y);
+            assert(button <= 0xFFFF);
+            return .{
+                .x = x,
+                .y = y,
+                .time_ms = time_ms,
+                .button = button_of(button),
+                .mods = mods_of(mods),
+            };
+        }
+
+        /// Wheel at CSS-pixel `(x, y)`. The deltas are in the same unit as the pointer
+        /// coordinates; positive `dy` scrolls content downward, positive `dx` right.
+        fn pointer_wheel(x: f32, y: f32, dx: f32, dy: f32) callconv(.c) u32 {
             assert(state.frame.running);
-            assert(x == x);
+            assert(dx == dx);
             assert(dy == dy);
-            return note_event(.{ .wheel = .{ .x = x, .y = y, .dy = dy } });
+            return note_event(.{ .wheel = .{ .x = x, .y = y, .dx = dx, .dy = dy } });
+        }
+
+        /// The input buffer's linear-memory address.
+        fn input_ptr() callconv(.c) [*]u8 {
+            assert(state.frame.running);
+            return &input_buffer;
+        }
+
+        fn input_capacity() callconv(.c) u32 {
+            assert(input_buffer.len == input_cap);
+            return input_cap;
+        }
+
+        /// A key press named by the `len` bytes of `KeyboardEvent.key` in the input buffer.
+        /// Returns bit 0 = dirty, bit 1 = consumed (section 4a).
+        fn key_down(len: u32, mods: u32, repeat: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(len <= input_cap);
+            const name = input_buffer[0..len];
+            const single = len >= 1 and input.sequence_length(name[0]) == len;
+            const typed: []const u8 = if (single and len <= input.key_text_cap) name else "";
+            const press = input.key_press(
+                input.key_of_dom(name),
+                mods_of(mods),
+                repeat != 0,
+                typed,
+            );
+            _ = context.take_copy();
+            const dirty = note_event(.{ .key_down = press });
+            const consumed: u32 = @intFromBool(context.consumed());
+            assert(dirty <= 1);
+            return dirty | consumed << 1;
+        }
+
+        /// A key release named like `key_down`. Returns the dirty flag.
+        fn key_up(len: u32, mods: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(len <= input_cap);
+            const key = input.key_of_dom(input_buffer[0..len]);
+            return note_event(.{ .key_up = input.key_press(key, mods_of(mods), false, "") });
+        }
+
+        /// Dispatches the `len` bytes of pasted UTF-8 in the input buffer. Returns the dirty
+        /// flag.
+        fn paste(len: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(len <= input_cap);
+            return note_event(.{ .paste = input_buffer[0..len] });
+        }
+
+        /// The address of the text `copy_take` reports.
+        fn copy_ptr() callconv(.c) [*]const u8 {
+            assert(context.copy_len <= ui.cx.clipboard_cap);
+            return &context.clipboard;
+        }
+
+        /// The length of the copy the last key press made, or 0; clears it (section 4a).
+        fn copy_take() callconv(.c) u32 {
+            assert(state.frame.running);
+            if (!context.take_copy()) return 0;
+            assert(!context.copy_pending);
+            return context.copy_len;
+        }
+
+        /// The canvas gained (1) or lost (0) keyboard focus. Returns the dirty flag.
+        fn window_focus(focused: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(focused <= 1);
+            return note_event(.{ .window_focus = focused != 0 });
+        }
+
+        /// The `ui.Cursor` value to show over the canvas.
+        fn cursor() callconv(.c) u32 {
+            assert(state.frame.running);
+            return @backingInt(context.cursor());
         }
 
         /// Pointer left the canvas or the gesture was cancelled. A press in progress
@@ -258,6 +427,8 @@ fn WebApp(comptime App: type) type {
 
         fn note_event(event: input.Event) u32 {
             ui.dispatch(App, &app, &context, event);
+            // The page's own paste event delivers the text, so a request needs no action.
+            _ = context.take_paste_request();
             if (context.dirty) {
                 state.frame.request_redraw();
             }
@@ -325,6 +496,16 @@ fn WebApp(comptime App: type) type {
             return 0;
         }
     };
+}
+
+// Locks the cursor name export: the CSS names in `ui.Cursor` order.
+test "the cursor names are the CSS names by value" {
+    const expected =
+        \\["default","pointer","text","grab","grabbing","ew-resize","ns-resize"]
+    ;
+    try std.testing.expectEqualStrings(expected, cursor_names_json);
+    try std.testing.expectEqual(@as(u8, 0x0B), @as(u8, @bitCast(mods_of(0xFB))));
+    try std.testing.expectEqual(input.MouseButton.right, button_of(2));
 }
 
 // Locks that the exported op table is the generated one, so `shell.js` decodes exactly the

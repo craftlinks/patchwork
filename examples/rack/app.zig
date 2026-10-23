@@ -39,8 +39,18 @@
 //! ## 2. Events and Actions
 //! `event` routes every event, `.frame` included, to every knob's `handle`, which resolves it
 //! against the areas of the last draw; knobs record their ring as a wheel area while drawing.
-//! A `changed` action rewrites the status line ("filter.cut changed 0.42"); meters are
-//! passive.
+//! A `changed` action rewrites the status line ("filter.cut changed 0.42"); a right press on
+//! a knob resets it to its initial value ("filter.cut reset 0.50"); meters are passive. Knob
+//! rings show the grab cursor (grabbing while dragged).
+//!
+//! ## 2b. Renaming a Panel
+//! Panel titles are owned bytes (`titles`, at most `title_cap`), each with an area
+//! `id("title", panel)`. A double press on a title loads it into the one shared `rename`
+//! field (`widgets.TextField`, limit `title_cap`), selects all of it, and gives the field focus;
+//! the band then draws the field (I-beam cursor) instead of the title. Enter or a press
+//! elsewhere commits ("osc renamed vco"; an empty or unchanged name keeps the old one), and
+//! Escape cancels. Copy, cut, and paste work in the field through the host clipboard. Test
+//! "a double click renames a panel and Escape cancels" locks the flow.
 //!
 //! ## 2a. Presets and the Status Line
 //! The preset list is a `ui.List` of `preset_count` rows of `preset_row_px` in a view
@@ -124,6 +134,30 @@ const knob_gap_px: f32 = 8;
 const panel_radius: f32 = 8;
 
 const panel_names = [_][]const u8{ "osc", "filter", "amp" };
+
+/// Bytes of a panel title, and the rename field's width in its band.
+pub const title_cap: u32 = 16;
+const rename_width_px: f32 = 160;
+const rename_id = ui.id("rename", 0);
+
+/// A panel title the user can rename.
+pub const Title = struct {
+    bytes: [title_cap]u8,
+    len: u8,
+
+    pub fn of(utf8: []const u8) Title {
+        assert(utf8.len <= title_cap);
+        var title: Title = .{ .bytes = @splat(0), .len = @intCast(utf8.len) };
+        @memcpy(title.bytes[0..utf8.len], utf8);
+        assert(title.len <= title_cap);
+        return title;
+    }
+
+    pub fn text(self: *const Title) []const u8 {
+        assert(self.len <= title_cap);
+        return self.bytes[0..self.len];
+    }
+};
 
 /// Header bar above the panels: its height. The gap below it is `panel_gap_px`.
 const header_px: f32 = 52;
@@ -210,11 +244,11 @@ const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.ch
 /// Pool, batch, and area capacities. The comptime block checks each against the worst case.
 const box_cap: u32 = 24;
 const arc_cap: u32 = 32;
-const glyph_cap: u32 = 768;
+const glyph_cap: u32 = 792;
 const image_cap: u32 = 4;
 const led_cap: u32 = 4;
 const batch_cap: u32 = 16;
-const area_cap: u32 = 64;
+const area_cap: u32 = 68;
 
 /// Bytes of the tooltip text: a name of up to 8, a space, and the 4-byte value.
 const tooltip_text_cap: u32 = 13;
@@ -241,6 +275,10 @@ const Context = patchwork.app.Context(App);
 pub const App = struct {
     knobs: [knob_count]widgets.Knob,
     meters: [panel_count]widgets.Meter,
+    /// Panel titles, the shared rename field, and the panel it renames (section 2b).
+    titles: [panel_count]Title,
+    rename: widgets.TextField,
+    renaming: ?u32,
     /// Hover time toward the tooltip; see the module guide, section 3b.
     dwell: animator.Animator,
     /// The knob `dwell` is timing, or null when no knob is hovered.
@@ -288,6 +326,9 @@ pub const App = struct {
             knob.* = widgets.Knob.init(id, spec.name, spec.value, accent);
         }
         for (&app.meters) |*meter| meter.* = .{ .name = "", .value = 0.5 };
+        for (&app.titles, panel_names) |*title, name| title.* = Title.of(name);
+        app.rename = widgets.TextField.init(rename_id, title_cap, title_style);
+        app.renaming = null;
         app.presets = ui.ViewState.init();
         app.preset_range = .{ .first = 0, .end = 0 };
         app.preset_selected = null;
@@ -298,12 +339,25 @@ pub const App = struct {
         assert(!app.dwell.live());
     }
 
-    /// Routes the event to every knob, the preset view, and the rows it drew last, then times
-    /// the tooltip.
+    /// Routes the event to the rename field, the titles, every knob, the preset view, and the
+    /// rows it drew last, then times the tooltip.
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.rename.handle(cx, event_value)) {
+            .committed => app.finish_rename(cx, true),
+            .cancelled => app.finish_rename(cx, false),
+            .none, .changed => {},
+        }
+        var panel: u32 = 0;
+        while (panel < panel_count) : (panel += 1) {
+            switch (cx.hit(ui.id("title", panel), event_value)) {
+                .down => |press| if (press.clicks == 2) app.start_rename(cx, panel),
+                else => {},
+            }
+        }
         for (&app.knobs, 0..) |*knob, index| {
             switch (knob.handle(cx, event_value)) {
-                .changed => app.note_change(cx, @intCast(index)),
+                .changed => app.note_knob(cx, @intCast(index), " changed "),
+                .reset => app.note_knob(cx, @intCast(index), " reset "),
                 .none, .released => {},
             }
         }
@@ -313,7 +367,7 @@ pub const App = struct {
             switch (cx.hit(ui.id("preset", row), event_value)) {
                 .hover_in, .hover_out => cx.redraw(),
                 .up => |up| if (up.inside) app.select_preset(cx, row),
-                .none, .down, .drag, .wheel => {},
+                .none, .down, .drag, .wheel, .secondary => {},
             }
         }
         app.retarget_dwell(cx);
@@ -445,13 +499,41 @@ pub const App = struct {
         assert(app.preset_selected.? == row);
     }
 
-    /// Reports knob `index`'s new value on the status line: "filter.cut changed 0.42".
-    fn note_change(app: *App, cx: *Context, index: u32) void {
+    /// Reports knob `index`'s new value on the status line: "filter.cut changed 0.42" or
+    /// "filter.cut reset 0.50", `verb` being the middle word with its spaces.
+    fn note_knob(app: *App, cx: *Context, index: u32, verb: []const u8) void {
         assert(index < knob_count);
+        assert(verb.len <= " changed ".len);
         const knob = &app.knobs[index];
-        const panel = panel_names[index / knobs_per_panel];
-        app.set_status(&.{ panel, ".", knob.name, " changed ", knob.value_text[0..4] });
+        const panel = app.titles[index / knobs_per_panel].text();
+        app.set_status(&.{ panel, ".", knob.name, verb, knob.value_text[0..4] });
         cx.redraw();
+    }
+
+    /// Opens the rename field on `panel`'s title with all of it selected (section 2b).
+    fn start_rename(app: *App, cx: *Context, panel: u32) void {
+        assert(panel < panel_count);
+        app.rename.load(app.titles[panel].text());
+        app.renaming = panel;
+        cx.set_focus(rename_id);
+        cx.redraw();
+        assert(app.rename.edit.has_selection() or app.rename.edit.len == 0);
+    }
+
+    /// Closes the rename field; `commit` writes a non-empty, changed name and reports it
+    /// ("osc renamed vco").
+    fn finish_rename(app: *App, cx: *Context, commit: bool) void {
+        const panel = app.renaming orelse return;
+        app.renaming = null;
+        cx.redraw();
+        if (!commit) return;
+        const name = app.rename.bytes();
+        if (name.len == 0) return;
+        const old = app.titles[panel];
+        if (std.mem.eql(u8, old.text(), name)) return;
+        app.titles[panel] = Title.of(name);
+        app.set_status(&.{ old.text(), " renamed ", name });
+        assert(app.renaming == null);
     }
 
     /// Joins `parts` into the status buffer. The comptime block bounds every message.
@@ -485,8 +567,11 @@ pub const App = struct {
         const band_h = band_height(room.height);
         const meter_on = room.width >= meter_column_px and room.height - band_h > 0;
         const band = cx.begin(ui.sized(.fill, .{ .fixed = band_h }), ui.flow_of(.overlay));
-        const title: widgets.Label = .{ .text = panel_names[panel_index], .style = title_style };
-        title.draw(cx, ui.sized(.fill, .fill));
+        if (app.renaming == panel_index) {
+            app.draw_rename(cx, band);
+        } else {
+            draw_title(cx, app.titles[panel_index].text(), panel_index);
+        }
         app.draw_title_marks(cx, panel_index, band, meter_on);
         _ = cx.end();
         _ = cx.begin(ui.sized(.fill, .fill), ui.flow_of(.right));
@@ -507,6 +592,17 @@ pub const App = struct {
         }
         _ = cx.end();
         _ = cx.end();
+    }
+
+    /// The rename field centered in the title band, as wide as `rename_width_px` allows
+    /// between the badges' room at both ends.
+    fn draw_rename(app: *const App, cx: *Context, band: Rect) void {
+        assert(app.renaming != null);
+        const room = band.width - 2 * (badge_inset_px + badge_px + 8);
+        const width = std.math.clamp(room, 0, rename_width_px);
+        var walk = ui.sized(.{ .fixed = width }, .fill);
+        walk.margin.left = @max(0, (band.width - width) * 0.5);
+        app.rename.draw(cx, walk);
     }
 
     /// The badge at the band's left end and the LED over the meter track. A band too short
@@ -646,6 +742,25 @@ fn draw_header(cx: *Context, bar: Rect) void {
     });
 }
 
+/// A panel title centered in the band, with its area over the text (section 2b).
+fn draw_title(cx: *Context, title: []const u8, panel_index: u32) void {
+    assert(title.len <= title_cap);
+    assert(panel_index < panel_count);
+    const label: widgets.Label = .{ .text = title, .style = title_style };
+    const rect = cx.peek(ui.sized(.fill, .fill));
+    label.draw(cx, ui.sized(.fill, .fill));
+    _ = cx.visible(rect) orelse return;
+    const width = @min(rect.width, text.measure(title_style, title) + 8);
+    if (!(width > 0)) return;
+    const area: Rect = .{
+        .x = rect.x + (rect.width - width) * 0.5,
+        .y = rect.y,
+        .width = width,
+        .height = rect.height,
+    };
+    cx.area(ui.id("title", panel_index), area, 0, ui.cx.plain);
+}
+
 /// Appends through `cx`, skipping on a full pool or batch list (the context counts it).
 fn append_or_skip(cx: *Context, comptime T: type, texture: ?quads.TextureId, instance: T) void {
     assert(instance.rect[2] > 0);
@@ -732,23 +847,25 @@ comptime {
     assert(knob_count == 12);
     assert(levels.meter_count == panel_count);
     // Worst-case boxes: one per panel, two per meter, the tooltip, the header bar, the
-    // preset panel, the selected and the hovered row, and the thumb.
-    assert(panel_count + panel_count * 2 + 1 + 1 + 1 + 2 + 1 <= box_cap);
+    // preset panel, the selected and the hovered row, the thumb, and the rename field's face,
+    // selection, and caret.
+    assert(panel_count + panel_count * 2 + 1 + 1 + 1 + 2 + 1 + 3 <= box_cap);
     // Worst-case arcs: two per knob (track and value arc).
     assert(knob_count * 2 <= arc_cap);
-    // Worst-case glyphs: a label of up to 8 per panel, up to 8 for each knob name and 4 for
-    // each value text, the tooltip text, the header, the visible preset rows, and the status
-    // line; 75 of 768 to spare.
-    assert(panel_count * 8 + knob_count * (8 + 4) + tooltip_text_cap + header_glyph_cap +
-        preset_rows_max * preset_glyphs + status_cap + 75 == glyph_cap);
+    // Worst-case glyphs: a title of up to `title_cap` per panel (the rename field replaces
+    // its panel's title and holds as many), up to 8 for each knob name and 4 for each value
+    // text, the tooltip text, the header, the visible preset rows, and the status line; 75 of
+    // 792 to spare.
+    assert(panel_count * title_cap + knob_count * (8 + 4) + tooltip_text_cap +
+        header_glyph_cap + preset_rows_max * preset_glyphs + status_cap + 75 == glyph_cap);
     // The largest row index fits the name buffer, and the longest status messages fit theirs.
     assert(preset_count <= 1000);
     assert("preset ".len + 3 == preset_name_cap);
-    var longest_panel: usize = 0;
-    for (panel_names) |name| longest_panel = @max(longest_panel, name.len);
     var longest_knob: usize = 0;
     for (knob_table) |spec| longest_knob = @max(longest_knob, spec.name.len);
-    assert(longest_panel + 1 + longest_knob + " changed ".len + 4 <= status_cap);
+    assert(title_cap + 1 + longest_knob + " changed ".len + 4 <= status_cap);
+    assert(title_cap + " renamed ".len + title_cap <= status_cap);
+    for (panel_names) |name| assert(name.len <= title_cap);
     assert(preset_name_cap + " selected".len <= status_cap);
     // Every codepoint of the header draws at most one glyph.
     const author_codepoints = std.unicode.utf8CountCodepoints(patch_author) catch unreachable;
@@ -758,8 +875,9 @@ comptime {
     assert(panel_count <= led_cap);
     // Base: box, glyph, image, LED, arc; overlay: box and glyph.
     assert(5 + 2 <= batch_cap);
-    // Areas: one ring per knob, the preset view and its thumb, and the visible rows.
-    assert(knob_count + 2 + preset_rows_max <= area_cap);
+    // Areas: one ring per knob, the preset view and its thumb, the visible rows, one title per
+    // panel, and the rename field; 2 to spare.
+    assert(knob_count + 2 + preset_rows_max + panel_count + 1 + 2 == area_cap);
     // At most `preset_rows_max` rows overlap the tallest viewport, partial rows included.
     assert(preset_view_max_px / preset_row_px + 2 <= preset_rows_max);
     // The box covers the neighbouring cell's whole name column.
@@ -901,8 +1019,11 @@ test "rack layout at 1280 by 720" {
     try std.testing.expectEqual(@as(usize, 321), cx.draw.items(quads.Glyph).len);
     try std.testing.expectEqual(@as(usize, 3), cx.draw.items(quads.Image).len);
     try std.testing.expectEqual(@as(usize, 3), cx.draw.items(led.Led).len);
-    // Areas: 12 rings, the view, 25 rows, and the thumb.
-    try std.testing.expectEqual(@as(usize, knob_count + 1 + 25 + 1), cx.area_list().len);
+    // Areas: 12 rings, the view, 25 rows, the thumb, and 3 titles.
+    try std.testing.expectEqual(
+        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
+        cx.area_list().len,
+    );
     const mix = ring_at(cx, app, 3).?;
     var arcs: u32 = 0;
     for (cx.draw.items(quads.Arc)) |arc| {
@@ -947,7 +1068,7 @@ test "timer writes the sample and a knob drag does not" {
     for (app.meters, sampled) |meter, value| try std.testing.expectEqual(value, meter.value);
     const amp = app.meters[2].value;
     const center = ring_center(cx, app, 8);
-    try std.testing.expect(send(app, .{ .pointer_down = center }));
+    try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[8].value);
     try std.testing.expectEqual(amp, app.meters[2].value);
@@ -961,15 +1082,18 @@ test "a ring drag and a ring wheel change the knob" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     const center = ring_center(cx, app, 0);
-    try std.testing.expect(send(app, .{ .pointer_down = center }));
+    try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 0.75), app.knobs[0].value);
-    try std.testing.expect(send(app, .{ .pointer_up = .{ .x = center.x, .y = center.y - 60 } }));
-    const wheel: input.Wheel = .{ .x = center.x, .y = center.y, .dy = -60 };
+    try std.testing.expect(send(
+        app,
+        .{ .pointer_up = input.left_at(.{ .x = center.x, .y = center.y - 60 }) },
+    ));
+    const wheel: input.Wheel = .{ .x = center.x, .y = center.y, .dx = 0, .dy = -60 };
     try std.testing.expect(send(app, .{ .wheel = wheel }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[0].value);
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = 40, .y = 30 } }));
-    try std.testing.expect(!send(app, .{ .wheel = .{ .x = 40, .y = 30, .dy = 40 } }));
+    try std.testing.expect(!send(app, .{ .wheel = .{ .x = 40, .y = 30, .dx = 0, .dy = 40 } }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[0].value);
 }
 
@@ -977,7 +1101,7 @@ test "a ring drag and a ring wheel change the knob" {
 test "dragging mix off zero adds the value arc" {
     const app = new_app();
     const center = ring_center(frame_at(app, 1280, 720), app, 3);
-    try std.testing.expect(send(app, .{ .pointer_down = center }));
+    try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 0.5), app.knobs[3].value);
     const drawn = frame_at(app, 1280, 720);
@@ -1187,8 +1311,12 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     try std.testing.expect(app.tooltip_visible());
     try std.testing.expect(cx.dirty);
     _ = frame_at(app, 1280, 720);
-    // The same areas as a frame without the tooltip: 12 rings, the view, 25 rows, the thumb.
-    try std.testing.expectEqual(@as(usize, knob_count + 1 + 25 + 1), cx.area_list().len);
+    // The same areas as a frame without the tooltip: 12 rings, the view, 25 rows, the thumb,
+    // and 3 titles.
+    try std.testing.expectEqual(
+        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
+        cx.area_list().len,
+    );
     const boxes = cx.draw.items(quads.Box);
     const last = boxes.len - 1;
     try std.testing.expectEqual(quads.Layer.overlay, cx.draw.layer_at(quads.Box, @intCast(last)));
@@ -1247,8 +1375,8 @@ test "clicking a preset row selects and highlights it" {
     const cx = frame_at(app, 1280, 720);
     const point = center_of(preset_rect(cx, 3));
     try std.testing.expect(send(app, .{ .pointer_move = point }));
-    try std.testing.expect(!send(app, .{ .pointer_down = point }));
-    try std.testing.expect(send(app, .{ .pointer_up = point }));
+    try std.testing.expect(!send(app, .{ .pointer_down = input.left_at(point) }));
+    try std.testing.expect(send(app, .{ .pointer_up = input.left_at(point) }));
     try std.testing.expectEqual(@as(?u32, 3), app.preset_selected);
     try std.testing.expectEqualStrings("preset 3 selected", app.status_text());
     _ = frame_at(app, 1280, 720);
@@ -1271,18 +1399,24 @@ test "the preset list scrolls and draws only its visible rows" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     const top = center_of(preset_rect(cx, 0));
-    try std.testing.expect(send(app, .{ .wheel = .{ .x = top.x, .y = top.y, .dy = 412 * 24 } }));
+    try std.testing.expect(send(
+        app,
+        .{ .wheel = .{ .x = top.x, .y = top.y, .dx = 0, .dy = 412 * 24 } },
+    ));
     try std.testing.expectEqual(@as(f32, 412 * 24), app.presets.scroll_y);
     _ = frame_at(app, 1280, 720);
     try std.testing.expectEqual(ui.List.Range{ .first = 412, .end = 437 }, app.preset_range);
     try std.testing.expect(cx.find(ui.id("preset", 411)) == null);
     try std.testing.expect(cx.find(ui.id("preset", 437)) == null);
-    try std.testing.expectEqual(@as(usize, knob_count + 1 + 25 + 1), cx.area_list().len);
+    try std.testing.expectEqual(
+        @as(usize, knob_count + 1 + 25 + 1 + panel_count),
+        cx.area_list().len,
+    );
     const first = preset_rect(cx, 412);
     try std.testing.expectEqual(app.presets.viewport.y, first.y);
     const point = center_of(first);
-    _ = send(app, .{ .pointer_down = point });
-    _ = send(app, .{ .pointer_up = point });
+    _ = send(app, .{ .pointer_down = input.left_at(point) });
+    _ = send(app, .{ .pointer_up = input.left_at(point) });
     try std.testing.expectEqualStrings("preset 412 selected", app.status_text());
     try std.testing.expectEqual(@as(u32, 0), cx.area_overflow);
 }
@@ -1294,7 +1428,10 @@ test "a knob change is reported on the status line" {
     const cx = frame_at(app, 1280, 720);
     try std.testing.expectEqualStrings("ready", app.status_text());
     const cut = ring_center(cx, app, 4);
-    try std.testing.expect(send(app, .{ .wheel = .{ .x = cut.x, .y = cut.y, .dy = 9.6 } }));
+    try std.testing.expect(send(
+        app,
+        .{ .wheel = .{ .x = cut.x, .y = cut.y, .dx = 0, .dy = 9.6 } },
+    ));
     try std.testing.expectEqualStrings("filter.cut changed 0.42", app.status_text());
 }
 
@@ -1309,4 +1446,93 @@ fn count_highlights(cx: *const Context) u32 {
 
 fn center_of(rect: Rect) input.Point {
     return .{ .x = rect.x + rect.width * 0.5, .y = rect.y + rect.height * 0.5 };
+}
+
+fn press_at(point: input.Point, which: input.MouseButton, time_ms: u32) input.Event {
+    const sample: input.Button = .{
+        .x = point.x,
+        .y = point.y,
+        .time_ms = time_ms,
+        .button = which,
+        .mods = .none,
+    };
+    return .{ .pointer_down = sample };
+}
+
+fn release_at(point: input.Point, which: input.MouseButton, time_ms: u32) input.Event {
+    const sample = press_at(point, which, time_ms).pointer_down;
+    return .{ .pointer_up = sample };
+}
+
+fn key(name: input.Key, utf8: []const u8) input.Event {
+    return .{ .key_down = input.key_press(name, .none, false, utf8) };
+}
+
+/// Double-presses the title of `panel` at `time_ms` and draws the frame that shows the field.
+fn double_click_title(app: *App, panel: u32, time_ms: u32) *Context {
+    const title = center_of(rect_of(fixture.context.find(ui.id("title", panel)).?.rect));
+    _ = send(app, press_at(title, .left, time_ms));
+    _ = send(app, release_at(title, .left, time_ms + 50));
+    _ = send(app, press_at(title, .left, time_ms + 150));
+    _ = send(app, release_at(title, .left, time_ms + 200));
+    return frame_at(app, 1280, 720);
+}
+
+// Locks renaming: a double press on the "osc" title opens the focused field with all of it
+// selected in place of the title (the I-beam over it), typing replaces it, Enter commits
+// "osc renamed vco" and the status line names knobs by the new title, and a second rename
+// cancelled with Escape keeps "vco".
+test "a double click renames a panel and Escape cancels" {
+    const app = new_app();
+    _ = frame_at(app, 1280, 720);
+    const cx = double_click_title(app, 0, 1000);
+    try std.testing.expectEqual(@as(?u32, 0), app.renaming);
+    try std.testing.expect(cx.focused(rename_id));
+    try std.testing.expectEqualStrings("osc", app.rename.edit.selected());
+    try std.testing.expect(cx.find(ui.id("title", 0)) == null);
+    const field = center_of(rect_of(cx.find(rename_id).?.rect));
+    _ = send(app, .{ .pointer_move = field });
+    try std.testing.expectEqual(ui.Cursor.text, cx.cursor());
+    for ("vco") |byte| _ = send(app, key(input.key_of_dom(&.{byte}), &.{byte}));
+    try std.testing.expect(send(app, key(.enter, "")));
+    try std.testing.expectEqualStrings("osc renamed vco", app.status_text());
+    try std.testing.expectEqualStrings("vco", app.titles[0].text());
+    try std.testing.expectEqual(@as(?u32, null), app.renaming);
+    try std.testing.expectEqual(ui.Id.none, cx.focus);
+    _ = frame_at(app, 1280, 720);
+    const rate = ring_center(cx, app, 0);
+    _ = send(app, .{ .wheel = .{ .x = rate.x, .y = rate.y, .dx = 0, .dy = -12 } });
+    try std.testing.expectEqualStrings("vco.rate changed 0.35", app.status_text());
+    _ = double_click_title(app, 0, 5000);
+    _ = send(app, key(.x, "x"));
+    try std.testing.expect(send(app, key(.escape, "")));
+    try std.testing.expectEqualStrings("vco", app.titles[0].text());
+    try std.testing.expectEqual(ui.Id.none, cx.focus);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+}
+
+// Locks blur commits and the knob reset: End then "!" extends the selected title, a press on
+// a knob while renaming commits it ("filter renamed filter!"), and a right press on
+// filter.cut after a wheel resets it to 0.50 ("filter!.cut reset 0.50") without capturing,
+// while the ring shows the grab cursor.
+test "a press elsewhere commits a rename and a right click resets a knob" {
+    const app = new_app();
+    _ = frame_at(app, 1280, 720);
+    const cx = double_click_title(app, 1, 1000);
+    _ = send(app, key(.end, ""));
+    _ = send(app, key(.other, "!"));
+    const cut = ring_center(cx, app, 4);
+    _ = send(app, press_at(cut, .left, 3000));
+    try std.testing.expectEqualStrings("filter!", app.titles[1].text());
+    try std.testing.expectEqualStrings("filter renamed filter!", app.status_text());
+    _ = send(app, release_at(cut, .left, 3050));
+    _ = frame_at(app, 1280, 720);
+    _ = send(app, .{ .pointer_move = cut });
+    try std.testing.expectEqual(ui.Cursor.grab, cx.cursor());
+    _ = send(app, .{ .wheel = .{ .x = cut.x, .y = cut.y, .dx = 0, .dy = 9.6 } });
+    try std.testing.expectEqual(@as(f32, 0.42), app.knobs[4].value);
+    try std.testing.expect(send(app, press_at(cut, .right, 4000)));
+    try std.testing.expectEqual(@as(f32, 0.5), app.knobs[4].value);
+    try std.testing.expectEqual(ui.Id.none, cx.capture);
+    try std.testing.expectEqualStrings("filter!.cut reset 0.50", app.status_text());
 }

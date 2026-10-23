@@ -95,6 +95,9 @@ pub const Run = struct {
 /// touches the cache.
 pub const measure = layout.measure;
 
+/// The codepoint boundary of `utf8` nearest to `x` logical pixels from the pen start. Pure.
+pub const index_at = layout.index_at;
+
 /// Lays out `utf8` in `rect` and appends one `draw.Glyph` per inked glyph to `cx`, each with
 /// `clip`. See `text/layout.zig`.
 pub const place = layout.place;

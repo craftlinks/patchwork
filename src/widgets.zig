@@ -1,4 +1,5 @@
-//! Widgets: panels, labels, buttons, sliders, knobs, meters, and toggles as plain structs.
+//! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, and a text field as
+//! plain structs.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -21,6 +22,10 @@
 //!   one event delivers one hit and a press may arrive without a prior move.
 //! - The return value says what changed for the app (`Knob.Action.changed`), so an app can
 //!   react to a value, not only repaint.
+//! - A right press reaches only the hot widget, as `secondary`; the knob resets on it
+//!   (`Knob.Action.reset`), the others ignore it.
+//! - Keyboard and paste events answer `none` from `hit`; only the focused `TextField` reads
+//!   them (section 7).
 //! `Panel`, `Label`, and `Meter` are passive: they draw and record no area.
 //!
 //! ### Blend Weights
@@ -42,7 +47,8 @@
 //!   vertically; the hit area is the disc inscribed in it and takes the wheel. Drag and
 //!   wheel are relative: `value' = clamp(value - delta / drag_span_px, 0, 1)` with
 //!   `delta = y - drag_y` for drags and `delta = wheel.dy` for the wheel. A row shorter than
-//!   the ring draws nothing. Test "knob drag is relative and clamped".
+//!   the ring draws nothing. The ring area shows the grab cursor (`knob_flags`). Test "knob
+//!   drag is relative and clamped".
 //! - **Value text:** hundredths as `d.dd` in the fixed `[8]u8` `value_text`, tail zeroed.
 //! - **Meter:** the track is `meter_track_w` by `meter_track_h`, centered over the ring
 //!   column and vertically in `row`; the fill grows up from the track bottom and is omitted at
@@ -63,8 +69,30 @@
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: label text points at app-owned bytes bounded by `text.byte_cap`; a
-//!   knob's value text is inline.
+//!   knob's value text and a field's bytes are inline.
 //! - Geometry helpers are pure; `handle` is the only mutator.
+//!
+//! ## 7. TextField
+//! A single-line field over the pure editing core (`ui/edit.zig`: a contiguous buffer of at
+//! most `edit.field_cap` bytes, here limited to the field's `limit`). Its area is focusable
+//! with the I-beam cursor (`field_flags`); a left press focuses it (`ui/cx.zig`, section 7).
+//! - Pointer: a press puts the caret at `text.index_at` of the press, Shift extends, a double
+//!   press selects the word and a triple press everything (`Press.clicks`), and a drag extends
+//!   the selection. There is no auto-scroll past the edges.
+//! - Keys while focused: arrows, Home, End (Up, Page Up and Down, Page Down act as Home and
+//!   End), Backspace, Delete, typed text, and with Ctrl or Meta: A selects all, C copies, X
+//!   cuts, V asks for a paste, arrows jump words, Backspace and Delete erase words. Enter
+//!   clears focus and returns `committed`, Escape returns `cancelled` (the context clears
+//!   focus after), and losing focus to a press or Tab returns `committed`. There is no undo.
+//! - A paste is made one line (`edit.sanitize_line`) and cut to the limit.
+//! - Scroll: `scroll_x` keeps the caret inside the inner box (`field_inner`, the rect inset
+//!   by `field_padding_x`), measured with `cx.focused_rect()` for keys and the press rect for
+//!   the pointer, and never scrolls past the text's end. Test "a field scrolls to keep the
+//!   caret visible".
+//! - Drawing: the face (with the focus border), the selection band, the glyphs offset by
+//!   `-scroll_x` and clipped to the inner box, and while focused a steady caret one device
+//!   pixel wide snapped to the device grid. It never blinks, so a focused field keeps the
+//!   host asleep. Measuring the caret is O(bytes), at most 256 per drawn frame.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -74,6 +102,7 @@ const text = @import("text.zig");
 const input = @import("input.zig");
 const theme = @import("theme.zig");
 const ui = @import("ui.zig");
+const edit = @import("ui/edit.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -136,6 +165,27 @@ pub const thumb_side: f32 = 20;
 pub const thumb_inset: f32 = 2;
 pub const label_line_px: f32 = 36;
 pub const accent_count: u32 = 4;
+
+/// A text field's area: focusable, with the I-beam cursor.
+pub const field_flags: ui.Flags = .{ .wheel = false, .focusable = true, .cursor = .text };
+/// Text field metrics in logical pixels: the text inset, the face's corner radius and border,
+/// and the caret's inset from the top and bottom.
+pub const field_padding_x: f32 = 6;
+pub const field_radius: f32 = 4;
+pub const field_border_px: f32 = 1;
+pub const field_caret_inset: f32 = 4;
+/// The focused field's border and the selection band behind its text.
+pub const field_focus_border: [4]f32 = .{ 0.40, 0.62, 0.95, 1 };
+pub const field_selection: [4]f32 = .{ 0.26, 0.42, 0.72, 1 };
+/// Field text starts at the left and is centered vertically, never cut.
+pub const field_text_options: text.Options = .{
+    .align_x = .start,
+    .align_y = .center,
+    .ellipsis = false,
+};
+
+/// A knob's ring area: it takes the wheel and shows the grab cursor.
+pub const knob_flags: ui.Flags = .{ .wheel = true, .focusable = false, .cursor = .grab };
 
 /// Fill and corner radius copied onto each instance a widget appends.
 pub const Paint = struct {
@@ -241,7 +291,7 @@ pub const Button = struct {
             return .none;
         }
         switch (cx.hit(self.id, event)) {
-            .none, .drag, .wheel => return .none,
+            .none, .drag, .wheel, .secondary => return .none,
             .hover_in => aim(cx, &self.hover, 1),
             .hover_out => aim(cx, &self.hover, 0),
             .down => {
@@ -293,7 +343,7 @@ pub const Slider = struct {
             return .none;
         }
         switch (cx.hit(self.id, event)) {
-            .none, .wheel => return .none,
+            .none, .wheel, .secondary => return .none,
             .hover_in => aim(cx, &self.hover, 1),
             .hover_out => aim(cx, &self.hover, 0),
             .down => |press| {
@@ -336,12 +386,14 @@ pub const Slider = struct {
     }
 };
 
-/// Open ring. Drag is relative: up increases `value`. Value 0 omits the value arc.
+/// Open ring. Drag is relative: up increases `value`. Value 0 omits the value arc. A right
+/// press resets it to `default`, its value at `init`.
 pub const Knob = struct {
     id: Id,
     name: []const u8,
     value_text: [8]u8,
     value: f32,
+    default: f32,
     accent: Paint,
     hover: animator.Animator,
     drag_y: f32,
@@ -350,9 +402,11 @@ pub const Knob = struct {
         none,
         changed: f32,
         released,
+        /// A right press set the value back to `default`.
+        reset: f32,
     };
 
-    /// A knob at `value` with its text written.
+    /// A knob at `value` (also its default) with its text written.
     pub fn init(id: Id, name: []const u8, value: f32, accent: Paint) Knob {
         assert(id != .none);
         assert(name.len <= 8);
@@ -361,6 +415,7 @@ pub const Knob = struct {
             .name = name,
             .value_text = @splat(0),
             .value = value,
+            .default = value,
             .accent = accent,
             .hover = animator.Animator.init(hover_rate_per_ms),
             .drag_y = 0,
@@ -398,6 +453,14 @@ pub const Knob = struct {
                 aim(cx, &self.hover, 1);
                 return self.nudge(cx, -wheel.dy / drag_span_px);
             },
+            .secondary => {
+                aim(cx, &self.hover, 1);
+                if (self.value == self.default) return .none;
+                self.set_value(self.default);
+                cx.redraw();
+                assert(self.value == self.default);
+                return .{ .reset = self.default };
+            },
         }
         return .none;
     }
@@ -412,7 +475,7 @@ pub const Knob = struct {
         if (row.height < ring_size) return;
         const clip = cx.visible(row) orelse return;
         const ring = ring_of(row);
-        cx.area(self.id, ring, ring_size * 0.5, ui.cx.wheel_flag);
+        cx.area(self.id, ring, ring_size * 0.5, knob_flags);
         append_arc(cx, ring, paint_of(theme.chrome.track, ring_thickness), 0, 1, clip);
         if (self.value > 0) {
             const weight = mix_weight(self.hover.value, hover_lighten);
@@ -510,7 +573,7 @@ pub const Toggle = struct {
             return .none;
         }
         switch (cx.hit(self.id, event)) {
-            .none, .drag, .wheel => return .none,
+            .none, .drag, .wheel, .secondary => return .none,
             .hover_in, .down => aim(cx, &self.hover, 1),
             .hover_out => aim(cx, &self.hover, 0),
             .up => |up| {
@@ -540,6 +603,255 @@ pub const Toggle = struct {
         place_text(cx, name_style, self.name, side_box(row), clip);
     }
 };
+
+/// A single-line text field over the editing core (`ui/edit.zig`). Its area is focusable and
+/// shows the I-beam. See the module guide, section 7.
+pub const TextField = struct {
+    id: Id,
+    edit: edit.Edit,
+    /// How far the text is scrolled left inside the field, in logical pixels.
+    scroll_x: f32,
+    style: text.Style,
+
+    pub const Action = enum {
+        none,
+        changed,
+        /// Enter, or focus moved away (a press elsewhere or Tab).
+        committed,
+        /// Escape.
+        cancelled,
+    };
+
+    /// An empty field holding at most `limit` bytes.
+    pub fn init(id: Id, limit: u32, style: text.Style) TextField {
+        assert(id != .none);
+        assert(limit <= edit.field_cap);
+        const field: TextField = .{
+            .id = id,
+            .edit = edit.Edit.init(limit),
+            .scroll_x = 0,
+            .style = style,
+        };
+        assert(field.edit.len == 0);
+        return field;
+    }
+
+    /// The text.
+    pub fn bytes(self: *const TextField) []const u8 {
+        assert(self.id != .none);
+        return self.edit.text();
+    }
+
+    /// Replaces the text with `utf8` and selects all of it, scrolled to the start.
+    pub fn load(self: *TextField, utf8: []const u8) void {
+        self.edit.set(utf8);
+        self.edit.select_all();
+        self.scroll_x = 0;
+        assert(self.edit.anchor == 0);
+    }
+
+    pub fn handle(self: *TextField, cx: anytype, event: input.Event) Action {
+        assert(self.id != .none);
+        assert(self.scroll_x >= 0);
+        if (event == .frame) return .none;
+        if (cx.focus_lost(self.id)) {
+            cx.redraw();
+            return .committed;
+        }
+        switch (event) {
+            .key_down => |press| {
+                if (!cx.focused(self.id)) return .none;
+                return self.key(cx, press);
+            },
+            .paste => |pasted| {
+                if (!cx.focused(self.id)) return .none;
+                var line: [edit.field_cap]u8 = undefined;
+                const length = edit.sanitize_line(pasted, &line);
+                return self.changed_if(cx, self.edit.insert(line[0..length]));
+            },
+            else => {},
+        }
+        switch (cx.hit(self.id, event)) {
+            .down => |press| {
+                const index = self.index_at(press);
+                if (press.clicks >= 3) {
+                    self.edit.select_all();
+                } else if (press.clicks == 2) {
+                    self.edit.select_word(index);
+                } else {
+                    self.edit.move_to(index, press.mods.shift);
+                }
+                self.follow(press.rect);
+                cx.redraw();
+            },
+            .drag => |press| {
+                self.edit.move_to(self.index_at(press), true);
+                self.follow(press.rect);
+                cx.redraw();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    /// Draws the face, the selection and the caret while focused, and the text scrolled by
+    /// `scroll_x` and clipped to the field, and records the focusable I-beam area.
+    pub fn draw(self: *const TextField, cx: anytype, walk: Walk) void {
+        assert(self.scroll_x >= 0);
+        const rect = cx.walk(walk);
+        const clip = cx.visible(rect) orelse return;
+        const focused = cx.focused(self.id);
+        cx.area(self.id, rect, field_radius, field_flags);
+        const border = if (focused) field_focus_border else theme.chrome.control;
+        push(cx, quads.Box, .{
+            .rect = .{ rect.x, rect.y, rect.width, rect.height },
+            .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+            .fill = theme.chrome.track,
+            .border_color = border,
+            .radius = field_radius,
+            .border_width = field_border_px,
+            .hover = 0,
+            .down = 0,
+        });
+        const inner = field_inner(rect);
+        const inner_clip = ui.cx.intersect(clip, inner) orelse return;
+        const origin = inner.x - self.scroll_x;
+        const all = self.edit.text();
+        if (focused and self.edit.has_selection()) {
+            const range = self.edit.selection();
+            const x0 = origin + text.measure(self.style, all[0..range.start]);
+            const x1 = origin + text.measure(self.style, all[0..range.end]);
+            const band: Rect = .{ .x = x0, .y = inner.y, .width = x1 - x0, .height = inner.height };
+            face(cx, band, paint_of(field_selection, 0), 0, 0, inner_clip);
+        }
+        const line: Rect = .{
+            .x = origin,
+            .y = inner.y,
+            .width = inner.width + self.scroll_x,
+            .height = inner.height,
+        };
+        text.place(cx.drawing(), self.style, all, line, inner_clip, field_text_options);
+        if (focused) {
+            const scale = @as(f32, @floatFromInt(cx.drawing().text.scale_120)) / 120;
+            const caret_x = origin + text.measure(self.style, all[0..self.edit.caret]);
+            const caret: Rect = .{
+                .x = @round(caret_x * scale) / scale,
+                .y = inner.y + field_caret_inset,
+                .width = 1 / scale,
+                .height = inner.height - 2 * field_caret_inset,
+            };
+            face(cx, caret, paint_of(theme.chrome.text, 0), 0, 0, inner_clip);
+        }
+    }
+
+    /// One key press while focused: shortcuts, movement, deletion, Enter, Escape, or typed
+    /// text. Tab is the library's (`ui/cx.zig`, section 7).
+    fn key(self: *TextField, cx: anytype, press: input.KeyPress) Action {
+        assert(cx.focused(self.id));
+        const shift = press.mods.shift;
+        const all = self.edit.text();
+        const caret = self.edit.caret;
+        if (press.mods.shortcut()) {
+            switch (press.key) {
+                .a => self.edit.select_all(),
+                .c => if (self.edit.has_selection()) cx.copy(self.edit.selected()),
+                .x => {
+                    if (!self.edit.has_selection()) return .none;
+                    cx.copy(self.edit.selected());
+                    return self.changed_if(cx, self.edit.delete_selection());
+                },
+                .v => cx.request_paste(),
+                .left => self.edit.move_to(edit.word_left(all, caret), shift),
+                .right => self.edit.move_to(edit.word_right(all, caret), shift),
+                .backspace => return self.changed_if(cx, self.edit.erase(.backward, true)),
+                .delete => return self.changed_if(cx, self.edit.erase(.forward, true)),
+                else => return .none,
+            }
+            self.moved(cx);
+            return .none;
+        }
+        const range = self.edit.selection();
+        const collapse = self.edit.has_selection() and !shift;
+        switch (press.key) {
+            .left => {
+                const target = if (collapse) range.start else edit.prev_boundary(all, caret);
+                self.edit.move_to(target, shift);
+            },
+            .right => {
+                const target = if (collapse) range.end else edit.next_boundary(all, caret);
+                self.edit.move_to(target, shift);
+            },
+            .home, .up, .page_up => self.edit.move_to(0, shift),
+            .end, .down, .page_down => self.edit.move_to(self.edit.len, shift),
+            .backspace => return self.changed_if(cx, self.edit.erase(.backward, false)),
+            .delete => return self.changed_if(cx, self.edit.erase(.forward, false)),
+            .enter => {
+                cx.clear_focus();
+                cx.redraw();
+                return .committed;
+            },
+            .escape => {
+                cx.redraw();
+                return .cancelled;
+            },
+            .tab => return .none,
+            else => {
+                if (press.len == 0) return .none;
+                return self.changed_if(cx, self.edit.insert(press.typed()));
+            },
+        }
+        self.moved(cx);
+        return .none;
+    }
+
+    fn changed_if(self: *TextField, cx: anytype, changed: bool) Action {
+        self.moved(cx);
+        if (changed) return .changed;
+        return .none;
+    }
+
+    /// After the caret or text moved: keep the caret in view and owe a draw.
+    fn moved(self: *TextField, cx: anytype) void {
+        self.follow(cx.focused_rect());
+        cx.redraw();
+        assert(self.scroll_x >= 0);
+    }
+
+    /// Scrolls so the caret is inside the field's inner box, and never past the text's end.
+    /// A field not drawn yet has no box and keeps its scroll.
+    fn follow(self: *TextField, rect: Rect) void {
+        const room = field_inner(rect).width;
+        if (!(room > 0)) return;
+        const all = self.edit.text();
+        const caret_x = text.measure(self.style, all[0..self.edit.caret]);
+        if (caret_x - self.scroll_x > room) self.scroll_x = caret_x - room;
+        if (caret_x < self.scroll_x) self.scroll_x = caret_x;
+        const limit = @max(0, text.measure(self.style, all) - room);
+        self.scroll_x = std.math.clamp(self.scroll_x, 0, limit);
+        assert(self.scroll_x >= 0);
+    }
+
+    /// The boundary under a press, from the field's rect at the last draw.
+    fn index_at(self: *const TextField, press: ui.Press) u32 {
+        const local = press.x - field_inner(press.rect).x + self.scroll_x;
+        const index = text.index_at(self.style, self.edit.text(), local);
+        assert(index <= self.edit.len);
+        return index;
+    }
+};
+
+/// The text box of a field: its rect inset by `field_padding_x` on both sides.
+pub fn field_inner(rect: Rect) Rect {
+    const inner: Rect = .{
+        .x = rect.x + field_padding_x,
+        .y = rect.y,
+        .width = rect.width - 2 * field_padding_x,
+        .height = rect.height,
+    };
+    assert(inner.height == rect.height);
+    assert(inner.x == rect.x + field_padding_x);
+    return inner;
+}
 
 /// Steps `value` by `dt_ms`: a moved value owes a redraw and a live one another frame.
 fn step(cx: anytype, value: *animator.Animator, dt_ms: f32) void {
@@ -912,12 +1224,21 @@ test "button up inside clicks and up outside does not" {
     draw_one(cx, &button, at(0, 0, 80, 48));
     const inside: input.Point = .{ .x = 40, .y = 24 };
     const outside: input.Point = .{ .x = 400, .y = 400 };
-    try testing.expectEqual(Button.Action.none, send(cx, &button, .{ .pointer_down = inside }));
+    try testing.expectEqual(
+        Button.Action.none,
+        send(cx, &button, .{ .pointer_down = input.left_at(inside) }),
+    );
     try testing.expectEqual(@as(f32, 1), button.down.target);
-    try testing.expectEqual(Button.Action.clicked, send(cx, &button, .{ .pointer_up = inside }));
+    try testing.expectEqual(
+        Button.Action.clicked,
+        send(cx, &button, .{ .pointer_up = input.left_at(inside) }),
+    );
     try testing.expectEqual(@as(f32, 0), button.down.target);
-    _ = send(cx, &button, .{ .pointer_down = inside });
-    try testing.expectEqual(Button.Action.none, send(cx, &button, .{ .pointer_up = outside }));
+    _ = send(cx, &button, .{ .pointer_down = input.left_at(inside) });
+    try testing.expectEqual(
+        Button.Action.none,
+        send(cx, &button, .{ .pointer_up = input.left_at(outside) }),
+    );
     try testing.expectEqual(@as(f32, 0), button.hover.target);
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
 }
@@ -937,7 +1258,7 @@ test "slider drag sets an absolute value" {
     };
     const walk = at(16, 616, 1248, 24);
     draw_one(cx, &slider, walk);
-    const pressed = send(cx, &slider, .{ .pointer_down = .{ .x = 640, .y = 628 } });
+    const pressed = send(cx, &slider, .{ .pointer_down = input.left_at(.{ .x = 640, .y = 628 }) });
     try testing.expectEqual(@as(f32, 0.5), pressed.changed);
     _ = send(cx, &slider, .{ .frame = hover_duration_ms });
     try testing.expectEqual(@as(f32, 1), slider.hover.value);
@@ -949,7 +1270,7 @@ test "slider drag sets an absolute value" {
     try testing.expectEqual(@as(f32, 0), dragged.changed);
     draw_one(cx, &slider, walk);
     try testing.expectEqual(@as(usize, 2), cx.draw.items(quads.Box).len);
-    const released = send(cx, &slider, .{ .pointer_up = .{ .x = 28, .y = 628 } });
+    const released = send(cx, &slider, .{ .pointer_up = input.left_at(.{ .x = 28, .y = 628 }) });
     try testing.expectEqual(Slider.Action.released, released);
 }
 
@@ -966,22 +1287,28 @@ test "knob drag is relative and clamped" {
     try testing.expectEqualStrings("0.25", knob.value_text[0..4]);
     // The ring sits at (8, 8 + 72 - 56) / 2 inside a 200 by 72 row at the origin: center 36.
     draw_one(cx, &knob, at(0, 0, 200, knob_height));
-    try testing.expectEqual(Knob.Action.none, send(cx, &knob, .{ .pointer_down = at_y(36) }));
+    try testing.expectEqual(
+        Knob.Action.none,
+        send(cx, &knob, .{ .pointer_down = input.left_at(at_y(36)) }),
+    );
     // Move up 30 px: 30 / drag_span_px = 0.25 added.
     try testing.expectEqual(@as(f32, 0.5), send(cx, &knob, .{ .pointer_move = at_y(6) }).changed);
     try testing.expectEqualStrings("0.50", knob.value_text[0..4]);
     // A move of exactly drag_span_px down removes the whole range; further down is clamped.
     try testing.expectEqual(@as(f32, 0), send(cx, &knob, .{ .pointer_move = at_y(126) }).changed);
     try testing.expectEqual(Knob.Action.none, send(cx, &knob, .{ .pointer_move = at_y(4000) }));
-    try testing.expectEqual(Knob.Action.released, send(cx, &knob, .{ .pointer_up = at_y(36) }));
+    try testing.expectEqual(
+        Knob.Action.released,
+        send(cx, &knob, .{ .pointer_up = input.left_at(at_y(36)) }),
+    );
     // Wheel dy = -60 adds 60 / drag_span_px; a further push up clamps at 1.
-    const up_60: input.Wheel = .{ .x = 36, .y = 36, .dy = -60 };
+    const up_60: input.Wheel = .{ .x = 36, .y = 36, .dx = 0, .dy = -60 };
     try testing.expectEqual(@as(f32, 0.5), send(cx, &knob, .{ .wheel = up_60 }).changed);
-    const up_far: input.Wheel = .{ .x = 36, .y = 36, .dy = -4000 };
+    const up_far: input.Wheel = .{ .x = 36, .y = 36, .dx = 0, .dy = -4000 };
     try testing.expectEqual(@as(f32, 1), send(cx, &knob, .{ .wheel = up_far }).changed);
     try testing.expectEqualStrings("1.00", knob.value_text[0..4]);
     // A wheel off the ring does nothing.
-    const off_ring: input.Wheel = .{ .x = 150, .y = 36, .dy = 60 };
+    const off_ring: input.Wheel = .{ .x = 150, .y = 36, .dx = 0, .dy = 60 };
     try testing.expectEqual(Knob.Action.none, send(cx, &knob, .{ .wheel = off_ring }));
 }
 
@@ -999,12 +1326,19 @@ test "toggle thumb spans the pill and flips only on an inside release" {
     try testing.expectEqual(pill.x + pill.width - thumb_inset, on.x + on.width);
     try testing.expectEqual(pill.y + thumb_inset, off.y);
     draw_one(cx, &toggle, at(0, 0, 200, toggle_height));
-    _ = send(cx, &toggle, .{ .pointer_down = .{ .x = 30, .y = 20 } });
+    _ = send(cx, &toggle, .{ .pointer_down = input.left_at(.{ .x = 30, .y = 20 }) });
     const outside: input.Point = .{ .x = 300, .y = 20 };
-    try testing.expectEqual(Toggle.Action.none, send(cx, &toggle, .{ .pointer_up = outside }));
+    try testing.expectEqual(
+        Toggle.Action.none,
+        send(cx, &toggle, .{ .pointer_up = input.left_at(outside) }),
+    );
     try testing.expect(!toggle.on);
-    _ = send(cx, &toggle, .{ .pointer_down = .{ .x = 30, .y = 20 } });
-    try testing.expect(send(cx, &toggle, .{ .pointer_up = .{ .x = 30, .y = 20 } }).toggled);
+    _ = send(cx, &toggle, .{ .pointer_down = input.left_at(.{ .x = 30, .y = 20 }) });
+    try testing.expect(send(
+        cx,
+        &toggle,
+        .{ .pointer_up = input.left_at(.{ .x = 30, .y = 20 }) },
+    ).toggled);
     try testing.expectEqual(@as(f32, 1), toggle.thumb.target);
     cx.animating = false;
     _ = send(cx, &toggle, .{ .frame = 50 });
@@ -1029,5 +1363,145 @@ test "meter fill grows upward from the track bottom" {
     try testing.expect(meter.set_value(0));
     draw_one(cx, &meter, walk);
     try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+}
+
+const field_style: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 } };
+
+fn typed(key: input.Key, utf8: []const u8) input.Event {
+    return .{ .key_down = input.key_press(key, .none, false, utf8) };
+}
+
+fn chord(key: input.Key, mods: input.Mods) input.Event {
+    return .{ .key_down = input.key_press(key, mods, false, "") };
+}
+
+fn click_at(x: f32, time_ms: u32) input.Event {
+    return .{ .pointer_down = .{
+        .x = x,
+        .y = 10,
+        .time_ms = time_ms,
+        .button = .left,
+        .mods = .none,
+    } };
+}
+
+fn release_at(x: f32, time_ms: u32) input.Event {
+    return .{ .pointer_up = .{
+        .x = x,
+        .y = 10,
+        .time_ms = time_ms,
+        .button = .left,
+        .mods = .none,
+    } };
+}
+
+/// A field drawn at (0, 0), 106 px wide: 94 px of text room, about 9.8 mono advances.
+fn drawn_field(cx: *TestContext, field: *TextField) void {
+    draw_one(cx, field, at(0, 0, 106, 24));
+}
+
+// Locks typing and the field's actions: a press focuses it, text inserts at the caret,
+// Backspace and arrows edit, Ctrl+Left jumps a word, Enter commits and drops focus, and
+// Escape cancels.
+test "a field types, edits, commits on Enter, and cancels on Escape" {
+    const cx = test_context();
+    var field = TextField.init(ui.id("field", 0), edit.field_cap, field_style);
+    drawn_field(cx, &field);
+    try testing.expectEqual(TextField.Action.none, send(cx, &field, click_at(30, 0)));
+    _ = send(cx, &field, release_at(30, 0));
+    try testing.expect(cx.focused(field.id));
+    try testing.expectEqual(TextField.Action.changed, send(cx, &field, typed(.o, "o")));
+    _ = send(cx, &field, typed(.s, "s"));
+    _ = send(cx, &field, typed(.other, " "));
+    _ = send(cx, &field, typed(.c, "c"));
+    try testing.expectEqualStrings("os c", field.bytes());
+    try testing.expectEqual(TextField.Action.changed, send(cx, &field, chord(.backspace, .none)));
+    _ = send(cx, &field, chord(.left, .none));
+    _ = send(cx, &field, typed(.other, "\u{e4}"));
+    try testing.expectEqualStrings("os\u{e4} ", field.bytes());
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    _ = send(cx, &field, chord(.left, ctrl));
+    try testing.expectEqual(@as(u32, 0), field.edit.caret);
+    try testing.expectEqual(TextField.Action.none, send(cx, &field, typed(.q, "")));
+    try testing.expectEqual(TextField.Action.committed, send(cx, &field, chord(.enter, .none)));
+    try testing.expect(!cx.focused(field.id));
+    _ = send(cx, &field, click_at(30, 1000));
+    _ = send(cx, &field, release_at(30, 1000));
+    try testing.expectEqual(TextField.Action.cancelled, send(cx, &field, chord(.escape, .none)));
+    try testing.expectEqual(Id.none, cx.focus);
+}
+
+// Locks the pointer: one press puts the caret at the nearest boundary (9.6 px mono advances
+// from x = 6), a drag extends the selection, a double press selects the word and a triple
+// press everything, and a press elsewhere commits.
+test "a field selects by press, drag, double, and triple click" {
+    const cx = test_context();
+    var field = TextField.init(ui.id("field", 0), edit.field_cap, field_style);
+    field.load("ab cd");
+    drawn_field(cx, &field);
+    // x = 6 + 2.4 * 9.6 = 29.04: nearest to the boundary after "ab".
+    _ = send(cx, &field, click_at(29.04, 0));
+    try testing.expectEqual(@as(u32, 2), field.edit.caret);
+    try testing.expect(!field.edit.has_selection());
+    _ = send(cx, &field, .{ .pointer_move = .{ .x = 50, .y = 10 } });
+    try testing.expectEqualStrings(" cd", field.edit.selected());
+    _ = send(cx, &field, release_at(50, 0));
+    _ = send(cx, &field, click_at(48, 1000));
+    _ = send(cx, &field, release_at(48, 1000));
+    _ = send(cx, &field, click_at(48, 1200));
+    try testing.expectEqualStrings("cd", field.edit.selected());
+    _ = send(cx, &field, release_at(48, 1200));
+    _ = send(cx, &field, click_at(48, 1300));
+    try testing.expectEqualStrings("ab cd", field.edit.selected());
+    _ = send(cx, &field, release_at(48, 1300));
+    try testing.expectEqual(TextField.Action.committed, send(cx, &field, click_at(500, 5000)));
+}
+
+// Locks the clipboard keys and paste: Ctrl+C copies the selection, Ctrl+X copies and deletes
+// it, Ctrl+V asks the host, and a paste is one sanitized line cut to the limit.
+test "a field copies, cuts, and pastes one line within its limit" {
+    const cx = test_context();
+    var field = TextField.init(ui.id("field", 0), 8, field_style);
+    field.load("vco");
+    drawn_field(cx, &field);
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_focus(field.id);
+    cx.event_end();
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    _ = send(cx, &field, chord(.c, ctrl));
+    try testing.expectEqualStrings("vco", cx.copied());
+    try testing.expect(cx.take_copy());
+    try testing.expectEqual(TextField.Action.changed, send(cx, &field, chord(.x, ctrl)));
+    try testing.expectEqual(@as(u32, 0), field.edit.len);
+    try testing.expect(cx.take_copy());
+    _ = send(cx, &field, chord(.v, ctrl));
+    try testing.expect(cx.take_paste_request());
+    const action = send(cx, &field, .{ .paste = "lfo\r\nbank 2" });
+    try testing.expectEqual(TextField.Action.changed, action);
+    try testing.expectEqualStrings("lfo bank", field.bytes());
+}
+
+// Locks horizontal scroll: typing past the 94 px room scrolls so the caret stays at the right
+// edge, Home scrolls back to 0, and the drawn glyphs are clipped to the field's inner box.
+test "a field scrolls to keep the caret visible" {
+    const cx = test_context();
+    var field = TextField.init(ui.id("field", 0), edit.field_cap, field_style);
+    drawn_field(cx, &field);
+    _ = send(cx, &field, click_at(30, 0));
+    _ = send(cx, &field, release_at(30, 0));
+    var index: u32 = 0;
+    while (index < 12) : (index += 1) _ = send(cx, &field, typed(.x, "x"));
+    // Twelve advances of 9.6 px = 115.2 px; room 94 px, so the scroll is 21.2 px.
+    try testing.expectApproxEqAbs(@as(f32, 115.2 - 94), field.scroll_x, 0.001);
+    drawn_field(cx, &field);
+    for (cx.draw.items(quads.Glyph)) |glyph| {
+        try testing.expectEqual(@as(f32, field_padding_x), glyph.clip[0]);
+        try testing.expectEqual(@as(f32, 106 - field_padding_x), glyph.clip[2]);
+    }
+    _ = send(cx, &field, chord(.home, .none));
+    try testing.expectEqual(@as(f32, 0), field.scroll_x);
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
 }

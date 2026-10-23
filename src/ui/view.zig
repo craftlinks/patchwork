@@ -9,8 +9,8 @@
 //! the viewport, start the children `scroll_y` above the viewport top, measure the content
 //! height at the end, and draw the thumb with its own area from that same frame's height.
 //! This file owns what survives the frame (`ViewState`), the pure geometry, and the event
-//! side (`ViewState.handle`). Only vertical scrolling exists, because the input layer
-//! carries only a vertical wheel delta.
+//! side (`ViewState.handle`). Views scroll vertically only; they read the wheel's `dy` and
+//! ignore its `dx`.
 //!
 //! ## 2. Geometry
 //! The viewport is the view's border box inset by its layout padding. The children walk in

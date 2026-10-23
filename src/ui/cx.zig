@@ -15,9 +15,9 @@
 //! idle  --event_begin-->  event  --event_end-->  idle      ui.dispatch, once per event
 //! idle  --begin_frame-->  draw   --end_frame-->  idle      ui.draw_frame, when owed
 //! ```
-//! `append`, `drawing`, `walk`, `begin`, and `area` assert the draw phase; `hit` asserts the
-//! event phase; `redraw` asserts that no draw is running, because a draw reads the state it
-//! would mark dirty.
+//! `append`, `drawing`, `walk`, `begin`, and `area` assert the draw phase; `hit`, the focus
+//! changes, `copy`, and `request_paste` assert the event phase; `redraw` asserts that no draw
+//! is running, because a draw reads the state it would mark dirty.
 //!
 //! ## 3. Turtles and Clips
 //! `begin_frame` pushes the root turtle: the window, flowing down, clipped to the window.
@@ -40,15 +40,20 @@
 //! `event_begin` stores the pointer and resolves the hot area and the wheel target once
 //! (`areas.resolve`, O(areas)); `hit(id, event)` is then O(1) per widget:
 //! ```text
-//! move   captured: the capture gets drag; else hover_in / hover_out from the old to the new
-//!        hover (the hot id)
-//! down   the hot area gets down and becomes the capture; the old hover gets hover_out
-//! up     the capture gets up { inside = hot is the capture }; a new hot id gets hover_in
-//! leave  the capture gets up { inside = false }; else the hover gets hover_out
-//! wheel  the wheel target gets wheel; otherwise as move
+//! move        captured: the capture gets drag; else hover_in / hover_out from the old to
+//!             the new hover (the hot id)
+//! left down   the hot area gets down and becomes the capture; the old hover gets hover_out
+//! left up     the capture gets up { inside = hot is the capture }; a new hot id gets hover_in
+//! right down  uncaptured: the hot area gets secondary (no capture); otherwise as move
+//! other       a middle press and every non-left release act as a move
+//! leave       the capture gets up { inside = false }; else the hover gets hover_out
+//! wheel       the wheel target gets wheel; otherwise as move
+//! keys, paste, window focus, frame: none (section 7)
 //! ```
-//! While a capture is held, hover is frozen on it. `down` and `drag` carry the area's rect
-//! (`Press.rect`) from the last draw, so widgets keep no rects of their own.
+//! While a capture is held, hover is frozen on it. `down`, `drag`, and `secondary` carry the
+//! area's rect (`Press.rect`) from the last draw, so widgets keep no rects of their own, and
+//! the press count of the click sequence (`Press.clicks`, `input.count_click`). Only the left
+//! button captures, so a right release never ends a left drag.
 //!
 //! ## 6. Hover After a Redraw
 //! Areas are single-buffered: drawing never interleaves with events. After a draw moved
@@ -56,10 +61,34 @@
 //! captured it returns true and `ui.draw_frame` dispatches a synthetic `pointer_move` at the
 //! pointer, so hover lands one frame late.
 //!
-//! ## 7. TigerStyle Invariants
-//! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, and the duplicate
-//!   stamps of safe builds. Per-frame work is proportional to instances, areas, and depth;
-//!   nothing capacity-sized is cleared per frame.
+//! ## 7. Keyboard Focus
+//! `focus` is the id that receives keys and pastes. Widgets ask `focused(id)` (O(1)) and read
+//! the event themselves; `hit` answers `none` for keyboard events, so pointer-only widgets
+//! ignore them. Areas flagged `focusable` define the Tab order: their order in the area list,
+//! which is draw order.
+//! - A left press focuses the hot area when it is focusable and clears focus otherwise.
+//! - Tab and Shift+Tab move to the next or previous focusable area, wrapping, with one scan of
+//!   the areas: the only O(areas) keyboard path. A focus that was not drawn starts the cycle.
+//! - Escape clears focus in `event_end`, after the widgets saw the key, so a field reads it as
+//!   cancel; a move away by a press or Tab is visible during that event as `focus_lost(id)`,
+//!   which a field reads as commit.
+//! - A focused id that the last draw did not record stays focused; `focus_rect` is its area's
+//!   rect from the last draw that recorded it (refreshed in `end_frame`, only while focused).
+//! - `window_focus(false)` clears the held keys and the modifiers.
+//! A browser key is `consumed` when a widget had focus or Tab moved it, unless it is a
+//! clipboard shortcut, so the page's own copy, cut, and paste events still fire.
+//!
+//! ## 8. Cursor and Clipboard
+//! The hot area's `Flags.cursor` is resolved with the hot area; `cursor()` reports it, the
+//! captured area's cursor while a press is held (a held `grab` reads `grabbing`), and
+//! `default` outside the window. `copy(bytes)` stores up to `clipboard_cap` bytes (cut on a
+//! codepoint boundary) in `clipboard` and flags the host; `request_paste` asks the host for
+//! the clipboard text, which arrives as a `paste` event routed to the focused widget.
+//!
+//! ## 9. TigerStyle Invariants
+//! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, the clipboard, and the
+//!   duplicate stamps of safe builds. Per-frame work is proportional to instances, areas, and
+//!   depth; nothing capacity-sized is cleared per frame or per event.
 //! - Overflowing areas are counted in `area_overflow` and are not hittable.
 
 const std = @import("std");
@@ -76,7 +105,11 @@ pub const Clip = draw.Clip;
 pub const Id = areas.Id;
 pub const Area = areas.Area;
 pub const Flags = areas.Flags;
+pub const Cursor = areas.Cursor;
 pub const ViewState = view.ViewState;
+
+/// Bytes `copy` keeps for the host to offer: one paste-sized buffer per context.
+pub const clipboard_cap: u32 = 65536;
 
 /// What the context is doing; see the module guide, section 2.
 pub const Phase = enum(u8) {
@@ -85,11 +118,14 @@ pub const Phase = enum(u8) {
     draw,
 };
 
-/// A press or drag sample, with the rect of the area that was hit at the last draw.
+/// A press or drag sample, with the rect of the area that was hit at the last draw, the press
+/// count of the click sequence, and the modifiers.
 pub const Press = struct {
     x: f32,
     y: f32,
     rect: Rect,
+    clicks: u8,
+    mods: input.Mods,
 };
 
 /// A release sample. `inside` is true when the pointer is still over the captured area.
@@ -108,12 +144,14 @@ pub const Hit = union(enum) {
     drag: Press,
     up: Up,
     wheel: input.Wheel,
+    /// A right press on the hot area. It does not capture.
+    secondary: Press,
 };
 
 /// No hover, press, or wheel interest beyond the default.
-pub const plain: Flags = .{ .wheel = false, .focusable = false };
+pub const plain: Flags = .{ .wheel = false, .focusable = false, .cursor = .default };
 /// Takes wheel input.
-pub const wheel_flag: Flags = .{ .wheel = true, .focusable = false };
+pub const wheel_flag: Flags = .{ .wheel = true, .focusable = false, .cursor = .default };
 
 /// The layout of the root turtle: the window, flowing down, clipped to the window.
 pub const root_layout: turtle.Layout = .{
@@ -164,13 +202,37 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         pointer: input.Pointer,
         hot: Id,
         hot_rect: Rect,
+        hot_focusable: bool,
+        hot_cursor: Cursor,
         wheel: Id,
         hover: Id,
         hover_prev: Id,
         capture: Id,
         capture_rect: Rect,
+        capture_cursor: Cursor,
         /// True during the event whose `down` set the capture.
         pressed: bool,
+        /// True during the left release that ends the capture.
+        ending_capture: bool,
+        /// The click sequence of the last press (`input.count_click`).
+        clicks: input.Clicks,
+        /// Keyboard focus and the focus when the current event began (section 7).
+        focus: Id,
+        focus_prev: Id,
+        focus_rect: Rect,
+        /// True during an Escape press; `event_end` then clears focus.
+        escaping: bool,
+        /// True after a key press a widget or Tab took (section 7).
+        key_consumed: bool,
+        /// Held keys as `Key.bit` flags, and the latest modifiers.
+        keys_held: u64,
+        mods: input.Mods,
+        window_focused: bool,
+        /// `copy` output: `clipboard[0..copy_len]`. The flags are for the host (section 8).
+        clipboard: [clipboard_cap]u8,
+        copy_len: u32,
+        copy_pending: bool,
+        paste_pending: bool,
         /// A draw is owed. Set by `redraw`, cleared by `begin_frame`.
         dirty: bool,
         /// An animator is still moving; see `keep_animating`.
@@ -194,12 +256,28 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.pointer = input.Pointer.init();
             self.hot = .none;
             self.hot_rect = self.window;
+            self.hot_focusable = false;
+            self.hot_cursor = .default;
             self.wheel = .none;
             self.hover = .none;
             self.hover_prev = .none;
             self.capture = .none;
             self.capture_rect = self.window;
+            self.capture_cursor = .default;
             self.pressed = false;
+            self.ending_capture = false;
+            self.clicks = .none;
+            self.focus = .none;
+            self.focus_prev = .none;
+            self.focus_rect = self.window;
+            self.escaping = false;
+            self.key_consumed = false;
+            self.keys_held = 0;
+            self.mods = .none;
+            self.window_focused = true;
+            self.copy_len = 0;
+            self.copy_pending = false;
+            self.paste_pending = false;
             self.dirty = true;
             self.animating = false;
             assert(self.phase == .idle);
@@ -263,8 +341,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.depth == 1);
             self.depth = 0;
             self.phase = .idle;
+            if (self.focus != .none) {
+                if (self.find(self.focus)) |focused_area| {
+                    self.focus_rect = rect_of(focused_area.rect);
+                }
+            }
             if (self.capture != .none) {
-                if (self.find(self.capture)) |held| self.capture_rect = rect_of(held.rect);
+                if (self.find(self.capture)) |captured| self.capture_rect = rect_of(captured.rect);
                 return false;
             }
             if (!self.pointer.inside) return false;
@@ -534,47 +617,64 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         // --------------------------------------------------------------- events
 
         /// Starts dispatching `event`: stores the pointer and resolves the hot area and the
-        /// wheel target once (section 5).
+        /// wheel target once (section 5), and applies focus, keys, and window focus (section 7).
         pub fn event_begin(self: *Self, event: input.Event) void {
             assert(self.phase == .idle);
             self.phase = .event;
             self.event_tag = event;
             self.hover_prev = self.hover;
+            self.focus_prev = self.focus;
             self.pressed = false;
+            self.ending_capture = false;
+            self.escaping = false;
             switch (event) {
-                .frame => {},
+                .frame, .paste => {},
                 .pointer_leave => {
                     self.pointer.leave();
                     self.hot = .none;
+                    self.hot_focusable = false;
+                    self.hot_cursor = .default;
                     self.wheel = .none;
                     self.hover = .none;
                 },
                 .pointer_move => |point| self.point_at(point.x, point.y, false),
-                .pointer_up => |point| {
-                    self.pointer.button(false);
-                    self.point_at(point.x, point.y, true);
-                },
                 .wheel => |wheel| self.point_at(wheel.x, wheel.y, false),
-                .pointer_down => |point| {
-                    self.pointer.button(true);
-                    self.point_at(point.x, point.y, false);
-                    if (self.capture == .none and self.hot != .none) {
-                        self.capture = self.hot;
-                        self.capture_rect = self.hot_rect;
-                        self.pressed = true;
+                .pointer_down => |down| self.press_at(down),
+                .pointer_up => |up| {
+                    self.mods = up.mods;
+                    const left = up.button == .left;
+                    if (left) self.pointer.button(false);
+                    self.ending_capture = left and self.capture != .none;
+                    self.point_at(up.x, up.y, left);
+                },
+                .key_down => |press| self.key_at(press),
+                .key_up => |press| {
+                    self.mods = press.mods;
+                    self.keys_held &= ~press.key.bit();
+                },
+                .window_focus => |focused_now| {
+                    self.window_focused = focused_now;
+                    if (!focused_now) {
+                        self.keys_held = 0;
+                        self.mods = .none;
                     }
                 },
             }
             assert(self.phase == .event);
         }
 
-        /// Finishes dispatching: a release or a leave drops the capture.
+        /// Finishes dispatching: a left release or a leave drops the capture, and an Escape
+        /// press clears focus after the widgets saw it (section 7).
         pub fn event_end(self: *Self) void {
             assert(self.phase == .event);
             switch (self.event_tag) {
-                .pointer_up, .pointer_leave => self.capture = .none,
+                .pointer_up => if (self.ending_capture) {
+                    self.capture = .none;
+                },
+                .pointer_leave => self.capture = .none,
                 else => {},
             }
+            if (self.escaping) self.focus = .none;
             self.phase = .idle;
             assert(self.phase == .idle);
         }
@@ -585,23 +685,36 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(id != .none);
             assert(@as(std.meta.Tag(input.Event), event) == self.event_tag);
             switch (event) {
-                .frame => return .none,
+                .frame, .key_down, .key_up, .paste, .window_focus => return .none,
                 .pointer_move => |point| {
-                    if (self.capture != .none) return self.drag_of(id, point);
+                    if (self.capture != .none) return self.drag_of(id, point.x, point.y);
                     return self.hover_change(id);
                 },
-                .pointer_down => |point| {
-                    if (self.pressed and id == self.capture) {
-                        return .{ .down = .{ .x = point.x, .y = point.y, .rect = self.hot_rect } };
+                .pointer_down => |down| {
+                    if (down.button == .left) {
+                        if (self.pressed and id == self.capture) {
+                            return .{ .down = self.press_of(down.x, down.y, self.hot_rect) };
+                        }
+                        if (!self.pressed and self.capture != .none) {
+                            return self.drag_of(id, down.x, down.y);
+                        }
+                        return self.hover_change(id);
                     }
-                    if (!self.pressed and self.capture != .none) return self.drag_of(id, point);
+                    if (self.capture != .none) return self.drag_of(id, down.x, down.y);
+                    if (down.button == .right and id == self.hot) {
+                        return .{ .secondary = self.press_of(down.x, down.y, self.hot_rect) };
+                    }
                     return self.hover_change(id);
                 },
-                .pointer_up => |point| {
+                .pointer_up => |up| {
+                    if (up.button != .left) {
+                        if (self.capture != .none) return self.drag_of(id, up.x, up.y);
+                        return self.hover_change(id);
+                    }
                     if (self.capture == .none) return self.hover_change(id);
                     if (id == self.capture) {
                         const inside = self.hot == self.capture;
-                        return .{ .up = .{ .x = point.x, .y = point.y, .inside = inside } };
+                        return .{ .up = .{ .x = up.x, .y = up.y, .inside = inside } };
                     }
                     if (id == self.hover and id != self.hover_prev) return .hover_in;
                     return .none;
@@ -622,11 +735,23 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             }
         }
 
-        fn drag_of(self: *const Self, id: Id, point: input.Point) Hit {
+        fn press_of(self: *const Self, x: f32, y: f32, rect: Rect) Press {
+            assert(x == x);
+            assert(self.clicks.count >= 1);
+            return .{
+                .x = x,
+                .y = y,
+                .rect = rect,
+                .clicks = self.clicks.count,
+                .mods = self.mods,
+            };
+        }
+
+        fn drag_of(self: *const Self, id: Id, x: f32, y: f32) Hit {
             assert(self.capture != .none);
             assert(id != .none);
             if (id != self.capture) return .none;
-            return .{ .drag = .{ .x = point.x, .y = point.y, .rect = self.capture_rect } };
+            return .{ .drag = self.press_of(x, y, self.capture_rect) };
         }
 
         fn hover_change(self: *const Self, id: Id) Hit {
@@ -646,14 +771,206 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.pointer.move(x, y);
             const found = areas.resolve(self.areas[0..self.area_count], x, y);
             self.hot = .none;
+            self.hot_focusable = false;
+            self.hot_cursor = .default;
             self.wheel = .none;
             if (found.hot) |index| {
-                self.hot = self.areas[index].id;
-                self.hot_rect = rect_of(self.areas[index].rect);
+                const hot_area = &self.areas[index];
+                self.hot = hot_area.id;
+                self.hot_rect = rect_of(hot_area.rect);
+                self.hot_focusable = hot_area.flags.focusable;
+                self.hot_cursor = hot_area.flags.cursor;
             }
             if (found.wheel) |index| self.wheel = self.areas[index].id;
             if (self.capture == .none or releasing) self.hover = self.hot;
             assert(self.pointer.inside);
+        }
+
+        /// A press: counts the click, and a left press captures the hot area and moves focus
+        /// to it when it is focusable, or clears focus (section 7).
+        fn press_at(self: *Self, down: input.Button) void {
+            self.mods = down.mods;
+            self.clicks = input.count_click(self.clicks, down);
+            if (down.button != .left) {
+                self.point_at(down.x, down.y, false);
+                return;
+            }
+            self.pointer.button(true);
+            self.point_at(down.x, down.y, false);
+            if (self.capture != .none) return;
+            if (self.hot != .none) {
+                self.capture = self.hot;
+                self.capture_rect = self.hot_rect;
+                self.capture_cursor = self.hot_cursor;
+                self.pressed = true;
+            }
+            self.focus = if (self.hot_focusable) self.hot else .none;
+            if (self.focus != .none) self.focus_rect = self.hot_rect;
+            assert(self.clicks.count >= 1);
+        }
+
+        /// A key press: holds the key, cycles focus on Tab, notes Escape, and decides whether
+        /// the browser should keep the key from the page (section 7).
+        fn key_at(self: *Self, press: input.KeyPress) void {
+            self.mods = press.mods;
+            self.keys_held |= press.key.bit();
+            self.escaping = press.key == .escape;
+            if (press.key == .tab and !press.mods.shortcut() and !press.mods.alt) {
+                self.cycle_focus(press.mods.shift);
+            }
+            const clipboard_key = press.key == .c or press.key == .x or press.key == .v;
+            const shortcut = press.mods.shortcut() and clipboard_key;
+            const routed = self.focus_prev != .none or self.focus != .none;
+            self.key_consumed = routed and !shortcut;
+            if (shortcut) assert(!self.key_consumed);
+        }
+
+        /// Moves focus to the next focusable area in draw order, or the previous one when
+        /// `backward`, wrapping. One scan of the areas; nothing focusable leaves focus as is.
+        fn cycle_focus(self: *Self, backward: bool) void {
+            var first: ?u32 = null;
+            var last: ?u32 = null;
+            var before: ?u32 = null;
+            var after: ?u32 = null;
+            var seen = false;
+            for (self.areas[0..self.area_count], 0..) |candidate, index| {
+                if (!candidate.flags.focusable) continue;
+                const at: u32 = @intCast(index);
+                if (first == null) first = at;
+                last = at;
+                if (candidate.id == self.focus) {
+                    seen = true;
+                } else if (!seen) {
+                    before = at;
+                } else if (after == null) {
+                    after = at;
+                }
+            }
+            const chosen: ?u32 = if (!seen)
+                (if (backward) last else first)
+            else if (backward)
+                (before orelse last)
+            else
+                (after orelse first);
+            const index = chosen orelse return;
+            assert(index < self.area_count);
+            self.focus = self.areas[index].id;
+            self.focus_rect = rect_of(self.areas[index].rect);
+        }
+
+        // ---------------------------------------------------------------- focus
+
+        /// True when `id` has keyboard focus.
+        pub fn focused(self: *const Self, id: Id) bool {
+            assert(id != .none);
+            assert(self.area_count <= area_cap);
+            return self.focus == id;
+        }
+
+        /// True during the event that gave `id` focus.
+        pub fn focus_gained(self: *const Self, id: Id) bool {
+            assert(self.phase == .event);
+            assert(id != .none);
+            return self.focus == id and self.focus_prev != id;
+        }
+
+        /// True during the event that took focus from `id` (a press elsewhere or Tab).
+        pub fn focus_lost(self: *const Self, id: Id) bool {
+            assert(self.phase == .event);
+            assert(id != .none);
+            return self.focus_prev == id and self.focus != id;
+        }
+
+        /// Gives `id` focus, as a widget that opens an editor does. Event phase only.
+        pub fn set_focus(self: *Self, id: Id) void {
+            assert(self.phase == .event);
+            assert(id != .none);
+            self.focus = id;
+            if (self.find(id)) |found| self.focus_rect = rect_of(found.rect);
+            assert(self.focus == id);
+        }
+
+        /// Clears focus, as a field does when Enter commits. Event phase only.
+        pub fn clear_focus(self: *Self) void {
+            assert(self.phase == .event);
+            self.focus = .none;
+            assert(self.focus == .none);
+        }
+
+        /// The focused area's rect at the last draw that recorded it (section 7).
+        pub fn focused_rect(self: *const Self) Rect {
+            assert(self.focus != .none);
+            assert(self.focus_rect.width >= 0);
+            return self.focus_rect;
+        }
+
+        /// True while `key` is held.
+        pub fn held(self: *const Self, key: input.Key) bool {
+            assert(key != .other);
+            assert(self.phase != .draw);
+            return self.keys_held & key.bit() != 0;
+        }
+
+        /// True when the last key press went to a widget or moved focus (section 7).
+        pub fn consumed(self: *const Self) bool {
+            assert(self.phase == .idle);
+            assert(self.event_tag == .key_down);
+            return self.key_consumed;
+        }
+
+        // ------------------------------------------------------ cursor, clipboard
+
+        /// The pointer shape to show (section 8).
+        pub fn cursor(self: *const Self) Cursor {
+            assert(self.phase != .draw);
+            if (self.capture != .none) {
+                if (self.capture_cursor == .grab) return .grabbing;
+                return self.capture_cursor;
+            }
+            if (!self.pointer.inside) return .default;
+            return self.hot_cursor;
+        }
+
+        /// Stores `utf8` (cut to `clipboard_cap` on a codepoint boundary) for the host to offer
+        /// as the clipboard selection. Event phase only.
+        pub fn copy(self: *Self, utf8: []const u8) void {
+            assert(self.phase == .event);
+            const length = input.utf8_prefix(utf8, clipboard_cap);
+            @memcpy(self.clipboard[0..length], utf8[0..length]);
+            self.copy_len = length;
+            self.copy_pending = true;
+            assert(self.copy_len <= clipboard_cap);
+        }
+
+        /// The bytes of the last `copy`.
+        pub fn copied(self: *const Self) []const u8 {
+            assert(self.copy_len <= clipboard_cap);
+            return self.clipboard[0..self.copy_len];
+        }
+
+        /// Host side: true once after a `copy`.
+        pub fn take_copy(self: *Self) bool {
+            assert(self.phase == .idle);
+            const pending = self.copy_pending;
+            self.copy_pending = false;
+            assert(!self.copy_pending);
+            return pending;
+        }
+
+        /// Asks the host for the clipboard text; it arrives as a `paste` event. Event phase.
+        pub fn request_paste(self: *Self) void {
+            assert(self.phase == .event);
+            self.paste_pending = true;
+            assert(self.paste_pending);
+        }
+
+        /// Host side: true once after a `request_paste`.
+        pub fn take_paste_request(self: *Self) bool {
+            assert(self.phase == .idle);
+            const pending = self.paste_pending;
+            self.paste_pending = false;
+            assert(!self.paste_pending);
+            return pending;
         }
 
         // ------------------------------------------------------------- internals
@@ -859,7 +1176,7 @@ test "topmost wins and capture persists across frames" {
     send(context, .{ .pointer_move = .{ .x = 90, .y = 90 } }, &ids, &out);
     try testing.expectEqual(Hit.hover_out, out[1]);
     try testing.expectEqual(Hit.hover_in, out[2]);
-    send(context, .{ .pointer_down = .{ .x = 60, .y = 60 } }, &ids, &out);
+    send(context, .{ .pointer_down = input.left_at(.{ .x = 60, .y = 60 }) }, &ids, &out);
     try testing.expectEqual(@as(f32, 50), out[1].down.rect.x);
     try testing.expectEqual(Hit.hover_out, out[2]);
     try testing.expectEqual(knob, context.hovered());
@@ -869,7 +1186,7 @@ test "topmost wins and capture persists across frames" {
     send(context, .{ .pointer_move = .{ .x = 170, .y = 60 } }, &ids, &out);
     try testing.expectEqual(@as(f32, 150), out[1].drag.rect.x);
     try testing.expectEqual(Hit.none, out[0]);
-    send(context, .{ .pointer_up = .{ .x = 390, .y = 290 } }, &ids, &out);
+    send(context, .{ .pointer_up = input.left_at(.{ .x = 390, .y = 290 }) }, &ids, &out);
     try testing.expect(!out[1].up.inside);
     try testing.expectEqual(Id.none, context.capture);
     try testing.expectEqual(Id.none, context.hovered());
@@ -958,7 +1275,7 @@ test "a 1,000-row list emits only visible rows" {
             const first = context.find(areas.id("row", 4)).?;
             try testing.expectEqualSlices(f32, &.{ 0, -4, 184, 24 }, &first.rect);
             var out: [1]Hit = undefined;
-            const wheel: input.Event = .{ .wheel = .{ .x = 20, .y = 10, .dy = 30000 } };
+            const wheel: input.Event = .{ .wheel = .{ .x = 20, .y = 10, .dx = 0, .dy = 30000 } };
             context.event_begin(wheel);
             const action = state.handle(context, view_id, wheel);
             try testing.expectEqual(ViewState.Action.scrolled, action);
@@ -971,4 +1288,203 @@ test "a 1,000-row list emits only visible rows" {
     try testing.expectEqual(@as(f32, 24000 - 240), state.scroll_y);
     try testing.expectEqual(view.List.Range{ .first = 990, .end = 1000 }, drawn[1]);
     try testing.expectEqual(@as(u32, 0), context.area_overflow);
+}
+
+fn press_key(key: input.Key, mods: input.Mods) input.Event {
+    return .{ .key_down = input.key_press(key, mods, false, "") };
+}
+
+fn button_event(x: f32, y: f32, which: input.MouseButton, down: bool) input.Event {
+    const sample: input.Button = .{ .x = x, .y = y, .time_ms = 0, .button = which, .mods = .none };
+    if (down) return .{ .pointer_down = sample };
+    return .{ .pointer_up = sample };
+}
+
+const focusable_text: Flags = .{ .wheel = false, .focusable = true, .cursor = .text };
+
+/// Draws three focusable fields at x = 0, 100, 200 and one plain area at x = 300.
+fn draw_fields(context: *TestContext) void {
+    context.begin_frame(400, 300, 120);
+    var index: u32 = 0;
+    while (index < 3) : (index += 1) {
+        const x: f32 = @floatFromInt(index * 100);
+        context.area(areas.id("field", index), rect_at(x, 0, 80, 20), 0, focusable_text);
+    }
+    context.area(areas.id("plain", 0), rect_at(300, 0, 80, 20), 0, plain);
+    _ = context.end_frame();
+}
+
+// Locks focus: a left press focuses a focusable area and clears focus elsewhere, Tab and
+// Shift+Tab walk the areas in draw order and wrap, the event that moves focus reports
+// `focus_lost` and `focus_gained`, Escape clears focus only after the widgets saw it, and an
+// undrawn focus survives a draw while Tab restarts from the first area.
+test "focus follows presses, Tab cycles in draw order, and Escape clears after routing" {
+    const context = new_context();
+    draw_fields(context);
+    const first = areas.id("field", 0);
+    const second = areas.id("field", 1);
+    const third = areas.id("field", 2);
+    var out: [1]Hit = undefined;
+    send(context, button_event(110, 10, .left, true), &.{second}, &out);
+    try testing.expect(context.focused(second));
+    try testing.expectEqual(@as(f32, 100), context.focused_rect().x);
+    send(context, button_event(110, 10, .left, false), &.{second}, &out);
+    context.event_begin(press_key(.tab, .none));
+    try testing.expect(context.focus_lost(second));
+    try testing.expect(context.focus_gained(third));
+    context.event_end();
+    try testing.expect(context.consumed());
+    send(context, press_key(.tab, .none), &.{third}, &out);
+    try testing.expect(context.focused(first));
+    var shift = input.Mods.none;
+    shift.shift = true;
+    send(context, press_key(.tab, shift), &.{first}, &out);
+    try testing.expect(context.focused(third));
+    context.event_begin(press_key(.escape, .none));
+    try testing.expect(context.focused(third));
+    try testing.expect(!context.focus_lost(third));
+    context.event_end();
+    try testing.expectEqual(Id.none, context.focus);
+    send(context, button_event(10, 10, .left, true), &.{first}, &out);
+    send(context, button_event(10, 10, .left, false), &.{first}, &out);
+    context.event_begin(button_event(310, 10, .left, true));
+    try testing.expect(context.focus_lost(first));
+    context.event_end();
+    try testing.expectEqual(Id.none, context.focus);
+    send(context, button_event(310, 10, .left, false), &.{first}, &out);
+    context.event_begin(press_key(.tab, .none));
+    context.set_focus(areas.id("gone", 0));
+    context.event_end();
+    draw_fields(context);
+    try testing.expectEqual(areas.id("gone", 0), context.focus);
+    send(context, press_key(.tab, .none), &.{first}, &out);
+    try testing.expect(context.focused(first));
+}
+
+// Locks the browser key verdict: with nothing focusable a Tab is not consumed (the page may
+// move focus), a focused widget consumes keys, and Ctrl+C, Ctrl+X, and Ctrl+V are never
+// consumed so the page's clipboard events fire.
+test "keys are consumed by focus but clipboard shortcuts never are" {
+    const context = new_context();
+    var out: [1]Hit = undefined;
+    const field = areas.id("field", 0);
+    send(context, press_key(.tab, .none), &.{field}, &out);
+    try testing.expect(!context.consumed());
+    draw_fields(context);
+    send(context, press_key(.tab, .none), &.{field}, &out);
+    try testing.expect(context.consumed());
+    send(context, press_key(.a, .none), &.{field}, &out);
+    try testing.expect(context.consumed());
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    for ([_]input.Key{ .c, .x, .v }) |key| {
+        send(context, press_key(key, ctrl), &.{field}, &out);
+        try testing.expect(!context.consumed());
+    }
+    send(context, press_key(.a, ctrl), &.{field}, &out);
+    try testing.expect(context.consumed());
+    try testing.expectEqual(Hit.none, out[0]);
+}
+
+// Locks held keys: presses set and releases clear their bits, and a window blur releases every
+// held key and the modifiers.
+test "a window blur releases held keys and modifiers" {
+    const context = new_context();
+    var out: [1]Hit = undefined;
+    const ids = [_]Id{areas.id("any", 0)};
+    var shift = input.Mods.none;
+    shift.shift = true;
+    send(context, press_key(.a, shift), &ids, &out);
+    send(context, press_key(.left, shift), &ids, &out);
+    try testing.expect(context.held(.a));
+    try testing.expect(context.held(.left));
+    try testing.expect(context.mods.shift);
+    send(context, .{ .key_up = input.key_press(.a, shift, false, "") }, &ids, &out);
+    try testing.expect(!context.held(.a));
+    send(context, .{ .window_focus = false }, &ids, &out);
+    try testing.expect(!context.held(.left));
+    try testing.expect(!context.mods.shift);
+    try testing.expect(!context.window_focused);
+    try testing.expectEqual(@as(u64, 0), context.keys_held);
+}
+
+// Locks the other buttons: a right press on the hot area is `secondary` without a capture, a
+// right release during a left drag does not end it, and the left release does; the drag
+// carries the click count.
+test "right presses are secondary and never end a left capture" {
+    const context = new_context();
+    const knob = areas.id("knob", 0);
+    const other = areas.id("other", 0);
+    context.begin_frame(400, 300, 120);
+    context.area(knob, rect_at(0, 0, 50, 50), 0, plain);
+    context.area(other, rect_at(100, 0, 50, 50), 0, plain);
+    _ = context.end_frame();
+    const ids = [_]Id{ knob, other };
+    var out: [2]Hit = undefined;
+    send(context, button_event(10, 10, .right, true), &ids, &out);
+    try testing.expectEqual(@as(f32, 0), out[0].secondary.rect.x);
+    try testing.expectEqual(@as(u8, 1), out[0].secondary.clicks);
+    try testing.expectEqual(Id.none, context.capture);
+    send(context, button_event(10, 10, .right, false), &ids, &out);
+    send(context, button_event(10, 10, .left, true), &ids, &out);
+    try testing.expectEqual(knob, context.capture);
+    send(context, button_event(120, 10, .right, true), &ids, &out);
+    try testing.expectEqual(@as(f32, 120), out[0].drag.x);
+    try testing.expectEqual(Hit.none, out[1]);
+    send(context, button_event(120, 10, .right, false), &ids, &out);
+    try testing.expectEqual(knob, context.capture);
+    send(context, button_event(120, 10, .left, false), &ids, &out);
+    try testing.expect(!out[0].up.inside);
+    try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks the cursor: the hot area's shape, `default` off every area and outside the window,
+// and a held `grab` reads `grabbing` until the release.
+test "the cursor follows the hot area and a held grab reads grabbing" {
+    const context = new_context();
+    const knob = areas.id("knob", 0);
+    const field = areas.id("field", 0);
+    const grab: Flags = .{ .wheel = true, .focusable = false, .cursor = .grab };
+    context.begin_frame(400, 300, 120);
+    context.area(knob, rect_at(0, 0, 50, 50), 0, grab);
+    context.area(field, rect_at(100, 0, 50, 50), 0, focusable_text);
+    _ = context.end_frame();
+    var out: [1]Hit = undefined;
+    try testing.expectEqual(Cursor.default, context.cursor());
+    send(context, .{ .pointer_move = .{ .x = 120, .y = 10 } }, &.{field}, &out);
+    try testing.expectEqual(Cursor.text, context.cursor());
+    send(context, .{ .pointer_move = .{ .x = 10, .y = 10 } }, &.{field}, &out);
+    try testing.expectEqual(Cursor.grab, context.cursor());
+    send(context, button_event(10, 10, .left, true), &.{knob}, &out);
+    send(context, .{ .pointer_move = .{ .x = 300, .y = 200 } }, &.{knob}, &out);
+    try testing.expectEqual(Cursor.grabbing, context.cursor());
+    send(context, button_event(300, 200, .left, false), &.{knob}, &out);
+    try testing.expectEqual(Cursor.default, context.cursor());
+    send(context, .pointer_leave, &.{knob}, &out);
+    try testing.expectEqual(Cursor.default, context.cursor());
+}
+
+// Locks the clipboard handshake: `copy` keeps the bytes and flags the host once, a copy over
+// `clipboard_cap` is cut on a codepoint boundary, and a paste request flags the host once.
+test "copy keeps the bytes for the host and cuts on a codepoint boundary" {
+    const context = new_context();
+    context.event_begin(.{ .frame = 0 });
+    context.copy("vco \u{e4}");
+    context.request_paste();
+    context.event_end();
+    try testing.expectEqualStrings("vco \u{e4}", context.copied());
+    try testing.expect(context.take_copy());
+    try testing.expect(!context.take_copy());
+    try testing.expect(context.take_paste_request());
+    try testing.expect(!context.take_paste_request());
+    const static = struct {
+        var long: [clipboard_cap + 1]u8 = undefined;
+    };
+    @memset(static.long[0 .. clipboard_cap - 1], 'a');
+    static.long[clipboard_cap - 1] = 0xC3;
+    static.long[clipboard_cap] = 0xA4;
+    context.event_begin(.{ .frame = 0 });
+    context.copy(&static.long);
+    context.event_end();
+    try testing.expectEqual(@as(usize, clipboard_cap - 1), context.copied().len);
 }

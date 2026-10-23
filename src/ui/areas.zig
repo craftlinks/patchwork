@@ -18,8 +18,10 @@
 //! ## 3. The Record
 //! `Area` is 48 bytes: `id`, `rect` and `clip` as `[4]f32` (`clip` exclusive-max like an
 //! instance's), the corner `radius` of the rounded hit shape, the draw `layer` it was
-//! recorded on, and `flags` (`wheel`: the area takes wheel input; `focusable` is reserved).
-//! A point hits an area when the clip contains it and `draw.contains_box` accepts it.
+//! recorded on, and `flags`: `wheel` (the area takes wheel input), `focusable` (a left press
+//! focuses it and Tab visits it; the area list in draw order is the Tab order), and `cursor`
+//! (the pointer shape over it, resolved with the hot area). A point hits an area when the clip
+//! contains it and `draw.contains_box` accepts it.
 //!
 //! ## 4. Resolution
 //! `resolve` scans the areas once from last to first. The hot area is the topmost: the
@@ -60,12 +62,25 @@ pub const Id = enum(u64) {
     }
 };
 
-/// What an area takes besides presses and hover.
+/// The pointer shape over an area. The tag names are the CSS cursor names with `_` for `-`;
+/// the native host maps them onto `wp_cursor_shape_device_v1` shapes.
+pub const Cursor = enum(u3) {
+    default,
+    pointer,
+    text,
+    grab,
+    grabbing,
+    ew_resize,
+    ns_resize,
+};
+
+/// What an area takes besides presses and hover. See the module guide, section 3.
 pub const Flags = packed struct(u8) {
     wheel: bool,
-    /// Reserved for keyboard focus order.
+    /// A left press focuses the area, and Tab visits it in draw order.
     focusable: bool,
-    unused: u6 = 0,
+    cursor: Cursor,
+    unused: u3 = 0,
 };
 
 /// One hit area. See the module guide, section 3.
@@ -94,6 +109,7 @@ comptime {
     assert(@offsetOf(Area, "rect") == 8);
     assert(@offsetOf(Area, "clip") == 24);
     assert(@sizeOf(Flags) == 1);
+    assert(@typeInfo(Cursor).@"enum".field_names.len == 7);
     assert(area_cap_max <= std.math.maxInt(u16) + 1);
 }
 
@@ -226,7 +242,7 @@ fn test_area(key: Id, x: f32, layer: u8, wheel: bool) Area {
         .clip = .{ 0, 0, 1000, 1000 },
         .radius = 0,
         .layer = layer,
-        .flags = .{ .wheel = wheel, .focusable = false },
+        .flags = .{ .wheel = wheel, .focusable = false, .cursor = .default },
         .pad = 0,
     };
 }

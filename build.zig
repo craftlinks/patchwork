@@ -47,12 +47,17 @@
 //! starts the installed executable, never the copy in the cache.
 //!
 //! ## 5. Steps
-//! - `run` installs, then runs the installed native executable (Wayland and wgpu-native).
+//! - `run` installs, then runs the installed native executable (Wayland, libxkbcommon, and
+//!   wgpu-native).
+//! - Native executables link `libwayland-client` and `libxkbcommon` dynamically through
+//!   pkg-config (`link_xkbcommon`): a consumer's build machine needs both `.so` files and
+//!   their `.pc` files, and its users need both libraries. The wasm build links nothing.
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
 //! - `serve` serves the page, `shell.js`, and the wasm through `src/serve.zig`, which owns
 //!   the address and port.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
-//! - `zig build test` in this repo adds the library tests. `zig build test-contract`
+//! - `zig build test` in this repo adds the library tests and the native-only tests
+//!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
 //!   compiles an app with no `draw` and an app whose draw type is not a multiple of 16 bytes,
 //!   and passes only if the compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, and `wasm` steps through
@@ -188,7 +193,7 @@ fn add_run(b: *std.Build, options: AppOptions, install: *std.Build.Step) *std.Bu
 ///   `addApp` installs the library. The 0.17 build runner hands the compiler paths relative to
 ///   the build root, so a RUNPATH taken from `lib_path` would resolve against the working
 ///   directory of whoever starts the executable.
-/// - Dynamically links `libwayland-client.so` and `libwgpu_native.so`.
+/// - Dynamically links `libwayland-client.so`, `libxkbcommon.so`, and `libwgpu_native.so`.
 fn add_native(
     b: *std.Build,
     patchwork_builder: *std.Build,
@@ -215,6 +220,7 @@ fn add_native(
         .preferred_link_mode = .dynamic,
         .search_strategy = .paths_first,
     });
+    link_xkbcommon(exe.root_module);
     exe.root_module.linkSystemLibrary("wgpu_native", .{
         .needed = true,
         .weak = false,
@@ -223,6 +229,18 @@ fn add_native(
         .search_strategy = .paths_first,
     });
     return exe;
+}
+
+/// Links `libxkbcommon.so` dynamically through pkg-config: native keyboard input
+/// (`src/host/xkb.zig`). Required at build and run time, like `libwayland-client`.
+fn link_xkbcommon(module: *std.Build.Module) void {
+    module.linkSystemLibrary("xkbcommon", .{
+        .needed = true,
+        .weak = false,
+        .use_pkg_config = .yes,
+        .preferred_link_mode = .dynamic,
+        .search_strategy = .paths_first,
+    });
 }
 
 /// Freestanding WebAssembly module.
@@ -347,6 +365,16 @@ fn add_test_steps(
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
+    // Native-only tests call libxkbcommon, so they get their own root and link it.
+    const native = b.createModule(.{
+        .root_source_file = b.path("src/native_tests.zig"),
+        .target = library.resolved_target,
+        .optimize = library.optimize.?,
+        .link_libc = true,
+    });
+    link_xkbcommon(native);
+    const native_tests = b.addTest(.{ .root_module = native });
+    test_step.dependOn(&b.addRunArtifact(native_tests).step);
     for (examples) |example| {
         test_step.dependOn(example.tests);
     }

@@ -218,7 +218,7 @@ fn center(rect: Rect) input.Point {
 /// A wheel in the view's gutter, 40 px below its top, where no control sits.
 fn gutter_wheel(app: *const App, dy: f32) input.Event {
     const view = app.view.viewport;
-    return .{ .wheel = .{ .x = view.x + view.width - 8, .y = view.y + 40, .dy = dy } };
+    return .{ .wheel = .{ .x = view.x + view.width - 8, .y = view.y + 40, .dx = 0, .dy = dy } };
 }
 
 fn has_clip(instance_clip: [4]f32, clip: quads.Clip) bool {
@@ -328,7 +328,7 @@ test "knob drag from the ring center clamps at both ends" {
     var app = new_app();
     _ = frame_at(&app, 1280, 720);
     const point = center(area_rect(app.knobs[0].id));
-    try std.testing.expect(send(&app, .{ .pointer_down = point }));
+    try std.testing.expect(send(&app, .{ .pointer_down = input.left_at(point) }));
     try std.testing.expect(send(&app, .{ .pointer_move = .{ .x = point.x, .y = point.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 0.75), app.knobs[0].value);
     try std.testing.expect(send(&app, .{ .pointer_move = .{ .x = point.x, .y = point.y + 4000 } }));
@@ -343,10 +343,16 @@ test "wheel on the ring nudges and wheel on the label scrolls" {
     _ = frame_at(&app, 1280, 720);
     const ring = area_rect(app.knobs[0].id);
     const point = center(ring);
-    try std.testing.expect(send(&app, .{ .wheel = .{ .x = point.x, .y = point.y, .dy = -60 } }));
+    try std.testing.expect(send(
+        &app,
+        .{ .wheel = .{ .x = point.x, .y = point.y, .dx = 0, .dy = -60 } },
+    ));
     try std.testing.expectEqual(@as(f32, 0.75), app.knobs[0].value);
     try std.testing.expectEqual(@as(f32, 0), app.view.scroll_y);
-    try std.testing.expect(send(&app, .{ .wheel = .{ .x = ring.x + 80, .y = point.y, .dy = 40 } }));
+    try std.testing.expect(send(
+        &app,
+        .{ .wheel = .{ .x = ring.x + 80, .y = point.y, .dx = 0, .dy = 40 } },
+    ));
     try std.testing.expectEqual(@as(f32, 0.75), app.knobs[0].value);
     try std.testing.expectEqual(@as(f32, 40), app.view.scroll_y);
 }
@@ -363,8 +369,8 @@ test "toggle up inside drums slides the thumb" {
     var app = new_app();
     _ = frame_at(&app, 1280, 720);
     const pill = scroll_to_drums(&app);
-    try std.testing.expect(send(&app, .{ .pointer_down = pill }));
-    try std.testing.expect(send(&app, .{ .pointer_up = pill }));
+    try std.testing.expect(send(&app, .{ .pointer_down = input.left_at(pill) }));
+    try std.testing.expect(send(&app, .{ .pointer_up = input.left_at(pill) }));
     try std.testing.expect(app.toggles[1].on);
     try std.testing.expectEqual(@as(f32, 1), app.toggles[1].thumb.target);
     try std.testing.expect(ui.animate(App, &app, &test_context, 50));
@@ -378,8 +384,8 @@ test "toggle up outside does not flip" {
     var app = new_app();
     _ = frame_at(&app, 1280, 720);
     const pill = scroll_to_drums(&app);
-    _ = send(&app, .{ .pointer_down = pill });
-    _ = send(&app, .{ .pointer_up = .{ .x = 0, .y = 0 } });
+    _ = send(&app, .{ .pointer_down = input.left_at(pill) });
+    _ = send(&app, .{ .pointer_up = input.left_at(.{ .x = 0, .y = 0 }) });
     try std.testing.expect(!app.toggles[1].on);
     try std.testing.expectEqual(@as(f32, 0), app.toggles[1].thumb.target);
 }
@@ -415,7 +421,10 @@ test "relayout by 8 px keeps gain hover" {
 test "pointer leave during a knob press releases capture" {
     var app = new_app();
     _ = frame_at(&app, 1280, 720);
-    try std.testing.expect(send(&app, .{ .pointer_down = center(area_rect(app.knobs[0].id)) }));
+    try std.testing.expect(send(
+        &app,
+        .{ .pointer_down = input.left_at(center(area_rect(app.knobs[0].id))) },
+    ));
     _ = send(&app, .pointer_leave);
     try std.testing.expectEqual(ui.Id.none, test_context.capture);
     try std.testing.expect(!test_context.pointer.inside);
