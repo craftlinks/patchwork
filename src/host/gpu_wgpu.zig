@@ -85,7 +85,19 @@
 //! compositor still latches whole buffers; tearing needs `wp_tearing_control_v1`. Remove the
 //! preference if a Mesa release makes FIFO a single commit per present.
 //!
-//! ## 9. TigerStyle Invariants
+//! ## 9. Profiling (Bench Mode)
+//! With `Options.profile` (the native host's `--bench`, see `bench.zig`) the backend:
+//! - requests `TimestampQuery` when the adapter has it, attaches `timestampWrites` (indices 0
+//!   and 1) to every pass, resolves them after the pass, copies them to a map-read buffer,
+//!   and blocks on `wgpuDevicePoll` after present to read `pass_ns`. Blocking removes CPU and
+//!   GPU overlap, so profiled frames time the pass, not the pipeline;
+//! - adds `copy_src` to the surface usage, so `request_frame_image` can copy the next frame's
+//!   swapchain texture into a 256-byte-aligned buffer, mapped until `release_frame_image`;
+//! - keeps the adapter's device name for the report.
+//! Without it no feature is requested, the surface usage is unchanged, and none of this runs.
+//! `Options.adapter` maps to `power_preference` in either mode.
+//!
+//! ## 10. TigerStyle Invariants
 //! Long-lived resources are created only by setup ops, into fixed tables; frame ops create
 //! and release only per-frame handles. Searches over driver-reported lists are bounded by
 //! `present_mode_cap` and `format_cap`, waiting is bounded by `wait_max`, and an error
@@ -94,6 +106,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const commands = @import("../gpu/commands.zig");
+const bench = @import("../bench.zig");
 
 /// Every native WebGPU handle the backend owns. The device objects are created by `create`
 /// and the resource tables are filled by setup ops; nothing is freed, since the process
@@ -120,6 +133,14 @@ pub const Gpu = struct {
     views: [cap(.texture)]?TextureView,
     samplers: [cap(.sampler)]?Sampler,
     bind_groups: [cap(.bind_group)]?BindGroup,
+    /// Bench-mode state (module guide section 9); `enabled` is false otherwise.
+    profile: Profile,
+};
+
+/// How `create` picks the adapter and whether it profiles (module guide section 9).
+pub const Options = struct {
+    adapter: bench.Adapter,
+    profile: bool,
 };
 
 fn cap(comptime kind: commands.Kind) usize {
@@ -219,6 +240,7 @@ const format_r8_unorm: TextureFormat = 0x00000001;
 const format_rgba8_unorm: TextureFormat = 0x00000016;
 /// Texture `COPY_DST` is 0x2. Buffer `usage_copy_dst` is 0x8, which is texture `STORAGE_BINDING`.
 const texture_usage_copy_dst: TextureUsage = 0x0000000000000002;
+const texture_usage_copy_src: TextureUsage = 0x0000000000000001;
 const usage_texture_binding: TextureUsage = 0x0000000000000004;
 const dimension_2d: u32 = 0x00000002;
 const sample_float: u32 = 0x00000002;
@@ -807,13 +829,15 @@ var error_slot: ErrorSlot = .{ .failed = false, .len = 0, .message = undefined }
 /// resource tables. `display` and `wl_surface` must be live Wayland handles that outlive the
 /// returned `Gpu`. The swapchain is left unconfigured until the first `pass_begin`.
 /// Errors: any failed handle request, `error.WaitTimeout`, or `error.Bgra8Unsupported`.
-pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
+pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(wl_surface) != 0);
     const instance = try create_instance();
     const surface = try create_surface(instance, display, wl_surface);
-    const adapter = try request_adapter(instance, surface);
-    const device = try request_device(instance, adapter);
+    const adapter = try request_adapter(instance, surface, options.adapter);
+    const timestamps = options.profile and
+        wgpuAdapterHasFeature(adapter, feature_timestamp_query) != 0;
+    const device = try request_device(instance, adapter, timestamps);
     const queue = wgpuDeviceGetQueue(device);
     const chosen = try pick_format(surface, adapter);
     return .{
@@ -835,6 +859,7 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque) !Gpu {
         .views = @splat(null),
         .samplers = @splat(null),
         .bind_groups = @splat(null),
+        .profile = profile_create(adapter, device, queue, options.profile, timestamps),
     };
 }
 
@@ -1287,6 +1312,10 @@ fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
         .store_op = store_store,
         .clear_value = .{ .r = p.clear[0], .g = p.clear[1], .b = p.clear[2], .a = p.clear[3] },
     };
+    var writes: PassTimestampWrites = undefined;
+    if (self.profile.query) |query| {
+        writes = .{ .next_in_chain = null, .query_set = query, .begin_index = 0, .end_index = 1 };
+    }
     const descriptor: RenderPassDescriptor = .{
         .next_in_chain = null,
         .label = empty_label,
@@ -1294,7 +1323,7 @@ fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
         .color_attachments = @ptrCast(&attachment),
         .depth_stencil_attachment = null,
         .occlusion_query_set = null,
-        .timestamp_writes = null,
+        .timestamp_writes = if (self.profile.query != null) @ptrCast(&writes) else null,
     };
     frame.pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
 }
@@ -1304,10 +1333,12 @@ fn pass_end_present(self: *Gpu, frame: *Frame) void {
     const pass = open_pass("pass_end_present", frame);
     const encoder = frame.encoder.?;
     wgpuRenderPassEncoderEnd(pass);
+    profile_record(self, encoder, frame.texture.?);
     const commands_buffer = wgpuCommandEncoderFinish(encoder, null);
     wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands_buffer));
     _ = wgpuSurfacePresent(self.surface);
     wgpuCommandBufferRelease(commands_buffer);
+    profile_read(self);
     frame.release();
     assert(frame.pass == null);
     assert(frame.texture == null);
@@ -1372,14 +1403,18 @@ fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaqu
 }
 
 /// Requests an adapter compatible with `surface` and blocks (bounded) until it resolves.
-fn request_adapter(instance: Instance, surface: Surface) !Adapter {
+fn request_adapter(instance: Instance, surface: Surface, preference: bench.Adapter) !Adapter {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(surface) != 0);
     var slot: AdapterSlot = .{ .adapter = null, .ok = false };
     const options: RequestAdapterOptions = .{
         .next_in_chain = null,
         .feature_level = 0,
-        .power_preference = 0,
+        .power_preference = switch (preference) {
+            .default => power_undefined,
+            .low => power_low,
+            .high => power_high,
+        },
         .force_fallback_adapter = 0,
         .backend_type = 0,
         .compatible_surface = surface,
@@ -1400,10 +1435,11 @@ fn request_adapter(instance: Instance, surface: Surface) !Adapter {
 
 /// Requests a device from `adapter` with `uncaptured_error` installed (module guide section
 /// 5) and blocks (bounded) until it resolves.
-fn request_device(instance: Instance, adapter: Adapter) !Device {
+fn request_device(instance: Instance, adapter: Adapter, timestamps: bool) !Device {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(adapter) != 0);
     var slot: DeviceSlot = .{ .device = null, .ok = false };
+    const features = [1]u32{feature_timestamp_query};
     const info: RequestDeviceCallbackInfo = .{
         .next_in_chain = null,
         .mode = callback_process_events,
@@ -1414,8 +1450,8 @@ fn request_device(instance: Instance, adapter: Adapter) !Device {
     const descriptor: DeviceDescriptor = .{
         .next_in_chain = null,
         .label = empty_label,
-        .required_feature_count = 0,
-        .required_features = null,
+        .required_feature_count = if (timestamps) features.len else 0,
+        .required_features = if (timestamps) @ptrCast(&features) else null,
         .required_limits = null,
         .default_queue = .{ .next_in_chain = null, .label = empty_label },
         .device_lost_callback_info = .{
@@ -1554,7 +1590,10 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
         .next_in_chain = @ptrCast(&extras.chain),
         .device = self.device,
         .format = self.format,
-        .usage = usage_render_attachment,
+        .usage = if (self.profile.enabled)
+            usage_render_attachment | texture_usage_copy_src
+        else
+            usage_render_attachment,
         .width = width_px,
         .height = height_px,
         .view_format_count = 0,
@@ -1676,4 +1715,349 @@ test "bgra8 lookup rejects malformed lists" {
 
     capabilities.format_count = format_cap + 1;
     try std.testing.expectEqual(@as(?TextureFormat, null), find_bgra8(capabilities));
+}
+
+// ------------------------------------------------------------------ profiling (section 9)
+
+const QuerySet = *opaque {};
+
+const QuerySetDescriptor = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    label: StringView,
+    type: u32,
+    count: u32,
+};
+
+const PassTimestampWrites = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    query_set: QuerySet,
+    begin_index: u32,
+    end_index: u32,
+};
+
+const BufferMapCallbackInfo = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    mode: CallbackMode,
+    callback: ?*const fn (
+        status: u32,
+        message: StringView,
+        userdata1: ?*anyopaque,
+        userdata2: ?*anyopaque,
+    ) callconv(.c) void,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+};
+
+const TexelCopyBufferInfo = extern struct {
+    layout: TexelCopyBufferLayout,
+    buffer: Buffer,
+};
+
+const AdapterInfo = extern struct {
+    next_in_chain: ?*ChainedStruct,
+    vendor: StringView,
+    architecture: StringView,
+    device: StringView,
+    description: StringView,
+    backend_type: u32,
+    adapter_type: u32,
+    vendor_id: u32,
+    device_id: u32,
+    subgroup_min_size: u32,
+    subgroup_max_size: u32,
+};
+
+comptime {
+    assert(@sizeOf(QuerySetDescriptor) == 32);
+    assert(@sizeOf(PassTimestampWrites) == 24);
+    assert(@sizeOf(BufferMapCallbackInfo) == 40);
+    assert(@sizeOf(TexelCopyBufferInfo) == 24);
+    assert(@sizeOf(AdapterInfo) == 96);
+}
+
+extern fn wgpuAdapterHasFeature(adapter: Adapter, feature: u32) Bool;
+extern fn wgpuAdapterGetInfo(adapter: Adapter, info: *AdapterInfo) Status;
+extern fn wgpuAdapterInfoFreeMembers(info: AdapterInfo) void;
+extern fn wgpuDeviceCreateQuerySet(device: Device, descriptor: *const QuerySetDescriptor) ?QuerySet;
+extern fn wgpuQueueGetTimestampPeriod(queue: Queue) f32;
+extern fn wgpuCommandEncoderResolveQuerySet(
+    encoder: CommandEncoder,
+    query_set: QuerySet,
+    first: u32,
+    count: u32,
+    destination: Buffer,
+    offset: u64,
+) void;
+extern fn wgpuCommandEncoderCopyBufferToBuffer(
+    encoder: CommandEncoder,
+    source: Buffer,
+    source_offset: u64,
+    destination: Buffer,
+    destination_offset: u64,
+    size: u64,
+) void;
+extern fn wgpuCommandEncoderCopyTextureToBuffer(
+    encoder: CommandEncoder,
+    source: *const TexelCopyTextureInfo,
+    destination: *const TexelCopyBufferInfo,
+    size: *const Extent3D,
+) void;
+extern fn wgpuBufferMapAsync(
+    buffer: Buffer,
+    mode: Flags,
+    offset: usize,
+    size: usize,
+    info: BufferMapCallbackInfo,
+) Future;
+extern fn wgpuBufferGetConstMappedRange(
+    buffer: Buffer,
+    offset: usize,
+    size: usize,
+) ?*const anyopaque;
+extern fn wgpuBufferUnmap(buffer: Buffer) void;
+extern fn wgpuBufferRelease(buffer: Buffer) void;
+extern fn wgpuDevicePoll(device: Device, wait: Bool, index: ?*const u64) Bool;
+
+const feature_timestamp_query: u32 = 0x00000009;
+const query_type_timestamp: u32 = 0x00000002;
+const power_undefined: u32 = 0x00000000;
+const power_low: u32 = 0x00000001;
+const power_high: u32 = 0x00000002;
+const buffer_usage_map_read: Flags = 0x0000000000000001;
+const buffer_usage_copy_src: Flags = 0x0000000000000004;
+const buffer_usage_query_resolve: Flags = 0x0000000000000200;
+const map_mode_read: Flags = 0x0000000000000001;
+const map_status_success: u32 = 0x00000001;
+/// Two timestamps of 8 bytes each: the pass's beginning and end.
+const timestamp_bytes: u64 = 16;
+/// `wgpuCommandEncoderCopyTextureToBuffer` needs rows aligned to 256 bytes.
+const copy_row_align: u32 = 256;
+const adapter_name_cap: u32 = 96;
+
+/// Bench-mode state (module guide section 9). Every handle is null when disabled.
+const Profile = struct {
+    enabled: bool,
+    /// Null without the timestamp feature.
+    query: ?QuerySet,
+    resolve: ?Buffer,
+    read: ?Buffer,
+    period_ns: f32,
+    pass_ns: ?u64,
+    image_requested: bool,
+    image: ?Buffer,
+    image_width: u32,
+    image_height: u32,
+    image_row_bytes: u32,
+    image_mapped: bool,
+    adapter_name: [adapter_name_cap]u8,
+    adapter_name_len: u32,
+};
+
+/// A mapped copy of one presented frame: BGRA rows `row_bytes` apart.
+pub const FrameImage = struct {
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+    row_bytes: u32,
+};
+
+fn profile_create(
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+    enabled: bool,
+    timestamps: bool,
+) Profile {
+    if (timestamps) assert(enabled);
+    var profile: Profile = std.mem.zeroes(Profile);
+    profile.enabled = enabled;
+    if (!enabled) return profile;
+    var info: AdapterInfo = std.mem.zeroes(AdapterInfo);
+    if (wgpuAdapterGetInfo(adapter, &info) == status_success) {
+        const name = if (info.device.data) |data| data[0..info.device.length] else "";
+        const len: u32 = @intCast(@min(name.len, adapter_name_cap));
+        @memcpy(profile.adapter_name[0..len], name[0..len]);
+        profile.adapter_name_len = len;
+        wgpuAdapterInfoFreeMembers(info);
+    }
+    if (!timestamps) return profile;
+    profile.period_ns = wgpuQueueGetTimestampPeriod(queue);
+    profile.query = wgpuDeviceCreateQuerySet(device, &.{
+        .next_in_chain = null,
+        .label = empty_label,
+        .type = query_type_timestamp,
+        .count = 2,
+    });
+    profile.resolve = create_profile_buffer(device, buffer_usage_query_resolve |
+        buffer_usage_copy_src, timestamp_bytes);
+    profile.read = create_profile_buffer(
+        device,
+        buffer_usage_map_read | usage_copy_dst,
+        timestamp_bytes,
+    );
+    assert(profile.period_ns > 0);
+    assert(profile.query != null);
+    return profile;
+}
+
+fn create_profile_buffer(device: Device, usage: Flags, size: u64) ?Buffer {
+    assert(size % 4 == 0);
+    assert(usage != 0);
+    return wgpuDeviceCreateBuffer(device, &.{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = usage,
+        .size = size,
+        .mapped_at_creation = 0,
+    });
+}
+
+/// Records the timestamp resolve and, when requested, the frame copy into `encoder`, after
+/// the pass and before `finish`. Does nothing outside bench mode.
+fn profile_record(self: *Gpu, encoder: CommandEncoder, target: Texture) void {
+    const profile = &self.profile;
+    if (!profile.enabled) return;
+    if (profile.query) |query| {
+        wgpuCommandEncoderResolveQuerySet(encoder, query, 0, 2, profile.resolve.?, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(
+            encoder,
+            profile.resolve.?,
+            0,
+            profile.read.?,
+            0,
+            timestamp_bytes,
+        );
+    }
+    if (!profile.image_requested) return;
+    assert(profile.image == null);
+    const width = self.configured_width;
+    const height = self.configured_height;
+    const row_bytes = std.mem.alignForward(u32, width * 4, copy_row_align);
+    const buffer = create_profile_buffer(
+        self.device,
+        buffer_usage_map_read | usage_copy_dst,
+        @as(u64, row_bytes) * height,
+    ) orelse return;
+    const source: TexelCopyTextureInfo = .{
+        .texture = target,
+        .mip_level = 0,
+        .origin = .{ .x = 0, .y = 0, .z = 0 },
+        .aspect = 0,
+    };
+    const destination: TexelCopyBufferInfo = .{
+        .layout = .{ .offset = 0, .bytes_per_row = row_bytes, .rows_per_image = height },
+        .buffer = buffer,
+    };
+    const size: Extent3D = .{ .width = width, .height = height, .depth_or_array_layers = 1 };
+    wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &size);
+    profile.image = buffer;
+    profile.image_width = width;
+    profile.image_height = height;
+    profile.image_row_bytes = row_bytes;
+    profile.image_requested = false;
+}
+
+/// After present: blocks until the frame's GPU work is done, then reads the pass time and
+/// maps the frame copy if one was recorded.
+fn profile_read(self: *Gpu) void {
+    const profile = &self.profile;
+    if (!profile.enabled) return;
+    profile.pass_ns = null;
+    if (profile.read) |read| {
+        if (map_blocking(self, read, timestamp_bytes)) {
+            const range = wgpuBufferGetConstMappedRange(read, 0, timestamp_bytes).?;
+            const stamps: *const [2]u64 = @ptrCast(@alignCast(range));
+            const ticks = stamps[1] -% stamps[0];
+            const ns = @as(f64, @floatFromInt(ticks)) * profile.period_ns;
+            profile.pass_ns = @intFromFloat(ns);
+            wgpuBufferUnmap(read);
+        }
+    }
+    if (profile.image) |image| {
+        if (profile.image_mapped) return;
+        const size = @as(u64, profile.image_row_bytes) * profile.image_height;
+        profile.image_mapped = map_blocking(self, image, size);
+    }
+}
+
+/// Maps `buffer` for reading and waits, bounded by `wait_max` device polls.
+fn map_blocking(self: *Gpu, buffer: Buffer, size: u64) bool {
+    assert(size > 0);
+    assert(wait_max >= 1);
+    var done: bool = false;
+    const info: BufferMapCallbackInfo = .{
+        .next_in_chain = null,
+        .mode = callback_process_events,
+        .callback = map_ready,
+        .userdata1 = @ptrCast(&done),
+        .userdata2 = null,
+    };
+    _ = wgpuBufferMapAsync(buffer, map_mode_read, 0, @intCast(size), info);
+    var waits: u32 = 0;
+    while (waits < wait_max) : (waits += 1) {
+        _ = wgpuDevicePoll(self.device, 1, null);
+        wgpuInstanceProcessEvents(self.instance);
+        if (done) return true;
+    }
+    return false;
+}
+
+fn map_ready(
+    status: u32,
+    message: StringView,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+) callconv(.c) void {
+    _ = message;
+    _ = userdata2;
+    const done: *bool = @ptrCast(@alignCast(userdata1.?));
+    done.* = status == map_status_success;
+}
+
+/// The render pass time of the last presented frame, null outside bench mode or without
+/// the timestamp feature.
+pub fn profile_pass_ns(self: *const Gpu) ?u64 {
+    if (!self.profile.enabled) assert(self.profile.pass_ns == null);
+    return self.profile.pass_ns;
+}
+
+/// The adapter's device name, empty outside bench mode.
+pub fn profile_adapter(self: *const Gpu) []const u8 {
+    assert(self.profile.adapter_name_len <= adapter_name_cap);
+    return self.profile.adapter_name[0..self.profile.adapter_name_len];
+}
+
+/// Copies the next presented frame for `frame_image`. Bench mode only.
+pub fn request_frame_image(self: *Gpu) void {
+    assert(self.profile.enabled);
+    assert(self.profile.image == null);
+    self.profile.image_requested = true;
+}
+
+/// The copied frame, mapped, or null if none is ready.
+pub fn frame_image(self: *const Gpu) ?FrameImage {
+    const profile = &self.profile;
+    const image = profile.image orelse return null;
+    if (!profile.image_mapped) return null;
+    const size = @as(u64, profile.image_row_bytes) * profile.image_height;
+    const range = wgpuBufferGetConstMappedRange(image, 0, @intCast(size)) orelse return null;
+    const bytes: [*]const u8 = @ptrCast(range);
+    assert(profile.image_row_bytes >= profile.image_width * 4);
+    return .{
+        .bytes = bytes[0..@intCast(size)],
+        .width = profile.image_width,
+        .height = profile.image_height,
+        .row_bytes = profile.image_row_bytes,
+    };
+}
+
+/// Unmaps and releases the copied frame.
+pub fn release_frame_image(self: *Gpu) void {
+    const profile = &self.profile;
+    const image = profile.image orelse return;
+    if (profile.image_mapped) wgpuBufferUnmap(image);
+    wgpuBufferRelease(image);
+    profile.image = null;
+    profile.image_mapped = false;
+    assert(profile.image == null);
 }

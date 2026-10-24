@@ -55,13 +55,18 @@
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
 //! - `serve` serves the page, `shell.js`, and the wasm through `src/serve.zig`, which owns
 //!   the address and port.
+//! - `bench` runs the installed native executable with `--bench` and the arguments after
+//!   `--`: a scenario name, `--frames`, `--adapter`, `--dump`, `--csv` (`src/bench.zig`).
+//!   Build with `-Doptimize=ReleaseFast` for numbers that mean something; the report names
+//!   the mode.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests and the native-only tests
 //!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
 //!   compiles an app with no `draw` and an app whose draw type is not a multiple of 16 bytes,
 //!   and passes only if the compiler rejects each with its expected message.
-//! - Each example in this repo gets `run`, `serve`, and `wasm` steps through
+//! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
+//! - `zig build compare -- a.ppm b.ppm` compares two frame dumps (`tools/compare.zig`).
 
 const std = @import("std");
 
@@ -89,6 +94,8 @@ pub const AppSteps = struct {
     wasm: *std.Build.Step,
     /// Serves the browser surface on localhost. Depends on the wasm install.
     serve: *std.Build.Step,
+    /// Runs the installed native executable in bench mode (`--bench` plus the arguments).
+    bench: *std.Build.Step,
     /// Runs the app's own unit tests.
     tests: *std.Build.Step,
 };
@@ -125,7 +132,8 @@ pub fn addApp(
     const tests = b.addTest(.{ .root_module = native_app });
     return .{
         .install = &install.step,
-        .run = add_run(b, options, &install.step),
+        .run = add_run(b, options, &install.step, &.{}),
+        .bench = add_run(b, options, &install.step, &.{"--bench"}),
         .wasm = &wasm_install.step,
         .serve = add_serve(b, patchwork_builder, options, wasm, &wasm_install.step),
         .tests = &b.addRunArtifact(tests).step,
@@ -179,10 +187,18 @@ fn wgpu_lib_path(patchwork_builder: *std.Build, options: AppOptions) std.Build.L
 }
 
 /// Runs the installed executable rather than the cached one, because its RUNPATH
-/// (`$ORIGIN/../lib`) resolves only next to the installed library.
-fn add_run(b: *std.Build, options: AppOptions, install: *std.Build.Step) *std.Build.Step {
-    const run_cmd = std.Build.Step.Run.create(b, b.fmt("run {s}", .{options.name}));
+/// (`$ORIGIN/../lib`) resolves only next to the installed library. `leading` goes before the
+/// arguments after `--`.
+fn add_run(
+    b: *std.Build,
+    options: AppOptions,
+    install: *std.Build.Step,
+    leading: []const []const u8,
+) *std.Build.Step {
+    const what = if (leading.len == 0) "run" else "bench";
+    const run_cmd = std.Build.Step.Run.create(b, b.fmt("{s} {s}", .{ what, options.name }));
     run_cmd.addFileArg(b.graph.path(.install_bin, options.name));
+    run_cmd.addArgs(leading);
     run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(install);
     return &run_cmd.step;
@@ -337,6 +353,22 @@ pub fn build(b: *std.Build) void {
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
     add_test_steps(b, library, .{ rack, column, live });
+    add_compare_step(b, library);
+}
+
+/// `compare`: the frame-dump diff tool, run with the arguments after `--`.
+fn add_compare_step(b: *std.Build, library: *std.Build.Module) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("tools/compare.zig"),
+        .target = library.resolved_target,
+        .optimize = library.optimize.?,
+    });
+    root.addImport("patchwork", library);
+    const exe = b.addExecutable(.{ .name = "compare", .root_module = root });
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.addPassthruArgs();
+    const step = b.step("compare", "Compare two frame dumps: zig build compare -- a.ppm b.ppm");
+    step.dependOn(&run_cmd.step);
 }
 
 /// Names the steps of one example. The rack owns the plain names.
@@ -361,6 +393,11 @@ fn add_example_steps(
         b.fmt("Serve {s} on localhost", .{what}),
     );
     serve.dependOn(steps.serve);
+    const bench_step = b.step(
+        b.fmt("bench{s}", .{suffix}),
+        b.fmt("Run a bench scenario of {s}: -- <scenario> [options]", .{what}),
+    );
+    bench_step.dependOn(steps.bench);
 }
 
 /// `test` runs the library tests and every example's tests. A test root that imported only

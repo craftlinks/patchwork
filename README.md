@@ -37,6 +37,7 @@ pub const App = struct {
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
+| `scenarios` (optional) | `[]const bench.Scenario` | Scripted runs for `--bench` (see Bench Mode). |
 
 `Context(App)` is the UI context (`patchwork.ui.Context`): the draw context (`cx.draw`), the
 turtle stack, the hit areas of the last frame, and pointer, hover, and capture state. There
@@ -127,10 +128,11 @@ patchwork/
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
+│   ├── bench.zig               # Bench mode: scenarios, replay, samples, summaries, PPM images
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
 │   └── native_tests.zig        # Test root of tests that call libxkbcommon (native only)
 ├── src/host/                   # Platform host implementations generic over App
-│   ├── native_main.zig         # Native executable entry point: runs linux_window.run(app.App)
+│   ├── native_main.zig         # Native entry point: parses options, runs linux_window.run(App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
 │   ├── linux_window.zig        # Linux Wayland event loop, timerfd, and Host(App)
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
@@ -159,7 +161,10 @@ patchwork/
 │       ├── lanes.zig           # Transport and automation lanes: in-place rings, playhead
 │       ├── shaper.zig          # The inline shaper row's transfer curve
 │       ├── icon.zig            # The live app's own draw type: transport and status icons
+│       ├── bench.zig           # The live screen's bench scenarios
 │       └── patch.lpg           # The embedded patch the editor opens
+├── tools/
+│   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
@@ -194,6 +199,10 @@ zig build serve-live      # Serve the live-coding screen on localhost (prints th
 # Validation
 zig build test            # Run unit tests across the library and the three examples
 zig build test-contract   # Verify compile errors for a missing `draw` and a ragged draw type
+
+# Bench mode (see Bench Mode below)
+zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
+zig build compare -- a.ppm b.ppm   # Compare two frame dumps; exit 1 when they differ
 ```
 
 An optional override flag `-Dwgpu-lib-dir=` is available if you wish to link against a
@@ -268,6 +277,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run natively").dependOn(steps.run);
     b.step("wasm", "Build for the browser").dependOn(steps.wasm);
     b.step("serve", "Serve on localhost").dependOn(steps.serve);
+    b.step("bench", "Run a bench scenario").dependOn(steps.bench);
     b.step("test", "Run app tests").dependOn(steps.tests);
     b.getInstallStep().dependOn(steps.install);
 }
@@ -535,6 +545,41 @@ values are UI state that lives in the text. It demonstrates:
 - **Uploads.** The panel draws before the editor and the header last, so a typed key writes
   the glyphs from the edited line on; tests "uploads of a scrolled frame and a typed key" and
   "transport ticks upload the playhead and one recorded point" lock the byte counts.
+- **Bench scenarios** (`bench.zig`). `transport`, `typing`, `transport-stress`, and
+  `typing-stress`, replayed headless by test "the bench scenarios replay headless".
+
+## Bench Mode
+
+`src/bench.zig` and the native host measure frames on request; without `--bench` nothing of
+it runs, no GPU feature is requested, and the frame path is unchanged.
+
+```text
+<app> [--adapter low|high] [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
+zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
+```
+
+- **Scenarios.** An app declares `pub const scenarios: []const bench.Scenario`: a `setup`
+  list run once and a `cycle` list repeated while `frames` frames are measured. Steps are
+  `key`, `click` and `click_at` (an area of the last frame, by `bench.area(name, index)`),
+  `wheel`, and `wait`. Each step runs when the host is idle and presents one frame; an empty
+  cycle measures the frames the app presents itself (a timer). `app.check` validates the
+  list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
+  a name lists the scenarios.
+- **Per frame.** `App.draw` (with layout), `finalize`, record (compare and stream), submit
+  and present on the CPU; the render pass on the GPU from timestamp queries, read back by
+  blocking after present (so profiled frames do not overlap CPU and GPU work); instances
+  and shaded area (`rect` intersected with `clip`, in windows) per draw type.
+- **Report.** Min, p10, p50, p90, and max per metric, the mode, the adapter's name, and the
+  window size; `--csv` writes every measured frame. Compare runs at the same window size: GPU
+  time scales with it, and drivers change clock states under light load, so read the minimum
+  next to the median.
+- **Frames.** `--dump` copies the last measured frame from the swapchain and writes a PPM.
+  Two runs of a scenario give identical dumps; `zig build compare` reports differing pixels by
+  size of difference (1, 2, 3-8, 9-32, 33-255) and exits 1 when any differ.
+- **Adapter.** `--adapter low` asks for `low_power` (an integrated GPU), `high` for
+  `high_performance`; it works without `--bench` too.
+- **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
+  timed passes (`window.patchworkBench` holds the last). No scenarios or dumps.
 
 ## GPU Command Stream
 
@@ -837,3 +882,5 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
 - `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.
   JavaScript decodes the stream and its spans in place, with no intermediate copies, and
   asserts that `pass_begin` carries the canvas backing size.
+- `?bench=1` times every render pass with `timestamp-query` when the adapter has it (see Bench
+  Mode).

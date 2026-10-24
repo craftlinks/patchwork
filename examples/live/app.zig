@@ -83,6 +83,7 @@ const knob = @import("knob.zig");
 const shaper = @import("shaper.zig");
 const lanes = @import("lanes.zig");
 const icon = @import("icon.zig");
+const live_bench = @import("bench.zig");
 
 const Rect = quads.Rect;
 const Clip = quads.Clip;
@@ -340,6 +341,9 @@ pub const App = struct {
         .area_cap = area_cap,
         .point_cap = point_cap,
     };
+
+    /// The bench runs (`bench.zig`): transport and typing, on the patch and the stress text.
+    pub const scenarios: []const patchwork.bench.Scenario = &live_bench.scenarios;
 
     pub fn init(app: *App, textures: *quads.Textures) void {
         _ = textures;
@@ -1657,6 +1661,29 @@ test "the transport gates the timer and the ring wraps" {
     const back = cx.find(transport_ids[0]).?.rect;
     click(app, back[0] + 4, back[1] + 4);
     try std.testing.expectEqual(@as(u32, 0), app.transport.head);
+}
+
+// Locks the bench scenarios against this screen without a GPU (`patchwork.bench`, section
+// 2a): the typing scenario's targets resolve, its click focuses the editor, and an even number
+// of cycle steps leaves the stress text as loaded; the transport scenario starts the timer and
+// then has no step of its own to run.
+test "the bench scenarios replay headless" {
+    const bench = patchwork.bench;
+    const size: [2]u32 = .{ 1280, 720 };
+    var app = new_app();
+    const cx = &fixture.context;
+    const typing = bench.find(App.scenarios, "typing-stress").?;
+    const typed = try bench.replay_headless(App, app, cx, typing, size, 20);
+    try std.testing.expectEqual(@as(u32, 20), typed);
+    try std.testing.expectEqual(editor_id, cx.focus);
+    try std.testing.expectEqual(stress_lines, app.editor.buffer.line_count);
+    try std.testing.expectEqualStrings(app.stress[0..app.stress_len], app.editor.text());
+    app = new_app();
+    const transport = bench.find(App.scenarios, "transport").?;
+    const played = try bench.replay_headless(App, app, cx, transport, size, 20);
+    try std.testing.expectEqual(@as(u32, 11), played);
+    try std.testing.expect(cx.timer_on);
+    try std.testing.expect(app.transport.playing);
 }
 
 // Locks the bpm field: Enter after typing 130 rewrites `bpm := 121` as one undo entry;
