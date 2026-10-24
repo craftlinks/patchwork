@@ -23,16 +23,29 @@
 //! naming it (`zig build test-contract` locks one case).
 //!
 //! A type may also declare `pub const reads_points: bool`. When it is true the type's module
-//! declares the context's point buffer (`@group(0) @binding(1)`, read-only storage, fragment
-//! stage) as `points: array<vec2<f32>>`, and the renderer creates that buffer and binds it in
-//! the frame group, once per pass for every pipeline. A registry without such a type has no
-//! point buffer at all (`uses_points`), so its apps pay nothing for paths (`draw.Path`).
+//! declares the context's point buffer (`@group(0) @binding(1)`, read-only storage, vertex and
+//! fragment stages) as `points: array<vec2<f32>>`, and the renderer creates that buffer and
+//! binds it in the frame group, once per pass for every pipeline. A registry without such a
+//! type has no point buffer at all (`uses_points`), so its apps pay nothing for paths
+//! (`draw.Path`).
 //!
 //! All geometry is relative to `rect`: a type's parameters (radii, sweeps, UVs, the LED's
 //! glow) are expressed in the quad's local space, never as absolute positions. The UI layer
 //! aligns a container after its children drew by adding a delta to `rect.xy` alone
 //! (`Context.shift` in `draw/pools.zig`); a type that stored an absolute coordinate elsewhere
 //! would be left behind.
+//!
+//! ## 2a. The Vertex Contract
+//! By default a type's quad is its `rect`: the shared `vs_main` places the unit quad's corner
+//! `unit` (in [0, 1]^2) at `rect.xy + unit * rect.zw`. A type may instead declare
+//! `pub const vertex: []const u8` holding `fn vertex(px: Pixel, unit: vec2<f32>) -> vec2<f32>`,
+//! which returns the corner's local position (relative to `rect.xy`, logical pixels). `px`
+//! carries every field, with `local` zero. The fragment stage is unchanged: `local` still
+//! means `pos - rect.xy`, so `pixel` needs no change. The quad must cover every fragment
+//! with coverage; anything it covers outside `rect` is still cut by the clip mask, and `rect`
+//! stays the type's bounds for clipping, alignment shifts, and hit areas. `draw.Path` uses it
+//! to rasterize a quad along each chunk's chord instead of the chunk's axis-aligned box. The
+//! vertex stage has no derivatives.
 //!
 //! ## 3. WGSL Assembly (`source`)
 //! ```text
@@ -45,6 +58,8 @@
 //! struct Pixel                         local, size, pos, and every Zig field by name
 //! fn carry, fn unpack                  copy the groups through and name the fields
 //! T.pixel                              the type's own fn pixel(px: Pixel) -> vec4<f32>
+//! [T.vertex]                           the type's own fn vertex, when it declares one
+//! fn vertex_local                      unit * rect.zw, or vertex(unpack(carry(i)), unit)
 //! ```
 //! Generating `Theme` from the Zig record removes the hand-mirrored copy that a test used to
 //! police. The concatenation runs at compile time; the result is static data spanned by the
@@ -121,6 +136,9 @@ pub fn check(comptime T: type) ?[]const u8 {
         }
         if (@hasDecl(T, "reads_points")) {
             if (@TypeOf(T.reads_points) != bool) return name ++ ": `reads_points` must be bool";
+        }
+        if (@hasDecl(T, "vertex")) {
+            if (@TypeOf(T.vertex) != []const u8) return name ++ ": `vertex` must be []const u8";
         }
         return null;
     }
@@ -255,9 +273,24 @@ pub fn source(comptime T: type) []const u8 {
         var text: []const u8 = prelude ++ "\n" ++ theme_wgsl();
         if (T.texture != null) text = text ++ texture_wgsl;
         if (reads_points(T)) text = text ++ points_wgsl;
-        text = text ++ io_wgsl(T) ++ "\n" ++ T.pixel;
+        text = text ++ io_wgsl(T) ++ "\n" ++ T.pixel ++ vertex_wgsl(T);
         const copy = text[0..text.len].*;
         return &copy;
+    }
+}
+
+/// The type's `vertex` and the `vertex_local` that `vs_main` calls (module guide, section 2a).
+fn vertex_wgsl(comptime T: type) []const u8 {
+    comptime {
+        if (!@hasDecl(T, "vertex")) {
+            return "\nfn vertex_local(i: Instance, unit: vec2<f32>) -> vec2<f32> {\n" ++
+                "    return unit * i.g0.zw;\n}\n";
+        }
+        return "\n" ++ T.vertex ++
+            "\nfn vertex_local(i: Instance, unit: vec2<f32>) -> vec2<f32> {\n" ++
+            "    var v = carry(i);\n" ++
+            "    v.local = vec2<f32>(0.0, 0.0);\n" ++
+            "    return vertex(unpack(v), unit);\n}\n";
     }
 }
 
@@ -373,6 +406,28 @@ const Straddle = extern struct {
     pub const pixel: []const u8 = "";
 };
 
+const Turned = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+    pub const vertex: []const u8 =
+        \\fn vertex(px: Pixel, unit: vec2<f32>) -> vec2<f32> {
+        \\    return unit.yx * px.size;
+        \\}
+    ;
+};
+
+const BadVertex = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+    pub const vertex = 1;
+};
+
 const NoClip = extern struct {
     rect: [4]f32,
     tint: [4]f32,
@@ -407,6 +462,21 @@ test "source declares locations 1 to N and names every field" {
     try testing.expectEqual(@as(u8, 4), layout.attribute_count);
     try testing.expectEqual(@as(u16, 48), layout.attributes[3].offset);
     try testing.expectEqual(@as(u8, 4), layout.attributes[3].location);
+}
+
+// Locks the vertex contract (section 2a): a type without `vertex` gets the axis-aligned quad,
+// a type with one gets it called through `carry` and `unpack`, and a mistyped one is named.
+test "vertex_local is the rect quad or the type's own vertex" {
+    const plain = comptime source(Probe);
+    try testing.expect(std.mem.find(u8, plain, "return unit * i.g0.zw;") != null);
+    try testing.expect(std.mem.find(u8, plain, "fn vertex(px: Pixel") == null);
+    const turned = comptime source(Turned);
+    try testing.expect(std.mem.find(u8, turned, "return unit.yx * px.size;") != null);
+    try testing.expect(std.mem.find(u8, turned, "return vertex(unpack(v), unit);") != null);
+    try testing.expect(std.mem.find(u8, turned, "return unit * i.g0.zw;") == null);
+    try testing.expect(std.mem.find(u8, plain, "vertex_local(instance, unit)") != null);
+    const bad = comptime check(BadVertex).?;
+    try testing.expect(std.mem.find(u8, bad, "`vertex` must be []const u8") != null);
 }
 
 // Locks the negative space of the convention: each violation is named with the type.

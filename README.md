@@ -574,8 +574,10 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   time scales with it, and drivers change clock states under light load, so read the minimum
   next to the median.
 - **Frames.** `--dump` copies the last measured frame from the swapchain and writes a PPM.
-  Two runs of a scenario give identical dumps; `zig build compare` reports differing pixels by
-  size of difference (1, 2, 3-8, 9-32, 33-255) and exits 1 when any differ.
+  Two runs of a step-driven scenario (`typing`) give identical dumps; a timer-driven one
+  (`transport`) differs where the timer moved things, because how many ticks land during the
+  setup varies. `zig build compare` reports differing pixels by size of difference (1, 2,
+  3-8, 9-32, 33-255) and exits 1 when any differ.
 - **Adapter.** `--adapter low` asks for `low_power` (an integrated GPU), `high` for
   `high_performance`; it works without `--bench` too.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
@@ -645,9 +647,15 @@ adds its own (the rack's `Led`).
   `theme.Theme`, the per-type `Instance`, `Varyings`, and `Pixel` structs, and the type's
   `pixel`. Derivatives and `textureSample` must stay in uniform control flow, so `pixel`
   must not call them inside branches on instance data; the prelude guide explains.
+- **Vertex.** A type's quad is its `rect` unless it declares `pub const vertex`, a WGSL
+  `fn vertex(px: Pixel, unit: vec2<f32>) -> vec2<f32>` returning each corner's position
+  relative to `rect.xy`. `local` in `pixel` keeps its meaning, the quad must cover every
+  fragment with coverage, and `rect` stays the bounds for clips, shifts, and hit areas
+  (`draw/registry.zig`, section 2a). `draw.Path` uses it.
 - **Points.** A type that declares `pub const reads_points = true` reads the context's point
-  pool as `points: array<vec2<f32>>` at `@group(0) @binding(1)` (read-only storage, fragment
-  stage). The renderer creates that buffer and binds it with the frame uniform, once per pass;
+  pool as `points: array<vec2<f32>>` at `@group(0) @binding(1)` (read-only storage, vertex
+  and fragment stages). The renderer creates that buffer and binds it with the frame uniform,
+  once per pass;
   a registry without such a type has no point buffer.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
   layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
@@ -711,6 +719,13 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   segment, so a translucent stroke shows no dots at seams. Parts of one path closer than the
   width, more than a segment apart across a seam, still blend twice; the path tests measure
   it.
+- **Oriented quads.** A chunk's `rect` is its axis-aligned bounds, but it rasterizes a
+  rectangle along its chord (first to last point), padded by half the width plus one logical
+  pixel (`Path.vertex`). On the live screen's stress text the curves' boxes covered 0.98
+  windows for 0.09 windows of stroke; with the quads the integrated GPU's pass fell from about
+  6.5 to 2.8 ms (fastest of three interleaved runs, 2856 by 2514 window) and the RTX 3060's
+  from 641 to 371 microseconds. Test "every chunk's oriented quad contains its stroke" locks
+  the cover.
 - **Coordinates.** Points are stored relative to the path's origin, and each chunk carries
   `anchor = origin - rect.xy`, so a container's alignment shift moves strokes with their
   rects. The origin is the bounds' top-left, or the caller's with `polyline_at`, which keeps
@@ -718,8 +733,8 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
 
-The CPU twins (`distance_to_polyline`, `chunk_alpha`, `draw.sdf_segment`) check the shader's
-math, the chunk rects, and the seam blending without a GPU.
+The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `draw.sdf_segment`)
+check the shader's math, the chunk rects and quads, and the seam blending without a GPU.
 
 ## Code Editor
 

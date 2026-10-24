@@ -170,6 +170,37 @@ pub const Path = extern struct {
 
     pub const texture: ?textures.Format = null;
     pub const reads_points: bool = true;
+    // The quad along the chunk's chord (`draw/path.zig`, section 5a), so a diagonal chunk
+    // rasterizes its stroke's neighbourhood instead of its whole axis-aligned box. The pad
+    // `1.0` is `path.aa_pad`, which `path.zig` asserts. CPU twin: `path.oriented_quad`.
+    pub const vertex: []const u8 =
+        \\fn vertex(px: Pixel, unit: vec2<f32>) -> vec2<f32> {
+        \\    let head = u32(px.first_point);
+        \\    let tail = head + u32(px.point_count) - 1u;
+        \\    let a = points[head];
+        \\    let chord = points[tail] - a;
+        \\    let chord_length = length(chord);
+        \\    let along = chord / max(chord_length, 1.0e-6);
+        \\    let dir = select(vec2<f32>(1.0, 0.0), along, chord_length > 1.0e-3);
+        \\    let nrm = vec2<f32>(-dir.y, dir.x);
+        \\    var t_lo = 0.0;
+        \\    var t_hi = 0.0;
+        \\    var n_lo = 0.0;
+        \\    var n_hi = 0.0;
+        \\    for (var i = head + 1u; i <= tail; i = i + 1u) {
+        \\        let d = points[i] - a;
+        \\        t_lo = min(t_lo, dot(d, dir));
+        \\        t_hi = max(t_hi, dot(d, dir));
+        \\        n_lo = min(n_lo, dot(d, nrm));
+        \\        n_hi = max(n_hi, dot(d, nrm));
+        \\    }
+        \\    let r = 0.5 * px.width + 1.0;
+        \\    let t = mix(t_lo - r, t_hi + r, unit.x);
+        \\    let n = mix(n_lo - r, n_hi + r, unit.y);
+        \\    return a + dir * t + nrm * n + vec2<f32>(px.anchor_x, px.anchor_y);
+        \\}
+        \\
+    ;
     // `fwidth` runs before the loop, whose bound is instance data, so the derivative stays in
     // uniform control flow (prelude, section 3). For an exact distance it is one device pixel
     // in logical pixels. A fragment that a neighbouring chunk's seam segment is nearer to

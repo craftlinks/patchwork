@@ -19,6 +19,12 @@
 // the interpolated `local` position, and `unpack` exposes each Zig field by its own name in
 // `Pixel`, beside `local`, `size`, and `pos` (= rect.xy + local).
 //
+// ## 2a. Vertex
+// `vs_main` places each corner at `rect.xy + vertex_local(instance, unit)`. The registry
+// generates `vertex_local`: `unit * rect.zw` (the rect itself), or the type's own
+// `fn vertex(px, unit)` when it declares one (`draw/registry.zig`, section 2a). `local` is
+// then interpolated, so in `pixel` it still means `pos - rect.xy` for any quad shape.
+//
 // ## 3. Pixel Contract and Uniformity
 // `fs_main` calls `pixel` unconditionally and applies the clip mask by multiplication, never
 // by an early return or `discard`. WGSL requires derivatives (`fwidth`, so `coverage`) and
@@ -51,7 +57,7 @@ struct Frame {
 @vertex
 fn vs_main(@location(0) unit: vec2<f32>, instance: Instance) -> Varyings {
     var out = carry(instance);
-    let local = unit * instance.g0.zw;
+    let local = vertex_local(instance, unit);
     out.position = frame.ortho * vec4<f32>(instance.g0.xy + local, 0.0, 1.0);
     out.local = local;
     return out;

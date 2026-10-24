@@ -19,7 +19,8 @@
 //! uniform, shared by every pipeline; group 1 is a texture and the shared clamping linear
 //! sampler, for textured types only, with one bind group per texture. When a registered type
 //! reads points (`registry.reads_points`), group 0 also holds the point buffer at binding 1
-//! (read-only storage, fragment stage), so it is bound once per pass with the uniform and a
+//! (read-only storage, vertex and fragment stages, since a type's `vertex` may read it too),
+//! so it is bound once per pass with the uniform and a
 //! pipeline that does not declare it ignores it.
 //!
 //! ## 3. Frame Shape
@@ -274,7 +275,7 @@ pub fn Renderer(comptime Cx: type) type {
             if (uses_points) {
                 frame_entries[1] = .{
                     .binding = 1,
-                    .visibility = commands.stage_fragment,
+                    .visibility = commands.stage_vertex | commands.stage_fragment,
                     .kind = .storage_read,
                 };
             }
@@ -889,7 +890,8 @@ const PathFixture = struct {
 
 // Locks the point buffer's setup: a registry with a `reads_points` type creates a storage
 // buffer after the uniform, gives the frame layout a read-only storage entry at binding 1 for
-// the fragment stage, and binds the buffer there, so it is set once per pass with group 0.
+// the vertex and fragment stages, and binds the buffer there, so it is set once per pass with
+// group 0.
 test "a points type adds the point buffer to the frame group" {
     PathFixture.context.init();
     PathFixture.renderer.init();
@@ -914,7 +916,8 @@ test "a points type adds the point buffer to the frame group" {
             .layout_create => |layout| if (layout.id == r.frame_layout) {
                 try testing.expectEqual(@as(u16, 2), layout.entry_count);
                 try testing.expectEqual(commands.BindingKind.storage_read, layout.entries[1].kind);
-                try testing.expectEqual(commands.stage_fragment, layout.entries[1].visibility);
+                const both = commands.stage_vertex | commands.stage_fragment;
+                try testing.expectEqual(both, layout.entries[1].visibility);
             },
             .buffer_create => |created| if (created.id == r.points_buffer) {
                 const usage = commands.usage_storage | commands.usage_copy_dst;
