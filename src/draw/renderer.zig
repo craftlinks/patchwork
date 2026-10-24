@@ -16,8 +16,14 @@
 //! ## 2. Descriptors
 //! Buffer 0 is the unit quad stepped per vertex (location 0, `float32x2`); buffer 1 is the
 //! type's pool stepped per instance (`registry.instance_layout`). Group 0 is the frame
-//! uniform, shared by every pipeline; group 1 is a texture and the shared clamping linear
-//! sampler, for textured types only, with one bind group per texture. When a registered type
+//! uniform, shared by every pipeline; group 1 is a texture and its sampler, for textured types
+//! only, with one bind group per texture. There are two texture layouts, one per
+//! `textures.Class`: filterable (a float texture and a filtering sampler) and unfilterable
+//! (the 32-bit float formats, with a non-filtering sampler). A pipeline takes its type's
+//! class and a bind group its texture's, which agree because a type's format is its
+//! textures' format. Samplers are one per `textures.Sampling` mode: the default (linear,
+//! clamped) at setup, any other in the stream that first creates a texture using it, and
+//! shared from then on. Each pipeline blends by its type's `blend` (`registry.zig`, 2c). When a registered type
 //! reads points (`registry.reads_points`), group 0 also holds the point buffer at binding 1
 //! (read-only storage, vertex and fragment stages, since a type's `vertex` may read it too),
 //! so it is bound once per pass with the uniform and a
@@ -181,7 +187,7 @@ const rect_op_cap: u32 = 6;
 /// Upper bound on the ops `frame` records: a cached frame of `rects_max` rects (module guide,
 /// sections 3 and 4a), which is longer than a direct one.
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
-    const texture_ops = 2 * textures.texture_cap + textures.write_cap;
+    const texture_ops = textures.sampling_count + 2 * textures.texture_cap + textures.write_cap;
     const rects = rects_max(type_count, batch_cap);
     // Uniform, textures, one write per pool and one for the points, the time, the target,
     // the pass, the rects with their batches, the pass end, and the present.
@@ -206,8 +212,9 @@ pub fn rects_max(type_count: u32, batch_cap: u32) u32 {
 }
 
 fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
-    const texture_bytes = textures.texture_cap *
-        (op_bytes(commands.TextureCreate) + op_bytes(commands.BindGroupCreate)) +
+    const texture_bytes = textures.sampling_count * op_bytes(commands.SamplerCreate) +
+        textures.texture_cap *
+            (op_bytes(commands.TextureCreate) + op_bytes(commands.BindGroupCreate)) +
         textures.write_cap * op_bytes(commands.TextureWrite);
     const pass_bytes = op_bytes(commands.TargetCreate) + op_bytes(commands.PassBegin) +
         op_bytes(commands.PassEnd) + op_bytes(commands.PresentCopy);
@@ -310,12 +317,14 @@ pub fn Renderer(comptime Cx: type) type {
             pipelines: [R.count]u16,
             instance_buffers: [R.count]u16,
             frame_layout: u16,
-            texture_layout: u16,
+            /// One texture layout per `textures.Class`, by its value.
+            texture_layouts: [2]u16,
             unit_buffer: u16,
             uniform_buffer: u16,
             /// The point buffer; meaningful only when `Cx.point_capacity != 0`.
             points_buffer: u16,
-            sampler: u16,
+            /// One sampler per `textures.Sampling` mode, by `Sampling.index`, once created.
+            samplers: [textures.sampling_count]?u16,
             frame_group: u16,
             clear_shader: u16,
             clear_pipeline: u16,
@@ -376,8 +385,8 @@ pub fn Renderer(comptime Cx: type) type {
                     Cx.point_capacity * @sizeOf(pools.Point),
                 );
             }
-            r.sampler = self.ids.take(.sampler);
-            buffer.push(.{ .sampler_create = .{ .id = r.sampler, .filter = .linear } });
+            r.samplers = @splat(null);
+            _ = self.sampler_for(buffer, .{});
             r.frame_group = self.ids.take(.bind_group);
             var frame_bindings = std.mem.zeroes(BindGroupEntries);
             frame_bindings[0] = .{ .binding = 0, .resource = r.uniform_buffer };
@@ -426,17 +435,24 @@ pub fn Renderer(comptime Cx: type) type {
                 .entry_count = frame_entry_count,
                 .entries = frame_entries,
             } });
-            r.texture_layout = self.ids.take(.layout);
-            var texture_entries = std.mem.zeroes(LayoutEntries);
-            const fragment = commands.stage_fragment;
-            texture_entries[0] = .{ .binding = 0, .visibility = fragment, .kind = .texture };
-            texture_entries[1] = .{ .binding = 1, .visibility = fragment, .kind = .sampler };
-            buffer.push(.{ .layout_create = .{
-                .id = r.texture_layout,
-                .entry_count = 2,
-                .entries = texture_entries,
-            } });
-            assert(r.frame_layout != r.texture_layout);
+            const kinds = [2][2]commands.BindingKind{
+                .{ .texture, .sampler },
+                .{ .texture_unfilterable, .sampler_non_filtering },
+            };
+            for (&r.texture_layouts, kinds) |*layout, pair| {
+                layout.* = self.ids.take(.layout);
+                var texture_entries = std.mem.zeroes(LayoutEntries);
+                const fragment = commands.stage_fragment;
+                texture_entries[0] = .{ .binding = 0, .visibility = fragment, .kind = pair[0] };
+                texture_entries[1] = .{ .binding = 1, .visibility = fragment, .kind = pair[1] };
+                buffer.push(.{ .layout_create = .{
+                    .id = layout.*,
+                    .entry_count = 2,
+                    .entries = texture_entries,
+                } });
+            }
+            assert(r.frame_layout != r.texture_layouts[0]);
+            assert(r.texture_layouts[0] != r.texture_layouts[1]);
         }
 
         fn setup_type(self: *Self, buffer: *commands.CommandBuffer, comptime index: u32) void {
@@ -460,8 +476,13 @@ pub fn Renderer(comptime Cx: type) type {
                 .shader = r.shaders[index],
                 .layout_count = layout_count,
                 .buffer_count = 2,
-                .blend = .alpha,
-                .layouts = .{ r.frame_layout, r.texture_layout, 0, 0 },
+                .blend = R.blends[index],
+                .layouts = .{
+                    r.frame_layout,
+                    r.texture_layouts[@backingInt(R.classes[index])],
+                    0,
+                    0,
+                },
                 .vertex = .{ unit_layout(), R.vertex_layout(index) },
             } });
         }
@@ -487,6 +508,25 @@ pub fn Renderer(comptime Cx: type) type {
             } });
             assert(r.clear_pipeline >= R.count);
             assert(r.clear_shader >= R.count);
+        }
+
+        /// The sampler for `sampling`, created in `buffer` the first time a texture needs it.
+        fn sampler_for(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            sampling: textures.Sampling,
+        ) u16 {
+            const slot = &self.resources.samplers[sampling.index()];
+            if (slot.*) |id| return id;
+            const id = self.ids.take(.sampler);
+            buffer.push(.{ .sampler_create = .{
+                .id = id,
+                .filter = sampling.filter,
+                .address_u = sampling.address_u,
+                .address_v = sampling.address_v,
+            } });
+            slot.* = id;
+            return id;
         }
 
         fn create_buffer(
@@ -524,10 +564,15 @@ pub fn Renderer(comptime Cx: type) type {
                 r.texture_groups[index] = self.ids.take(.bind_group);
                 var bindings = std.mem.zeroes(BindGroupEntries);
                 bindings[0] = .{ .binding = 0, .resource = r.textures[index] };
-                bindings[1] = .{ .binding = 1, .resource = r.sampler };
+                bindings[1] = .{
+                    .binding = 1,
+                    .resource = self.sampler_for(buffer, table.samplings[index]),
+                };
                 buffer.push(.{ .bind_group_create = .{
                     .id = r.texture_groups[index],
-                    .layout = r.texture_layout,
+                    .layout = r.texture_layouts[
+                        @backingInt(textures.class_of(table.formats[index]))
+                    ],
                     .entry_count = 2,
                     .entries = bindings,
                 } });
@@ -1145,20 +1190,21 @@ fn scene(hover: f32) !void {
     try cx.append(types.Arc, null, ring(60, 0));
 }
 
-// Locks the setup recording: per type a shader (labelled), a buffer, and a pipeline; the
-// atlas texture and its bind group last, after the unit quad upload, with no texels: the
-// glyph cache uploads what it rasterizes in later frames.
+// Locks the setup recording: the frame layout and the two texture layouts, then per type a
+// shader (labelled), a buffer, and a pipeline; the atlas texture and its bind group last,
+// after the unit quad upload, with no texels: the glyph cache uploads what it rasterizes in
+// later frames.
 test "setup records one shader, buffer, and pipeline per type and the atlas" {
     Fixture.setup_only();
     var storage: [64]commands.Code = undefined;
     const expected = [_]commands.Code{
-        .layout_create,  .layout_create,     .buffer_create,
-        .buffer_create,  .sampler_create,    .bind_group_create,
-        .shader_create,  .buffer_create,     .pipeline_create,
-        .shader_create,  .buffer_create,     .pipeline_create,
-        .shader_create,  .buffer_create,     .pipeline_create,
-        .shader_create,  .pipeline_create,   .buffer_write,
-        .texture_create, .bind_group_create,
+        .layout_create,     .layout_create,  .layout_create,
+        .buffer_create,     .buffer_create,  .sampler_create,
+        .bind_group_create, .shader_create,  .buffer_create,
+        .pipeline_create,   .shader_create,  .buffer_create,
+        .pipeline_create,   .shader_create,  .buffer_create,
+        .pipeline_create,   .shader_create,  .pipeline_create,
+        .buffer_write,      .texture_create, .bind_group_create,
     };
     try testing.expectEqualSlices(commands.Code, &expected, codes(&Fixture.buffer, &storage));
     var reader = Fixture.buffer.reader();
@@ -1455,6 +1501,107 @@ test "with the cache off, animating follows the animated batches" {
     try testing.expect(!Animated.renderer.animating);
 }
 
+/// An unfilterable, multiplying test type.
+const Heat = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = .r32float;
+    pub const blend: draw.Blend = .multiply;
+    pub const pixel: []const u8 =
+        \\fn pixel(px: Pixel) -> vec4<f32> {
+        \\    return vec4<f32>(sample_texture(px.local / px.size).rrr, 1.0);
+        \\}
+        \\
+    ;
+};
+
+const data_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 4 },
+    .{ .type = Heat, .cap = 4 },
+    .{ .type = types.Image, .cap = 4 },
+};
+
+const DataContext = draw.Context(&data_draw, 8, 0);
+
+// Locks samplers, layouts, and blends (module guide, section 2): each pipeline takes its
+// type's blend and class layout; a nearest, repeating mode gets one sampler, created in the
+// stream that first needs it and shared by the second texture of that mode; each bind group
+// takes its texture's class layout and mode's sampler; the default mode is the setup sampler.
+test "textures get their class layout and their mode's sampler, created once" {
+    const static = struct {
+        var context: DataContext = undefined;
+        var renderer: Renderer(DataContext) = undefined;
+        var buffer: commands.CommandBuffer = undefined;
+    };
+    const cx = &static.context;
+    const renderer = &static.renderer;
+    cx.init();
+    renderer.init();
+    static.buffer = .init();
+    renderer.setup(&static.buffer, cx);
+    const r = &renderer.resources;
+    var reader = static.buffer.reader();
+    while (reader.next()) |op| {
+        switch (op) {
+            .pipeline_create => |pipeline| if (pipeline.id == r.pipelines[1]) {
+                try testing.expectEqual(commands.Blend.multiply, pipeline.blend);
+                try testing.expectEqual(r.texture_layouts[1], pipeline.layouts[1]);
+            } else if (pipeline.id == r.pipelines[2]) {
+                try testing.expectEqual(commands.Blend.alpha, pipeline.blend);
+                try testing.expectEqual(r.texture_layouts[0], pipeline.layouts[1]);
+            },
+            .layout_create => |layout| if (layout.id == r.texture_layouts[1]) {
+                try testing.expectEqual(commands.BindingKind.texture_unfilterable, layout.entries[0].kind);
+                try testing.expectEqual(commands.BindingKind.sampler_non_filtering, layout.entries[1].kind);
+            },
+            else => {},
+        }
+    }
+    const nearest: textures.Sampling = .{ .filter = .nearest, .address_u = .repeat };
+    _ = cx.textures.create_sampled(.r32float, 8, 4, nearest);
+    _ = cx.textures.create_sampled(.r32float, 4, 4, nearest);
+    _ = cx.textures.create(.rgba8, 2, 2);
+    static.buffer.reset();
+    renderer.frame(&static.buffer, cx, .{
+        .width_logical = 64,
+        .height_logical = 64,
+        .width_px = 64,
+        .height_px = 64,
+        .scale_120 = 120,
+    }, 0);
+    var storage: [64]commands.Code = undefined;
+    const expected = [_]commands.Code{
+        .buffer_write,   .texture_create,    .sampler_create, .bind_group_create,
+        .texture_create, .bind_group_create, .texture_create, .bind_group_create,
+    };
+    try testing.expectEqualSlices(commands.Code, &expected, codes(&static.buffer, &storage)[0..8]);
+    const shared = r.samplers[nearest.index()].?;
+    try testing.expect(shared != r.samplers[(textures.Sampling{}).index()].?);
+    reader = static.buffer.reader();
+    var groups: u32 = 0;
+    while (reader.next()) |op| {
+        switch (op) {
+            .sampler_create => |sampler| {
+                try testing.expectEqual(shared, sampler.id);
+                try testing.expectEqual(commands.Filter.nearest, sampler.filter);
+                try testing.expectEqual(commands.Address.repeat, sampler.address_u);
+                try testing.expectEqual(commands.Address.clamp, sampler.address_v);
+            },
+            .bind_group_create => |group| {
+                const heat = groups < 2;
+                const class: u32 = if (heat) 1 else 0;
+                const sampler = if (heat) shared else r.samplers[(textures.Sampling{}).index()].?;
+                try testing.expectEqual(r.texture_layouts[class], group.layout);
+                try testing.expectEqual(sampler, group.entries[1].resource);
+                groups += 1;
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(u32, 3), groups);
+}
+
 // Locks the bound that keeps the worst cached frame in one command buffer: an app of few
 // batches gets every rect, the default `batch_cap` of 256 fewer, and never zero.
 test "the rect count fits the command buffer" {
@@ -1587,12 +1734,13 @@ test "a points type adds the point buffer to the frame group" {
     PathFixture.renderer.setup(&PathFixture.buffer, &PathFixture.context);
     var storage: [64]commands.Code = undefined;
     const expected = [_]commands.Code{
-        .layout_create,     .layout_create,  .buffer_create,
-        .buffer_create,     .buffer_create,  .sampler_create,
-        .bind_group_create, .shader_create,  .buffer_create,
-        .pipeline_create,   .shader_create,  .buffer_create,
-        .pipeline_create,   .shader_create,  .pipeline_create,
-        .buffer_write,      .texture_create, .bind_group_create,
+        .layout_create,     .layout_create,     .layout_create,
+        .buffer_create,     .buffer_create,     .buffer_create,
+        .sampler_create,    .bind_group_create, .shader_create,
+        .buffer_create,     .pipeline_create,   .shader_create,
+        .buffer_create,     .pipeline_create,   .shader_create,
+        .pipeline_create,   .buffer_write,      .texture_create,
+        .bind_group_create,
     };
     const recorded = codes(&PathFixture.buffer, &storage);
     try testing.expectEqualSlices(commands.Code, &expected, recorded);

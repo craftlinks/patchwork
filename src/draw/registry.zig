@@ -44,6 +44,19 @@
 //! `check`: the pixel cache would otherwise keep its first frame forever. The search is
 //! textual, so a comment that names them counts too.
 //!
+//! ## 2c. Blending
+//! A type may declare `pub const blend: draw.Blend` (default `.alpha`); `.none` is rejected,
+//! because the clip mask works through alpha. Every mode blends the straight-alpha output of
+//! `fs_main`, `a = color.a * clip`, and the registry generates `blend_out`, which `fs_main`
+//! applies last:
+//! ```text
+//! alpha     out = (rgb, a)                 rgb * a + dst * (1 - a)
+//! additive  out = (rgb, a)                 dst + rgb * a
+//! multiply  out = (mix(1, rgb, a), a)      dst * mix(1, rgb, a)
+//! ```
+//! so a clipped-out pixel leaves the target unchanged in every mode. The factors are in
+//! `commands.Blend`.
+//!
 //! ## 2a. The Vertex Contract
 //! By default a type's quad is its `rect`: the shared `vs_main` places the unit quad's corner
 //! `unit` (in [0, 1]^2) at `rect.xy + unit * rect.zw`. A type may instead declare
@@ -60,7 +73,8 @@
 //! ```text
 //! prelude.wgsl                         Frame, vs_main, fs_main, coverage, sdf_*, clip_mask
 //! struct Theme { ... }                 one vec4 per `theme.Theme` field, in order
-//! bound_texture, bound_sampler         @group(1), textured types only, with sample_texture
+//! bound_texture, bound_sampler         @group(1), textured types only, with sample_texture,
+//!                                      load_texture, and texture_size
 //! points                               @group(0) @binding(1), `reads_points` types only
 //! struct Instance { g0 .. gN-1 }       @location(1 .. N) vec4<f32>
 //! struct Varyings                      position, local, and every group @interpolate(flat)
@@ -69,6 +83,7 @@
 //! T.pixel                              the type's own fn pixel(px: Pixel) -> vec4<f32>
 //! [T.vertex]                           the type's own fn vertex, when it declares one
 //! fn vertex_local                      unit * rect.zw, or vertex(unpack(carry(i)), unit)
+//! fn blend_out                         identity, or the multiply mix (section 2c)
 //! ```
 //! Generating `Theme` from the Zig record removes the hand-mirrored copy that a test used to
 //! police. The concatenation runs at compile time; the result is static data spanned by the
@@ -152,6 +167,12 @@ pub fn check(comptime T: type) ?[]const u8 {
         if (@hasDecl(T, "animated")) {
             if (@TypeOf(T.animated) != bool) return name ++ ": `animated` must be bool";
         }
+        if (@hasDecl(T, "blend")) {
+            if (@TypeOf(T.blend) != commands.Blend) {
+                return name ++ ": `blend` must be draw.Blend";
+            }
+            if (T.blend == .none) return name ++ ": `blend` must not be .none";
+        }
         if (!animated(T) and reads_time(T)) {
             return name ++ ": reads time but does not declare `animated = true`";
         }
@@ -181,6 +202,12 @@ pub fn reads_points(comptime T: type) bool {
 pub fn animated(comptime T: type) bool {
     if (comptime !@hasDecl(T, "animated")) return false;
     return comptime T.animated;
+}
+
+/// The blend `T` declares, `.alpha` by default (module guide, section 2c).
+pub fn blend_of(comptime T: type) commands.Blend {
+    if (comptime !@hasDecl(T, "blend")) return .alpha;
+    return comptime T.blend;
 }
 
 /// Names in WGSL that read the time slot (prelude guide, section 6).
@@ -259,6 +286,26 @@ pub fn Registry(comptime entries: []const DrawType) type {
             break :blk out;
         };
 
+        /// The blend of each type, by id (module guide, section 2c).
+        pub const blends: [count]commands.Blend = blk: {
+            var out: [count]commands.Blend = undefined;
+            for (entries, 0..) |entry, index| out[index] = blend_of(entry.type);
+            break :blk out;
+        };
+
+        /// The texture layout class of each textured type, by id; `filterable` for an
+        /// untextured one, which binds no texture.
+        pub const classes: [count]textures.Class = blk: {
+            var out: [count]textures.Class = undefined;
+            for (entries, 0..) |entry, index| {
+                out[index] = if (entry.type.texture) |format|
+                    textures.class_of(format)
+                else
+                    .filterable;
+            }
+            break :blk out;
+        };
+
         /// True when some registered type is animated.
         pub const any_animated: bool = blk: {
             var out = false;
@@ -324,10 +371,21 @@ pub fn source(comptime T: type) []const u8 {
         var text: []const u8 = prelude ++ "\n" ++ theme_wgsl();
         if (T.texture != null) text = text ++ texture_wgsl;
         if (reads_points(T)) text = text ++ points_wgsl;
-        text = text ++ io_wgsl(T) ++ "\n" ++ T.pixel ++ vertex_wgsl(T);
+        text = text ++ io_wgsl(T) ++ "\n" ++ T.pixel ++ vertex_wgsl(T) ++ blend_wgsl(T);
         const copy = text[0..text.len].*;
         return &copy;
     }
+}
+
+/// The `blend_out` that `fs_main` applies (module guide, section 2c).
+fn blend_wgsl(comptime T: type) []const u8 {
+    return switch (comptime blend_of(T)) {
+        .none => unreachable,
+        .alpha, .additive => "\nfn blend_out(c: vec4<f32>) -> vec4<f32> {\n" ++
+            "    return c;\n}\n",
+        .multiply => "\nfn blend_out(c: vec4<f32>) -> vec4<f32> {\n" ++
+            "    return vec4<f32>(mix(vec3<f32>(1.0, 1.0, 1.0), c.rgb, c.a), c.a);\n}\n",
+    };
 }
 
 /// The type's `vertex` and the `vertex_local` that `vs_main` calls (module guide, section 2a).
@@ -365,6 +423,15 @@ const texture_wgsl: []const u8 =
     \\// Samples the type's texture. Call it in uniform control flow (prelude, section 3).
     \\fn sample_texture(uv: vec2<f32>) -> vec4<f32> {
     \\    return textureSample(bound_texture, bound_sampler, uv);
+    \\}
+    \\
+    \\// Reads one texel, no filter and no derivatives, so it may run under branches.
+    \\fn load_texture(texel: vec2<i32>) -> vec4<f32> {
+    \\    return textureLoad(bound_texture, texel, 0);
+    \\}
+    \\
+    \\fn texture_size() -> vec2<i32> {
+    \\    return vec2<i32>(textureDimensions(bound_texture));
     \\}
     \\
 ;
@@ -514,6 +581,24 @@ const BadAnimated = extern struct {
     pub const animated = 1;
 };
 
+const Multiplied = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = .r32float;
+    pub const blend: commands.Blend = .multiply;
+    pub const pixel: []const u8 = "";
+};
+
+const Unblended = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const blend: commands.Blend = .none;
+    pub const pixel: []const u8 = "";
+};
+
 const NoClip = extern struct {
     rect: [4]f32,
     tint: [4]f32,
@@ -579,6 +664,24 @@ test "only an animated type may read time" {
     try testing.expectEqual([2]bool{ false, true }, Both.animates);
     try testing.expect(Both.any_animated);
     try testing.expect(!Registry(&.{.{ .type = Probe, .cap = 4 }}).any_animated);
+}
+
+// Locks blending and textures (sections 2c and 3): a multiply type gets the mix toward white
+// as `blend_out` and the texel helpers, an alpha type the identity, `.none` is named, and the
+// registry tables carry each type's blend and layout class.
+test "blend_out follows the declared blend, and none is rejected" {
+    const multiplied = comptime source(Multiplied);
+    try testing.expect(std.mem.find(u8, multiplied, "mix(vec3<f32>(1.0, 1.0, 1.0), c.rgb") != null);
+    try testing.expect(std.mem.find(u8, multiplied, "fn load_texture(texel: vec2<i32>)") != null);
+    try testing.expect(std.mem.find(u8, multiplied, "fn texture_size()") != null);
+    const plain = comptime source(Probe);
+    try testing.expect(std.mem.find(u8, plain, "fn blend_out(c: vec4<f32>) -> vec4<f32> {\n    return c;") != null);
+    try testing.expect(std.mem.find(u8, plain, "return blend_out(vec4<f32>(") != null);
+    const unblended = comptime check(Unblended).?;
+    try testing.expect(std.mem.find(u8, unblended, "Unblended: `blend` must not be .none") != null);
+    const Both = Registry(&.{ .{ .type = Probe, .cap = 4 }, .{ .type = Multiplied, .cap = 4 } });
+    try testing.expectEqual([2]commands.Blend{ .alpha, .multiply }, Both.blends);
+    try testing.expectEqual([2]textures.Class{ .filterable, .unfilterable }, Both.classes);
 }
 
 // Locks the negative space of the convention: each violation is named with the type.

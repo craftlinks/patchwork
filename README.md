@@ -156,15 +156,19 @@ patchwork/
 │   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
 │   ├── column/                 # Scrolling view regression app
 │   │   └── app.zig             # Column App (config.timer_period_ms = 0)
-│   └── live/                   # Live-coding screen
-│       ├── app.zig             # Live App: header, editor, knob column, curves, lanes, transport
-│       ├── bindings.zig        # Binding parser: k() calls, shape() calls, bpm, fixed point
-│       ├── knob.zig            # The bound knob: any ring size, value text inside the ring
-│       ├── lanes.zig           # Transport and automation lanes: in-place rings, playhead
-│       ├── shaper.zig          # The inline shaper row's transfer curve
-│       ├── icon.zig            # The live app's own draw type: transport and status icons
-│       ├── bench.zig           # The live screen's bench scenarios
-│       └── patch.lpg           # The embedded patch the editor opens
+│   ├── live/                   # Live-coding screen
+│   │   ├── app.zig             # Live App: header, editor, knob column, curves, lanes, transport
+│   │   ├── bindings.zig        # Binding parser: k() calls, shape() calls, bpm, fixed point
+│   │   ├── knob.zig            # The bound knob: any ring size, value text inside the ring
+│   │   ├── lanes.zig           # Transport and automation lanes: in-place rings, playhead
+│   │   ├── shaper.zig          # The inline shaper row's transfer curve
+│   │   ├── icon.zig            # The live app's own draw type: transport and status icons
+│   │   ├── glow.zig            # Its animated draw type: the armed record button's glow
+│   │   ├── bench.zig           # The live screen's bench scenarios
+│   │   └── patch.lpg           # The embedded patch the editor opens
+│   └── data/                   # Data textures, samplers, and blending
+│       ├── app.zig             # Data App: float textures, sampling modes, additive and multiply
+│       └── views.zig           # Its draw types: Heat, Shade, Tile, Bars, Light
 ├── tools/
 │   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
@@ -172,7 +176,8 @@ patchwork/
 │   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
 └── test/                       # Regression tests
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
-    └── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
+    ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
+    └── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
 ```
 
 ## Build Steps
@@ -198,9 +203,15 @@ zig build run-live        # Build and run the live-coding screen natively
 zig build wasm-live       # Compile the live-coding screen to zig-out/bin/live.wasm
 zig build serve-live      # Serve the live-coding screen on localhost (prints the address)
 
+# Examples (Data Textures)
+zig build run-data        # Build and run the data textures screen natively
+zig build wasm-data       # Compile it to zig-out/bin/data.wasm
+zig build serve-data      # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the three examples
-zig build test-contract   # Verify compile errors for a missing `draw` and a ragged draw type
+zig build test            # Run unit tests across the library and the four examples
+zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
+                          # and a type that reads time without declaring `animated`
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
@@ -218,9 +229,10 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 
 ```text
 zig-out/
-├── bin/rack, column, live      # native executables, RUNPATH $ORIGIN/../lib
+├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
+│   data
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
-│   live.wasm                   #   and `zig build wasm-live`
+│   live.wasm, data.wasm        #   `zig build wasm-live`, and `zig build wasm-data`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -554,6 +566,16 @@ values are UI state that lives in the text. It demonstrates:
   `pulse` (record armed while paused: animation-only frames), `transport`, `typing`, `transport-stress`, and `typing-stress`, replayed headless by test
   "the bench scenarios replay headless".
 
+### 4. Data Textures (`examples/data/app.zig`)
+
+Four panels at fixed positions from the top-left, so a native frame dump and a browser
+screenshot compare region for region: an `r32float` spectrogram sampled `nearest` under a
+`multiply` shade, an `rg16float` tile repeated 3x3 with linear filtering, an `r16float` ring
+of bars read with `load_texture` from a write head, and three `additive` discs that sum to
+white. No input, no timer: it draws once and sleeps. Its `still` scenario dumps the frame.
+Natively and in Chromium on the same GPU (RTX 3060) the four panels are bitwise identical;
+across the RTX 3060 and the UHD 770 they differ by at most 2/255 (filtering and blending).
+
 ## Bench Mode
 
 `src/bench.zig` and the native host measure frames on request; without `--bench` nothing of
@@ -602,11 +624,13 @@ replay it: native through `gpu_wgpu.execute`, the browser through `submit_js(ptr
 
 ```text
 Renderer.setup  (once, after device creation)
-  layout_create  buffer_create  [buffer_create (points)]  sampler_create
+  layout_create (frame, filterable and unfilterable texture)  buffer_create
+  [buffer_create (points)]  sampler_create (the default mode: linear, clamped)
   bind_group_create (frame: uniform [and points])
   per draw type: shader_create (labelled with the type)  buffer_create  pipeline_create
   shader_create pipeline_create (the clear pipeline of the pixel cache)
-  buffer_write (unit quad)  per queued texture: texture_create  bind_group_create
+  buffer_write (unit quad)  per queued texture: texture_create  [sampler_create (its mode,
+  the first time)]  bind_group_create
   texture_write* (the app's images; the glyph atlas starts empty)
 Renderer.frame  (every drawn frame)
   buffer_write (uniform, if the device size or scale changed)
@@ -736,10 +760,22 @@ adds its own (the rack's `Led`).
   counting sort, skipped when appends were already in order, and each (layer, type, texture)
   run is one draw call. Layers draw in order; within a layer, batches draw in order of first
   appearance. Box, glyph, box, glyph in one layer is two draw calls, not four.
-- **Textures.** `textures.create(.r8 | .rgba8, width, height)` returns a `TextureId` and
+- **Textures.** `textures.create(format, width, height)` returns a `TextureId` and
   `textures.write(id, region, bytes)` queues pixels (`write_strided` takes a row stride, for a
   sub-rectangle of a larger image); both are recorded into the next stream, each texture with
-  its own bind group. The glyph atlas is texture 0.
+  its own bind group. The glyph atlas is texture 0. Formats are `r8`, `rgba8`, `r16float`,
+  `rg16float` (bytes are `f16` bit patterns), `r32float`, and `rg32float`; all sample as
+  `texture_2d<f32>`. The 32-bit formats are not filterable in core WebGPU, so they bind
+  through a second layout with a non-filtering sampler and must be sampled `nearest`.
+- **Sampling.** `textures.create_sampled(format, width, height, .{ .filter, .address_u,
+  .address_v })` picks the filter (`nearest`, `linear`) and per-axis address mode (`clamp`,
+  `repeat`); `create` is linear and clamped. One sampler per mode (8 at most) is created the
+  first time a texture uses it. Textured types also get `load_texture(texel)` (a
+  `textureLoad`, no derivatives) and `texture_size()` beside `sample_texture(uv)`.
+- **Blending.** A type may declare `pub const blend: draw.Blend`: `.alpha` (default,
+  source-over), `.additive` (`dst + rgb * a`), or `.multiply` (`dst * mix(1, rgb, a)`, the mix
+  generated as the type's `blend_out`). Clipped-out pixels leave the target unchanged in every
+  mode, and the pixel cache stays exact because a cached rect replays every batch in order.
 - **Clip mask.** Shaders evaluate an analytic hard clip mask instead of scissor state:
 
 ```text

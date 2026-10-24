@@ -14,9 +14,18 @@
 //! `TextureId` is the index into this table, `0 .. texture_cap`. Id 0 is the glyph atlas
 //! (`TextureId.atlas`): `draw.Context.init` creates it before anything else, empty, and the
 //! glyph cache (`text/cache.zig`) queues the regions it rasterizes into. `Format.r8` is
-//! single-channel coverage (`r8unorm`), and `Format.rgba8` is straight-alpha color
-//! (`rgba8unorm`). Both sample as filterable float, so one bind group layout and one clamping
-//! linear sampler serve every texture.
+//! single-channel coverage (`r8unorm`) and `Format.rgba8` straight-alpha color (`rgba8unorm`);
+//! `r16float` and `rg16float` (bytes are `f16` bit patterns) and `r32float` and `rg32float`
+//! (`f32`) are data. Every format samples as `texture_2d<f32>`. The 32-bit float formats are
+//! not filterable without an optional WebGPU feature, so they are `Class.unfilterable`: they
+//! bind through a second layout with a non-filtering sampler, and `create_sampled` asserts
+//! they are sampled `nearest`.
+//!
+//! ## 2a. Sampling
+//! Each texture has a `Sampling`: its filter and its address mode per axis (clamp to the
+//! edge, or repeat). `create` takes the default (linear, clamp, clamp). There are
+//! `sampling_count` modes; `Sampling.index` numbers them, and the renderer creates one sampler
+//! per mode the first time a texture uses it (`draw/renderer.zig`, section 2).
 //!
 //! ## 3. Lifetime of Written Bytes and Row Strides
 //! `write` and `write_strided` store a slice, not a copy. The bytes must stay valid and
@@ -49,7 +58,35 @@ pub const write_cap: u32 = 16;
 pub const Format = enum(u8) {
     r8,
     rgba8,
+    r16float,
+    rg16float,
+    r32float,
+    rg32float,
 };
+
+/// Which texture bind group layout a format binds through (module guide, section 2).
+pub const Class = enum(u8) {
+    filterable,
+    unfilterable,
+};
+
+/// How a texture is sampled (module guide, section 2a).
+pub const Sampling = struct {
+    filter: commands.Filter = .linear,
+    address_u: commands.Address = .clamp,
+    address_v: commands.Address = .clamp,
+
+    /// The mode's number, `0 .. sampling_count`: filter, then u, then v.
+    pub fn index(self: Sampling) u32 {
+        const value = @as(u32, @backingInt(self.filter)) * 4 +
+            @as(u32, @backingInt(self.address_u)) * 2 + @backingInt(self.address_v);
+        assert(value < sampling_count);
+        return value;
+    }
+};
+
+/// Distinct sampling modes: two filters times two address modes per axis.
+pub const sampling_count: u32 = 8;
 
 /// Index into the texture table. `atlas` is always id 0.
 pub const TextureId = enum(u8) {
@@ -80,6 +117,7 @@ pub const Textures = struct {
     formats: [texture_cap]Format,
     widths: [texture_cap]u32,
     heights: [texture_cap]u32,
+    samplings: [texture_cap]Sampling,
     writes: [write_cap]Write,
     write_count: u32,
     /// Moves on every queued write of a texture: the pixel cache folds it into the tiles that
@@ -96,16 +134,30 @@ pub const Textures = struct {
         assert(self.write_count == 0);
     }
 
-    /// Reserves the next id for a `width` by `height` texture of `format`. The GPU texture
-    /// and its bind group are created in the next recorded stream.
+    /// Reserves the next id for a `width` by `height` texture of `format`, sampled linear and
+    /// clamped. The GPU texture and its bind group are created in the next recorded stream.
     pub fn create(self: *Textures, format: Format, width: u32, height: u32) TextureId {
+        return self.create_sampled(format, width, height, .{});
+    }
+
+    /// `create` with a sampling mode (module guide, section 2a). An unfilterable format must
+    /// be sampled `nearest`.
+    pub fn create_sampled(
+        self: *Textures,
+        format: Format,
+        width: u32,
+        height: u32,
+        sampling: Sampling,
+    ) TextureId {
         assert(self.count < texture_cap);
         assert(width != 0);
         assert(height != 0);
+        if (class_of(format) == .unfilterable) assert(sampling.filter == .nearest);
         const index = self.count;
         self.formats[index] = format;
         self.widths[index] = width;
         self.heights[index] = height;
+        self.samplings[index] = sampling;
         self.count += 1;
         assert(self.count == index + 1);
         return @fromBackingInt(@intCast(index));
@@ -190,6 +242,10 @@ pub fn bytes_per_texel(format: Format) u32 {
     return switch (format) {
         .r8 => 1,
         .rgba8 => 4,
+        .r16float => 2,
+        .rg16float => 4,
+        .r32float => 4,
+        .rg32float => 8,
     };
 }
 
@@ -198,6 +254,18 @@ pub fn gpu_format(format: Format) commands.TextureFormat {
     return switch (format) {
         .r8 => .r8unorm,
         .rgba8 => .rgba8unorm,
+        .r16float => .r16float,
+        .rg16float => .rg16float,
+        .r32float => .r32float,
+        .rg32float => .rg32float,
+    };
+}
+
+/// The layout class of `format` (module guide, section 2).
+pub fn class_of(format: Format) Class {
+    return switch (format) {
+        .r8, .rgba8, .r16float, .rg16float => .filterable,
+        .r32float, .rg32float => .unfilterable,
     };
 }
 
@@ -207,6 +275,36 @@ comptime {
     assert(texture_cap + 1 <= commands.caps.get(.bind_group));
     assert(write_cap >= 1);
     assert(@backingInt(TextureId.atlas) == 0);
+    // Every sampling mode gets its own sampler.
+    assert(sampling_count <= commands.caps.get(.sampler));
+    assert(sampling_count == 2 * 2 * 2);
+}
+
+// Locks the formats: bytes per texel, the command-stream name, and the class, and that a
+// 32-bit float texture keeps its nearest, repeating mode while `create` defaults to linear
+// clamping. Mode numbers run filter, u, v.
+test "float formats have their sizes, classes, and sampling modes" {
+    var textures: Textures = undefined;
+    textures.init();
+    const atlas = textures.create(.r8, 4, 4);
+    const heat = textures.create_sampled(.r32float, 8, 4, .{
+        .filter = .nearest,
+        .address_u = .repeat,
+    });
+    try std.testing.expectEqual(Sampling{}, textures.samplings[@backingInt(atlas)]);
+    try std.testing.expectEqual(commands.Address.repeat, textures.samplings[1].address_u);
+    try std.testing.expectEqual(Format.r32float, textures.format_of(heat));
+    try std.testing.expectEqual(@as(u32, 2), bytes_per_texel(.r16float));
+    try std.testing.expectEqual(@as(u32, 8), bytes_per_texel(.rg32float));
+    try std.testing.expectEqual(commands.TextureFormat.rg16float, gpu_format(.rg16float));
+    try std.testing.expectEqual(Class.unfilterable, class_of(.rg32float));
+    try std.testing.expectEqual(Class.filterable, class_of(.rg16float));
+    try std.testing.expectEqual(@as(u32, 4), (Sampling{}).index());
+    try std.testing.expectEqual(@as(u32, 2), textures.samplings[1].index());
+    // A 16-bit float texel is the `f16` bit pattern: 0.5 is 0x3800 and -2 is 0xC000.
+    const half = [_]f16{ 0.5, -2 };
+    const data = std.mem.sliceAsBytes(&half);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x38, 0x00, 0xC0 }, data);
 }
 
 // Locks id assignment in creation order, the per-format row size of a write, and the queue.

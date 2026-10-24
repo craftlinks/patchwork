@@ -37,8 +37,8 @@
 //! `vertex_entry` and `fragment_entry`, topology is a triangle list with no culling, the color
 //! target is the host's surface format, a texture is created with binding and copy-destination
 //! usage and bound through its default view (a `target_create` render target instead with
-//! render-attachment, copy-source, and binding usage in the surface format), a bind-group buffer entry binds the whole buffer,
-//! and a sampler clamps to the edge. Buffer usage bits and shader stage bits are the WebGPU
+//! render-attachment, copy-source, and binding usage in the surface format), and a bind-group
+//! buffer entry binds the whole buffer. Buffer usage bits and shader stage bits are the WebGPU
 //! values, which `webgpu.h` shares, so both hosts pass them through unchanged.
 //!
 //! ## 5. One Op Table for Both Interpreters
@@ -138,11 +138,15 @@ pub const Code = enum(u16) {
 };
 
 /// What one bind group layout entry holds, and so what its bind group resource id names.
+/// `texture` samples as filterable float and pairs with a filtering `sampler`;
+/// `texture_unfilterable` (the 32-bit float formats) pairs with `sampler_non_filtering`.
 pub const BindingKind = enum(u8) {
     uniform,
     texture,
     sampler,
     storage_read,
+    texture_unfilterable,
+    sampler_non_filtering,
 };
 
 pub const VertexFormat = enum(u8) {
@@ -155,23 +159,40 @@ pub const StepMode = enum(u8) {
     instance,
 };
 
-/// `alpha` is source-over on straight alpha for color and alpha.
+/// Color target blending, on the straight-alpha output of `fs_main` (`draw/registry.zig`,
+/// section 2c). `alpha` is source-over for color and alpha: (src_alpha, one_minus_src_alpha).
+/// `additive` adds `rgb * a`: color (src_alpha, one), alpha (zero, one). `multiply` scales the
+/// target by the output, which the shader has already mixed toward white by `1 - a`: color
+/// (dst, zero), alpha (zero, one).
 pub const Blend = enum(u8) {
     none,
     alpha,
+    additive,
+    multiply,
 };
 
 /// `r8unorm` is single-channel coverage (the glyph atlas); `rgba8unorm` is straight-alpha
-/// color (images). Both sample as filterable float, so one bind group layout serves both.
+/// color (images); the 16-bit float formats are filterable data. The 32-bit float formats
+/// are unfilterable without an optional feature, so they bind as `texture_unfilterable`.
 pub const TextureFormat = enum(u8) {
     r8unorm,
     rgba8unorm,
+    r16float,
+    rg16float,
+    r32float,
+    rg32float,
 };
 
 /// Min and mag filter of a sampler.
 pub const Filter = enum(u8) {
     nearest,
     linear,
+};
+
+/// Address mode of a sampler along one axis: clamp to the edge texel, or wrap.
+pub const Address = enum(u8) {
+    clamp,
+    repeat,
 };
 
 /// What `pass_begin` does with the target's pixels: clear them, or keep them (a render
@@ -187,7 +208,7 @@ pub const surface_target: u16 = std.math.maxInt(u16);
 /// The payload enums, listed in `table_json`. Each must be contiguous from zero so the table
 /// can list names by value.
 const payload_enums = .{
-    BindingKind, VertexFormat, StepMode, Blend, TextureFormat, Filter, LoadOp,
+    BindingKind, VertexFormat, StepMode, Blend, TextureFormat, Filter, Address, LoadOp,
 };
 
 pub const Header = extern struct {
@@ -289,7 +310,10 @@ pub const TextureCreate = extern struct {
 pub const SamplerCreate = extern struct {
     id: u16,
     filter: Filter,
-    pad: u8 = 0,
+    address_u: Address,
+    address_v: Address,
+    pad0: u8 = 0,
+    pad1: u16 = 0,
 };
 
 pub const BindGroupEntry = extern struct {
@@ -730,7 +754,12 @@ fn samples() [@typeInfo(Op).@"union".field_names.len]Op {
         } },
         .{ .buffer_create = .{ .id = 7, .usage = usage_vertex | usage_copy_dst, .size = 4096 } },
         .{ .texture_create = .{ .id = 1, .format = .rgba8unorm, .width = 32, .height = 32 } },
-        .{ .sampler_create = .{ .id = 1, .filter = .linear } },
+        .{ .sampler_create = .{
+            .id = 1,
+            .filter = .linear,
+            .address_u = .repeat,
+            .address_v = .clamp,
+        } },
         .{ .bind_group_create = .{ .id = 9, .layout = 2, .entry_count = 2, .entries = .{
             .{ .binding = 0, .resource = 1 },
             .{ .binding = 1, .resource = 1 },
