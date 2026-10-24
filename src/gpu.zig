@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const assert = std.debug.assert;
 const commands = @import("gpu/commands.zig");
+const bench = @import("bench.zig");
 
 /// Conditionally import native wgpu bindings only when compiling for non-Wasm targets.
 const gpu_wgpu = if (builtin.target.cpu.arch == .wasm32) void else @import("host/gpu_wgpu.zig");
@@ -31,6 +32,17 @@ const gpu_wgpu = if (builtin.target.cpu.arch == .wasm32) void else @import("host
 /// Backend state. Native: wgpu-native handles and resource tables. Wasm: zero-sized, because
 /// JavaScript owns the WebGPU objects.
 pub const Gpu = if (builtin.target.cpu.arch == .wasm32) struct {} else gpu_wgpu.Gpu;
+
+/// Adapter preference and bench-mode profiling for `create`. The browser picks its adapter in
+/// `web/shell.js`, so the fields matter natively only.
+pub const Options = if (builtin.target.cpu.arch == .wasm32) struct {
+    adapter: bench.Adapter,
+    profile: bool,
+} else gpu_wgpu.Options;
+
+/// The native backend, for the bench-mode calls only the native host makes (timestamps and
+/// frame readback; `host/gpu_wgpu.zig`, section 9). `void` on Wasm.
+pub const native = gpu_wgpu;
 
 /// Replays one recorded stream. The buffer and everything its spans name must stay valid for
 /// the duration of the call (see the module guide for the Wasm rule).
@@ -53,11 +65,12 @@ pub fn submit(gpu: *Gpu, buffer: *const commands.CommandBuffer) !void {
 pub fn create(
     display: *anyopaque,
     surface: *anyopaque,
+    options: Options,
 ) !Gpu {
     assert(@intFromPtr(display) != 0);
     assert(@intFromPtr(surface) != 0);
     if (builtin.target.cpu.arch == .wasm32) {
         return .{};
     }
-    return gpu_wgpu.create(display, surface);
+    return gpu_wgpu.create(display, surface, options);
 }

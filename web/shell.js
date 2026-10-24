@@ -71,9 +71,25 @@
 // `paste` writes the clipboard text into the input buffer and calls `paste`. After every Wasm
 // input call and every tick, `sync_cursor` reads `cursor()` and sets `canvas.style.cursor`
 // only when it changed, using the CSS names Wasm exports (`cursor_names_ptr/len`).
+//
+// ## 8. Bench Timestamps
+// Loading the page with `?bench=1` requests `timestamp-query` when the adapter offers it and
+// times every render pass on the GPU, the browser half of the native `--bench` mode
+// (`src/bench.zig`). Readback is asynchronous: each pass resolves its two timestamps into a
+// buffer taken from a small pool, and a pass that finds the pool empty is not timed. Every
+// `BENCH_WINDOW` timed passes, the console logs p10, p50, and p90 in microseconds, and
+// `window.patchworkBench` holds the latest summary. Browsers may quantize timestamps (Chrome
+// does unless a flag is set), so native numbers are the reference. Scenarios, phase timers,
+// and frame dumps are native only.
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
+const benchRequested = new URLSearchParams(window.location.search).get("bench") === "1";
+const BENCH_WINDOW = 120;
+const BENCH_POOL = 4;
+
+/** Timestamp query state for `?bench=1` (guide, section 8); null when off or unsupported. */
+let bench = null;
 
 let device = null;
 let context = null;
@@ -321,14 +337,22 @@ const OPS = {
         }
         encoder = device.createCommandEncoder();
         const [r, g, b, a] = p.clear;
-        pass = encoder.beginRenderPass({
+        const descriptor = {
             colorAttachments: [{
                 view: context.getCurrentTexture().createView(),
                 loadOp: "clear",
                 storeOp: "store",
                 clearValue: { r, g, b, a },
             }],
-        });
+        };
+        if (bench !== null) {
+            descriptor.timestampWrites = {
+                querySet: bench.querySet,
+                beginningOfPassWriteIndex: 0,
+                endOfPassWriteIndex: 1,
+            };
+        }
+        pass = encoder.beginRenderPass(descriptor);
     },
     pipeline_set(p) {
         open_pass("pipeline_set").setPipeline(lookup("pipeline", p.id, "pipeline_set"));
@@ -345,11 +369,63 @@ const OPS = {
     },
     pass_end_present() {
         open_pass("pass_end_present").end();
+        const readback = bench_resolve(encoder);
         device.queue.submit([encoder.finish()]);
+        if (readback !== null) bench_read(readback);
         pass = null;
         encoder = null;
     },
 };
+
+/**
+ * Creates the query set, the resolve buffer, and the readback pool (guide, section 8).
+ */
+function bench_create() {
+    const readback = () => device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    bench = {
+        querySet: device.createQuerySet({ type: "timestamp", count: 2 }),
+        resolve: device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        }),
+        free: Array.from({ length: BENCH_POOL }, readback),
+        samples: [],
+    };
+}
+
+/**
+ * Resolves this pass's timestamps into a free readback buffer, or returns null when bench
+ * mode is off or the pool is empty.
+ */
+function bench_resolve(frameEncoder) {
+    if (bench === null || bench.free.length === 0) return null;
+    const readback = bench.free.pop();
+    frameEncoder.resolveQuerySet(bench.querySet, 0, 2, bench.resolve, 0);
+    frameEncoder.copyBufferToBuffer(bench.resolve, 0, readback, 0, 16);
+    return readback;
+}
+
+/** Reads a resolved pass time once the GPU is done, then returns the buffer to the pool. */
+function bench_read(readback) {
+    readback.mapAsync(GPUMapMode.READ).then(() => {
+        const [begin, end] = new BigUint64Array(readback.getMappedRange());
+        readback.unmap();
+        bench.free.push(readback);
+        if (end <= begin) return;
+        bench.samples.push(Number(end - begin) / 1000);
+        if (bench.samples.length < BENCH_WINDOW) return;
+        const sorted = bench.samples.sort((x, y) => x - y);
+        const at = (q) => sorted[Math.floor((sorted.length - 1) * q)];
+        window.patchworkBench = { passes: sorted.length, p10: at(0.1), p50: at(0.5), p90: at(0.9) };
+        const { p10, p50, p90 } = window.patchworkBench;
+        console.log(`bench: gpu pass p10 ${p10.toFixed(1)} p50 ${p50.toFixed(1)} ` +
+            `p90 ${p90.toFixed(1)} us over ${sorted.length} passes`);
+        bench.samples = [];
+    });
+}
 
 /**
  * Host import called synchronously from `gpu.submit` in Zig. Decodes and runs every op of the
@@ -681,7 +757,15 @@ async function main() {
         throw new Error("no WebGPU adapter found");
     }
 
-    device = await adapter.requestDevice();
+    const timestamps = benchRequested && adapter.features.has("timestamp-query");
+    device = await adapter.requestDevice(
+        timestamps ? { requiredFeatures: ["timestamp-query"] } : {},
+    );
+    if (timestamps) {
+        bench_create();
+    } else if (benchRequested) {
+        console.warn("bench: this adapter has no timestamp-query feature");
+    }
     device.addEventListener("uncapturederror", (event) => {
         console.error(`WebGPU error after ops [${lastTrace}]: ${event.error.message}`);
     });

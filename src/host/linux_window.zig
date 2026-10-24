@@ -124,6 +124,17 @@
 //!   paste from `cx.copied()` while we own the selection). A finished receive is dispatched
 //!   directly as one `paste` event, never queued. `SIGPIPE` is ignored from `run` on.
 //!
+//! ## 5b. Bench Mode
+//! `run` takes `bench.Options` from the command line (`native_main.zig`). With `--bench
+//! <scenario>` the host replays the app's scenario (`bench.zig`, section 2): `bench_step` runs
+//! one step whenever the loop is idle (the last frame presented, its callback arrived, nothing
+//! owed), before `sync_clock`, so the forced frame is scheduled like real input. Around the
+//! existing seams it times `prepare_app`, `finalize` (run once early, since it is idempotent),
+//! `Renderer.frame`, and `gpu.submit`, reads the pass time from `gpu.native`, and counts shaded
+//! area per draw type. After the last measured frame the loop ends and `bench_finish` writes
+//! the frame dump and prints the report. Without `--bench` only two clock reads per present
+//! remain.
+//!
 //! ## 6. TigerStyle Invariants
 //! - `State` lives on the stack of `run`; the app, the draw context, and the renderer are
 //!   static in `Host(App)`, because their sizes follow the app (an editor holds hundreds of
@@ -150,6 +161,8 @@ const xkb = @import("xkb.zig");
 const wp_cursor_shape = @import("wp_cursor_shape.zig");
 const wl_data_device = @import("wl_data_device.zig");
 const clipboard_module = @import("clipboard.zig");
+const bench = @import("../bench.zig");
+const builtin = @import("builtin");
 
 /// First refresh-period guess, re-exported from `frame` for `main`.
 pub const refresh_ns_initial: u64 = frame.refresh_ns_initial;
@@ -491,9 +504,12 @@ comptime {
 /// The window state lives on this stack frame. The app, the UI context (with the draw context
 /// inside it), and the renderer, whose pools and shadows are sized by `App.config`, are static
 /// (`Host(App)`), as on the web host, so a large app or configuration never grows the stack.
-pub fn run(comptime App: type) !void {
+pub fn run(comptime App: type, options: bench.Options) !void {
     comptime app_contract.check(App);
     const AppHost = Host(App);
+    if (options.bench) {
+        if (!AppHost.bench_select(options)) return;
+    }
     var state = initial_state();
     AppHost.context.init();
     app_contract.start_timer(App, &AppHost.context);
@@ -504,7 +520,7 @@ pub fn run(comptime App: type) !void {
     try connect(&state);
     try bind_globals(&state);
     try create_toplevel(&state, App.config.title);
-    try create_device(&state);
+    try create_device(&state, .{ .adapter = options.adapter, .profile = options.bench });
     var host: AppHost = .{
         .state = &state,
         .app = &AppHost.app_static,
@@ -523,6 +539,7 @@ pub fn run(comptime App: type) !void {
         }
     }
     try host.loop();
+    if (options.bench) AppHost.bench_finish(&state);
 }
 
 /// The window state before the display is connected: nothing bound, nothing owed but the
@@ -669,6 +686,265 @@ fn Host(comptime App: type) type {
         var context: Context = undefined;
         var render: Renderer = undefined;
 
+        // ------------------------------------------------------------ bench mode
+
+        const type_count = Context.DrawContext.Registry.count;
+        const scenarios: []const bench.Scenario =
+            if (@hasDecl(App, "scenarios")) App.scenarios else &.{};
+
+        /// The run `--bench <scenario>` drives (`bench.zig`, module guide section 2).
+        /// Inactive without `--bench`; then only `draw_ns` and `drew` are written.
+        const BenchRun = struct {
+            active: bool,
+            scenario: bench.Scenario,
+            replay: bench.Replay,
+            options: bench.Options,
+            /// No step runs before the first frame recorded its areas.
+            presented_any: bool,
+            draw_ns: u64,
+            drew: bool,
+            count: u32,
+            /// Instances and shaded area per draw type of the last measured frame.
+            types: [type_count]bench.TypeArea,
+            csv_fd: i32,
+        };
+        var bench_run: BenchRun = .{
+            .active = false,
+            .scenario = undefined,
+            .replay = undefined,
+            .options = .off,
+            .presented_any = false,
+            .draw_ns = 0,
+            .drew = false,
+            .count = 0,
+            .types = undefined,
+            .csv_fd = -1,
+        };
+        var bench_samples: [bench.sample_cap]bench.Sample = undefined;
+        var bench_values: [bench.sample_cap]u64 = undefined;
+        var bench_row: [bench.width_max * 3]u8 = undefined;
+
+        /// Resolves `--bench [name]` before any window opens. Lists the scenarios and returns
+        /// false when none is named or the name is unknown.
+        fn bench_select(options: bench.Options) bool {
+            assert(options.bench);
+            assert(!bench_run.active);
+            const name = options.scenario orelse "";
+            const found = bench.find(scenarios, name) orelse {
+                if (options.scenario != null) {
+                    std.debug.print("bench: no scenario \"{s}\"\n", .{name});
+                }
+                std.debug.print("bench: scenarios of {s}:", .{App.config.title});
+                if (scenarios.len == 0) std.debug.print(" none", .{});
+                for (scenarios) |scenario| std.debug.print(" {s}", .{scenario.name});
+                std.debug.print("\n", .{});
+                return false;
+            };
+            bench_run.active = true;
+            bench_run.scenario = found.*;
+            if (options.frames) |frames| bench_run.scenario.frames = frames;
+            bench_run.replay = .init();
+            bench_run.options = options;
+            if (options.csv) |path| bench_run.csv_fd = bench_open_csv(path);
+            assert(bench_run.scenario.frames >= 1);
+            assert(bench_run.scenario.frames <= bench.sample_cap);
+            return true;
+        }
+
+        /// Runs the next scenario step once the host is idle: the last frame is presented,
+        /// its callback arrived, and nothing is owed. Every step forces one frame
+        /// (`bench.zig`, section 2). Runs before `sync_clock`, so the frame is scheduled
+        /// against vblank like real input.
+        fn bench_step(self: *Self) void {
+            if (!bench_run.active) return;
+            const state = self.state;
+            if (!bench_run.presented_any) return;
+            if (state.frame.redraw) return;
+            if (state.frame_callback != null) return;
+            const step = bench_run.replay.next(&bench_run.scenario) orelse return;
+            var rect: ?[4]f32 = null;
+            if (bench.step_target(step)) |target| {
+                const found = context.find(target.id) orelse {
+                    std.debug.print("bench: no area {s} {d}\n", .{ target.name, target.index });
+                    state.frame.running = false;
+                    return;
+                };
+                rect = found.rect;
+            }
+            var events: [bench.event_cap]input.Event = undefined;
+            const time_ms: u32 = @truncate(monotonic_ns() / std.time.ns_per_ms);
+            const count = bench.step_events(step, rect, time_ms, &events);
+            for (events[0..count]) |event| self.dispatch(event);
+            state.frame.request_redraw();
+            assert(state.frame.redraw);
+        }
+
+        /// Asks the GPU to copy this frame when it is the last measured one and `--dump`
+        /// was given.
+        fn bench_request_image(state: *State) void {
+            assert(bench_run.active);
+            if (bench_run.options.dump == null) return;
+            const replay = bench_run.replay;
+            if (replay.phase != .measure) return;
+            if (replay.measured + 1 != bench_run.scenario.frames) return;
+            gpu.native.request_frame_image(&state.gpu);
+        }
+
+        /// Records a presented frame: a sample when it was measured, the CSV line, and the
+        /// end of the run after the last one.
+        fn bench_presented(state: *State, timing: bench.Sample) void {
+            assert(bench_run.active);
+            bench_run.presented_any = true;
+            if (!bench_run.replay.presented(&bench_run.scenario)) return;
+            var sample = timing;
+            const scale_120 = state.frame.scale_120;
+            sample.instances = bench.shaded_area(
+                Context.DrawContext,
+                &context.draw,
+                scale_120,
+                &bench_run.types,
+            );
+            var area_px: f64 = 0;
+            for (bench_run.types) |entry| area_px += entry.area_px;
+            const window_px: f64 = @floatFromInt(state.frame.width_px * state.frame.height_px);
+            sample.area_windows = @floatCast(area_px / window_px);
+            assert(bench_run.count < bench.sample_cap);
+            bench_samples[bench_run.count] = sample;
+            bench_run.count += 1;
+            if (bench_run.csv_fd >= 0) bench_write_csv(bench_run.count - 1, &sample);
+            if (bench_run.replay.phase == .done) state.frame.running = false;
+            assert(bench_run.count == bench_run.replay.measured);
+        }
+
+        fn bench_open_csv(path: [:0]const u8) i32 {
+            const fd = open_for_write(path) orelse return -1;
+            const header = "frame,drew,draw_us,finalize_us,record_us,submit_us,gpu_us," ++
+                "instances,area_windows\n";
+            write_all(fd, header);
+            return fd;
+        }
+
+        fn bench_write_csv(index: u32, sample: *const bench.Sample) void {
+            assert(bench_run.csv_fd >= 0);
+            var line: [256]u8 = undefined;
+            const gpu_us: f64 = if (sample.gpu_ns) |ns| microseconds(ns) else -1;
+            const format = "{d},{d},{d:.1},{d:.1},{d:.1},{d:.1},{d:.1},{d},{d:.3}\n";
+            const text = std.fmt.bufPrint(&line, format, .{
+                index,                          @intFromBool(sample.drew),
+                microseconds(sample.draw_ns),   microseconds(sample.finalize_ns),
+                microseconds(sample.record_ns), microseconds(sample.submit_ns),
+                gpu_us,                         sample.instances,
+                sample.area_windows,
+            }) catch unreachable;
+            write_all(bench_run.csv_fd, text);
+        }
+
+        /// After the loop: closes the CSV, writes the dump, and prints the report.
+        fn bench_finish(state: *State) void {
+            if (!bench_run.active) return;
+            if (bench_run.csv_fd >= 0) _ = std.os.linux.close(bench_run.csv_fd);
+            if (bench_run.options.dump) |path| bench_write_image(state, path);
+            bench_report_header(state);
+            if (bench_run.count == 0) return;
+            bench_report_rows();
+            bench_report_types(state);
+        }
+
+        fn bench_write_image(state: *State, path: [:0]const u8) void {
+            defer gpu.native.release_frame_image(&state.gpu);
+            const image = gpu.native.frame_image(&state.gpu) orelse {
+                std.debug.print("bench: no frame image to write\n", .{});
+                return;
+            };
+            assert(image.width <= bench.width_max);
+            const fd = open_for_write(path) orelse return;
+            defer _ = std.os.linux.close(fd);
+            var header: [32]u8 = undefined;
+            write_all(fd, bench.ppm_header(&header, image.width, image.height));
+            const rgb = bench_row[0 .. image.width * 3];
+            for (0..image.height) |y| {
+                const row = image.bytes[y * image.row_bytes ..][0 .. image.width * 4];
+                bench.ppm_row(rgb, row);
+                write_all(fd, rgb);
+            }
+            std.debug.print("bench: wrote {s} ({d}x{d})\n", .{ path, image.width, image.height });
+        }
+
+        fn bench_report_header(state: *State) void {
+            const adapter = gpu.native.profile_adapter(&state.gpu);
+            const scale: f64 = @as(f64, @floatFromInt(state.frame.scale_120)) / 120.0;
+            var drew: u32 = 0;
+            for (bench_samples[0..bench_run.count]) |sample| drew += @intFromBool(sample.drew);
+            std.debug.print("bench {s}/{s} mode {s} adapter \"{s}\" {d}x{d} px at {d:.2}: " ++
+                "{d} frames measured, {d} drew\n", .{
+                App.config.title,       bench_run.scenario.name,
+                @tagName(builtin.mode), adapter,
+                state.frame.width_px,   state.frame.height_px,
+                scale,                  bench_run.count,
+                drew,
+            });
+        }
+
+        fn bench_report_rows() void {
+            std.debug.print("{s:<12} {s:>9} {s:>9} {s:>9} {s:>9} {s:>9}   (us)\n", .{
+                "", "min", "p10", "p50", "p90", "max",
+            });
+            const names = [_][]const u8{
+                "draw", "finalize", "record", "submit", "cpu", "gpu pass",
+            };
+            for (names, 0..) |name, metric| {
+                var count: u32 = 0;
+                for (bench_samples[0..bench_run.count]) |*sample| {
+                    const value = bench_metric(sample, @intCast(metric)) orelse continue;
+                    bench_values[count] = value;
+                    count += 1;
+                }
+                if (count == 0) {
+                    std.debug.print("{s:<12} n/a (no timestamp-query feature)\n", .{name});
+                    continue;
+                }
+                const summary = bench.summarize(bench_values[0..count]);
+                std.debug.print("{s:<12} {d:>9.1} {d:>9.1} {d:>9.1} {d:>9.1} {d:>9.1}\n", .{
+                    name,
+                    microseconds(summary.min),
+                    microseconds(summary.p10),
+                    microseconds(summary.p50),
+                    microseconds(summary.p90),
+                    microseconds(summary.max),
+                });
+            }
+        }
+
+        /// One metric of a sample in nanoseconds: draw, finalize, record, submit, the CPU sum
+        /// of the first three, and the GPU pass (null without timestamps).
+        fn bench_metric(sample: *const bench.Sample, metric: u32) ?u64 {
+            assert(metric < 6);
+            return switch (metric) {
+                0 => sample.draw_ns,
+                1 => sample.finalize_ns,
+                2 => sample.record_ns,
+                3 => sample.submit_ns,
+                4 => sample.draw_ns + sample.finalize_ns + sample.record_ns,
+                else => sample.gpu_ns,
+            };
+        }
+
+        fn bench_report_types(state: *State) void {
+            const last = bench_samples[bench_run.count - 1];
+            std.debug.print("last frame: {d} instances, shaded area {d:.2} windows\n", .{
+                last.instances, last.area_windows,
+            });
+            const window_px: f64 = @floatFromInt(state.frame.width_px * state.frame.height_px);
+            inline for (0..type_count) |index| {
+                const entry = bench_run.types[index];
+                std.debug.print("  {s:<24} {d:>6} instances {d:>7.3} windows\n", .{
+                    Context.DrawContext.Registry.labels[index],
+                    entry.count,
+                    entry.area_px / window_px,
+                });
+            }
+        }
+
         /// Records the renderer's setup stream (every long-lived resource and the textures
         /// queued so far) and submits it.
         fn setup(self: *Self) !void {
@@ -687,6 +963,10 @@ fn Host(comptime App: type) type {
             assert(state.frame.redraw);
             assert(state.frame.width_px != 0);
             state.commands.reset();
+            const finalize_start_ns = monotonic_ns();
+            // `finalize` is idempotent, so bench mode runs it first to time it alone.
+            if (bench_run.active) context.draw.finalize();
+            const record_start_ns = monotonic_ns();
             render.frame(&state.commands, &context.draw, .{
                 .width_logical = state.frame.width_logical,
                 .height_logical = state.frame.height_logical,
@@ -694,7 +974,19 @@ fn Host(comptime App: type) type {
                 .height_px = state.frame.height_px,
                 .scale_120 = state.frame.scale_120,
             });
+            const submit_start_ns = monotonic_ns();
+            if (bench_run.active) bench_request_image(state);
             try gpu.submit(&state.gpu, &state.commands);
+            if (bench_run.active) bench_presented(state, .{
+                .draw_ns = bench_run.draw_ns,
+                .finalize_ns = record_start_ns - finalize_start_ns,
+                .record_ns = submit_start_ns - record_start_ns,
+                .submit_ns = monotonic_ns() - submit_start_ns,
+                .gpu_ns = gpu.native.profile_pass_ns(&state.gpu),
+                .instances = 0,
+                .area_windows = 0,
+                .drew = bench_run.drew,
+            });
             state.frame.mark_presented();
             assert(!state.frame.redraw);
             // Glyphs skipped for the budget or a full atlas finish on the next frame, and a
@@ -718,6 +1010,7 @@ fn Host(comptime App: type) type {
             while (state.frame.running) {
                 ack_if_needed(state);
                 self.sync_input();
+                self.bench_step();
                 self.sync_clock();
                 try self.present_if_dirty();
                 self.sync_timer();
@@ -825,7 +1118,9 @@ fn Host(comptime App: type) type {
                 }
             }
             state.present_at_ns = 0;
+            const draw_start_ns = monotonic_ns();
             self.prepare_app();
+            bench_run.draw_ns = monotonic_ns() - draw_start_ns;
             apply_surface_scale(state);
             // Both requests attach to the next commit, and `gpu.submit` is that commit.
             arm_frame(state);
@@ -846,7 +1141,7 @@ fn Host(comptime App: type) type {
             }
             assert(!state.frame.relayout);
             const scale_120 = state.frame.scale_120;
-            _ = ui.draw_frame(
+            bench_run.drew = ui.draw_frame(
                 App,
                 self.app,
                 &context,
@@ -1046,10 +1341,10 @@ fn log_integer_mode() void {
 
 /// Initializes the hardware WebGPU device. `Host.setup` then records the renderer's setup
 /// stream, which creates every long-lived GPU resource.
-fn create_device(state: *State) !void {
+fn create_device(state: *State, options: gpu.Options) !void {
     const display = state.display;
     const surface = state.surface orelse return error.MissingSurface;
-    state.gpu = try gpu.create(@ptrCast(display), @ptrCast(surface));
+    state.gpu = try gpu.create(@ptrCast(display), @ptrCast(surface), options);
     assert(state.gpu.configured_width == 0);
     assert(state.gpu.configured_height == 0);
 }
@@ -2090,4 +2385,41 @@ fn toplevel_close(data: ?*anyopaque, toplevel: ?*xdg.XdgToplevel) callconv(.c) v
     if (state.frame.running) {
         state.frame.close();
     }
+}
+
+/// Opens `path` for writing, created or truncated, or logs and returns null.
+fn open_for_write(path: [:0]const u8) ?i32 {
+    const flags: std.os.linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .CLOEXEC = true,
+    };
+    const rc = std.os.linux.open(path, flags, 0o644);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        std.debug.print("bench: cannot open {s}\n", .{path});
+        return null;
+    }
+    const fd: i32 = @intCast(rc);
+    assert(fd >= 0);
+    return fd;
+}
+
+/// Writes all of `bytes`, bounded by `write_retry_max` short writes; an error drops the rest.
+fn write_all(fd: i32, bytes: []const u8) void {
+    assert(fd >= 0);
+    var done: usize = 0;
+    var tries: u32 = 0;
+    while (done < bytes.len and tries < write_retry_max) : (tries += 1) {
+        const rc = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
+        if (std.os.linux.errno(rc) != .SUCCESS) return;
+        done += rc;
+    }
+    assert(done <= bytes.len);
+}
+
+const write_retry_max: u32 = 64;
+
+fn microseconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_us;
 }

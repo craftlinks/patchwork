@@ -44,6 +44,8 @@
 //!   repeatable: unchanged state draws the same instances again. It must not call `redraw`.
 //! - `cx.set_timer(on)` during `event` or `timer` starts or stops the host timer of an app
 //!   that declared a period (section 4).
+//! - Optional: `pub const scenarios: []const patchwork.bench.Scenario`, the scripted runs the
+//!   native host replays with `--bench <name>` (`bench.zig`). `check` validates them.
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
@@ -89,6 +91,7 @@ const renderer = @import("draw/renderer.zig");
 const ui = @import("ui.zig");
 const areas = @import("ui/areas.zig");
 const pools = @import("draw/pools.zig");
+const bench = @import("bench.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
 pub const Config = struct {
@@ -166,6 +169,14 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     }
     if (App.config.point_cap > pools.point_cap_max) {
         return "App.config.point_cap must be at most 65536";
+    }
+    if (@hasDecl(App, "scenarios")) {
+        if (@TypeOf(App.scenarios) != []const bench.Scenario) {
+            return "App.scenarios must have type []const patchwork.bench.Scenario";
+        }
+        if (bench.validate(App.scenarios)) |message| {
+            return message;
+        }
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
     const expected = [_]type{
@@ -313,6 +324,18 @@ const NoPoints = struct {
     };
 };
 
+const BadScenarios = struct {
+    pub const config: Config = .{ .title = "bad", .timer_period_ms = 0, .draw = &test_draw };
+    pub const scenarios: []const bench.Scenario = &.{
+        .{ .name = "idle", .setup = &.{}, .cycle = &.{.{ .wait = 0 }}, .frames = 10 },
+    };
+};
+
+const WrongScenarios = struct {
+    pub const config: Config = .{ .title = "wrong", .timer_period_ms = 0, .draw = &test_draw };
+    pub const scenarios = 3;
+};
+
 const OldEvent = struct {
     pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
     pub fn init(app: *OldEvent, textures: *quads.Textures) void {
@@ -370,6 +393,16 @@ test "a point cap of zero or above the maximum is rejected" {
     const huge = comptime conformance(HugePoints).?;
     try std.testing.expect(std.mem.find(u8, huge, "65536") != null);
     try std.testing.expectEqual(@as(u32, 65536), pools.point_cap_max);
+}
+
+// Locks the optional scenarios: a wrong type and an invalid scenario are rejected by name, and
+// an app without the declaration passes (`GoodApp`).
+test "scenarios of the wrong type or with a zero wait are rejected" {
+    const invalid = comptime conformance(BadScenarios).?;
+    try std.testing.expect(std.mem.find(u8, invalid, "idle") != null);
+    const wrong = comptime conformance(WrongScenarios).?;
+    try std.testing.expect(std.mem.find(u8, wrong, "App.scenarios") != null);
+    try std.testing.expect(!@hasDecl(GoodApp, "scenarios"));
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and
