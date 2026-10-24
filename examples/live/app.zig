@@ -342,7 +342,8 @@ pub const App = struct {
         .point_cap = point_cap,
     };
 
-    /// The bench runs (`bench.zig`): transport and typing, on the patch and the stress text.
+    /// The bench runs (`bench.zig`): idle, then transport and typing on the patch and the
+    /// stress text.
     pub const scenarios: []const patchwork.bench.Scenario = &live_bench.scenarios;
 
     pub fn init(app: *App, textures: *quads.Textures) void {

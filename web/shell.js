@@ -119,6 +119,7 @@ const VERTEX_FORMAT_TABLE = { float32x2: "float32x2", float32x4: "float32x4" };
 const STEP_MODE_TABLE = { vertex: "vertex", instance: "instance" };
 const TEXTURE_FORMAT_TABLE = { r8unorm: "r8unorm", rgba8unorm: "rgba8unorm" };
 const FILTER_TABLE = { nearest: "nearest", linear: "linear" };
+const LOAD_OP_TABLE = { clear: "clear", load: "load" };
 const BLEND_TABLE = {
     none: undefined,
     alpha: {
@@ -329,18 +330,29 @@ const OPS = {
         if (pass !== null) {
             throw new Error("pass_begin: a render pass is already open");
         }
-        if (p.width_px !== canvas.width || p.height_px !== canvas.height) {
-            throw new Error(
-                `pass_begin: frame is ${p.width_px}x${p.height_px} but the canvas is ` +
-                `${canvas.width}x${canvas.height}`,
-            );
+        let view;
+        if (p.target === table.surface_target) {
+            if (p.width_px !== canvas.width || p.height_px !== canvas.height) {
+                throw new Error(
+                    `pass_begin: frame is ${p.width_px}x${p.height_px} but the canvas is ` +
+                    `${canvas.width}x${canvas.height}`,
+                );
+            }
+            view = context.getCurrentTexture().createView();
+        } else {
+            const target = lookup("texture", p.target, "pass_begin");
+            if (p.width_px !== target.width || p.height_px !== target.height) {
+                throw new Error(`pass_begin: target ${p.target} is ${target.width}x` +
+                    `${target.height}, the pass ${p.width_px}x${p.height_px}`);
+            }
+            view = lookup("view", p.target, "pass_begin");
         }
-        encoder = device.createCommandEncoder();
+        if (encoder === null) encoder = device.createCommandEncoder();
         const [r, g, b, a] = p.clear;
         const descriptor = {
             colorAttachments: [{
-                view: context.getCurrentTexture().createView(),
-                loadOp: "clear",
+                view,
+                loadOp: LOAD_OP_TABLE[p.load],
                 storeOp: "store",
                 clearValue: { r, g, b, a },
             }],
@@ -369,13 +381,59 @@ const OPS = {
     },
     pass_end_present() {
         open_pass("pass_end_present").end();
-        const readback = bench_resolve(encoder);
-        device.queue.submit([encoder.finish()]);
-        if (readback !== null) bench_read(readback);
         pass = null;
-        encoder = null;
+        submit_frame();
+    },
+    target_create(p) {
+        // The one create that may repeat an id: a new size replaces the target.
+        const old = resources.texture[p.id];
+        if (old !== undefined) {
+            old.destroy();
+            resources.texture[p.id] = undefined;
+            resources.view[p.id] = undefined;
+        }
+        const texture = device.createTexture({
+            size: { width: p.width, height: p.height },
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC |
+                GPUTextureUsage.TEXTURE_BINDING,
+        });
+        store("texture", p.id, texture, "target_create");
+        store("view", p.id, texture.createView(), "target_create");
+    },
+    scissor_set(p) {
+        open_pass("scissor_set").setScissorRect(p.x, p.y, p.width, p.height);
+    },
+    pass_end() {
+        open_pass("pass_end").end();
+        pass = null;
+    },
+    present_copy(p) {
+        if (pass !== null) {
+            throw new Error("present_copy: a render pass is still open");
+        }
+        const source = lookup("texture", p.target, "present_copy");
+        if (source.width !== canvas.width || source.height !== canvas.height) {
+            throw new Error(`present_copy: target is ${source.width}x${source.height} but ` +
+                `the canvas is ${canvas.width}x${canvas.height}`);
+        }
+        if (encoder === null) encoder = device.createCommandEncoder();
+        encoder.copyTextureToTexture(
+            { texture: source },
+            { texture: context.getCurrentTexture() },
+            [source.width, source.height],
+        );
+        submit_frame();
     },
 };
+
+/** Submits the frame's encoder, with the bench timestamps when they are on. */
+function submit_frame() {
+    const readback = bench_resolve(encoder);
+    device.queue.submit([encoder.finish()]);
+    if (readback !== null) bench_read(readback);
+    encoder = null;
+}
 
 /**
  * Creates the query set, the resolve buffer, and the readback pool (guide, section 8).
@@ -774,7 +832,8 @@ async function main() {
     context.configure({
         device,
         format,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        // COPY_DST: a cached frame copies the kept render target onto the canvas.
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
         alphaMode: "opaque",
     });
 

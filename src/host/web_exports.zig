@@ -484,8 +484,12 @@ fn WebApp(comptime App: type) type {
                 .height_px = state.frame.height_px,
                 .scale_120 = scale_120,
             });
-            var unused: gpu.Gpu = .{};
-            gpu.submit(&unused, &state.commands) catch unreachable;
+            // A skipped frame (`draw/renderer.zig`, section 4a) may record nothing at all; the
+            // canvas keeps showing the last frame.
+            if (state.commands.len != 0) {
+                var unused: gpu.Gpu = .{};
+                gpu.submit(&unused, &state.commands) catch unreachable;
+            }
             state.frame.mark_presented();
             assert(!state.frame.redraw);
             // Glyphs skipped for the budget or a full atlas finish on the next frame, and a

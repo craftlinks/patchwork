@@ -58,6 +58,7 @@ const assert = std.debug.assert;
 const input = @import("input.zig");
 const areas = @import("ui/areas.zig");
 const ui = @import("ui.zig");
+const renderer = @import("draw/renderer.zig");
 
 /// Most steps in one `setup` or `cycle` list.
 pub const steps_max: u32 = 256;
@@ -369,6 +370,9 @@ pub const Options = struct {
     dump: ?[:0]const u8,
     /// Writes one CSV line per measured frame.
     csv: ?[:0]const u8,
+    /// The renderer's pixel cache (`draw/renderer.zig`, section 4a); `--no-cache` turns it
+    /// off to compare against.
+    cache: bool,
 
     pub const off: Options = .{
         .bench = false,
@@ -377,12 +381,13 @@ pub const Options = struct {
         .adapter = .default,
         .dump = null,
         .csv = null,
+        .cache = true,
     };
 };
 
 pub const usage =
-    \\usage: <app> [--adapter low|high] [--bench [scenario] [--frames N] [--dump out.ppm]
-    \\       [--csv out.csv]]
+    \\usage: <app> [--adapter low|high] [--no-cache] [--bench [scenario] [--frames N]
+    \\       [--dump out.ppm] [--csv out.csv]]
     \\
 ;
 
@@ -404,6 +409,10 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
                     options.scenario = args[index];
                 }
             }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--no-cache")) {
+            options.cache = false;
             continue;
         }
         if (index + 1 == args.len) {
@@ -453,6 +462,8 @@ pub const Sample = struct {
     /// Shaded area in windows: the sum of `rect` and `clip` intersections over the window.
     area_windows: f32,
     drew: bool,
+    /// What the renderer recorded (`draw/renderer.zig`, section 4a).
+    kind: renderer.Kind,
 };
 
 pub const Summary = struct {
@@ -729,6 +740,8 @@ test "arguments parse into options and reject mistakes" {
     try testing.expectEqual(@as(?[]const u8, null), list.scenario);
     try testing.expectEqualStrings("a.ppm", list.dump.?);
     try testing.expect(!(try parse_args(&.{})).bench);
+    try testing.expect((try parse_args(&.{})).cache);
+    try testing.expect(!(try parse_args(&.{"--no-cache"})).cache);
     try testing.expectError(error.MissingValue, parse_args(&.{"--frames"}));
     try testing.expectError(error.BadNumber, parse_args(&.{ "--frames", "0" }));
     try testing.expectError(error.BadAdapter, parse_args(&.{ "--adapter", "fast" }));

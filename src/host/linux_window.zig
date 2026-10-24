@@ -514,6 +514,7 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     AppHost.context.init();
     app_contract.start_timer(App, &AppHost.context);
     AppHost.render.init();
+    AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     try init_input(&state);
     defer _ = std.os.linux.close(state.repeat_fd);
@@ -788,6 +789,8 @@ fn Host(comptime App: type) type {
             if (replay.phase != .measure) return;
             if (replay.measured + 1 != bench_run.scenario.frames) return;
             gpu.native.request_frame_image(&state.gpu);
+            // A skipped frame would present nothing to copy.
+            render.present_next = true;
         }
 
         /// Records a presented frame: a sample when it was measured, the CSV line, and the
@@ -846,6 +849,7 @@ fn Host(comptime App: type) type {
             if (bench_run.options.dump) |path| bench_write_image(state, path);
             bench_report_header(state);
             if (bench_run.count == 0) return;
+            bench_report_kinds();
             bench_report_rows();
             bench_report_types(state);
         }
@@ -883,6 +887,19 @@ fn Host(comptime App: type) type {
                 scale,                  bench_run.count,
                 drew,
             });
+        }
+
+        /// Measured frames per renderer kind (`draw/renderer.zig`, section 4a).
+        fn bench_report_kinds() void {
+            var counts = std.EnumArray(renderer.Kind, u32).initFill(0);
+            for (bench_samples[0..bench_run.count]) |sample| {
+                counts.set(sample.kind, counts.get(sample.kind) + 1);
+            }
+            std.debug.print("frames:", .{});
+            for (std.enums.values(renderer.Kind)) |kind| {
+                std.debug.print(" {s} {d}", .{ @tagName(kind), counts.get(kind) });
+            }
+            std.debug.print(" (cache {s})\n", .{if (render.cache) "on" else "off"});
         }
 
         fn bench_report_rows() void {
@@ -966,6 +983,7 @@ fn Host(comptime App: type) type {
             const finalize_start_ns = monotonic_ns();
             // `finalize` is idempotent, so bench mode runs it first to time it alone.
             if (bench_run.active) context.draw.finalize();
+            if (bench_run.active) bench_request_image(state);
             const record_start_ns = monotonic_ns();
             render.frame(&state.commands, &context.draw, .{
                 .width_logical = state.frame.width_logical,
@@ -975,17 +993,26 @@ fn Host(comptime App: type) type {
                 .scale_120 = state.frame.scale_120,
             });
             const submit_start_ns = monotonic_ns();
-            if (bench_run.active) bench_request_image(state);
-            try gpu.submit(&state.gpu, &state.commands);
+            const presents = render.last != .skipped;
+            // Both requests attach to the next commit. A presenting frame's commit is the
+            // present inside `gpu.submit`; a skipped frame (`draw/renderer.zig`, section 4a)
+            // commits no buffer, only the frame callback that paces the next frame.
+            arm_frame(state);
+            if (presents) arm_feedback(state);
+            if (state.commands.len != 0) try gpu.submit(&state.gpu, &state.commands);
+            // No attached buffer: the frame callback and any viewport change take effect, and
+            // the compositor keeps showing the last frame.
+            if (!presents) commit_surface(state.surface.?);
             if (bench_run.active) bench_presented(state, .{
                 .draw_ns = bench_run.draw_ns,
                 .finalize_ns = record_start_ns - finalize_start_ns,
                 .record_ns = submit_start_ns - record_start_ns,
                 .submit_ns = monotonic_ns() - submit_start_ns,
-                .gpu_ns = gpu.native.profile_pass_ns(&state.gpu),
+                .gpu_ns = if (presents) gpu.native.profile_pass_ns(&state.gpu) else 0,
                 .instances = 0,
                 .area_windows = 0,
                 .drew = bench_run.drew,
+                .kind = render.last,
             });
             state.frame.mark_presented();
             assert(!state.frame.redraw);
@@ -1122,9 +1149,6 @@ fn Host(comptime App: type) type {
             self.prepare_app();
             bench_run.draw_ns = monotonic_ns() - draw_start_ns;
             apply_surface_scale(state);
-            // Both requests attach to the next commit, and `gpu.submit` is that commit.
-            arm_frame(state);
-            arm_feedback(state);
             try self.submit_frame();
             // A draw that moved things under the pointer re-resolved hover, and its cursor.
             apply_cursor(state, context.cursor());

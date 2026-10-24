@@ -247,6 +247,7 @@ test {
     _ = textures_module;
     _ = types;
     _ = path;
+    _ = @import("draw/tiles.zig");
 }
 
 fn project(matrix: [16]f32, x: f32, y: f32) [2]f32 {
