@@ -357,12 +357,21 @@ pub fn build(b: *std.Build) void {
         .wgpu_lib_dir = wgpu_lib_dir,
     });
     b.getInstallStep().dependOn(live.install);
+    const wave = addApp(b, b, .{
+        .name = "wave",
+        .root_source_file = b.path("examples/wave/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
     b.getInstallStep().dependOn(data.install);
+    b.getInstallStep().dependOn(wave.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
     add_example_steps(b, "-data", "the data textures", data);
-    add_test_steps(b, library, .{ rack, column, live, data });
+    add_example_steps(b, "-wave", "the wave views", wave);
+    add_test_steps(b, library, .{ rack, column, live, data, wave });
     add_compare_step(b, library);
 }
 
@@ -416,7 +425,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [4]AppSteps,
+    examples: [5]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

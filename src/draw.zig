@@ -17,6 +17,7 @@
 //! draw/types.zig      Box, Arc, Glyph, Image, Path, AppendError, and the CPU distance twins
 //! draw/pools.zig      Context: per-type pools, the point pool, layers, sort, sticky batches
 //! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
+//! draw/wave.zig       Waveform and Ring types, the waveform appender, the zoom pyramid
 //! draw/textures.zig   Textures: queued creates and writes, TextureId, Format
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
@@ -84,6 +85,9 @@ const types = @import("draw/types.zig");
 /// Stroked paths: `path.cubic`, `path.polyline`, `path.plot`, and their CPU twins.
 pub const path = @import("draw/path.zig");
 
+/// Waveforms and rings: `wave.append`, `wave.Pyramid`, and the `Waveform` and `Ring` types.
+pub const wave = @import("draw/wave.zig");
+
 /// Exclusive-max clip in logical pixels, copied into every instance's `clip`. `x1 > x0` and
 /// `y1 > y0`, all finite.
 pub const Clip = struct {
@@ -120,6 +124,8 @@ pub const Textures = textures_module.Textures;
 pub const TextureId = textures_module.TextureId;
 pub const TextureFormat = textures_module.Format;
 pub const TextureSampling = textures_module.Sampling;
+/// A ring texture with a write head; `draw.Ring` shows it.
+pub const TextureRing = textures_module.Ring;
 /// How a draw type's output blends into the target (`draw/registry.zig`, section 2c).
 pub const Blend = @import("gpu/commands.zig").Blend;
 pub const TextureRegion = textures_module.Region;
@@ -129,6 +135,8 @@ pub const Arc = types.Arc;
 pub const Glyph = types.Glyph;
 pub const Image = types.Image;
 pub const Path = types.Path;
+pub const Waveform = wave.Waveform;
+pub const Ring = wave.Ring;
 pub const Point = pools.Point;
 pub const point_cap_max = pools.point_cap_max;
 pub const sdf_box = types.sdf_box;
@@ -262,6 +270,7 @@ test {
     _ = textures_module;
     _ = types;
     _ = path;
+    _ = wave;
     _ = @import("draw/tiles.zig");
 }
 

@@ -39,6 +39,17 @@
 //! length WebGPU's `writeTexture` requires. Neither host needs `bytes_per_row` aligned to
 //! 256: that rule applies to buffer-to-texture copies, not to `queue.writeTexture`.
 //!
+//! ## 3a. Rings
+//! `Ring(format, width, height)` is an app-owned mirror of `width` by `height` texels with
+//! `head`, the column the next `push` writes. `push` copies one column into the mirror,
+//! advances `head = (head + 1) mod width`, and counts it pending; it queues nothing, so any
+//! number of pushes between two streams (a timer that ticks while the window is hidden and
+//! frame callbacks stop) costs no queue room. `flush`, called once per draw, queues the pending
+//! columns with `write_strided` (rows `width * texel` bytes apart): one write, or two when
+//! they wrap past the last column, or the whole mirror once `width` columns are pending. `set`
+//! writes a column without counting it, and `fill` queues the whole mirror, for a prefill.
+//! `draw.Ring` shows the oldest column (`head`) at the left (`draw/wave.zig`).
+//!
 //! ## 4. TigerStyle Invariants
 //! - `texture_cap` bounds the table and `write_cap` bounds the queued writes per stream; both
 //!   are asserted, and `layer_count * texture_cap` must fit the `u8` sort key in `pools.zig`.
@@ -238,6 +249,92 @@ pub const Textures = struct {
     }
 };
 
+/// A ring texture with a write head (module guide, section 3a). Initialize with `init`.
+pub fn Ring(comptime format: Format, comptime width: u32, comptime height: u32) type {
+    comptime {
+        assert(width >= 1);
+        assert(height >= 1);
+    }
+    return struct {
+        const Self = @This();
+        pub const texel_bytes: u32 = bytes_per_texel(format);
+        pub const row_bytes: u32 = width * texel_bytes;
+        pub const column_bytes: u32 = height * texel_bytes;
+        pub const columns: u32 = width;
+        pub const rows: u32 = height;
+
+        texels: [width * height * texel_bytes]u8,
+        /// The column the next `push` writes: the oldest one.
+        head: u32,
+        /// Columns pushed since the last `flush`, at most `width` (then all of them).
+        pending: u32,
+        id: TextureId,
+
+        /// Creates the texture (sampled nearest, though `draw.Ring` only loads texels) and
+        /// zeroes the mirror. The texture holds whatever its first write puts there.
+        pub fn init(self: *Self, table: *Textures) void {
+            self.id = table.create_sampled(format, width, height, .{ .filter = .nearest });
+            @memset(&self.texels, 0);
+            self.head = 0;
+            self.pending = 0;
+            assert(table.format_of(self.id) == format);
+        }
+
+        /// Writes `column` (`column_bytes`, top row first) at `index` of the mirror only.
+        pub fn set(self: *Self, index: u32, column: []const u8) void {
+            assert(index < width);
+            assert(column.len == column_bytes);
+            for (0..height) |row| {
+                const at = row * row_bytes + index * texel_bytes;
+                @memcpy(self.texels[at..][0..texel_bytes], column[row * texel_bytes ..][0..texel_bytes]);
+            }
+        }
+
+        /// Writes `column` at `head`, advances `head`, and counts the column pending.
+        pub fn push(self: *Self, column: []const u8) void {
+            self.set(self.head, column);
+            self.head = (self.head + 1) % width;
+            self.pending = @min(self.pending + 1, width);
+            assert(self.head < width);
+        }
+
+        /// Queues the pending columns (module guide, section 3a). Returns how many writes it
+        /// queued: 0, 1, or 2.
+        pub fn flush(self: *Self, table: *Textures) u32 {
+            const count = self.pending;
+            self.pending = 0;
+            if (count == 0) return 0;
+            if (count == width) {
+                self.fill(table);
+                return 1;
+            }
+            const first = (self.head + width - count) % width;
+            const before_end = @min(count, width - first);
+            self.queue(table, first, before_end);
+            if (before_end == count) return 1;
+            self.queue(table, 0, count - before_end);
+            return 2;
+        }
+
+        fn queue(self: *Self, table: *Textures, x: u32, count: u32) void {
+            assert(count >= 1);
+            assert(x + count <= width);
+            const first = x * texel_bytes;
+            table.write_strided(
+                self.id,
+                .{ .x = x, .y = 0, .width = count, .height = height },
+                row_bytes,
+                self.texels[first..][0 .. row_bytes * (height - 1) + count * texel_bytes],
+            );
+        }
+
+        /// Queues the whole mirror, after a prefill with `set`.
+        pub fn fill(self: *Self, table: *Textures) void {
+            table.write(self.id, .{ .x = 0, .y = 0, .width = width, .height = height }, &self.texels);
+        }
+    };
+}
+
 pub fn bytes_per_texel(format: Format) u32 {
     return switch (format) {
         .r8 => 1,
@@ -278,6 +375,37 @@ comptime {
     // Every sampling mode gets its own sampler.
     assert(sampling_count <= commands.caps.get(.sampler));
     assert(sampling_count == 2 * 2 * 2);
+}
+
+// Locks the ring (section 3a): pushes queue nothing; a flush of two consecutive columns is
+// one strided write two columns wide, holding each row's two texels; pushes that wrap past
+// the last column flush as two writes; a ring pushed more than its width flushes the whole
+// mirror once; and a flush with nothing pending queues nothing.
+test "ring pushes queue nothing and flush one or two writes" {
+    var textures: Textures = undefined;
+    textures.init();
+    var ring: Ring(.r16float, 3, 2) = undefined;
+    ring.init(&textures);
+    try std.testing.expectEqual(@as(u32, 6), @TypeOf(ring).row_bytes);
+    ring.push(&.{ 1, 2, 3, 4 });
+    ring.push(&.{ 5, 6, 7, 8 });
+    try std.testing.expectEqual(@as(u32, 0), textures.write_count);
+    try std.testing.expectEqual(@as(u32, 1), ring.flush(&textures));
+    try std.testing.expectEqual(Region{ .x = 0, .y = 0, .width = 2, .height = 2 }, textures.writes[0].region);
+    try std.testing.expectEqual(@as(u32, 6), textures.writes[0].bytes_per_row);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 5, 6, 0, 0, 3, 4, 7, 8 }, textures.writes[0].data);
+    ring.push(&.{ 9, 9, 9, 9 });
+    ring.push(&.{ 4, 4, 4, 4 });
+    try std.testing.expectEqual(@as(u32, 1), ring.head);
+    try std.testing.expectEqual(@as(u32, 2), ring.flush(&textures));
+    try std.testing.expectEqual(@as(u32, 2), textures.writes[1].region.x);
+    try std.testing.expectEqual(@as(u32, 0), textures.writes[2].region.x);
+    try std.testing.expectEqual(@as(u32, 1), textures.writes[2].region.width);
+    for (0..7) |_| ring.push(&.{ 7, 7, 7, 7 });
+    try std.testing.expectEqual(@as(u32, 1), ring.flush(&textures));
+    try std.testing.expectEqual(@as(u32, 3), textures.writes[3].region.width);
+    try std.testing.expectEqual(@as(u32, 0), ring.flush(&textures));
+    try std.testing.expectEqual(@as(u32, 4), textures.write_count);
 }
 
 // Locks the formats: bytes per texel, the command-stream name, and the class, and that a
