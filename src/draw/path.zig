@@ -55,6 +55,21 @@
 //! chunk's rect is its bounds padded by `width / 2 + aa_pad`, which holds every fragment with
 //! coverage at display scales of 1 and above.
 //!
+//! ## 5a. Oriented Quads
+//! A chunk's `rect` is its axis-aligned bounds, but a diagonal chunk's box is mostly empty:
+//! on the live screen's stress text the curves' boxes covered 0.98 windows for 0.09 windows of
+//! stroke. `Path` therefore declares a `vertex` (`draw/registry.zig`, section 2a) that
+//! rasterizes a rectangle along the chunk's chord instead:
+//! ```text
+//! a = first point, dir = (last - a) / |last - a| (the x axis below 1e-3), nrm = dir turned 90
+//! t, n = min and max of dot(p - a, dir) and dot(p - a, nrm) over the chunk's points
+//! quad = a + dir * [t_lo - r, t_hi + r] + nrm * [n_lo - r, n_hi + r],  r = width / 2 + aa_pad
+//! ```
+//! Every point within `r` of a segment lies inside, because the segments lie in the hull of
+//! the points and the box of the points contains the hull. `rect`, chunking, capacities, and
+//! hit areas do not change. `oriented_quad` is the CPU twin, `chunk_alpha` applies it, and test
+//! "every chunk's oriented quad contains its stroke" locks the containment.
+//!
 //! ## 6. Hit Testing
 //! `distance_to_polyline` is the CPU twin of the stroke distance. `ui.Context.path_area`
 //! records a path area whose `radius` is `width / 2 + hit_slop` and whose rect is the bounds
@@ -248,10 +263,61 @@ pub fn distance_to_polyline(points: []const Point, x: f32, y: f32) f32 {
     return best;
 }
 
+/// The corners of the quad `types.Path.vertex` rasterizes for a chunk through `points`, in
+/// the points' coordinates, in the order (t_lo, n_lo), (t_hi, n_lo), (t_hi, n_hi),
+/// (t_lo, n_hi) (section 5a).
+pub fn oriented_quad(points: []const Point, width: f32) [4]Point {
+    assert(points.len >= 2);
+    assert(points.len <= chunk_points_max);
+    assert(width > 0);
+    const a = points[0];
+    const chord: Point = .{ points[points.len - 1][0] - a[0], points[points.len - 1][1] - a[1] };
+    const chord_length = @sqrt(chord[0] * chord[0] + chord[1] * chord[1]);
+    const dir: Point = if (chord_length > 1.0e-3)
+        .{ chord[0] / chord_length, chord[1] / chord_length }
+    else
+        .{ 1, 0 };
+    const nrm: Point = .{ -dir[1], dir[0] };
+    var low: Point = .{ 0, 0 };
+    var high: Point = .{ 0, 0 };
+    for (points[1..]) |point| {
+        const d: Point = .{ point[0] - a[0], point[1] - a[1] };
+        const t = d[0] * dir[0] + d[1] * dir[1];
+        const n = d[0] * nrm[0] + d[1] * nrm[1];
+        low = .{ @min(low[0], t), @min(low[1], n) };
+        high = .{ @max(high[0], t), @max(high[1], n) };
+    }
+    const r = width * 0.5 + aa_pad;
+    var corners: [4]Point = undefined;
+    const ts = [4]f32{ low[0] - r, high[0] + r, high[0] + r, low[0] - r };
+    const ns = [4]f32{ low[1] - r, low[1] - r, high[1] + r, high[1] + r };
+    for (&corners, ts, ns) |*corner, t, n| {
+        corner.* = .{ a[0] + dir[0] * t + nrm[0] * n, a[1] + dir[1] * t + nrm[1] * n };
+    }
+    assert(high[0] >= low[0]);
+    assert(high[1] >= low[1]);
+    return corners;
+}
+
+/// True when `p` is inside the convex quad `corners` (either winding), edges included.
+pub fn quad_contains(corners: [4]Point, p: Point) bool {
+    var negative = false;
+    var positive = false;
+    for (0..4) |index| {
+        const a = corners[index];
+        const b = corners[(index + 1) % 4];
+        const cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        if (cross < 0) negative = true;
+        if (cross > 0) positive = true;
+    }
+    return !(negative and positive);
+}
+
 /// The alpha the `Path` shader writes at `(x, y)` (absolute, logical pixels) for `chunk`,
 /// with `points` the frame's whole point buffer and `pixel_size` the logical size of one
-/// device pixel. Zero outside the chunk's rect, where no fragment runs. CPU twin of
-/// `types.Path.pixel` and the prelude's clip mask.
+/// device pixel. Zero outside the chunk's rect and outside its oriented quad, where no
+/// fragment runs. CPU twin of `types.Path.vertex`, `types.Path.pixel`, and the prelude's clip
+/// mask.
 pub fn chunk_alpha(
     points: []const Point,
     chunk: *const types.Path,
@@ -268,7 +334,9 @@ pub fn chunk_alpha(
     const head: u32 = @intFromFloat(chunk.first_point);
     const tail: u32 = head + @as(u32, @intFromFloat(chunk.point_count)) - 1;
     assert(tail < points.len);
-    const own = distance_to_polyline(points[head .. tail + 1], qx, qy);
+    const own_points = points[head .. tail + 1];
+    if (!quad_contains(oriented_quad(own_points, chunk.width), .{ qx, qy })) return 0;
+    const own = distance_to_polyline(own_points, qx, qy);
     var before: f32 = std.math.floatMax(f32);
     if (chunk.prev > 0.5) before = segment_at(points, head - 1, qx, qy);
     var after: f32 = std.math.floatMax(f32);
@@ -448,6 +516,8 @@ fn length(a: Point, b: Point) f32 {
 }
 
 comptime {
+    // `types.Path.vertex` writes this pad as the literal `1.0`.
+    assert(aa_pad == 1);
     assert(chunk_points_max == 16);
     assert(chunk_segments_min <= chunk_segments_max);
     assert(segments_min >= 1);
@@ -648,6 +718,43 @@ test "every chunk's rect contains its stroke" {
         }
     }
     try testing.expectEqual(@as(f32, 64), expected_first);
+}
+
+// Locks section 5a: every point a stroke covers (within half the width plus half a device
+// pixel, at 1x and 2x) lies inside its chunk's oriented quad, for a sagging cable, a straight
+// diagonal, a hairpin folded back on itself, and a chunk whose points all coincide.
+test "every chunk's oriented quad contains its stroke" {
+    var cable: [cubic_points_max]Point = undefined;
+    const control = sagging(.{ 100, 100 }, .{ 800, 700 }, 160);
+    const count = flatten_cubic(&cable, control[0], control[1], control[2], control[3]);
+    const diagonal = [_]Point{ .{ 0, 0 }, .{ 30, 30 }, .{ 60, 60 }, .{ 90, 90 }, .{ 120, 120 } };
+    const hairpin = [_]Point{ .{ 0, 0 }, .{ 40, 0 }, .{ 60, 6 }, .{ 40, 12 }, .{ 0, 12 } };
+    const dot = [_]Point{ .{ 5, 5 }, .{ 5, 5 }, .{ 5, 5 } };
+    const shapes = [_][]const Point{ cable[0..count], &diagonal, &hairpin, &dot };
+    for (shapes) |shape| {
+        var start: u32 = 0;
+        while (start + 1 < shape.len) {
+            const end = chunk_end(shape, start, cable_stroke.width);
+            try expect_quad_holds_stroke(shape[start .. end + 1], cable_stroke.width);
+            start = end;
+        }
+    }
+}
+
+fn expect_quad_holds_stroke(points: []const Point, width: f32) !void {
+    const quad = oriented_quad(points, width);
+    const box = bounds_of(points);
+    for ([_]f32{ 1, 0.5 }) |pixel_size| {
+        const reach = width * 0.5 + 0.5 * pixel_size;
+        var y = box.y - reach - 2;
+        while (y < box.y + box.height + reach + 2) : (y += 0.25) {
+            var x = box.x - reach - 2;
+            while (x < box.x + box.width + reach + 2) : (x += 0.25) {
+                if (distance_to_polyline(points, x, y) >= reach) continue;
+                try testing.expect(quad_contains(quad, .{ x, y }));
+            }
+        }
+    }
 }
 
 // Locks the seam rule (section 4): source-over of every chunk of a translucent straight cable
