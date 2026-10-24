@@ -82,12 +82,16 @@ pub const Textures = struct {
     heights: [texture_cap]u32,
     writes: [write_cap]Write,
     write_count: u32,
+    /// Moves on every queued write of a texture: the pixel cache folds it into the tiles that
+    /// sample the texture, because a rewrite changes pixels without changing any record.
+    revisions: [texture_cap]u32,
 
     /// An empty table. Out-pointer init so a static table needs no stack copy.
     pub fn init(self: *Textures) void {
         self.count = 0;
         self.created = 0;
         self.write_count = 0;
+        self.revisions = @splat(0);
         assert(self.count == 0);
         assert(self.write_count == 0);
     }
@@ -127,6 +131,7 @@ pub const Textures = struct {
             .data = data,
         };
         self.write_count += 1;
+        self.revisions[index] +%= 1;
         assert(self.write_count <= write_cap);
     }
 
@@ -156,7 +161,15 @@ pub const Textures = struct {
             .data = data,
         };
         self.write_count += 1;
+        self.revisions[index] +%= 1;
         assert(self.write_count <= write_cap);
+    }
+
+    /// How many writes `id` has had queued, wrapping (see `revisions`).
+    pub fn revision_of(self: *const Textures, id: TextureId) u32 {
+        const index = @backingInt(id);
+        assert(index < self.count);
+        return self.revisions[index];
     }
 
     /// The format `id` was created with.

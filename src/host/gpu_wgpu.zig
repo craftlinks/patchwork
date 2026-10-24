@@ -34,11 +34,17 @@
 //!
 //! ## 4. Frame Lifecycle
 //! ```text
-//! pass_begin        -> reconfigure the surface if the size changed, acquire its texture,
-//!                      create the view, encoder, and clearing render pass
-//! pipeline_set .. draw -> recorded into that pass; they panic when no pass is open
+//! pass_begin        -> open the frame's encoder if needed; for the surface, reconfigure it
+//!                      if the size changed and acquire its texture; begin a render pass on
+//!                      the surface or a render target, clearing or loading it
+//! pipeline_set .. draw, scissor_set -> recorded into that pass; they panic with no pass open
 //! pass_end_present  -> end, finish, submit, present, release every per-frame handle
+//! pass_end          -> end the pass, keep the encoder
+//! present_copy      -> acquire the surface texture, copy a render target onto it, finish,
+//!                      submit, present, release (`draw/renderer.zig`, section 6)
 //! ```
+//! `target_create` makes a render target in the surface format and is the one create that may
+//! repeat an id: a new size replaces the texture.
 //! Buffer and texture writes go straight to the queue, so a write recorded before
 //! `pass_begin` is visible to the pass. If `execute` returns early, a deferred release frees
 //! whatever per-frame handles exist.
@@ -133,6 +139,8 @@ pub const Gpu = struct {
     views: [cap(.texture)]?TextureView,
     samplers: [cap(.sampler)]?Sampler,
     bind_groups: [cap(.bind_group)]?BindGroup,
+    /// Width and height of each render target (`target_create`); zero for other textures.
+    target_sizes: [cap(.texture)][2]u32,
     /// Bench-mode state (module guide section 9); `enabled` is false otherwise.
     profile: Profile,
 };
@@ -211,6 +219,7 @@ const s_type_surface_configuration_extras: SType = 0x00030008;
 const frame_latency: u32 = 1;
 const alpha_auto: CompositeAlphaMode = 0x00000000;
 const load_clear: LoadOp = 0x00000002;
+const load_load: LoadOp = 0x00000001;
 const store_store: StoreOp = 0x00000001;
 const status_success: Status = 0x00000001;
 const adapter_success: RequestAdapterStatus = 0x00000001;
@@ -837,7 +846,9 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gp
     const adapter = try request_adapter(instance, surface, options.adapter);
     const timestamps = options.profile and
         wgpuAdapterHasFeature(adapter, feature_timestamp_query) != 0;
-    const device = try request_device(instance, adapter, timestamps);
+    const inside_encoders = timestamps and
+        wgpuAdapterHasFeature(adapter, feature_timestamps_inside_encoders) != 0;
+    const device = try request_device(instance, adapter, timestamps, inside_encoders);
     const queue = wgpuDeviceGetQueue(device);
     const chosen = try pick_format(surface, adapter);
     return .{
@@ -859,18 +870,34 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gp
         .views = @splat(null),
         .samplers = @splat(null),
         .bind_groups = @splat(null),
-        .profile = profile_create(adapter, device, queue, options.profile, timestamps),
+        .target_sizes = @splat(.{ 0, 0 }),
+        .profile = profile_create(adapter, device, queue, .{
+            .enabled = options.profile,
+            .timestamps = timestamps,
+            .inside_encoders = inside_encoders,
+        }),
     };
 }
 
-/// Per-frame handles between `pass_begin` and `pass_end_present`. All null outside a pass.
+/// Per-frame handles between the first op that opens the encoder and the present. All null
+/// outside a frame. `texture` and `view` are the surface's; a pass on a render target uses
+/// the target's own view. `timed_pass` and `timed_copy` say which timestamps bench mode wrote.
 const Frame = struct {
     texture: ?Texture,
     view: ?TextureView,
     encoder: ?CommandEncoder,
     pass: ?RenderPassEncoder,
+    timed_pass: bool,
+    timed_copy: bool,
 
-    const empty: Frame = .{ .texture = null, .view = null, .encoder = null, .pass = null };
+    const empty: Frame = .{
+        .texture = null,
+        .view = null,
+        .encoder = null,
+        .pass = null,
+        .timed_pass = false,
+        .timed_copy = false,
+    };
 
     /// Releases whatever exists, innermost first. Only reached with handles on an error path.
     fn release(self: *Frame) void {
@@ -962,6 +989,21 @@ fn run(self: *Gpu, op: commands.Op, frame: *Frame) !void {
             p.first_instance,
         ),
         .pass_end_present => pass_end_present(self, frame),
+        .target_create => |p| try target_create(self, p),
+        .scissor_set => |p| wgpuRenderPassEncoderSetScissorRect(
+            open_pass("scissor_set", frame),
+            p.x,
+            p.y,
+            p.width,
+            p.height,
+        ),
+        .pass_end => {
+            const pass = open_pass("pass_end", frame);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            frame.pass = null;
+        },
+        .present_copy => |p| try present_copy(self, p, frame),
     }
 }
 
@@ -1294,27 +1336,39 @@ fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
     }
     assert(p.width_px != 0);
     assert(p.height_px != 0);
-    configure_surface(self, p.width_px, p.height_px);
-    const texture = try acquire_texture(self.surface);
-    frame.texture = texture;
-    const view = wgpuTextureCreateView(texture, null);
-    frame.view = view;
-    const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
-    frame.encoder = encoder;
-    assert(@intFromPtr(view) != 0);
-    assert(@intFromPtr(encoder) != 0);
+    const view = if (p.target == commands.surface_target) blk: {
+        assert(p.load == .clear);
+        try acquire_surface(self, p.width_px, p.height_px, frame);
+        break :blk frame.view.?;
+    } else blk: {
+        const size = self.target_sizes[p.target];
+        if (size[0] != p.width_px or size[1] != p.height_px) {
+            std.debug.panic("pass_begin: target {d} is {d}x{d}, the pass {d}x{d}", .{
+                p.target, size[0], size[1], p.width_px, p.height_px,
+            });
+        }
+        break :blk get(TextureView, "pass_begin", &self.views, p.target);
+    };
+    const encoder = open_encoder(self, frame);
     const attachment: RenderPassColorAttachment = .{
         .next_in_chain = null,
         .view = view,
         .depth_slice = depth_slice_undefined,
         .resolve_target = null,
-        .load_op = load_clear,
+        .load_op = if (p.load == .clear) load_clear else load_load,
         .store_op = store_store,
         .clear_value = .{ .r = p.clear[0], .g = p.clear[1], .b = p.clear[2], .a = p.clear[3] },
     };
     var writes: PassTimestampWrites = undefined;
-    if (self.profile.query) |query| {
-        writes = .{ .next_in_chain = null, .query_set = query, .begin_index = 0, .end_index = 1 };
+    const timed = self.profile.query != null and !frame.timed_pass;
+    if (timed) {
+        writes = .{
+            .next_in_chain = null,
+            .query_set = self.profile.query.?,
+            .begin_index = 0,
+            .end_index = 1,
+        };
+        frame.timed_pass = true;
     }
     const descriptor: RenderPassDescriptor = .{
         .next_in_chain = null,
@@ -1323,25 +1377,118 @@ fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
         .color_attachments = @ptrCast(&attachment),
         .depth_stencil_attachment = null,
         .occlusion_query_set = null,
-        .timestamp_writes = if (self.profile.query != null) @ptrCast(&writes) else null,
+        .timestamp_writes = if (timed) @ptrCast(&writes) else null,
     };
     frame.pass = wgpuCommandEncoderBeginRenderPass(encoder, &descriptor);
+}
+
+/// The frame's encoder, created by the first op that needs it.
+fn open_encoder(self: *Gpu, frame: *Frame) CommandEncoder {
+    if (frame.encoder) |encoder| return encoder;
+    const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
+    assert(@intFromPtr(encoder) != 0);
+    frame.encoder = encoder;
+    return encoder;
+}
+
+/// Reconfigures the surface if its size changed and acquires its texture and view.
+fn acquire_surface(self: *Gpu, width_px: u32, height_px: u32, frame: *Frame) !void {
+    assert(frame.texture == null);
+    configure_surface(self, width_px, height_px);
+    const texture = try acquire_texture(self.surface);
+    frame.texture = texture;
+    const view = wgpuTextureCreateView(texture, null);
+    assert(@intFromPtr(view) != 0);
+    frame.view = view;
 }
 
 /// Ends the pass, submits, presents, and releases every per-frame handle.
 fn pass_end_present(self: *Gpu, frame: *Frame) void {
     const pass = open_pass("pass_end_present", frame);
-    const encoder = frame.encoder.?;
     wgpuRenderPassEncoderEnd(pass);
-    profile_record(self, encoder, frame.texture.?);
+    wgpuRenderPassEncoderRelease(pass);
+    frame.pass = null;
+    submit_present(self, frame);
+}
+
+/// Copies render target `p.target` onto the surface texture, then submits and presents.
+fn present_copy(self: *Gpu, p: commands.PresentCopy, frame: *Frame) !void {
+    if (frame.pass != null) std.debug.panic("present_copy: a render pass is still open", .{});
+    const source = get(Texture, "present_copy", &self.textures, p.target);
+    const size = self.target_sizes[p.target];
+    assert(size[0] != 0);
+    assert(size[1] != 0);
+    try acquire_surface(self, size[0], size[1], frame);
+    const encoder = open_encoder(self, frame);
+    const timed = self.profile.inside_encoders;
+    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 2);
+    const from: TexelCopyTextureInfo = .{
+        .texture = source,
+        .mip_level = 0,
+        .origin = .{ .x = 0, .y = 0, .z = 0 },
+        .aspect = 0,
+    };
+    const to: TexelCopyTextureInfo = .{
+        .texture = frame.texture.?,
+        .mip_level = 0,
+        .origin = .{ .x = 0, .y = 0, .z = 0 },
+        .aspect = 0,
+    };
+    const extent: Extent3D = .{ .width = size[0], .height = size[1], .depth_or_array_layers = 1 };
+    wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
+    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 3);
+    frame.timed_copy = timed;
+    submit_present(self, frame);
+}
+
+/// Finishes the frame's encoder, submits it, presents the surface, and releases every
+/// per-frame handle.
+fn submit_present(self: *Gpu, frame: *Frame) void {
+    assert(frame.pass == null);
+    const encoder = frame.encoder.?;
+    profile_record(self, encoder, frame);
     const commands_buffer = wgpuCommandEncoderFinish(encoder, null);
     wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands_buffer));
     _ = wgpuSurfacePresent(self.surface);
     wgpuCommandBufferRelease(commands_buffer);
-    profile_read(self);
+    profile_read(self, frame);
     frame.release();
     assert(frame.pass == null);
     assert(frame.texture == null);
+}
+
+/// Creates render target `p.id`, or replaces it at a new size (module guide section 4).
+fn target_create(self: *Gpu, p: commands.TargetCreate) !void {
+    assert(p.width != 0);
+    assert(p.height != 0);
+    if (p.id >= self.textures.len) std.debug.panic("target_create: id {d} out of range", .{p.id});
+    if (self.textures[p.id]) |old| {
+        if (self.target_sizes[p.id][0] == 0) {
+            std.debug.panic("target_create: id {d} is a sampled texture", .{p.id});
+        }
+        wgpuTextureViewRelease(self.views[p.id].?);
+        wgpuTextureRelease(old);
+    }
+    const descriptor: TextureDescriptor = .{
+        .next_in_chain = null,
+        .label = empty_label,
+        .usage = usage_render_attachment | texture_usage_copy_src | usage_texture_binding,
+        .dimension = dimension_2d,
+        .size = .{ .width = p.width, .height = p.height, .depth_or_array_layers = 1 },
+        .format = self.format,
+        .mip_level_count = 1,
+        .sample_count = 1,
+        .view_format_count = 0,
+        .view_formats = null,
+    };
+    const texture = wgpuDeviceCreateTexture(self.device, &descriptor) orelse {
+        return error.TextureFailed;
+    };
+    const view = wgpuTextureCreateView(texture, null);
+    assert(@intFromPtr(view) != 0);
+    self.textures[p.id] = texture;
+    self.views[p.id] = view;
+    self.target_sizes[p.id] = .{ p.width, p.height };
 }
 
 /// C ABI callback installed by `request_device` (module guide section 5). Keeps the first
@@ -1435,11 +1582,18 @@ fn request_adapter(instance: Instance, surface: Surface, preference: bench.Adapt
 
 /// Requests a device from `adapter` with `uncaptured_error` installed (module guide section
 /// 5) and blocks (bounded) until it resolves.
-fn request_device(instance: Instance, adapter: Adapter, timestamps: bool) !Device {
+fn request_device(
+    instance: Instance,
+    adapter: Adapter,
+    timestamps: bool,
+    inside_encoders: bool,
+) !Device {
     assert(@intFromPtr(instance) != 0);
     assert(@intFromPtr(adapter) != 0);
+    if (inside_encoders) assert(timestamps);
     var slot: DeviceSlot = .{ .device = null, .ok = false };
-    const features = [1]u32{feature_timestamp_query};
+    const features = [2]u32{ feature_timestamp_query, feature_timestamps_inside_encoders };
+    const feature_count: usize = if (inside_encoders) 2 else if (timestamps) 1 else 0;
     const info: RequestDeviceCallbackInfo = .{
         .next_in_chain = null,
         .mode = callback_process_events,
@@ -1450,8 +1604,8 @@ fn request_device(instance: Instance, adapter: Adapter, timestamps: bool) !Devic
     const descriptor: DeviceDescriptor = .{
         .next_in_chain = null,
         .label = empty_label,
-        .required_feature_count = if (timestamps) features.len else 0,
-        .required_features = if (timestamps) @ptrCast(&features) else null,
+        .required_feature_count = feature_count,
+        .required_features = if (feature_count != 0) @ptrCast(&features) else null,
         .required_limits = null,
         .default_queue = .{ .next_in_chain = null, .label = empty_label },
         .device_lost_callback_info = .{
@@ -1590,10 +1744,12 @@ fn configure_surface(self: *Gpu, width_px: u32, height_px: u32) void {
         .next_in_chain = @ptrCast(&extras.chain),
         .device = self.device,
         .format = self.format,
+        // `present_copy` copies a render target onto the surface texture; bench mode also
+        // copies the surface texture out (module guide section 9).
         .usage = if (self.profile.enabled)
-            usage_render_attachment | texture_usage_copy_src
+            usage_render_attachment | texture_usage_copy_dst | texture_usage_copy_src
         else
-            usage_render_attachment,
+            usage_render_attachment | texture_usage_copy_dst,
         .width = width_px,
         .height = height_px,
         .view_format_count = 0,
@@ -1817,8 +1973,28 @@ extern fn wgpuBufferGetConstMappedRange(
 extern fn wgpuBufferUnmap(buffer: Buffer) void;
 extern fn wgpuBufferRelease(buffer: Buffer) void;
 extern fn wgpuDevicePoll(device: Device, wait: Bool, index: ?*const u64) Bool;
+extern fn wgpuCommandEncoderWriteTimestamp(
+    encoder: CommandEncoder,
+    query_set: QuerySet,
+    index: u32,
+) void;
+extern fn wgpuCommandEncoderCopyTextureToTexture(
+    encoder: CommandEncoder,
+    source: *const TexelCopyTextureInfo,
+    destination: *const TexelCopyTextureInfo,
+    size: *const Extent3D,
+) void;
+extern fn wgpuRenderPassEncoderSetScissorRect(
+    pass: RenderPassEncoder,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) void;
 
 const feature_timestamp_query: u32 = 0x00000009;
+/// wgpu-native's `TimestampQueryInsideEncoders`: timestamps around `present_copy`'s copy.
+const feature_timestamps_inside_encoders: u32 = 0x00030024;
 const query_type_timestamp: u32 = 0x00000002;
 const power_undefined: u32 = 0x00000000;
 const power_low: u32 = 0x00000001;
@@ -1828,8 +2004,9 @@ const buffer_usage_copy_src: Flags = 0x0000000000000004;
 const buffer_usage_query_resolve: Flags = 0x0000000000000200;
 const map_mode_read: Flags = 0x0000000000000001;
 const map_status_success: u32 = 0x00000001;
-/// Two timestamps of 8 bytes each: the pass's beginning and end.
-const timestamp_bytes: u64 = 16;
+/// Four timestamps of 8 bytes each: the pass's beginning and end, then the copy's.
+const timestamp_count: u32 = 4;
+const timestamp_bytes: u64 = timestamp_count * 8;
 /// `wgpuCommandEncoderCopyTextureToBuffer` needs rows aligned to 256 bytes.
 const copy_row_align: u32 = 256;
 const adapter_name_cap: u32 = 96;
@@ -1839,6 +2016,8 @@ const Profile = struct {
     enabled: bool,
     /// Null without the timestamp feature.
     query: ?QuerySet,
+    /// Timestamps around `present_copy`'s copy are available.
+    inside_encoders: bool,
     resolve: ?Buffer,
     read: ?Buffer,
     period_ns: f32,
@@ -1861,17 +2040,24 @@ pub const FrameImage = struct {
     row_bytes: u32,
 };
 
+const ProfileFeatures = struct {
+    enabled: bool,
+    timestamps: bool,
+    inside_encoders: bool,
+};
+
 fn profile_create(
     adapter: Adapter,
     device: Device,
     queue: Queue,
-    enabled: bool,
-    timestamps: bool,
+    features: ProfileFeatures,
 ) Profile {
-    if (timestamps) assert(enabled);
+    if (features.timestamps) assert(features.enabled);
+    if (features.inside_encoders) assert(features.timestamps);
     var profile: Profile = std.mem.zeroes(Profile);
-    profile.enabled = enabled;
-    if (!enabled) return profile;
+    profile.enabled = features.enabled;
+    profile.inside_encoders = features.inside_encoders;
+    if (!features.enabled) return profile;
     var info: AdapterInfo = std.mem.zeroes(AdapterInfo);
     if (wgpuAdapterGetInfo(adapter, &info) == status_success) {
         const name = if (info.device.data) |data| data[0..info.device.length] else "";
@@ -1880,13 +2066,13 @@ fn profile_create(
         profile.adapter_name_len = len;
         wgpuAdapterInfoFreeMembers(info);
     }
-    if (!timestamps) return profile;
+    if (!features.timestamps) return profile;
     profile.period_ns = wgpuQueueGetTimestampPeriod(queue);
     profile.query = wgpuDeviceCreateQuerySet(device, &.{
         .next_in_chain = null,
         .label = empty_label,
         .type = query_type_timestamp,
-        .count = 2,
+        .count = timestamp_count,
     });
     profile.resolve = create_profile_buffer(device, buffer_usage_query_resolve |
         buffer_usage_copy_src, timestamp_bytes);
@@ -1912,21 +2098,30 @@ fn create_profile_buffer(device: Device, usage: Flags, size: u64) ?Buffer {
     });
 }
 
-/// Records the timestamp resolve and, when requested, the frame copy into `encoder`, after
-/// the pass and before `finish`. Does nothing outside bench mode.
-fn profile_record(self: *Gpu, encoder: CommandEncoder, target: Texture) void {
+/// Records the timestamp resolve and, when requested, the copy of the surface texture into
+/// `encoder`, before `finish`. Does nothing outside bench mode.
+fn profile_record(self: *Gpu, encoder: CommandEncoder, frame: *const Frame) void {
     const profile = &self.profile;
     if (!profile.enabled) return;
+    const target = frame.texture.?;
     if (profile.query) |query| {
-        wgpuCommandEncoderResolveQuerySet(encoder, query, 0, 2, profile.resolve.?, 0);
-        wgpuCommandEncoderCopyBufferToBuffer(
-            encoder,
-            profile.resolve.?,
-            0,
-            profile.read.?,
-            0,
-            timestamp_bytes,
-        );
+        // Only queries this frame wrote: resolving one never written waits on it forever on
+        // Vulkan, which loses the device. The pass writes 0 and 1, the copy 2 and 3; both
+        // land at offset 0 of the resolve buffer (its offset must be a multiple of 256).
+        const first: u32 = if (frame.timed_pass) 0 else 2;
+        const count: u32 = 2 * (@as(u32, @intFromBool(frame.timed_pass)) +
+            @intFromBool(frame.timed_copy));
+        if (count != 0) {
+            wgpuCommandEncoderResolveQuerySet(encoder, query, first, count, profile.resolve.?, 0);
+            wgpuCommandEncoderCopyBufferToBuffer(
+                encoder,
+                profile.resolve.?,
+                0,
+                profile.read.?,
+                0,
+                timestamp_bytes,
+            );
+        }
     }
     if (!profile.image_requested) return;
     assert(profile.image == null);
@@ -1957,17 +2152,24 @@ fn profile_record(self: *Gpu, encoder: CommandEncoder, target: Texture) void {
     profile.image_requested = false;
 }
 
-/// After present: blocks until the frame's GPU work is done, then reads the pass time and
-/// maps the frame copy if one was recorded.
-fn profile_read(self: *Gpu) void {
+/// After present: blocks until the frame's GPU work is done, then reads its GPU time (the
+/// pass plus `present_copy`'s copy, whichever ran) and maps the frame copy if one was
+/// recorded.
+fn profile_read(self: *Gpu, frame: *const Frame) void {
     const profile = &self.profile;
     if (!profile.enabled) return;
     profile.pass_ns = null;
     if (profile.read) |read| {
         if (map_blocking(self, read, timestamp_bytes)) {
             const range = wgpuBufferGetConstMappedRange(read, 0, timestamp_bytes).?;
-            const stamps: *const [2]u64 = @ptrCast(@alignCast(range));
-            const ticks = stamps[1] -% stamps[0];
+            const stamps: *const [timestamp_count]u64 = @ptrCast(@alignCast(range));
+            // Resolved from offset 0: the pass's pair first when it ran (`profile_record`).
+            var ticks: u64 = 0;
+            if (frame.timed_pass) ticks += stamps[1] -% stamps[0];
+            if (frame.timed_copy) {
+                const at: u32 = if (frame.timed_pass) 2 else 0;
+                ticks += stamps[at + 1] -% stamps[at];
+            }
             const ns = @as(f64, @floatFromInt(ticks)) * profile.period_ns;
             profile.pass_ns = @intFromFloat(ns);
             wgpuBufferUnmap(read);

@@ -112,8 +112,9 @@ patchwork/
 │   ├── draw/types.zig          # Library draw types (Box, Arc, Glyph, Image, Path) and CPU twins
 │   ├── draw/pools.zig          # Context: per-type pools, point pool, layers, sort, batches
 │   ├── draw/path.zig           # Stroked paths: flattening, chunking, twins, appenders
-│   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId
-│   ├── draw/renderer.zig       # Records setup and frame command streams (pipelines, uploads, draws)
+│   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId, write revisions
+│   ├── draw/tiles.zig          # Pixel cache tiles: hashes, dirty bits, scissor rects, record keys
+│   ├── draw/renderer.zig       # Records setup and frame command streams; frame kinds, kept target
 │   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
 │   ├── text/ttf.zig            # Comptime TrueType reader: cmap 12/4, hmtx, glyf, composites
 │   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
@@ -545,8 +546,9 @@ values are UI state that lives in the text. It demonstrates:
 - **Uploads.** The panel draws before the editor and the header last, so a typed key writes
   the glyphs from the edited line on; tests "uploads of a scrolled frame and a typed key" and
   "transport ticks upload the playhead and one recorded point" lock the byte counts.
-- **Bench scenarios** (`bench.zig`). `transport`, `typing`, `transport-stress`, and
-  `typing-stress`, replayed headless by test "the bench scenarios replay headless".
+- **Bench scenarios** (`bench.zig`). `idle` (every frame skipped by the pixel cache),
+  `transport`, `typing`, `transport-stress`, and `typing-stress`, replayed headless by test
+  "the bench scenarios replay headless".
 
 ## Bench Mode
 
@@ -554,7 +556,8 @@ values are UI state that lives in the text. It demonstrates:
 it runs, no GPU feature is requested, and the frame path is unchanged.
 
 ```text
-<app> [--adapter low|high] [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
+<app> [--adapter low|high] [--no-cache] [--bench [scenario] [--frames N] [--dump out.ppm]
+      [--csv out.csv]]
 zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 ```
 
@@ -579,7 +582,10 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   setup varies. `zig build compare` reports differing pixels by size of difference (1, 2,
   3-8, 9-32, 33-255) and exits 1 when any differ.
 - **Adapter.** `--adapter low` asks for `low_power` (an integrated GPU), `high` for
-  `high_performance`; it works without `--bench` too.
+  `high_performance`; it works without `--bench` too. `--no-cache` turns the pixel cache off.
+- **Frame kinds.** The report counts measured frames by what the renderer recorded (skipped,
+  copied, cached, full, direct); a skipped frame's GPU time is 0, and a cached frame's includes
+  the copy to the surface when the adapter supports timestamps inside encoders.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
   timed passes (`window.patchworkBench` holds the last). No scenarios or dumps.
 
@@ -595,15 +601,23 @@ Renderer.setup  (once, after device creation)
   layout_create  buffer_create  [buffer_create (points)]  sampler_create
   bind_group_create (frame: uniform [and points])
   per draw type: shader_create (labelled with the type)  buffer_create  pipeline_create
+  shader_create pipeline_create (the clear pipeline of the pixel cache)
   buffer_write (unit quad)  per queued texture: texture_create  bind_group_create
   texture_write* (the app's images; the glyph atlas starts empty)
-Renderer.frame  (every presented frame)
+Renderer.frame  (every drawn frame)
   buffer_write (uniform, if the device size or scale changed)
   queued texture ops (the glyph cache's dirty atlas rectangle, one strided texture_write)
   buffer_write* (pools)  [buffer_write (points)]
-  pass_begin  bind_group_set 0  vertex_buffer_set 0
-  per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
-  pass_end_present
+  then by the frame's kind (see Pixel Cache):
+  direct   pass_begin (surface)  bind_group_set 0  vertex_buffer_set 0
+           per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
+           pass_end_present
+  full     [target_create]  pass_begin (kept target, clear)  every batch  pass_end
+           present_copy
+  cached   pass_begin (kept target, load)  per dirty rect: scissor_set, the clear
+           pipeline's draw, every batch  pass_end  present_copy
+  copied   present_copy
+  skipped  nothing
 ```
 
 Each op is an 8-byte header `{ code, size, pad }` followed by an `extern struct` payload,
@@ -626,6 +640,34 @@ exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack 
 the step 16 op sequences" in `examples/rack/app.zig`. The path point pool follows the same
 rule with its own shadow: a rebuilt path whose shape is unchanged writes no points, and a
 recolored one writes its `Path` records only.
+
+### Pixel Cache
+
+Every frame rebuilds every instance, but most frames change a few percent of the window (a
+playhead, a caret line). The renderer keeps the last frame in a render target and repaints only
+what changed (`src/draw/tiles.zig`, `src/draw/renderer.zig` section 4a):
+
+- **Tiles.** After the uploads, every instance folds a key into each 64-pixel tile its `rect`
+  (cut by its `clip`, grown by a pixel) touches, in draw order. The key covers the record's
+  bytes and the points it names, mixed with its batch and its texture's write revision (not
+  the glyph atlas's, which only grows). Keys are kept per record and recomputed only for
+  records and points the upload found changed. A tile whose hash differs from the last frame's
+  is dirty; a size or scale change dirties all.
+- **Frames.** No dirty tile: `skipped`, nothing presented; natively the surface still commits a
+  frame callback, so animation pacing holds. More than half dirty (scrolling, resize, the first
+  frame): `direct`, today's pass on the surface. Otherwise a pass on the kept target: `full`
+  (cleared, every batch) when it is stale, else `cached`: loaded, and per merged dirty rect a
+  scissor, a clear quad (WebGPU clears only whole attachments), and every batch. Then
+  `present_copy` copies the kept target onto the surface. Rects merge down rows and are capped
+  per app by `renderer.rects_max` so the worst frame fits one command buffer.
+- **Exact.** A scissor does not change any pixel, so a cached frame equals a direct one bit
+  for bit: on both GPUs here, `typing` and `typing-stress` dumps with and without `--no-cache`
+  are identical.
+- **Cost.** At a 2856 by 2514 window, the GPU frame falls from 3.9 to 1.5 ms (`typing`) and
+  from 5.7 to 1.7 ms (`typing-stress`) on the UHD 770, and from 0.29 to 0.13 ms and 0.37 to
+  0.14 ms on the RTX 3060; most of a cached frame is the full-window copy, which WebGPU cannot
+  avoid (no buffer age). Hashing adds about 40 microseconds of CPU per frame, 60 to 90 on the
+  stress text.
 
 ## Draw Types, Layers, and Batches
 

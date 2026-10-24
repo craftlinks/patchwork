@@ -1804,7 +1804,8 @@ test "rack frames record the step 16 op sequences" {
         if (code == .pipeline_create) pipelines += 1;
     }
     try std.testing.expectEqual(@as(u32, 2), textures);
-    try std.testing.expectEqual(@as(u32, 6), pipelines);
+    // Six draw types and the renderer's clear pipeline.
+    try std.testing.expectEqual(@as(u32, 7), pipelines);
     var writes: [16]patchwork.commands.BufferWrite = undefined;
 
     record(app, 120);

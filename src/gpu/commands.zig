@@ -36,7 +36,8 @@
 //! Things every pipeline shares are conventions instead of payload fields: entry points are
 //! `vertex_entry` and `fragment_entry`, topology is a triangle list with no culling, the color
 //! target is the host's surface format, a texture is created with binding and copy-destination
-//! usage and bound through its default view, a bind-group buffer entry binds the whole buffer,
+//! usage and bound through its default view (a `target_create` render target instead with
+//! render-attachment, copy-source, and binding usage in the surface format), a bind-group buffer entry binds the whole buffer,
 //! and a sampler clamps to the edge. Buffer usage bits and shader stage bits are the WebGPU
 //! values, which `webgpu.h` shares, so both hosts pass them through unchanged.
 //!
@@ -104,11 +105,11 @@ pub const Kind = enum {
 
 /// Host table size per kind. Ids are `0 .. caps.get(kind)`.
 pub const caps = std.EnumArray(Kind, u16).init(.{
-    .shader = 16,
+    .shader = 24,
     .layout = 16,
     .pipeline = 32,
     .buffer = 64,
-    .texture = 32,
+    .texture = 40,
     .sampler = 8,
     .bind_group = 64,
 });
@@ -130,6 +131,10 @@ pub const Code = enum(u16) {
     vertex_buffer_set,
     draw,
     pass_end_present,
+    target_create,
+    scissor_set,
+    pass_end,
+    present_copy,
 };
 
 /// What one bind group layout entry holds, and so what its bind group resource id names.
@@ -169,9 +174,21 @@ pub const Filter = enum(u8) {
     linear,
 };
 
+/// What `pass_begin` does with the target's pixels: clear them, or keep them (a render
+/// target that holds the last frame).
+pub const LoadOp = enum(u8) {
+    clear,
+    load,
+};
+
+/// The `pass_begin.target` that names the surface instead of a render target.
+pub const surface_target: u16 = std.math.maxInt(u16);
+
 /// The payload enums, listed in `table_json`. Each must be contiguous from zero so the table
 /// can list names by value.
-const payload_enums = .{ BindingKind, VertexFormat, StepMode, Blend, TextureFormat, Filter };
+const payload_enums = .{
+    BindingKind, VertexFormat, StepMode, Blend, TextureFormat, Filter, LoadOp,
+};
 
 pub const Header = extern struct {
     code: u16,
@@ -309,14 +326,50 @@ pub const TextureWrite = extern struct {
     data: Span,
 };
 
-/// Acquires the surface texture and begins a pass that clears it. `width_px` and `height_px`
-/// are the physical size the frame was recorded for; native reconfigures the surface when it
-/// changes and the browser asserts it equals the canvas backing size.
+/// Begins a pass on `target`. For `surface_target` the host acquires the surface texture:
+/// `width_px` and `height_px` are the physical size the frame was recorded for, native
+/// reconfigures the surface when it changes, and the browser asserts it equals the canvas
+/// backing size. Otherwise `target` is a render target from `target_create` of that size.
+/// `load` clears to `clear` or keeps the target's pixels (a render target only).
 pub const PassBegin = extern struct {
     width_px: u32,
     height_px: u32,
     /// Straight RGBA clear color.
     clear: [4]f32,
+    /// A render target's texture id, or `surface_target`.
+    target: u16,
+    load: LoadOp,
+    pad0: u8 = 0,
+    pad1: u32 = 0,
+};
+
+/// Creates render target `id` in the surface format, `width` by `height`, with render
+/// attachment and copy-source usage. The one id that may be created again: a new size
+/// replaces the old texture, whose pixels are lost.
+pub const TargetCreate = extern struct {
+    id: u16,
+    pad: u16 = 0,
+    width: u32,
+    height: u32,
+};
+
+/// Limits the open pass's draws to a rect in physical pixels, inside the pass's target.
+pub const ScissorSet = extern struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+};
+
+/// Ends the open pass and keeps the frame's encoder for `present_copy`.
+pub const PassEnd = extern struct {};
+
+/// Acquires the surface texture, copies render target `target` onto it (same size), submits
+/// the frame, and presents. Opens the frame's encoder itself when no pass ran.
+pub const PresentCopy = extern struct {
+    target: u16,
+    pad0: u16 = 0,
+    pad1: u32 = 0,
 };
 
 pub const PipelineSet = extern struct {
@@ -362,6 +415,10 @@ pub const Op = union(Code) {
     vertex_buffer_set: VertexBufferSet,
     draw: Draw,
     pass_end_present: PassEndPresent,
+    target_create: TargetCreate,
+    scissor_set: ScissorSet,
+    pass_end: PassEnd,
+    present_copy: PresentCopy,
 };
 
 /// Allocates resource ids per kind, in order, bounded by `caps`. Ids are never freed: every
@@ -509,8 +566,8 @@ fn json_table() []const u8 {
     comptime {
         var out: []const u8 = "{";
         out = out ++ std.fmt.comptimePrint(
-            "\"capacity\":{d},\"header_bytes\":{d},\"align\":{d},",
-            .{ capacity, header_bytes, op_align },
+            "\"capacity\":{d},\"header_bytes\":{d},\"align\":{d},\"surface_target\":{d},",
+            .{ capacity, header_bytes, op_align, surface_target },
         );
         out = out ++ "\"entry\":{\"vertex\":\"" ++ vertex_entry ++ "\",\"fragment\":\"" ++
             fragment_entry ++ "\"},";
@@ -624,6 +681,10 @@ comptime {
     assert(@sizeOf(PipelineCreate) == 88);
     assert(@sizeOf(TextureWrite) == 40);
     assert(@sizeOf(PassEndPresent) == 0);
+    assert(@sizeOf(PassBegin) == 32);
+    assert(@sizeOf(PassEnd) == 0);
+    // No texture id can be the surface sentinel.
+    assert(caps.get(.texture) < surface_target);
 }
 
 const testing = std.testing;
@@ -686,7 +747,13 @@ fn samples() [@typeInfo(Op).@"union".field_names.len]Op {
             .bytes_per_row = 2,
             .data = .of(&sample_data),
         } },
-        .{ .pass_begin = .{ .width_px = 1280, .height_px = 720, .clear = .{ 0.1, 0.2, 0.3, 1 } } },
+        .{ .pass_begin = .{
+            .width_px = 1280,
+            .height_px = 720,
+            .clear = .{ 0.1, 0.2, 0.3, 1 },
+            .target = surface_target,
+            .load = .clear,
+        } },
         .{ .pipeline_set = .{ .id = 5 } },
         .{ .bind_group_set = .{ .slot = 1, .id = 9 } },
         .{ .vertex_buffer_set = .{ .slot = 1, .buffer = 7, .offset = 64 } },
@@ -697,6 +764,10 @@ fn samples() [@typeInfo(Op).@"union".field_names.len]Op {
             .first_instance = 2,
         } },
         .{ .pass_end_present = .{} },
+        .{ .target_create = .{ .id = 4, .width = 1280, .height = 720 } },
+        .{ .scissor_set = .{ .x = 64, .y = 128, .width = 192, .height = 64 } },
+        .{ .pass_end = .{} },
+        .{ .present_copy = .{ .target = 4 } },
     };
 }
 
