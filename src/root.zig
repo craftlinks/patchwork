@@ -23,6 +23,7 @@ pub const gpu = @import("gpu.zig");
 pub const commands = @import("gpu/commands.zig");
 pub const renderer = @import("draw/renderer.zig");
 pub const bench = @import("bench.zig");
+pub const realtime = @import("realtime.zig");
 
 /// The platform hosts. `linux_window.run` and `web_exports.export_app` are the only entry
 /// points an app build uses.
@@ -59,6 +60,7 @@ test {
     _ = commands;
     _ = renderer;
     _ = bench;
+    _ = realtime;
     _ = host.wp_presentation;
     _ = host.wp_fractional_scale;
     _ = host.wl_seat;

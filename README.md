@@ -38,6 +38,8 @@ pub const App = struct {
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 | `scenarios` (optional) | `[]const bench.Scenario` | Scripted runs for `--bench` (see Bench Mode). |
+| `Audio` (optional) | a type with `init(*Audio, u32)` and `render(*Audio, *realtime.Block)` | An audio source the host runs off the UI thread (see Audio Data). |
+| `audio` (with `Audio`) | `fn (*App, *Context(App), *const realtime.Block) void` | Receives every block of the source, in order, on the UI thread. |
 
 `Context(App)` is the UI context (`patchwork.ui.Context`): the draw context (`cx.draw`), the
 turtle stack, the hit areas of the last frame, and pointer, hover, and capture state. There
@@ -52,6 +54,9 @@ drawing.
 `timer`, and the hosts arm or disarm it after each call (a `timerfd_settime` natively,
 `setInterval` and `clearInterval` in the browser), so a stopped timer wakes nothing. Calling
 `set_timer` on an app without a period is an assertion failure.
+
+**Audio.** An app with an `Audio` source starts with it stopped; `cx.set_audio(on)` starts and
+stops it, and the hosts apply the change after the call (see Audio Data below).
 
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
@@ -131,12 +136,14 @@ patchwork/
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
 │   ├── bench.zig               # Bench mode: scenarios, replay, samples, summaries, PPM images
+│   ├── realtime.zig            # Audio blocks, the SPSC queue, the wake, test tone, meters, scope
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
-│   └── native_tests.zig        # Test root of tests that call libxkbcommon (native only)
+│   └── native_tests.zig        # Test root of tests that call libxkbcommon or spawn threads
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native entry point: parses options, runs linux_window.run(App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
-│   ├── linux_window.zig        # Linux Wayland event loop, timerfd, and Host(App)
+│   ├── linux_window.zig        # Linux Wayland event loop, timerfd, audio wake, and Host(App)
+│   ├── audio_thread.zig        # Native audio engine: the app's source on a paced thread
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
 │   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain
 │   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
@@ -151,7 +158,6 @@ patchwork/
 ├── examples/                   # Example applications
 │   ├── rack/                   # Modular synthesizer rack
 │   │   ├── app.zig             # Rack App implementing the patchwork.app contract
-│   │   ├── levels.zig          # Procedural triangle-wave meter sampling
 │   │   ├── led.zig             # The rack's own draw type: a glowing LED
 │   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
 │   ├── column/                 # Scrolling view regression app
@@ -172,17 +178,21 @@ patchwork/
 │   ├── wave/                   # Waveforms and spectra
 │   │   ├── app.zig             # Wave App: overview, zoomable sample view, DJ waveform, spectrogram
 │   │   └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
-│   └── fx/                     # Offscreen effects
-│       └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
+│   ├── fx/                     # Offscreen effects
+│   │   └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
+│   └── audio/                  # Audio data into the UI
+│       └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
 ├── tools/
 │   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
-│   └── shell.js                # Generic command interpreter, Wasm bridge, and input handler
+│   ├── shell.js                # Generic command interpreter, Wasm bridge, and input handler
+│   └── worklet.js              # AudioWorklet processor running the app's source from its wasm
 └── test/                       # Regression tests
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
-    └── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
+    ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
+    └── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
 ```
 
 ## Build Steps
@@ -223,10 +233,16 @@ zig build run-fx          # Build and run the offscreen effects natively
 zig build wasm-fx         # Compile them to zig-out/bin/fx.wasm
 zig build serve-fx        # Serve them on localhost (prints the address)
 
+# Examples (Audio)
+zig build run-audio       # Build and run the audio meters and scope natively (silent)
+zig build wasm-audio      # Compile them to zig-out/bin/audio.wasm
+zig build serve-audio     # Serve them on localhost; Space plays the tone (audible)
+
 # Validation
-zig build test            # Run unit tests across the library and the six examples
+zig build test            # Run unit tests across the library and the seven examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
-                          # and a type that reads time without declaring `animated`
+                          # a type that reads time without declaring `animated`, and an
+                          # `Audio` source without `audio`
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
@@ -245,10 +261,11 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```text
 zig-out/
 ├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
-│   data, wave, fx
+│   data, wave, fx, audio
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
 │   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
-│   wave.wasm, fx.wasm          #   `zig build wasm-wave`, and `zig build wasm-fx`
+│   wave.wasm, fx.wasm,         #   `zig build wasm-wave`, `zig build wasm-fx`,
+│   audio.wasm                  #   and `zig build wasm-audio`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -514,11 +531,12 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
   neighbouring knob's name. It is drawn on the overlay layer and records no hit area, so it
   never takes the hover from the knob; test "the tooltip box covers the neighbour's text on
   the overlay layer" locks it.
-- **Procedural meters** (`examples/rack/levels.zig`). Integer-period triangle waves sampled
-  from the clock: no trigonometry, no `f64`. Sampling never reads knobs, and dragging a knob
-  never changes a bar. Sample values are locked by the test in `levels.zig`.
-- **Timer-driven redraw.** `config.timer_period_ms` is `levels.meter_period_ms`, so the
-  host calls `App.timer` to resample the meters.
+- **Audio-driven meters.** The rack declares `Audio = realtime.TestTone`; Space (when no
+  title is being renamed) starts and stops it ("tone on", "tone off"). Each block's L, R, and
+  mid peaks go through `realtime.Ballistics` onto the osc, filter, and amp meters, and the
+  LEDs follow. Dragging a knob never changes a bar. The rack has no timer: stopped, it draws
+  empty meters and sleeps (before step 26 a 30 Hz timer woke it forever). In the browser the
+  tone is audible.
 
 Knob interaction: a knob draws a track arc and, unless its value is at the minimum, a value
 arc. Dragging vertically adjusts the value in proportion to `-dy` (up increases). Wheel over
@@ -619,6 +637,46 @@ frames, so its pictures are deterministic. At 2856 by 2514 the scope target cost
 770), 2.5 MB in all; the panel's target never re-renders when only its opacity changes.
 Natively and in Chromium the faded screen is bitwise identical.
 
+### 7. Audio (`examples/audio/app.zig`)
+
+Stereo meters (RMS fill, peak line, and a one-second hold on a 60 dB scale), a scope of 512
+frames triggered on L's rising zero crossing, and an XY trace of L against R on a feedback
+target with persistence, all fed by `realtime.TestTone` (220 and 330 Hz with slow gain
+triangles) through the audio queue, plus a line of blocks received and dropped. Space starts
+and stops the tone; stopped, the meters reset, the XY trail decays for 44 frames, and the
+screen sleeps. Scenarios: `still` and `play` (the bench feeds 6, 6, 6, 7 blocks per frame on
+the UI thread, so dumps are deterministic). At 2856 by 2514 a playing frame costs about 28
+microseconds of CPU on the RTX 3060 (41 on the UHD 770) plus 1.6 microseconds per block to
+render the tone and 0.4 to drain it; the never-started screen is bitwise identical natively
+and in Chromium.
+
+## Audio Data
+
+`patchwork.realtime` (`src/realtime.zig`) carries data from an audio engine into the UI:
+- **Blocks.** 128 stereo frames (the Web Audio render quantum), interleaved `f32`, 1 KiB, at
+  48 kHz; the producer posts 4 at a time (10.7 ms). `AudioQueue` holds 256 (683 ms).
+- **Queue.** A lock-free single-producer, single-consumer ring with `u32` indices on separate
+  cache lines. The producer renders into `slot()` and calls `publish()`; the consumer reads
+  `peek()` and calls `release()`. A full queue refuses and counts (`dropped`); it never
+  blocks or overwrites, so an audio thread is never held up by the UI.
+- **Wake.** The producer writes the wake's descriptor only when the consumer armed it before
+  sleeping, and the consumer arms only when nothing else will wake it (no frame callback in
+  flight, no commit latched). Both sides use `seq_cst` on the flag and the queue head, so a
+  block published just before the sleep is never missed. While frames flow the producer
+  makes no syscall.
+- **Source.** The app's `Audio` runs off the UI thread: natively on a thread paced by
+  `clock_nanosleep` at the device rate (there is no audio output yet; a PipeWire sink would
+  replace the clock), in the browser in an AudioWorklet (`web/worklet.js`) that instantiates
+  the same wasm and calls its `audio_render` export, so the browser plays it. Start and stop
+  (`cx.set_audio`) are the only control; no `SharedArrayBuffer` or cross-origin isolation is
+  needed.
+- **Analysis.** `levels` (peak and RMS of L, R, mid), `meter_of` (60 dB scale), `Ballistics`
+  (24 dB/s fall and a one-second hold, counted in blocks), and `Scope` (a history with a
+  rising-crossing trigger).
+- **Idle.** With the tone stopped the audio thread parks on a futex and the UI thread sleeps
+  (about 1 wake per second measured, against 30 for the rack's old timer); playing, the audio
+  thread wakes 94 times per second and the UI presents at most once per display frame.
+
 ## Bench Mode
 
 `src/bench.zig` and the native host measure frames on request; without `--bench` nothing of
@@ -657,6 +715,10 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   the copy to the surface when the adapter supports timestamps inside encoders. `gpu pass` is
   every pass of the frame plus the copy; `gpu target i` is the frame's i-th offscreen target
   pass, and the report ends with each target's device size and memory.
+- **Audio.** No thread runs in bench mode: while the app's audio is on, every frame is
+  presented and first fed `realtime.blocks_for_frame(n)` blocks (6, 6, 6, 7) rendered on the UI
+  thread, so dumps are deterministic. The report adds the blocks, drops, the most drained at
+  once, and the render and drain time per block.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
   timed passes (`window.patchworkBench` holds the last). No scenarios or dumps.
 
@@ -1000,15 +1062,19 @@ Zig's package manager, cached in `~/.cache/zig/p/`, and copied into the project'
 
 The event loop in `src/host/linux_window.zig` (`Host(App)`) implements the libwayland
 multi-thread reader protocol integrated with an optional Linux `timerfd`:
-- `poll` descriptor set: five fixed slots, the Wayland display socket, `timer_fd`, the key
-  repeat timerfd, and the clipboard's send and receive pipes; an inactive slot is -1, which
-  `poll` ignores. The repeat timer is armed only while a repeating key is held, and the pipes
+- `poll` descriptor set: six fixed slots, the Wayland display socket, `timer_fd`, the key
+  repeat timerfd, the clipboard's send and receive pipes, and the audio wake's `eventfd`; an
+  inactive slot is -1, which `poll` ignores. The repeat timer is armed only while a repeating key is held, and the pipes
   exist only during a transfer, so a focused idle text field sleeps.
   When `App.config.timer_period_ms == 0`, `timer_fd` is -1 (`no_timer_fd`), which `poll`
   ignores. The thread sleeps indefinitely while idle.
 - When `timer_period_ms != 0`, the timer is created disarmed and `sync_timer` arms or
   disarms it before every sleep to match `cx.timer_on`; while armed it wakes the thread via
   `drain_timer` calling `App.timer(now_ms)`.
+- An app with an `Audio` source gets an engine (`src/host/audio_thread.zig`): a thread spawned
+  at the first `set_audio(true)`, paced by `clock_nanosleep`, parked on a futex while stopped,
+  and joined at exit. Every wake drains the queue through `App.audio` (`sync_audio`) before
+  the frame is scheduled, and the exit log line reports blocks, drops, wakes, and late posts.
 - Frame pacing during gestures: each commit requests `wl_surface.frame` and
   `wp_presentation.feedback`. The `presented` event carries the pageflip time and the
   output's refresh period; the next commit is scheduled `present_margin_ns` before the vblank
@@ -1072,3 +1138,8 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   asserts that `pass_begin` carries the canvas backing size.
 - `?bench=1` times every render pass with `timestamp-query` when the adapter has it (see Bench
   Mode).
+- Audio: `sync_audio()` runs wherever `sync_timer()` runs. The first `audio_on()` creates an
+  `AudioContext` at 48 kHz inside the input handler, loads `worklet.js`, and passes it the
+  wasm's bytes; later changes resume or suspend the context. Each message of 4 blocks is
+  copied into `audio_inbox_ptr()` and pushed with `audio_push`, which schedules a frame;
+  `tick` drains the queue before it animates and presents.

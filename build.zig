@@ -53,8 +53,8 @@
 //!   pkg-config (`link_xkbcommon`): a consumer's build machine needs both `.so` files and
 //!   their `.pc` files, and its users need both libraries. The wasm build links nothing.
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
-//! - `serve` serves the page, `shell.js`, and the wasm through `src/serve.zig`, which owns
-//!   the address and port.
+//! - `serve` serves the page, `shell.js`, the wasm, and `worklet.js` through `src/serve.zig`,
+//!   which owns the address and port.
 //! - `bench` runs the installed native executable with `--bench` and the arguments after
 //!   `--`: a scenario name, `--frames`, `--adapter`, `--dump`, `--csv` (`src/bench.zig`).
 //!   Build with `-Doptimize=ReleaseFast` for numbers that mean something; the report names
@@ -307,6 +307,7 @@ fn add_serve(
     serve_run.addFileArg(patchwork_builder.path("web/index.html"));
     serve_run.addFileArg(patchwork_builder.path("web/shell.js"));
     serve_run.addFileArg(wasm.getEmittedBin());
+    serve_run.addFileArg(patchwork_builder.path("web/worklet.js"));
     return &serve_run.step;
 }
 
@@ -374,13 +375,22 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(wave.install);
     b.getInstallStep().dependOn(fx.install);
+    const audio = addApp(b, b, .{
+        .name = "audio",
+        .root_source_file = b.path("examples/audio/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    b.getInstallStep().dependOn(audio.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
     add_example_steps(b, "-data", "the data textures", data);
     add_example_steps(b, "-wave", "the wave views", wave);
     add_example_steps(b, "-fx", "the offscreen effects", fx);
-    add_test_steps(b, library, .{ rack, column, live, data, wave, fx });
+    add_example_steps(b, "-audio", "the audio meters and scope", audio);
+    add_test_steps(b, library, .{ rack, column, live, data, wave, fx, audio });
     add_compare_step(b, library);
 }
 
@@ -434,7 +444,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [6]AppSteps,
+    examples: [7]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
@@ -471,6 +481,10 @@ fn add_test_steps(
             .path = "test/contract_frozen_time.zig",
             .expected = "contract_frozen_time.Frozen: reads time but does not declare " ++
                 "`animated = true`",
+        },
+        .{
+            .path = "test/contract_audio_without_sink.zig",
+            .expected = "App declares `Audio` but is missing `pub fn audio`",
         },
     };
     for (contracts) |case| {
