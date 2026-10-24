@@ -93,9 +93,11 @@
 //!
 //! ## 9. Profiling (Bench Mode)
 //! With `Options.profile` (the native host's `--bench`, see `bench.zig`) the backend:
-//! - requests `TimestampQuery` when the adapter has it, attaches `timestampWrites` (indices 0
-//!   and 1) to every pass, resolves them after the pass, copies them to a map-read buffer,
-//!   and blocks on `wgpuDevicePoll` after present to read `pass_ns`. Blocking removes CPU and
+//! - requests `TimestampQuery` when the adapter has it, attaches `timestampWrites` to each of
+//!   the frame's first `pass_cap` passes (pass `i` writes `2i` and `2i + 1`; the offscreen
+//!   targets' passes come before the main one), resolves them after the frame, copies them to
+//!   a map-read buffer, and blocks on `wgpuDevicePoll` after present to read `pass_ns` (every
+//!   pass and the copy) and `passes_ns` (each pass). Blocking removes CPU and
 //!   GPU overlap, so profiled frames time the pass, not the pipeline;
 //! - adds `copy_src` to the surface usage, so `request_frame_image` can copy the next frame's
 //!   swapchain texture into a 256-byte-aligned buffer, mapped until `release_frame_image`;
@@ -794,6 +796,7 @@ extern fn wgpuQueueSubmit(
     commands: [*]const CommandBuffer,
 ) void;
 extern fn wgpuTextureViewRelease(view: TextureView) void;
+extern fn wgpuBindGroupRelease(group: BindGroup) void;
 extern fn wgpuTextureRelease(texture: Texture) void;
 extern fn wgpuCommandEncoderRelease(encoder: CommandEncoder) void;
 extern fn wgpuCommandBufferRelease(buffer: CommandBuffer) void;
@@ -827,9 +830,14 @@ const alpha_blend: BlendState = .{
     },
     .alpha = .{
         .operation = blend_add,
-        .src_factor = blend_src_alpha,
+        .src_factor = blend_one,
         .dst_factor = blend_one_minus_src_alpha,
     },
+};
+
+const premultiplied_blend: BlendState = .{
+    .color = .{ .operation = blend_add, .src_factor = blend_one, .dst_factor = blend_one_minus_src_alpha },
+    .alpha = .{ .operation = blend_add, .src_factor = blend_one, .dst_factor = blend_one_minus_src_alpha },
 };
 
 /// Keeps the target's alpha: the additive and multiply modes change color only.
@@ -909,13 +917,13 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gp
 
 /// Per-frame handles between the first op that opens the encoder and the present. All null
 /// outside a frame. `texture` and `view` are the surface's; a pass on a render target uses
-/// the target's own view. `timed_pass` and `timed_copy` say which timestamps bench mode wrote.
+/// the target's own view. `timed_passes` and `timed_copy` say which timestamps bench mode wrote.
 const Frame = struct {
     texture: ?Texture,
     view: ?TextureView,
     encoder: ?CommandEncoder,
     pass: ?RenderPassEncoder,
-    timed_pass: bool,
+    timed_passes: u32,
     timed_copy: bool,
 
     const empty: Frame = .{
@@ -923,7 +931,7 @@ const Frame = struct {
         .view = null,
         .encoder = null,
         .pass = null,
-        .timed_pass = false,
+        .timed_passes = 0,
         .timed_copy = false,
     };
 
@@ -1174,6 +1182,7 @@ fn pipeline_create(self: *Gpu, p: commands.PipelineCreate) void {
             .alpha => &alpha_blend,
             .additive => &additive_blend,
             .multiply => &multiply_blend,
+            .premultiplied => &premultiplied_blend,
         },
         .write_mask = color_write_all,
     };
@@ -1308,6 +1317,12 @@ fn address_of(address: commands.Address) u32 {
 }
 
 fn bind_group_create(self: *Gpu, p: commands.BindGroupCreate) void {
+    assert(p.replace <= 1);
+    if (p.replace == 1) {
+        const old = get(BindGroup, "bind_group_create", &self.bind_groups, p.id);
+        wgpuBindGroupRelease(old);
+        self.bind_groups[p.id] = null;
+    }
     claim(BindGroup, "bind_group_create", &self.bind_groups, p.id);
     assert(p.entry_count <= commands.bind_group_entry_cap);
     const layout = get(BindGroupLayout, "bind_group_create", &self.layouts, p.layout);
@@ -1406,15 +1421,15 @@ fn pass_begin(self: *Gpu, p: commands.PassBegin, frame: *Frame) !void {
         .clear_value = .{ .r = p.clear[0], .g = p.clear[1], .b = p.clear[2], .a = p.clear[3] },
     };
     var writes: PassTimestampWrites = undefined;
-    const timed = self.profile.query != null and !frame.timed_pass;
+    const timed = self.profile.query != null and frame.timed_passes < pass_cap;
     if (timed) {
         writes = .{
             .next_in_chain = null,
             .query_set = self.profile.query.?,
-            .begin_index = 0,
-            .end_index = 1,
+            .begin_index = 2 * frame.timed_passes,
+            .end_index = 2 * frame.timed_passes + 1,
         };
-        frame.timed_pass = true;
+        frame.timed_passes += 1;
     }
     const descriptor: RenderPassDescriptor = .{
         .next_in_chain = null,
@@ -1467,7 +1482,7 @@ fn present_copy(self: *Gpu, p: commands.PresentCopy, frame: *Frame) !void {
     try acquire_surface(self, size[0], size[1], frame);
     const encoder = open_encoder(self, frame);
     const timed = self.profile.inside_encoders;
-    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 2);
+    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 2 * pass_cap);
     const from: TexelCopyTextureInfo = .{
         .texture = source,
         .mip_level = 0,
@@ -1482,7 +1497,7 @@ fn present_copy(self: *Gpu, p: commands.PresentCopy, frame: *Frame) !void {
     };
     const extent: Extent3D = .{ .width = size[0], .height = size[1], .depth_or_array_layers = 1 };
     wgpuCommandEncoderCopyTextureToTexture(encoder, &from, &to, &extent);
-    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 3);
+    if (timed) wgpuCommandEncoderWriteTimestamp(encoder, self.profile.query.?, 2 * pass_cap + 1);
     frame.timed_copy = timed;
     submit_present(self, frame);
 }
@@ -2050,9 +2065,13 @@ const buffer_usage_copy_src: Flags = 0x0000000000000004;
 const buffer_usage_query_resolve: Flags = 0x0000000000000200;
 const map_mode_read: Flags = 0x0000000000000001;
 const map_status_success: u32 = 0x00000001;
-/// Four timestamps of 8 bytes each: the pass's beginning and end, then the copy's.
-const timestamp_count: u32 = 4;
-const timestamp_bytes: u64 = timestamp_count * 8;
+/// Passes timed per frame: every offscreen target's and the main one.
+pub const pass_cap: u32 = 1 + @import("../draw/textures.zig").target_cap;
+/// Two timestamps per pass, then two around the copy.
+const timestamp_count: u32 = 2 * pass_cap + 2;
+/// The copy's pair is resolved at this offset (a resolve offset is a multiple of 256).
+const copy_resolve_offset: u64 = 256;
+const timestamp_bytes: u64 = copy_resolve_offset + 2 * 8;
 /// `wgpuCommandEncoderCopyTextureToBuffer` needs rows aligned to 256 bytes.
 const copy_row_align: u32 = 256;
 const adapter_name_cap: u32 = 96;
@@ -2068,6 +2087,9 @@ const Profile = struct {
     read: ?Buffer,
     period_ns: f32,
     pass_ns: ?u64,
+    /// Each timed pass of the last frame, in recording order.
+    passes_ns: [pass_cap]u64,
+    pass_count: u32,
     image_requested: bool,
     image: ?Buffer,
     image_width: u32,
@@ -2152,13 +2174,14 @@ fn profile_record(self: *Gpu, encoder: CommandEncoder, frame: *const Frame) void
     const target = frame.texture.?;
     if (profile.query) |query| {
         // Only queries this frame wrote: resolving one never written waits on it forever on
-        // Vulkan, which loses the device. The pass writes 0 and 1, the copy 2 and 3; both
-        // land at offset 0 of the resolve buffer (its offset must be a multiple of 256).
-        const first: u32 = if (frame.timed_pass) 0 else 2;
-        const count: u32 = 2 * (@as(u32, @intFromBool(frame.timed_pass)) +
-            @intFromBool(frame.timed_copy));
-        if (count != 0) {
-            wgpuCommandEncoderResolveQuerySet(encoder, query, first, count, profile.resolve.?, 0);
+        // Vulkan, which loses the device. The passes' pairs land at offset 0, the copy's at
+        // `copy_resolve_offset` (a resolve offset must be a multiple of 256).
+        const passes = 2 * frame.timed_passes;
+        if (passes != 0) wgpuCommandEncoderResolveQuerySet(encoder, query, 0, passes, profile.resolve.?, 0);
+        if (frame.timed_copy) {
+            wgpuCommandEncoderResolveQuerySet(encoder, query, 2 * pass_cap, 2, profile.resolve.?, copy_resolve_offset);
+        }
+        if (passes != 0 or frame.timed_copy) {
             wgpuCommandEncoderCopyBufferToBuffer(
                 encoder,
                 profile.resolve.?,
@@ -2208,12 +2231,17 @@ fn profile_read(self: *Gpu, frame: *const Frame) void {
     if (profile.read) |read| {
         if (map_blocking(self, read, timestamp_bytes)) {
             const range = wgpuBufferGetConstMappedRange(read, 0, timestamp_bytes).?;
-            const stamps: *const [timestamp_count]u64 = @ptrCast(@alignCast(range));
-            // Resolved from offset 0: the pass's pair first when it ran (`profile_record`).
+            const stamps: *const [timestamp_bytes / 8]u64 = @ptrCast(@alignCast(range));
+            // The passes' pairs from offset 0, the copy's at `copy_resolve_offset`.
             var ticks: u64 = 0;
-            if (frame.timed_pass) ticks += stamps[1] -% stamps[0];
+            profile.pass_count = frame.timed_passes;
+            for (0..frame.timed_passes) |pass| {
+                const pass_ticks = stamps[2 * pass + 1] -% stamps[2 * pass];
+                profile.passes_ns[pass] = @intFromFloat(@as(f64, @floatFromInt(pass_ticks)) * profile.period_ns);
+                ticks += pass_ticks;
+            }
             if (frame.timed_copy) {
-                const at: u32 = if (frame.timed_pass) 2 else 0;
+                const at = copy_resolve_offset / 8;
                 ticks += stamps[at + 1] -% stamps[at];
             }
             const ns = @as(f64, @floatFromInt(ticks)) * profile.period_ns;
@@ -2264,6 +2292,13 @@ fn map_ready(
 
 /// The render pass time of the last presented frame, null outside bench mode or without
 /// the timestamp feature.
+/// Each timed pass of the last profiled frame, in recording order: the offscreen targets'
+/// passes first, then the main one.
+pub fn profile_passes_ns(self: *const Gpu) []const u64 {
+    assert(self.profile.pass_count <= pass_cap);
+    return self.profile.passes_ns[0..self.profile.pass_count];
+}
+
 pub fn profile_pass_ns(self: *const Gpu) ?u64 {
     if (!self.profile.enabled) assert(self.profile.pass_ns == null);
     return self.profile.pass_ns;

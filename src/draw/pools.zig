@@ -89,6 +89,14 @@ pub const Layer = enum(u8) {
     _,
 };
 
+/// A layer drawn into an offscreen target this frame (`Context.offscreen`): its target and the
+/// logical rect the target covers (x, y, width, height).
+pub const Binding = struct {
+    layer: u8,
+    target: textures.TextureId,
+    rect: [4]f32,
+};
+
 /// One draw call: `count` instances of type `type_id` starting at `first` in its pool.
 pub const Batch = struct {
     type_id: u8,
@@ -181,6 +189,9 @@ pub fn Context(
         point_count: u32,
         /// Moves on every `reset`, `reserve_points`, and `release_points`.
         point_revision: u64,
+        /// The layers drawn into offscreen targets this frame (`offscreen`), in call order.
+        bindings: [textures.target_cap]Binding,
+        binding_count: u32,
 
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
@@ -224,8 +235,41 @@ pub fn Context(
             self.appearance_count = 0;
             self.batch_count = 0;
             self.finalized = false;
+            self.binding_count = 0;
             assert(self.appearance_count == 0);
             assert(self.layer_now == .base);
+        }
+
+        /// Draws `layer` into the offscreen `target` this frame, covering the logical `rect`
+        /// (x, y, width, height): its instances render in the target's pass, not the main
+        /// pass (`draw/fx.zig`). Not the base layer, one target per layer and one layer per
+        /// target. `reset` clears every binding.
+        pub fn offscreen(self: *Self, layer_value: Layer, target: textures.TextureId, rect: [4]f32) void {
+            const layer_index: u8 = @backingInt(layer_value);
+            assert(layer_index != @backingInt(Layer.base));
+            assert(layer_index < layer_count);
+            assert(self.textures.is_target(target));
+            assert(rect[2] > 0 and rect[3] > 0);
+            assert(self.binding_count < textures.target_cap);
+            for (self.bindings[0..self.binding_count]) |binding| {
+                assert(binding.layer != layer_index);
+                assert(binding.target != target);
+            }
+            self.bindings[self.binding_count] = .{ .layer = layer_index, .target = target, .rect = rect };
+            self.binding_count += 1;
+        }
+
+        /// The binding of `layer_index` this frame, or null when it draws to the main pass.
+        pub fn binding_of(self: *const Self, layer_index: u8) ?Binding {
+            for (self.bindings[0..self.binding_count]) |binding| {
+                if (binding.layer == layer_index) return binding;
+            }
+            return null;
+        }
+
+        /// This frame's offscreen bindings.
+        pub fn binding_list(self: *const Self) []const Binding {
+            return self.bindings[0..self.binding_count];
         }
 
         /// Sets the layer later appends go to and returns the previous one, so a widget can

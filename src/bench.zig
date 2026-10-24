@@ -59,6 +59,7 @@ const input = @import("input.zig");
 const areas = @import("ui/areas.zig");
 const ui = @import("ui.zig");
 const renderer = @import("draw/renderer.zig");
+const textures = @import("draw/textures.zig");
 
 /// Most steps in one `setup` or `cycle` list.
 pub const steps_max: u32 = 256;
@@ -467,6 +468,10 @@ pub const Sample = struct {
     /// The renderer folded the instances into tiles; false when it repeated the last frame's
     /// (`draw/renderer.zig`, section 4b).
     hashed: bool,
+    /// Offscreen target passes the frame rendered (`draw/renderer.zig`, section 4c), and each
+    /// one's GPU time in recording order (meaningful below `targets`, with timestamps).
+    targets: u32 = 0,
+    target_ns: [textures.target_cap]u64 = @splat(0),
 };
 
 pub const Summary = struct {

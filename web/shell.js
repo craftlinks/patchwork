@@ -135,7 +135,7 @@ const BLEND_TABLE = {
     none: undefined,
     alpha: {
         color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-        alpha: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
     },
     additive: {
         color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
@@ -144,6 +144,10 @@ const BLEND_TABLE = {
     multiply: {
         color: { srcFactor: "dst", dstFactor: "zero", operation: "add" },
         alpha: KEEP_ALPHA,
+    },
+    premultiplied: {
+        color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
     },
 };
 const LAYOUT_ENTRY_TABLE = {
@@ -334,6 +338,11 @@ const OPS = {
             return { binding: entry.binding, resource: BIND_RESOURCE_TABLE[kind](entry.resource) };
         });
         const group = device.createBindGroup({ layout: layout.layout, entries });
+        // `replace` swaps the group an offscreen target's resize made stale.
+        if (p.replace === 1) {
+            lookup("bind_group", p.id, "bind_group_create");
+            resources.bind_group[p.id] = undefined;
+        }
         store("bind_group", p.id, group, "bind_group_create");
     },
     buffer_write(p) {

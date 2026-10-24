@@ -169,9 +169,11 @@ patchwork/
 │   ├── data/                   # Data textures, samplers, and blending
 │   │   ├── app.zig             # Data App: float textures, sampling modes, additive and multiply
 │   │   └── views.zig           # Its draw types: Heat, Shade, Tile, Bars, Light
-│   └── wave/                   # Waveforms and spectra
-│       ├── app.zig             # Wave App: overview, zoomable sample view, DJ waveform, spectrogram
-│       └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
+│   ├── wave/                   # Waveforms and spectra
+│   │   ├── app.zig             # Wave App: overview, zoomable sample view, DJ waveform, spectrogram
+│   │   └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
+│   └── fx/                     # Offscreen effects
+│       └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
 ├── tools/
 │   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
@@ -216,8 +218,13 @@ zig build run-wave        # Build and run the wave views natively
 zig build wasm-wave       # Compile them to zig-out/bin/wave.wasm
 zig build serve-wave      # Serve them on localhost (prints the address)
 
+# Examples (Offscreen Effects)
+zig build run-fx          # Build and run the offscreen effects natively
+zig build wasm-fx         # Compile them to zig-out/bin/fx.wasm
+zig build serve-fx        # Serve them on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the five examples
+zig build test            # Run unit tests across the library and the six examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # and a type that reads time without declaring `animated`
 
@@ -238,10 +245,10 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```text
 zig-out/
 ├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
-│   data, wave
+│   data, wave, fx
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
 │   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
-│   wave.wasm                   #   and `zig build wasm-wave`
+│   wave.wasm, fx.wasm          #   `zig build wasm-wave`, and `zig build wasm-fx`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -598,6 +605,20 @@ overview seeks. Scenarios: `still`, `play`, `zoom`. At 2856 by 2514 a playing ti
 about 37 microseconds of CPU and a cached GPU frame (0.13 to 0.4 ms on the RTX 3060, 1.7 ms
 on the UHD 770); the paused screen is bitwise identical natively and in Chromium.
 
+### 6. Offscreen Effects (`examples/fx/app.zig`)
+
+A phosphor scope and a panel faded two ways, at fixed positions. The scope is a feedback
+target: each frame its layer draws the target's last frame at 0.88 (less a 1.5/255 bias, so
+8-bit trails reach black) and then a Lissajous trace; a horizontal blur of it into a second
+target and a vertical blur out with `cover = 0` add a glow. The "one layer" panel is drawn
+into a single target and composited at the chosen opacity; the "per instance" panel scales
+every instance's alpha, so its overlaps stand out. Clicks step the opacity, Space pauses
+the scope (it decays for 44 frames, then the screen sleeps). The scope's clock is drawn
+frames, so its pictures are deterministic. At 2856 by 2514 the scope target costs about
+11 microseconds of GPU and the glow blur 20 on the RTX 3060 (0.11 and 0.48 ms on the UHD
+770), 2.5 MB in all; the panel's target never re-renders when only its opacity changes.
+Natively and in Chromium the faded screen is bitwise identical.
+
 ## Bench Mode
 
 `src/bench.zig` and the native host measure frames on request; without `--bench` nothing of
@@ -633,7 +654,9 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   `high_performance`; it works without `--bench` too. `--no-cache` turns the pixel cache off.
 - **Frame kinds.** The report counts measured frames by what the renderer recorded (skipped,
   copied, cached, full, direct); a skipped frame's GPU time is 0, and a cached frame's includes
-  the copy to the surface when the adapter supports timestamps inside encoders.
+  the copy to the surface when the adapter supports timestamps inside encoders. `gpu pass` is
+  every pass of the frame plus the copy; `gpu target i` is the frame's i-th offscreen target
+  pass, and the report ends with each target's device size and memory.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
   timed passes (`window.patchworkBench` holds the last). No scenarios or dumps.
 
@@ -780,6 +803,16 @@ adds its own (the rack's `Led`).
   up its own column: O(columns) upload, no loop, no texture. `wave.Pyramid(samples_max)`
   builds min, max, and sum-of-squares levels from 64-sample blocks so any zoom fills its
   columns in O(columns). Choose a column count that divides the device width.
+- **Offscreen targets.** `textures.create_target(.single | .feedback)` reserves a target, and
+  `cx.draw.offscreen(layer, target, rect)` sends that layer's instances, this frame, into
+  the target's own pass, recorded before the main pass in layer order, at the rect's device
+  pixels. `draw.fx.composite` (opacity, cover, bias) and `draw.fx.blur` (separable Gaussian,
+  up to 16 taps a side) sample targets with the `premultiplied` blend; `cover = 0` adds
+  light. A single target re-renders only when its layer's content key changes and keeps its
+  pixels otherwise; a feedback target renders every frame it is bound and, on its own layer,
+  reads its last frame. A rendered target's revision dirties the tiles of everything that
+  samples it. At most four targets; `Blend.alpha` writes premultiplied alpha, so a target
+  holds correct coverage.
 - **Rings.** `draw.TextureRing(format, width, height)` is a ring texture's CPU mirror:
   `push` writes a column at `head`, `flush` (once per draw) queues the pending columns as one
   strided write (two when they wrap). `draw.Ring(format, Color)` shows it oldest-first with

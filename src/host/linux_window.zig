@@ -148,6 +148,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("../animator.zig");
+const textures = @import("../draw/textures.zig");
 const app_contract = @import("../app.zig");
 const commands = @import("../gpu/commands.zig");
 const frame = @import("../frame.zig");
@@ -869,6 +870,7 @@ fn Host(comptime App: type) type {
             if (bench_run.count == 0) return;
             bench_report_kinds();
             bench_report_rows();
+            bench_report_targets();
             bench_report_types(state);
         }
 
@@ -956,6 +958,52 @@ fn Host(comptime App: type) type {
             }
         }
 
+        /// The GPU time of each offscreen target pass of the frame just submitted: the profiled
+        /// passes before the main one (`gpu_wgpu.zig`, section 9).
+        fn bench_target_ns(state: *State) [textures.target_cap]u64 {
+            var out: [textures.target_cap]u64 = @splat(0);
+            const passes = gpu.native.profile_passes_ns(&state.gpu);
+            const count = @min(render.rendered, passes.len);
+            for (passes[0..count], out[0..count]) |ns, *slot| slot.* = ns;
+            return out;
+        }
+
+        /// One GPU row per offscreen target index any measured frame rendered, then each
+        /// target's device size and memory (`draw/renderer.zig`, section 4c).
+        fn bench_report_targets() void {
+            for (0..textures.target_cap) |index| {
+                var count: u32 = 0;
+                for (bench_samples[0..bench_run.count]) |*sample| {
+                    if (sample.targets <= index or sample.gpu_ns == null) continue;
+                    bench_values[count] = sample.target_ns[index];
+                    count += 1;
+                }
+                if (count == 0) continue;
+                const summary = bench.summarize(bench_values[0..count]);
+                std.debug.print("gpu target {d} {d:>9.1} {d:>9.1} {d:>9.1} {d:>9.1} {d:>9.1}   ({d} frames)\n", .{
+                    index,
+                    microseconds(summary.min),
+                    microseconds(summary.p10),
+                    microseconds(summary.p50),
+                    microseconds(summary.p90),
+                    microseconds(summary.max),
+                    count,
+                });
+            }
+            for (render.targets[0..render.target_count], 0..) |target, index| {
+                if (!target.ready) continue;
+                const buffers: u64 = if (target.kind == .feedback) 2 else 1;
+                const bytes = buffers * target.device.width * target.device.height * 4;
+                std.debug.print("target {d}: {s} {d}x{d} px, {d} KiB\n", .{
+                    index,
+                    @tagName(target.kind),
+                    target.device.width,
+                    target.device.height,
+                    bytes / 1024,
+                });
+            }
+        }
+
         /// One metric of a sample in nanoseconds: draw, finalize, record, submit, the CPU sum
         /// of the first three, and the GPU pass (null without timestamps).
         fn bench_metric(sample: *const bench.Sample, metric: u32) ?u64 {
@@ -1039,6 +1087,8 @@ fn Host(comptime App: type) type {
                 .drew = bench_run.drew,
                 .kind = render.last,
                 .hashed = render.hashed,
+                .targets = render.rendered,
+                .target_ns = if (presents or render.rendered != 0) bench_target_ns(state) else @splat(0),
             });
             state.frame.mark_presented();
             assert(!state.frame.redraw);
