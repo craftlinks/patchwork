@@ -51,6 +51,7 @@ const input = @import("input.zig");
 pub const turtle = @import("ui/turtle.zig");
 pub const areas = @import("ui/areas.zig");
 pub const view = @import("ui/view.zig");
+pub const canvas = @import("ui/canvas.zig");
 pub const cx = @import("ui/cx.zig");
 pub const edit = @import("ui/edit.zig");
 
@@ -71,6 +72,7 @@ pub const Hit = cx.Hit;
 pub const Press = cx.Press;
 pub const Up = cx.Up;
 pub const ViewState = view.ViewState;
+pub const CanvasState = canvas.CanvasState;
 pub const List = view.List;
 pub const zero_inset = turtle.zero_inset;
 
@@ -139,6 +141,7 @@ test {
     _ = turtle;
     _ = areas;
     _ = view;
+    _ = canvas;
     _ = cx;
     _ = edit;
 }

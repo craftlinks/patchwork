@@ -23,6 +23,14 @@
 //! `raster_q` that fits, and the quad is stretched by `size_q / raster_q`. A glyph without
 //! ink is an entry with zero width that takes no atlas space.
 //!
+//! ## 2a. Zoom
+//! Inside a canvas (`ui/cx.zig`) text is placed in world pixels and drawn through a view at a
+//! zoom. `zoom` is the canvas's glyph zoom, a rung of the zoom ladder (`ui/canvas.zig`), and 1
+//! elsewhere. `device_scale` (`scale_120 / 120 * zoom`) is what placement snaps to, and
+//! `size_key_of(size)` keys `size * zoom`, so a canvas at rung `q` rasterizes and snaps exactly as
+//! unzoomed text at `q` times the size would. Multiplying by 1 is exact, so text outside a
+//! canvas keys and snaps bit for bit as before.
+//!
 //! ## 3. Frame Protocol
 //! ```text
 //! begin_frame   (Context.reset)  reset the table and shelves if `reset_owed`; zero the
@@ -64,6 +72,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const raster = @import("raster.zig");
+const text = @import("../text.zig");
 const textures = @import("../draw/textures.zig");
 const ttf = @import("ttf.zig");
 
@@ -109,6 +118,8 @@ pub const Cache = struct {
     shelf_height: u32,
     /// Display scale for this frame's draw, in 1/120 units. The host sets it.
     scale_120: u32,
+    /// The glyph zoom of the open canvas (section 2a), 1 outside one.
+    zoom: f32,
     /// `scale_120` at the last `begin_frame`; 0 before the first.
     drawn_scale_120: u32,
     /// Glyphs rasterized since `begin_frame`.
@@ -130,6 +141,7 @@ pub const Cache = struct {
     pub fn init(self: *Cache) void {
         self.clear_table();
         self.scale_120 = 120;
+        self.zoom = 1;
         self.drawn_scale_120 = 0;
         self.new_count = 0;
         self.pending = 0;
@@ -140,6 +152,20 @@ pub const Cache = struct {
         self.dirty = null;
         assert(self.entry_count == 0);
         assert(!self.reset_owed);
+    }
+
+    /// Device pixels per logical (or, in a canvas, world) pixel of text drawn now:
+    /// `scale_120 / 120 * zoom` (section 2a).
+    pub fn device_scale(self: *const Cache) f32 {
+        assert(self.scale_120 >= 1);
+        assert(self.zoom > 0);
+        return @as(f32, @floatFromInt(self.scale_120)) / 120 * self.zoom;
+    }
+
+    /// The size key of an em of `size` pixels drawn now: `size * zoom` at the frame's scale.
+    pub fn size_key_of(self: *const Cache, size: f32) u32 {
+        assert(self.zoom > 0);
+        return text.size_key(size * self.zoom, self.scale_120);
     }
 
     /// Starts a frame's draw: resets if owed, zeroes the per-frame counters, and records the
@@ -429,7 +455,6 @@ comptime {
 }
 
 const testing = std.testing;
-const text = @import("../text.zig");
 
 /// The static cache the tests share; each test starts with `init`.
 const fixture = struct {

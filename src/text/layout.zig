@@ -24,7 +24,8 @@
 //! width replaces `width` in the alignment. If not even the ellipsis fits, nothing is drawn.
 //!
 //! ## 3. Device Snapping
-//! With `s = scale_120 / 120` and the cache entry's raster pixel box (`left`, `top`, `width`,
+//! With `s = cx.text.device_scale()` (`scale_120 / 120`, times the glyph zoom inside a canvas,
+//! `text/cache.zig` section 2a) and the cache entry's raster pixel box (`left`, `top`, `width`,
 //! `height`, rasterized at `raster_q`; `k = size_q / raster_q`, 1 unless the glyph was clamped):
 //! ```text
 //! x_dev = round(pen_x * s) + left * k         y_dev = round(baseline * s) - top * k
@@ -161,7 +162,7 @@ pub fn place_runs(
             if (!cut.?.fits) return;
         }
     }
-    const scale = @as(f32, @floatFromInt(cx.text.scale_120)) / 120;
+    const scale = cx.text.device_scale();
     const pen: Pen = .{
         .x = rect.x + offset(options.align_x, rect.width - width),
         .baseline_px = @round(
@@ -241,7 +242,7 @@ fn emit_runs(cx: anytype, runs: []const text.Run, start: Pen, clip: draw.Clip, c
     var pen = start;
     for (runs, 0..) |run, run_index| {
         const font = text.font_of(run.style.face);
-        const size_q = text.size_key(run.style.size, cx.text.scale_120);
+        const size_q = cx.text.size_key_of(run.style.size);
         var index: u32 = 0;
         while (index < run.bytes.len) {
             if (cut) |c| {

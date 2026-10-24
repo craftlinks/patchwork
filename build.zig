@@ -389,8 +389,17 @@ pub fn build(b: *std.Build) void {
     add_example_steps(b, "-data", "the data textures", data);
     add_example_steps(b, "-wave", "the wave views", wave);
     add_example_steps(b, "-fx", "the offscreen effects", fx);
+    const canvas = addApp(b, b, .{
+        .name = "canvas",
+        .root_source_file = b.path("examples/canvas/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    b.getInstallStep().dependOn(canvas.install);
     add_example_steps(b, "-audio", "the audio meters and scope", audio);
-    add_test_steps(b, library, .{ rack, column, live, data, wave, fx, audio });
+    add_example_steps(b, "-canvas", "the pan and zoom canvas", canvas);
+    add_test_steps(b, library, .{ rack, column, live, data, wave, fx, audio, canvas });
     add_compare_step(b, library);
 }
 
@@ -444,7 +453,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [7]AppSteps,
+    examples: [8]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

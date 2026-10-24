@@ -16,7 +16,7 @@
 //! safe builds check it with `Stamps` (section 5).
 //!
 //! ## 3. The Record
-//! `Area` is 56 bytes: `id`, `rect` and `clip` as `[4]f32` (`clip` exclusive-max like an
+//! `Area` is 64 bytes: `id`, `rect` and `clip` as `[4]f32` (`clip` exclusive-max like an
 //! instance's), the corner `radius` of the rounded hit shape, the draw `layer` it was
 //! recorded on, `flags`, and the point range `first_point`, `point_count` of a path area.
 //! `flags` are `wheel` (the area takes wheel input), `focusable` (a left press focuses it and
@@ -32,6 +32,14 @@
 //! and the rect contain it and `draw.path.distance_to_polyline` is at most `radius`; only
 //! path areas whose rect contains the point measure the polyline. The points are those of
 //! the frame that recorded the area, which is the frame events resolve against.
+//!
+//! ## 3a. Areas in a Canvas
+//! An area recorded inside a canvas (`ui/cx.zig`, section 3a) is mapped to the screen when it
+//! is recorded: `rect`, `clip`, and `radius` through the canvas's view, so resolution, capture,
+//! and `Press.rect` stay in screen pixels. `zoom` is the view's zoom (1 outside a canvas): a
+//! path area's points stay in world pixels, so `contains` measures the polyline at
+//! `(point - origin) / zoom` against `radius / zoom`, where the origin `rect.xy + radius` is
+//! the path origin mapped.
 //!
 //! ## 4. Resolution
 //! `resolve` scans the areas once from last to first. The hot area is the topmost: the
@@ -110,6 +118,10 @@ pub const Area = extern struct {
     /// A path area's points in the point pool; `point_count == 0` for a box area.
     first_point: u32,
     point_count: u32,
+    /// Screen pixels per world pixel of the canvas it was recorded in, 1 outside one: a path
+    /// area's points are in world pixels (section 3a).
+    zoom: f32 = 1,
+    pad1: u32 = 0,
 };
 
 /// What `resolve` found under a point: indices into the area slice, or null.
@@ -123,7 +135,8 @@ const fnv_prime: u64 = 0x100000001b3;
 const golden: u64 = 0x9e3779b97f4a7c15;
 
 comptime {
-    assert(@sizeOf(Area) == 56);
+    assert(@sizeOf(Area) == 64);
+    assert(@offsetOf(Area, "zoom") == 56);
     assert(@offsetOf(Area, "first_point") == 48);
     assert(@offsetOf(Area, "rect") == 8);
     assert(@offsetOf(Area, "clip") == 24);
@@ -184,7 +197,11 @@ pub fn contains(area: *const Area, points: []const draw.Point, x: f32, y: f32) b
     const shape = points[area.first_point..][0..area.point_count];
     const origin_x = rect[0] + area.radius;
     const origin_y = rect[1] + area.radius;
-    return draw.path.distance_to_polyline(shape, x - origin_x, y - origin_y) <= area.radius;
+    // In world pixels inside a canvas (section 3a); dividing by 1 elsewhere is exact.
+    assert(area.zoom > 0);
+    const dx = (x - origin_x) / area.zoom;
+    const dy = (y - origin_y) / area.zoom;
+    return draw.path.distance_to_polyline(shape, dx, dy) <= area.radius / area.zoom;
 }
 
 /// The hot area and the wheel target under `(x, y)`; `points` are the point pool path areas
@@ -366,6 +383,14 @@ test "a path area hits near its polyline only" {
     try testing.expect(contains(&path, &points, 70, 20));
     try testing.expect(contains(&path, &points, 70, 24.5));
     try testing.expect(!contains(&path, &points, 70, 25.5));
+    // The same path recorded in a canvas at zoom 2 from (50, 40) (section 3a): every point
+    // maps to `(50 + 2x, 40 + 2y)` and hits exactly where its world point did.
+    var mapped = path;
+    mapped.rect = .{ 50 + 2 * 15, 40 + 2 * 15, 2 * 110, 2 * 70 };
+    mapped.radius = 2 * 5;
+    mapped.zoom = 2;
+    try testing.expect(contains(&mapped, &points, 50 + 2 * 70, 40 + 2 * 24.5));
+    try testing.expect(!contains(&mapped, &points, 50 + 2 * 70, 40 + 2 * 25.5));
     try testing.expect(contains(&path, &points, 124, 60));
     try testing.expect(!contains(&path, &points, 40, 70));
     const areas = [_]Area{ test_area(id("knob", 0), 0, 0, true), path };

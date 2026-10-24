@@ -105,6 +105,7 @@ patchwork/
 │   ├── ui/areas.zig            # Id, Area, the hit resolve scan, duplicate-id stamps
 │   ├── ui/cx.zig               # UI Context: draw context, turtle stack, areas, hover, capture
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
+│   ├── ui/canvas.zig           # Pan/zoom canvases: CanvasState, the zoom ladder, wheel and drag
 │   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
 │   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle,
 │   │                           #   TextField)
@@ -180,8 +181,10 @@ patchwork/
 │   │   └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
 │   ├── fx/                     # Offscreen effects
 │   │   └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
-│   └── audio/                  # Audio data into the UI
-│       └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
+│   ├── audio/                  # Audio data into the UI
+│   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
+│   └── canvas/                 # Pan and zoom
+│       └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
 ├── tools/
 │   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
@@ -238,8 +241,13 @@ zig build run-audio       # Build and run the audio meters and scope natively (s
 zig build wasm-audio      # Compile them to zig-out/bin/audio.wasm
 zig build serve-audio     # Serve them on localhost; Space plays the tone (audible)
 
+# Examples (Pan and Zoom Canvas)
+zig build run-canvas      # Build and run the module canvas natively
+zig build wasm-canvas     # Compile it to zig-out/bin/canvas.wasm
+zig build serve-canvas    # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the seven examples
+zig build test            # Run unit tests across the library and the eight examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, and an
                           # `Audio` source without `audio`
@@ -261,11 +269,12 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```text
 zig-out/
 ├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
-│   data, wave, fx, audio
+│   data, wave, fx, audio,
+│   canvas
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
 │   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
 │   wave.wasm, fx.wasm,         #   `zig build wasm-wave`, `zig build wasm-fx`,
-│   audio.wasm                  #   and `zig build wasm-audio`
+│   audio.wasm, canvas.wasm     #   `zig build wasm-audio`, and `zig build wasm-canvas`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -649,6 +658,44 @@ the UI thread, so dumps are deterministic). At 2856 by 2514 a playing frame cost
 microseconds of CPU on the RTX 3060 (41 on the UHD 770) plus 1.6 microseconds per block to
 render the tone and 0.4 to drain it; the never-started screen is bitwise identical natively
 and in Chromium.
+
+### 8. Pan and Zoom Canvas (`examples/canvas/app.zig`)
+
+A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, and a knob
+with its value) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
+rung (2^(1/4)) about the pointer from 25% to 400%, dragging the background pans, pressing a
+module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
+center, and `0` resets. Modules and cables are culled in world pixels, below 50% a module is
+its face and header, and text below a 6-pixel on-screen em is not placed, so the zoomed-out
+canvas (408 modules visible) places no glyphs. The status line shows the zoom, the offset,
+the visible modules and cables, and the glyph cache's epoch, which a full zoom sweep leaves
+at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), and `zoomed`
+(three rungs in and five steps right, for the browser compare).
+
+## Pan and Zoom
+
+A canvas draws content in world pixels through a view, `screen = (x, y) + zoom * world`
+(`src/ui/canvas.zig`, `src/ui/cx.zig` section 3a):
+- **Per-layer views.** `cx.begin_canvas(id, walk, layout, *CanvasState, layers)` gives each of
+  its 1 to 4 layers this frame's view (`draw.Context.view`). The renderer draws a viewed layer
+  with its own frame uniform whose projection is the window's times the view
+  (`draw.view_ortho`), so no record, shader, or op changes: distance fields are evaluated in
+  world pixels and `coverage` keeps edges one device pixel wide at any zoom. A pan writes that
+  uniform (256 bytes) and whatever entered or left the culled set.
+- **World inside, screen outside.** Inside a canvas the clip, the turtle (a root over the
+  visible world rect), and `cx.visible` are in world pixels, so culling is the usual cull
+  test. Areas are mapped to the screen when recorded (`Area.zoom` keeps a path area's
+  polyline in world pixels), so hit testing, capture, and `Press.rect` need no inverse;
+  `CanvasState.to_world` maps the pointer back for moving content. `cx.begin_at(rect,
+  layout)` places a container at a fixed rect outside its parent's flow (free placement).
+- **Zoom ladder.** 17 rungs `2^(k/4)` from 0.25 to 4. The wheel moves one rung about the
+  pointer; the offset is snapped to device pixels when drawn. Glyphs rasterize at the rung
+  nearest the zoom (`text.Cache.zoom`), so the cache holds at most one size per rung, text is
+  pixel-exact on every rung, and a full sweep fits the atlas without a reset.
+- **Pixel cache.** A viewed batch maps its bounds through the view and folds the view into
+  its key, so a pan or zoom dirties exactly the canvas's tiles; a still canvas is skipped or
+  cached like anything else.
+- **Paths.** `draw.path.cubic` flattens by the on-screen length (`view_zoom`).
 
 ## Audio Data
 
