@@ -35,6 +35,15 @@
 //! (`Context.shift` in `draw/pools.zig`); a type that stored an absolute coordinate elsewhere
 //! would be left behind.
 //!
+//! ## 2b. Animated Types
+//! A type may declare `pub const animated: bool`. An animated type may read the frame
+//! uniform's time slot (`frame.time`, `time_seconds()`, `time_pulse(hz)`; prelude guide,
+//! section 6), so its pixels change with no record change. The renderer repaints its tiles every
+//! frame and keeps the host presenting while one is on screen (`draw/renderer.zig`, section
+//! 4b). A type that does not declare it but names any of those in its `pixel` or `vertex` fails
+//! `check`: the pixel cache would otherwise keep its first frame forever. The search is
+//! textual, so a comment that names them counts too.
+//!
 //! ## 2a. The Vertex Contract
 //! By default a type's quad is its `rect`: the shared `vs_main` places the unit quad's corner
 //! `unit` (in [0, 1]^2) at `rect.xy + unit * rect.zw`. A type may instead declare
@@ -140,6 +149,12 @@ pub fn check(comptime T: type) ?[]const u8 {
         if (@hasDecl(T, "vertex")) {
             if (@TypeOf(T.vertex) != []const u8) return name ++ ": `vertex` must be []const u8";
         }
+        if (@hasDecl(T, "animated")) {
+            if (@TypeOf(T.animated) != bool) return name ++ ": `animated` must be bool";
+        }
+        if (!animated(T) and reads_time(T)) {
+            return name ++ ": reads time but does not declare `animated = true`";
+        }
         return null;
     }
 }
@@ -160,6 +175,28 @@ fn field_problem(comptime T: type, comptime name: []const u8, comptime F: type) 
 pub fn reads_points(comptime T: type) bool {
     if (comptime !@hasDecl(T, "reads_points")) return false;
     return comptime T.reads_points;
+}
+
+/// True when `T` declares `animated = true` (module guide, section 2b).
+pub fn animated(comptime T: type) bool {
+    if (comptime !@hasDecl(T, "animated")) return false;
+    return comptime T.animated;
+}
+
+/// Names in WGSL that read the time slot (prelude guide, section 6).
+const time_names = [_][]const u8{ "frame.time", "time_seconds(", "time_pulse(" };
+
+/// True when `T`'s own WGSL names the time slot or a helper that reads it.
+fn reads_time(comptime T: type) bool {
+    comptime {
+        const vertex_len = if (@hasDecl(T, "vertex")) T.vertex.len else 0;
+        @setEvalBranchQuota(1000 + 64 * time_names.len * (T.pixel.len + vertex_len));
+        for (time_names) |needle| {
+            if (std.mem.find(u8, T.pixel, needle) != null) return true;
+            if (@hasDecl(T, "vertex") and std.mem.find(u8, T.vertex, needle) != null) return true;
+        }
+        return false;
+    }
 }
 
 /// Null when `entries` is a valid registry, otherwise the first problem. Pure, so `app.zig`
@@ -212,6 +249,20 @@ pub fn Registry(comptime entries: []const DrawType) type {
         pub const uses_points: bool = blk: {
             var out = false;
             for (entries) |entry| out = out or reads_points(entry.type);
+            break :blk out;
+        };
+
+        /// True for an animated type, by id (module guide, section 2b).
+        pub const animates: [count]bool = blk: {
+            var out: [count]bool = undefined;
+            for (entries, 0..) |entry, index| out[index] = animated(entry.type);
+            break :blk out;
+        };
+
+        /// True when some registered type is animated.
+        pub const any_animated: bool = blk: {
+            var out = false;
+            for (entries) |entry| out = out or animated(entry.type);
             break :blk out;
         };
 
@@ -428,6 +479,41 @@ const BadVertex = extern struct {
     pub const vertex = 1;
 };
 
+const Pulsing = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const animated = true;
+    pub const pixel: []const u8 =
+        \\fn pixel(px: Pixel) -> vec4<f32> {
+        \\    return vec4<f32>(time_pulse(1.0));
+        \\}
+    ;
+};
+
+const Frozen = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+    pub const vertex: []const u8 =
+        \\fn vertex(px: Pixel, unit: vec2<f32>) -> vec2<f32> {
+        \\    return unit * px.size * frame.time.x;
+        \\}
+    ;
+};
+
+const BadAnimated = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+    pub const animated = 1;
+};
+
 const NoClip = extern struct {
     rect: [4]f32,
     tint: [4]f32,
@@ -477,6 +563,22 @@ test "vertex_local is the rect quad or the type's own vertex" {
     try testing.expect(std.mem.find(u8, plain, "vertex_local(instance, unit)") != null);
     const bad = comptime check(BadVertex).?;
     try testing.expect(std.mem.find(u8, bad, "`vertex` must be []const u8") != null);
+}
+
+// Locks the animated declaration (section 2b): an animated type may read time, a type that
+// reads time in its vertex without declaring it is rejected, and a mistyped one is named.
+test "only an animated type may read time" {
+    try testing.expect(comptime check(Pulsing) == null);
+    try testing.expect(comptime animated(Pulsing));
+    try testing.expect(comptime !animated(Probe));
+    const frozen = comptime check(Frozen).?;
+    try testing.expect(std.mem.find(u8, frozen, "Frozen: reads time") != null);
+    const bad = comptime check(BadAnimated).?;
+    try testing.expect(std.mem.find(u8, bad, "`animated` must be bool") != null);
+    const Both = Registry(&.{ .{ .type = Probe, .cap = 4 }, .{ .type = Pulsing, .cap = 4 } });
+    try testing.expectEqual([2]bool{ false, true }, Both.animates);
+    try testing.expect(Both.any_animated);
+    try testing.expect(!Registry(&.{.{ .type = Probe, .cap = 4 }}).any_animated);
 }
 
 // Locks the negative space of the convention: each violation is named with the type.

@@ -55,8 +55,8 @@
 //! logical pixels to device pixels at a fractional scale".
 //!
 //! ## 4. Uniform Size
-//! The frame uniform holds the projection matrix followed by `theme.Theme`; `uniform_bytes`
-//! is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
+//! The frame uniform holds the projection matrix, the time slot (`time_offset`, read by
+//! animated draw types), and `theme.Theme`; `uniform_bytes` is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
 //! offsets to be multiples of the `minUniformBufferOffsetAlignment` limit (WebGPU "Limits"
 //! table, default 256). The buffer size is kept a multiple of that limit so the record stays
 //! valid if it is ever bound at an offset. `draw/renderer.zig` owns the record and its uploads.
@@ -149,8 +149,18 @@ pub const matrix_bytes: u32 = 64;
 /// WebGPU `minUniformBufferOffsetAlignment` default (WebGPU "Limits" table).
 const min_uniform_offset_alignment: u32 = 256;
 
-/// Byte size of the frame uniform: the projection matrix followed by `theme.Theme`. Asserted to
-/// equal `matrix_bytes + theme.bytes` and to be a multiple of `min_uniform_offset_alignment`.
+/// Byte size of the frame uniform's time slot, one `vec4<f32>` whose `x` is the animation time
+/// in seconds (`animator.Time`).
+pub const time_bytes: u32 = 16;
+
+/// Offset of the time slot: right after the projection, so it does not move with the theme.
+pub const time_offset: u32 = matrix_bytes;
+
+/// Offset of `theme.Theme` in the frame uniform.
+pub const theme_offset: u32 = time_offset + time_bytes;
+
+/// Byte size of the frame uniform: the projection matrix, the time slot, and `theme.Theme`.
+/// Asserted to equal their sum and to be a multiple of `min_uniform_offset_alignment`.
 pub const uniform_bytes: u32 = 256;
 
 /// Two triangles covering the unit square, as flat `[x, y]` pairs drawn as a triangle list
@@ -227,13 +237,15 @@ comptime {
     assert(quad_bytes == @sizeOf(@TypeOf(unit_quad)));
     assert(unit_quad.len == 2 * vertex_count);
     assert(matrix_bytes == @sizeOf([16]f32));
-    assert(theme.bytes + matrix_bytes == uniform_bytes);
+    assert(matrix_bytes + time_bytes + theme.bytes == uniform_bytes);
+    assert(theme_offset + theme.bytes == uniform_bytes);
     assert(uniform_bytes % min_uniform_offset_alignment == 0);
     // The relations above hold for any consistent change; these pin the values the hosts
     // and the tests rely on, so changing one without the others fails the build.
     assert(quad_bytes == 48);
     assert(vertex_count == 6);
     assert(matrix_bytes == 64);
+    assert(time_offset == 64);
     assert(uniform_bytes == 256);
     // Layout geometry is four packed `f32`s, so a `Rect` copies like one instance field.
     assert(@sizeOf(Rect) == 16);

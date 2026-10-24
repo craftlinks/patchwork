@@ -38,9 +38,10 @@
 // There is no unconditional `requestAnimationFrame` loop; an idle UI should not burn power.
 // - Every Wasm entry point that can dirty the frame returns a flag, and `schedule()` runs
 //   only when it is 1.
-// - `tick` (the rAF callback) returns 1 while an animator is live or a redraw is still owed
-//   (the glyph cache finishes skipped glyphs on the next frame), so the rAF chain ends when
-//   the scene settles and is restarted by input or the app timer.
+// - `tick` (the rAF callback) returns 1 while an animator is live, an animated draw type is
+//   on screen, or a redraw is still owed (the glyph cache finishes skipped glyphs on the next
+//   frame), so the rAF chain ends when the scene settles and is restarted by input or the app
+//   timer.
 // - `sync_timer` keeps one interval of `wasm.timer_period_ms()` set exactly while
 //   `wasm.timer_on()` is 1. It runs wherever `sync_cursor` runs, in the interval callback,
 //   and after `start`, so an app that stops its timer stops waking the page. The timer

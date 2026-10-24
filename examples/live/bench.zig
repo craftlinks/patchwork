@@ -13,6 +13,8 @@
 //!   whose 64 bound literals draw a curve each across the screen.
 //! - `idle` presents frames in which nothing changed: with the pixel cache on, every one is
 //!   skipped (no pass, no present, only the frame callback's commit natively).
+//! - `pulse` arms record while paused and measures the animation-only frames its glow keeps
+//!   presenting: no `App.draw`, a 16-byte time write, and the glow's tiles repainted.
 //!
 //! ## 2. Setup
 //! Each setup waits a few frames first, so the glyph cache has rasterized what the first
@@ -26,6 +28,7 @@ const settle_frames: u32 = 5;
 const measured_frames: u32 = 300;
 
 const play = bench.area("transport", 1);
+const record = bench.area("transport", 2);
 const editor = bench.area("editor", 0);
 
 /// A point on the editor's thirteenth line (21 px lines), past the line numbers.
@@ -42,6 +45,12 @@ pub const scenarios = [_]bench.Scenario{
     .{
         .name = "idle",
         .setup = &.{settle},
+        .cycle = &.{.{ .wait = 1 }},
+        .frames = measured_frames,
+    },
+    .{
+        .name = "pulse",
+        .setup = &.{ settle, .{ .click = record }, settle },
         .cycle = &.{.{ .wait = 1 }},
         .frames = measured_frames,
     },

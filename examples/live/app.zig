@@ -51,7 +51,10 @@
 //! `lanes.zig` holds the semantics. `config.timer_period_ms` is 33 and `timer_armed` false:
 //! play starts the host timer (`cx.set_timer`), pause stops it, so a paused screen sleeps.
 //! Each lane plots its ring against the binding's `[lo, hi]` anchored at the lane rect
-//! (`path.polyline_at`), and one Box on layer 2 is the playhead.
+//! (`path.polyline_at`), and one Box on layer 2 is the playhead. While record is armed, a
+//! `Glow` (`glow.zig`, an animated draw type) breathes around the record icon at
+//! `record_glow_hz` from the frame's time, playing or not; armed and paused, frames repaint
+//! only the glow's tiles and run no `App.draw`. Disarmed and paused, nothing animates.
 //!
 //! ## 6. Texts
 //! F1 loads `patch.lpg` (embedded), F2 a generated stress text of 2,000 lines: 50 lines of
@@ -83,6 +86,7 @@ const knob = @import("knob.zig");
 const shaper = @import("shaper.zig");
 const lanes = @import("lanes.zig");
 const icon = @import("icon.zig");
+const glow = @import("glow.zig");
 const live_bench = @import("bench.zig");
 
 const Rect = quads.Rect;
@@ -155,6 +159,9 @@ const transport_gap_px: f32 = 8;
 const transport_color: [4]f32 = .{ 0.80, 0.82, 0.85, 1 };
 const record_color: [4]f32 = .{ 0.95, 0.30, 0.30, 1 };
 const record_idle_color: [4]f32 = .{ 0.55, 0.35, 0.35, 1 };
+/// The armed record glow: the record color at partial alpha, one breath per second.
+const record_glow_color: [4]f32 = .{ 0.95, 0.30, 0.30, 0.9 };
+const record_glow_hz: f32 = 1;
 const lane_fill: [4]f32 = .{ 1, 1, 1, 0.03 };
 const playhead_color: [4]f32 = .{ 0.95, 0.95, 0.90, 0.85 };
 const playhead_px: f32 = 1.5;
@@ -218,6 +225,8 @@ const point_need: u32 = binding_cap * lanes.sample_count +
     bindings.shape_cap * shaper.sample_count + binding_cap * quads.path.cubic_points_max;
 const point_cap: u32 = 24_576;
 const icon_cap: u32 = transport_count + 1;
+/// The armed record button's glow.
+const glow_cap: u32 = 1;
 /// The editor's area, view, and thumb; the column view and thumb; every knob; the transport;
 /// the bpm field.
 const area_cap: u32 = 3 + 2 + binding_cap + inline_knob_cap + transport_count + 1;
@@ -336,6 +345,7 @@ pub const App = struct {
             .{ .type = quads.Arc, .cap = arc_cap },
             .{ .type = quads.Path, .cap = path_cap },
             .{ .type = icon.Icon, .cap = icon_cap },
+            .{ .type = glow.Glow, .cap = glow_cap },
         },
         .batch_cap = 16,
         .area_cap = area_cap,
@@ -856,23 +866,16 @@ pub const App = struct {
     fn draw_transport(app: *App, cx: *Context, band: Rect, clip: Clip) void {
         const play: icon.Shape = if (app.transport.playing) .pause else .play;
         const shapes = [transport_count]icon.Shape{ .back, play, .record };
+        // Before the icons, so the glow's batch draws under them (section 5).
+        if (app.transport.recording and cx.visible(transport_hit(band, 2)) != null) {
+            const face = transport_face(transport_hit(band, 2));
+            append_glow(cx, glow.around(face, record_glow_color, record_glow_hz, clip));
+        }
         for (shapes, transport_ids, 0..) |shape, id, index| {
-            const step = transport_hit_px + transport_gap_px;
-            const hit: Rect = .{
-                .x = band.x + transport_left_px + @as(f32, @floatFromInt(index)) * step,
-                .y = band.y + (band_px - transport_hit_px) * 0.5,
-                .width = transport_hit_px,
-                .height = transport_hit_px,
-            };
+            const hit = transport_hit(band, @intCast(index));
             if (cx.visible(hit) == null) continue;
             cx.area(id, hit, 4, transport_flags);
-            const inset = (transport_hit_px - transport_icon_px) * 0.5;
-            const face: Rect = .{
-                .x = hit.x + inset,
-                .y = hit.y + inset,
-                .width = transport_icon_px,
-                .height = transport_icon_px,
-            };
+            const face = transport_face(hit);
             var color = transport_color;
             if (shape == .record) {
                 color = if (app.transport.recording) record_color else record_idle_color;
@@ -1229,6 +1232,36 @@ fn push_box(cx: *Context, rect: Rect, clip: Clip, fill: [4]f32) void {
         .hover = 0,
         .down = 0,
     }) catch |err| switch (err) {
+        error.PoolFull, error.BatchFull => {},
+        error.EdgeNotPositive, error.ClipUnordered => unreachable,
+    };
+}
+
+/// The hit rect of transport button `index` in `band`.
+fn transport_hit(band: Rect, index: u32) Rect {
+    assert(index < transport_count);
+    const step = transport_hit_px + transport_gap_px;
+    return .{
+        .x = band.x + transport_left_px + @as(f32, @floatFromInt(index)) * step,
+        .y = band.y + (band_px - transport_hit_px) * 0.5,
+        .width = transport_hit_px,
+        .height = transport_hit_px,
+    };
+}
+
+/// The icon face centered in a transport hit rect.
+fn transport_face(hit: Rect) Rect {
+    const inset = (transport_hit_px - transport_icon_px) * 0.5;
+    return .{
+        .x = hit.x + inset,
+        .y = hit.y + inset,
+        .width = transport_icon_px,
+        .height = transport_icon_px,
+    };
+}
+
+fn append_glow(cx: *Context, instance: glow.Glow) void {
+    cx.append(glow.Glow, null, instance) catch |err| switch (err) {
         error.PoolFull, error.BatchFull => {},
         error.EdgeNotPositive, error.ClipUnordered => unreachable,
     };
@@ -1667,7 +1700,7 @@ test "the transport gates the timer and the ring wraps" {
 // Locks the bench scenarios against this screen without a GPU (`patchwork.bench`, section
 // 2a): the typing scenario's targets resolve, its click focuses the editor, and an even number
 // of cycle steps leaves the stress text as loaded; the transport scenario starts the timer and
-// then has no step of its own to run.
+// then has no step of its own to run; the pulse scenario arms record and leaves the timer off.
 test "the bench scenarios replay headless" {
     const bench = patchwork.bench;
     const size: [2]u32 = .{ 1280, 720 };
@@ -1685,6 +1718,12 @@ test "the bench scenarios replay headless" {
     try std.testing.expectEqual(@as(u32, 11), played);
     try std.testing.expect(cx.timer_on);
     try std.testing.expect(app.transport.playing);
+    app = new_app();
+    const pulse = bench.find(App.scenarios, "pulse").?;
+    const pulsed = try bench.replay_headless(App, app, cx, pulse, size, 20);
+    try std.testing.expectEqual(@as(u32, 20), pulsed);
+    try std.testing.expect(app.transport.recording);
+    try std.testing.expect(!cx.timer_on);
 }
 
 // Locks the bpm field: Enter after typing 130 rewrites `bpm := 121` as one undo entry;
@@ -1734,11 +1773,11 @@ const fixture_gpu = struct {
 };
 
 /// Pool order in `config.draw`, plus the point buffer last.
-const Upload = enum(u8) { box, glyph, arc, path, icon, points };
+const Upload = enum(u8) { box, glyph, arc, path, icon, glow, points };
 
 /// Draws when owed and records one 1280 by 720 frame at scale 1; returns the bytes the
 /// stream's buffer writes carry per `Upload`.
-fn record(app: *App) [6]u64 {
+fn record(app: *App) [7]u64 {
     const cx = &fixture.context;
     _ = ui.draw_frame(App, app, cx, 1280, 720, 120);
     assert(cx.draw.overflow_count == 0);
@@ -1749,10 +1788,10 @@ fn record(app: *App) [6]u64 {
         .width_px = 1280,
         .height_px = 720,
         .scale_120 = 120,
-    });
+    }, 0);
     var writes: [16]patchwork.commands.BufferWrite = undefined;
     const resources = &fixture_gpu.renderer.resources;
-    var bytes: [6]u64 = @splat(0);
+    var bytes: [7]u64 = @splat(0);
     for (patchwork.renderer.writes(&fixture_gpu.buffer, &writes)) |write| {
         for (resources.instance_buffers, 0..) |id, index| {
             if (write.id == id) bytes[index] += write.data.len;
@@ -1782,16 +1821,16 @@ test "uploads of a scrolled frame and a typed key" {
     app.editor.view.scroll_y = 960 * 21;
     _ = record(app);
     fixture.context.redraw();
-    try std.testing.expectEqual([6]u64{ 0, 0, 0, 0, 0, 0 }, record(app));
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 0, 0, 0 }, record(app));
     _ = send(app, .{ .wheel = .{ .x = 600, .y = 400, .dx = 0, .dy = 21 } });
     const scrolled = record(app);
-    try std.testing.expectEqual([6]u64{ 3_280, 125_120, 0, 0, 0, 0 }, scrolled);
+    try std.testing.expectEqual([7]u64{ 3_280, 125_120, 0, 0, 0, 0, 0 }, scrolled);
     click(app, 49.5 + 4 * 9, 40 + 4 + 10.5 + 20 * 21);
     _ = record(app);
     _ = key(app, .other, .none, "q");
     const typed = record(app);
     try std.testing.expectEqual(@as(u32, 981), app.editor.caret_position()[0]);
-    try std.testing.expectEqual([6]u64{ 2_320, 69_952, 0, 0, 0, 0 }, typed);
+    try std.testing.expectEqual([7]u64{ 2_320, 69_952, 0, 0, 0, 0, 0 }, typed);
 }
 
 // Locks the transport's uploads on the patch at 1280 by 720: an idle redraw writes nothing;
@@ -1804,23 +1843,81 @@ test "transport ticks upload the playhead and one recorded point" {
     start_gpu();
     _ = record(app);
     fixture.context.redraw();
-    try std.testing.expectEqual([6]u64{ 0, 0, 0, 0, 0, 0 }, record(app));
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 0, 0, 0 }, record(app));
     const cx = &fixture.context;
     app.transport.playing = true;
     cx.set_timer(true);
     cx.redraw();
-    try std.testing.expectEqual([6]u64{ 0, 0, 0, 0, 64, 0 }, record(app));
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 64, 0, 0 }, record(app));
     App.timer(app, cx, 0);
-    try std.testing.expectEqual([6]u64{ 80, 0, 0, 0, 0, 0 }, record(app));
+    try std.testing.expectEqual([7]u64{ 80, 0, 0, 0, 0, 0, 0 }, record(app));
     const center = ring_center(4);
     _ = send(app, .{ .wheel = .{ .x = center[0], .y = center[1], .dx = 0, .dy = -12 } });
     _ = send(app, .{ .pointer_leave = {} });
     _ = record(app);
     app.transport.recording = true;
     cx.redraw();
-    try std.testing.expectEqual([6]u64{ 0, 0, 0, 0, 64, 0 }, record(app));
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 64, 64, 0 }, record(app));
     App.timer(app, cx, 0);
-    try std.testing.expectEqual([6]u64{ 80, 0, 0, 80, 0, 8 }, record(app));
+    try std.testing.expectEqual([7]u64{ 80, 0, 0, 80, 0, 0, 8 }, record(app));
+}
+
+// Locks the record glow (section 5): arming record while paused draws one glow, centered on
+// the record icon and under it, and the next undrawn frame is an animation-only frame (no
+// pool write, a 16-byte time write, cached, not hashed); disarming drops the glow, and the
+// frame after that is skipped with nothing animating, so the paused screen sleeps.
+test "an armed record glows from time and a disarmed one sleeps" {
+    const app = new_app();
+    start_gpu();
+    _ = record(app);
+    const cx = &fixture.context;
+    try std.testing.expect(!fixture_gpu.renderer.animating);
+    const armed = cx.find(transport_ids[2]).?.rect;
+    click(app, armed[0] + 4, armed[1] + 4);
+    try std.testing.expect(app.transport.recording);
+    try std.testing.expect(!cx.timer_on);
+    try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 64, 64, 0 }, record(app));
+    const glows = cx.draw.items(glow.Glow);
+    try std.testing.expectEqual(@as(usize, 1), glows.len);
+    try std.testing.expectEqual(armed[0] + 5 - glow.spread_px, glows[0].rect[0]);
+    try std.testing.expectEqual(transport_icon_px + 2 * glow.spread_px, glows[0].rect[2]);
+    try std.testing.expect(glow_batch_first(&cx.draw));
+    try std.testing.expect(fixture_gpu.renderer.animating);
+    try std.testing.expect(!cx.dirty);
+    const drew = ui.draw_frame(App, app, cx, 1280, 720, 120);
+    try std.testing.expect(!drew);
+    fixture_gpu.buffer.reset();
+    fixture_gpu.renderer.frame(&fixture_gpu.buffer, &cx.draw, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = 1280,
+        .height_px = 720,
+        .scale_120 = 120,
+    }, 0.25);
+    try std.testing.expect(!fixture_gpu.renderer.hashed);
+    try std.testing.expect(fixture_gpu.renderer.animating);
+    var writes: [4]patchwork.commands.BufferWrite = undefined;
+    const recorded = patchwork.renderer.writes(&fixture_gpu.buffer, &writes);
+    try std.testing.expectEqual(@as(usize, 1), recorded.len);
+    try std.testing.expectEqual(quads.time_offset, recorded[0].offset);
+    click(app, armed[0] + 4, armed[1] + 4);
+    try std.testing.expect(!app.transport.recording);
+    _ = record(app);
+    try std.testing.expectEqual(@as(usize, 0), cx.draw.items(glow.Glow).len);
+    try std.testing.expect(!fixture_gpu.renderer.animating);
+    _ = record(app);
+    try std.testing.expectEqual(patchwork.renderer.Kind.skipped, fixture_gpu.renderer.last);
+}
+
+/// True when the glow's batch comes before every icon batch, so it draws under the icons.
+fn glow_batch_first(draw_cx: *const Context.DrawContext) bool {
+    const glow_id = comptime Context.DrawContext.Registry.id(glow.Glow);
+    const icon_id = comptime Context.DrawContext.Registry.id(icon.Icon);
+    for (draw_cx.batch_list()) |batch| {
+        if (batch.type_id == glow_id) return true;
+        if (batch.type_id == icon_id) return false;
+    }
+    return false;
 }
 
 comptime {
@@ -1833,4 +1930,5 @@ test {
     _ = shaper;
     _ = lanes;
     _ = icon;
+    _ = glow;
 }
