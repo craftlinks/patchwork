@@ -62,8 +62,9 @@
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests and the native-only tests
 //!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
-//!   compiles an app with no `draw` and an app whose draw type is not a multiple of 16 bytes,
-//!   and passes only if the compiler rejects each with its expected message.
+//!   compiles an app with no `draw`, an app whose draw type is not a multiple of 16 bytes,
+//!   and an app whose draw type reads time without declaring `animated`, and passes only if
+//!   the compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm` compares two frame dumps (`tools/compare.zig`).
@@ -348,11 +349,20 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(rack.install);
     b.getInstallStep().dependOn(column.install);
+    const data = addApp(b, b, .{
+        .name = "data",
+        .root_source_file = b.path("examples/data/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
     b.getInstallStep().dependOn(live.install);
+    b.getInstallStep().dependOn(data.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
-    add_test_steps(b, library, .{ rack, column, live });
+    add_example_steps(b, "-data", "the data textures", data);
+    add_test_steps(b, library, .{ rack, column, live, data });
     add_compare_step(b, library);
 }
 
@@ -406,7 +416,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [3]AppSteps,
+    examples: [4]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

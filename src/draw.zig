@@ -119,6 +119,9 @@ pub const layer_count = pools.layer_count;
 pub const Textures = textures_module.Textures;
 pub const TextureId = textures_module.TextureId;
 pub const TextureFormat = textures_module.Format;
+pub const TextureSampling = textures_module.Sampling;
+/// How a draw type's output blends into the target (`draw/registry.zig`, section 2c).
+pub const Blend = @import("gpu/commands.zig").Blend;
 pub const TextureRegion = textures_module.Region;
 pub const AppendError = types.AppendError;
 pub const Box = types.Box;

@@ -40,8 +40,9 @@
 //   `clamp(0.5 - dist / max(fwidth(dist), 1e-5), 0, 1)`. Distances are in logical pixels.
 // - `clip_mask` is `step(x0, x) * step(y0, y) * step(x, x1) * step(y, y1)`; `step` makes the
 //   max edge inclusive even though the stored clip is exclusive-max.
-// - `pixel` returns straight (not premultiplied) RGBA; the host blends source-over on
-//   `src_alpha, one_minus_src_alpha`.
+// - `pixel` returns straight (not premultiplied) RGBA. `fs_main` applies the clip to alpha,
+//   then the type's generated `blend_out`, and the host blends by the type's `blend`
+//   (`draw/registry.zig`, section 2c): source-over by default, or additive or multiply.
 //
 // ## 5. Distance Fields
 // `sdf_box` and `sdf_arc` are twins of `draw.sdf_box` and `draw.sdf_arc`, whose CPU tests lock
@@ -75,7 +76,7 @@ fn vs_main(@location(0) unit: vec2<f32>, instance: Instance) -> Varyings {
 fn fs_main(varyings: Varyings) -> @location(0) vec4<f32> {
     let px = unpack(varyings);
     let color = pixel(px);
-    return vec4<f32>(color.rgb, color.a * clip_mask(px.pos, px.clip));
+    return blend_out(vec4<f32>(color.rgb, color.a * clip_mask(px.pos, px.clip)));
 }
 
 fn clip_mask(pos: vec2<f32>, clip: vec4<f32>) -> f32 {

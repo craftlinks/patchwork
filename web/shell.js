@@ -118,14 +118,32 @@ let pass = null;
 /** WebGPU vocabulary for the Zig payload enums, keyed by Zig tag name (guide, section 2). */
 const VERTEX_FORMAT_TABLE = { float32x2: "float32x2", float32x4: "float32x4" };
 const STEP_MODE_TABLE = { vertex: "vertex", instance: "instance" };
-const TEXTURE_FORMAT_TABLE = { r8unorm: "r8unorm", rgba8unorm: "rgba8unorm" };
+const TEXTURE_FORMAT_TABLE = {
+    r8unorm: "r8unorm",
+    rgba8unorm: "rgba8unorm",
+    r16float: "r16float",
+    rg16float: "rg16float",
+    r32float: "r32float",
+    rg32float: "rg32float",
+};
 const FILTER_TABLE = { nearest: "nearest", linear: "linear" };
+const ADDRESS_TABLE = { clamp: "clamp-to-edge", repeat: "repeat" };
 const LOAD_OP_TABLE = { clear: "clear", load: "load" };
+// The factors are documented on `commands.Blend`; additive and multiply keep the target alpha.
+const KEEP_ALPHA = { srcFactor: "zero", dstFactor: "one", operation: "add" };
 const BLEND_TABLE = {
     none: undefined,
     alpha: {
         color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
         alpha: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+    },
+    additive: {
+        color: { srcFactor: "src-alpha", dstFactor: "one", operation: "add" },
+        alpha: KEEP_ALPHA,
+    },
+    multiply: {
+        color: { srcFactor: "dst", dstFactor: "zero", operation: "add" },
+        alpha: KEEP_ALPHA,
     },
 };
 const LAYOUT_ENTRY_TABLE = {
@@ -133,12 +151,16 @@ const LAYOUT_ENTRY_TABLE = {
     storage_read: () => ({ buffer: { type: "read-only-storage" } }),
     texture: () => ({ texture: { sampleType: "float" } }),
     sampler: () => ({ sampler: { type: "filtering" } }),
+    texture_unfilterable: () => ({ texture: { sampleType: "unfilterable-float" } }),
+    sampler_non_filtering: () => ({ sampler: { type: "non-filtering" } }),
 };
 const BIND_RESOURCE_TABLE = {
     uniform: (id) => ({ buffer: lookup("buffer", id, "bind_group_create") }),
     storage_read: (id) => ({ buffer: lookup("buffer", id, "bind_group_create") }),
     texture: (id) => lookup("view", id, "bind_group_create"),
     sampler: (id) => lookup("sampler", id, "bind_group_create"),
+    texture_unfilterable: (id) => lookup("view", id, "bind_group_create"),
+    sampler_non_filtering: (id) => lookup("sampler", id, "bind_group_create"),
 };
 
 /**
@@ -295,8 +317,8 @@ const OPS = {
     sampler_create(p) {
         const filter = FILTER_TABLE[p.filter];
         const sampler = device.createSampler({
-            addressModeU: "clamp-to-edge",
-            addressModeV: "clamp-to-edge",
+            addressModeU: ADDRESS_TABLE[p.address_u],
+            addressModeV: ADDRESS_TABLE[p.address_v],
             magFilter: filter,
             minFilter: filter,
         });

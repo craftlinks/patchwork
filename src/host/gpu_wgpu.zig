@@ -238,8 +238,11 @@ const index_undefined: IndexFormat = 0x00000000;
 const front_ccw: FrontFace = 0x00000001;
 const cull_none: CullMode = 0x00000001;
 const blend_add: BlendOperation = 0x00000001;
+const blend_zero: BlendFactor = 0x00000001;
+const blend_one: BlendFactor = 0x00000002;
 const blend_src_alpha: BlendFactor = 0x00000005;
 const blend_one_minus_src_alpha: BlendFactor = 0x00000006;
+const blend_dst: BlendFactor = 0x00000007;
 const buffer_uniform: BufferBindingType = 0x00000002;
 const buffer_read_only_storage: BufferBindingType = 0x00000004;
 const error_type_no_error: u32 = 0x00000001;
@@ -247,18 +250,25 @@ const shader_vertex: Flags = 0x0000000000000001;
 const shader_fragment: Flags = 0x0000000000000002;
 const format_r8_unorm: TextureFormat = 0x00000001;
 const format_rgba8_unorm: TextureFormat = 0x00000016;
+const format_r16_float: TextureFormat = 0x00000009;
+const format_rg16_float: TextureFormat = 0x00000015;
+const format_r32_float: TextureFormat = 0x0000000E;
+const format_rg32_float: TextureFormat = 0x00000021;
 /// Texture `COPY_DST` is 0x2. Buffer `usage_copy_dst` is 0x8, which is texture `STORAGE_BINDING`.
 const texture_usage_copy_dst: TextureUsage = 0x0000000000000002;
 const texture_usage_copy_src: TextureUsage = 0x0000000000000001;
 const usage_texture_binding: TextureUsage = 0x0000000000000004;
 const dimension_2d: u32 = 0x00000002;
 const sample_float: u32 = 0x00000002;
+const sample_unfilterable_float: u32 = 0x00000003;
 const view_2d: u32 = 0x00000002;
 const address_clamp_to_edge: u32 = 0x00000001;
+const address_repeat: u32 = 0x00000002;
 const filter_nearest: u32 = 0x00000001;
 const filter_linear: u32 = 0x00000002;
 const mip_nearest: u32 = 0x00000001;
 const sampler_filtering: u32 = 0x00000002;
+const sampler_non_filtering: u32 = 0x00000003;
 const color_write_all: Flags = 0x000000000000000F;
 const whole_size: u64 = 0xFFFFFFFFFFFFFFFF;
 
@@ -808,6 +818,7 @@ comptime {
 
 const empty_label: StringView = .{ .data = null, .length = 0 };
 
+/// The blend states of `commands.Blend`, whose doc comment gives the factors.
 const alpha_blend: BlendState = .{
     .color = .{
         .operation = blend_add,
@@ -819,6 +830,23 @@ const alpha_blend: BlendState = .{
         .src_factor = blend_src_alpha,
         .dst_factor = blend_one_minus_src_alpha,
     },
+};
+
+/// Keeps the target's alpha: the additive and multiply modes change color only.
+const keep_alpha: BlendComponent = .{
+    .operation = blend_add,
+    .src_factor = blend_zero,
+    .dst_factor = blend_one,
+};
+
+const additive_blend: BlendState = .{
+    .color = .{ .operation = blend_add, .src_factor = blend_src_alpha, .dst_factor = blend_one },
+    .alpha = keep_alpha,
+};
+
+const multiply_blend: BlendState = .{
+    .color = .{ .operation = blend_add, .src_factor = blend_dst, .dst_factor = blend_zero },
+    .alpha = keep_alpha,
 };
 
 /// Longest error message kept by `uncaptured_error`; longer messages are truncated.
@@ -1073,7 +1101,12 @@ fn layout_create(self: *Gpu, p: commands.LayoutCreate) void {
                 out.texture.sample_type = sample_float;
                 out.texture.view_dimension = view_2d;
             },
+            .texture_unfilterable => {
+                out.texture.sample_type = sample_unfilterable_float;
+                out.texture.view_dimension = view_2d;
+            },
             .sampler => out.sampler.type = sampler_filtering,
+            .sampler_non_filtering => out.sampler.type = sampler_non_filtering,
         }
     }
     const descriptor: BindGroupLayoutDescriptor = .{
@@ -1139,6 +1172,8 @@ fn pipeline_create(self: *Gpu, p: commands.PipelineCreate) void {
         .blend = switch (p.blend) {
             .none => null,
             .alpha => &alpha_blend,
+            .additive => &additive_blend,
+            .multiply => &multiply_blend,
         },
         .write_mask = color_write_all,
     };
@@ -1221,6 +1256,10 @@ fn texture_create(self: *Gpu, p: commands.TextureCreate) !void {
         .format = switch (p.format) {
             .r8unorm => format_r8_unorm,
             .rgba8unorm => format_rgba8_unorm,
+            .r16float => format_r16_float,
+            .rg16float => format_rg16_float,
+            .r32float => format_r32_float,
+            .rg32float => format_rg32_float,
         },
         .mip_level_count = 1,
         .sample_count = 1,
@@ -1245,8 +1284,8 @@ fn sampler_create(self: *Gpu, p: commands.SamplerCreate) void {
     const descriptor: SamplerDescriptor = .{
         .next_in_chain = null,
         .label = empty_label,
-        .address_mode_u = address_clamp_to_edge,
-        .address_mode_v = address_clamp_to_edge,
+        .address_mode_u = address_of(p.address_u),
+        .address_mode_v = address_of(p.address_v),
         .address_mode_w = address_clamp_to_edge,
         .mag_filter = filter,
         .min_filter = filter,
@@ -1259,6 +1298,13 @@ fn sampler_create(self: *Gpu, p: commands.SamplerCreate) void {
     const sampler = wgpuDeviceCreateSampler(self.device, &descriptor);
     assert(@intFromPtr(sampler) != 0);
     self.samplers[p.id] = sampler;
+}
+
+fn address_of(address: commands.Address) u32 {
+    return switch (address) {
+        .clamp => address_clamp_to_edge,
+        .repeat => address_repeat,
+    };
 }
 
 fn bind_group_create(self: *Gpu, p: commands.BindGroupCreate) void {
@@ -1281,11 +1327,11 @@ fn bind_group_create(self: *Gpu, p: commands.BindGroupCreate) void {
             .uniform, .storage_read => {
                 out.buffer = get(Buffer, "bind_group_create", &self.buffers, entry.resource);
             },
-            .texture => {
+            .texture, .texture_unfilterable => {
                 const views = &self.views;
                 out.texture_view = get(TextureView, "bind_group_create", views, entry.resource);
             },
-            .sampler => {
+            .sampler, .sampler_non_filtering => {
                 out.sampler = get(Sampler, "bind_group_create", &self.samplers, entry.resource);
             },
         }
