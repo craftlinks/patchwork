@@ -166,9 +166,12 @@ patchwork/
 │   │   ├── glow.zig            # Its animated draw type: the armed record button's glow
 │   │   ├── bench.zig           # The live screen's bench scenarios
 │   │   └── patch.lpg           # The embedded patch the editor opens
-│   └── data/                   # Data textures, samplers, and blending
-│       ├── app.zig             # Data App: float textures, sampling modes, additive and multiply
-│       └── views.zig           # Its draw types: Heat, Shade, Tile, Bars, Light
+│   ├── data/                   # Data textures, samplers, and blending
+│   │   ├── app.zig             # Data App: float textures, sampling modes, additive and multiply
+│   │   └── views.zig           # Its draw types: Heat, Shade, Tile, Bars, Light
+│   └── wave/                   # Waveforms and spectra
+│       ├── app.zig             # Wave App: overview, zoomable sample view, DJ waveform, spectrogram
+│       └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
 ├── tools/
 │   └── compare.zig             # `zig build compare`: how two frame dumps differ
 ├── web/                        # Browser harness
@@ -208,8 +211,13 @@ zig build run-data        # Build and run the data textures screen natively
 zig build wasm-data       # Compile it to zig-out/bin/data.wasm
 zig build serve-data      # Serve it on localhost (prints the address)
 
+# Examples (Waveforms and Spectra)
+zig build run-wave        # Build and run the wave views natively
+zig build wasm-wave       # Compile them to zig-out/bin/wave.wasm
+zig build serve-wave      # Serve them on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the four examples
+zig build test            # Run unit tests across the library and the five examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # and a type that reads time without declaring `animated`
 
@@ -230,9 +238,10 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 ```text
 zig-out/
 ├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
-│   data
+│   data, wave
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
-│   live.wasm, data.wasm        #   `zig build wasm-live`, and `zig build wasm-data`
+│   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
+│   wave.wasm                   #   and `zig build wasm-wave`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -576,6 +585,19 @@ white. No input, no timer: it draws once and sleeps. Its `still` scenario dumps 
 Natively and in Chromium on the same GPU (RTX 3060) the four panels are bitwise identical;
 across the RTX 3060 and the UHD 770 they differ by at most 2/255 (filtering and blending).
 
+### 5. Waveforms and Spectra (`examples/wave/app.zig`)
+
+A 16-second synthetic track (kick, bass, hats, a swell; no asset) in four views at fixed
+positions: an overview of the whole track and a sample view with RMS, both `draw.Waveform`
+columns from a `wave.Pyramid`; a 3-band DJ waveform, `draw.Ring(.rgba8, ...)`; and a
+spectrogram of 128 log-spaced bins, `draw.Ring(.r16float, ...)`. Space plays and pauses (the
+timer runs only while playing); each 20 ms tick pushes one column into each ring, and the
+next draw flushes them: 4 bytes and 256 bytes per tick. The wheel zooms the sample view
+around the pointer, from the whole track to 1/8 sample per column, and a press on the
+overview seeks. Scenarios: `still`, `play`, `zoom`. At 2856 by 2514 a playing tick costs
+about 37 microseconds of CPU and a cached GPU frame (0.13 to 0.4 ms on the RTX 3060, 1.7 ms
+on the UHD 770); the paused screen is bitwise identical natively and in Chromium.
+
 ## Bench Mode
 
 `src/bench.zig` and the native host measure frames on request; without `--bench` nothing of
@@ -753,6 +775,16 @@ adds its own (the rack's `Led`).
   a registry without such a type has no point buffer.
 - **Animated.** A type that declares `pub const animated = true` may read the frame's time
   (see Animated Types).
+- **Waveforms.** `draw.wave.append(cx, rect, clip, columns, style)` writes one `(min, max)`
+  point per column (two with an RMS band) and one `draw.Waveform` quad, whose fragment looks
+  up its own column: O(columns) upload, no loop, no texture. `wave.Pyramid(samples_max)`
+  builds min, max, and sum-of-squares levels from 64-sample blocks so any zoom fills its
+  columns in O(columns). Choose a column count that divides the device width.
+- **Rings.** `draw.TextureRing(format, width, height)` is a ring texture's CPU mirror:
+  `push` writes a column at `head`, `flush` (once per draw) queues the pending columns as one
+  strided write (two when they wrap). `draw.Ring(format, Color)` shows it oldest-first with
+  `textureLoad`, interpolating rows by hand, and calls the app's `Color.wgsl`
+  `fn ring_color(value, px)`.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
   layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
   batch list refuses the instance and counts it in `cx.draw.overflow_count`.
