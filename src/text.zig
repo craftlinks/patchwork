@@ -19,8 +19,16 @@
 //! ## 2. Faces
 //! `Face.sans` is Noto Sans Regular, `Face.sans_bold` Noto Sans Bold, and `Face.mono` Noto
 //! Sans Mono Regular, all SIL OFL 1.1 (`text/fonts/OFL.txt`). Both targets `@embedFile` them
-//! from `text/fonts/`, so the browser needs no font fetch and a consumer project built with
-//! `addApp` gets them with the library.
+//! through the `patchwork_fonts` module, so the browser needs no font fetch and a consumer
+//! project built with `addApp` gets them with the library.
+//!
+//! ## 2a. Subsets
+//! The build subsets the three faces in `text/fonts/` to `AppOptions.font_ranges`
+//! (`text/subset.zig` through `tools/subset.zig`; by default Basic Latin, Latin-1, Latin
+//! Extended-A, and UI punctuation), and `patchwork_fonts` embeds the results, with the ranges
+//! and `subset`. Both targets get the same bytes, so native and browser draw the same. A
+//! codepoint outside the ranges maps to glyph 0 and draws `.notdef`, as an unmapped one
+//! always has; `font_ranges = null` embeds the full faces.
 //!
 //! ## 3. Units
 //! `Style.size` is the em size in logical pixels; `measure` and the pen advance in logical
@@ -29,7 +37,8 @@
 //!
 //! ## 4. Scope
 //! No kerning, shaping, ligatures, right-to-left, colour fonts, fallback chains, hinting, or
-//! subpixel antialiasing. A codepoint a face does not map draws its `.notdef` box.
+//! subpixel antialiasing. A codepoint a face does not map (or the subset dropped) draws its
+//! `.notdef` box.
 //!
 //! ## 5. TigerStyle Invariants
 //! - `byte_cap` bounds the bytes of one `place` or `place_runs` call, `run_cap` its runs.
@@ -60,11 +69,14 @@ pub const Face = enum(u8) {
     mono = 2,
 };
 
+/// The faces' bytes: the build's subsets of `text/fonts/` (section 2a).
+pub const font_data = @import("patchwork_fonts");
+
 /// The parsed faces, indexed by `Face`. Parsed at compile time.
 pub const fonts: [3]ttf.Font = .{
-    ttf.parse(@embedFile("text/fonts/NotoSans-Regular.ttf")),
-    ttf.parse(@embedFile("text/fonts/NotoSans-Bold.ttf")),
-    ttf.parse(@embedFile("text/fonts/NotoSansMono-Regular.ttf")),
+    ttf.parse(font_data.sans),
+    ttf.parse(font_data.sans_bold),
+    ttf.parse(font_data.mono),
 };
 
 /// How a run of text looks. `size` is the em size in logical pixels; `color` is straight
@@ -138,7 +150,32 @@ comptime {
 test {
     _ = ttf;
     _ = mono;
+    _ = @import("text/subset.zig");
     _ = raster;
     _ = cache;
     _ = layout;
+}
+
+// Locks the embedded faces (section 2a): the library's build embeds the default subsets, every
+// printable ASCII codepoint, the ellipsis `place` cuts with, the replacement character, and
+// "Jürgen Köhler · Café" (the live patch) map to inked or spacing glyphs, and a codepoint
+// outside the ranges (U+0416) draws `.notdef`.
+test "the embedded faces are the default subsets and cover the UI text" {
+    try std.testing.expect(font_data.subset);
+    try std.testing.expectEqual(@as(u21, 0x20), font_data.ranges[0][0]);
+    for (&fonts) |*font| {
+        try std.testing.expect(font.glyph_count < 400);
+        var codepoint: u21 = 0x20;
+        while (codepoint <= 0x7E) : (codepoint += 1) {
+            try std.testing.expect(ttf.glyph_id(font, codepoint) != 0);
+        }
+        const name = "Jürgen Köhler · Café";
+        var index: u32 = 0;
+        while (index < name.len) {
+            try std.testing.expect(ttf.glyph_id(font, layout.decode(name, &index)) != 0);
+        }
+        try std.testing.expect(ttf.glyph_id(font, layout.ellipsis_char) != 0);
+        try std.testing.expect(ttf.glyph_id(font, layout.replacement_char) != 0);
+        try std.testing.expectEqual(@as(u16, 0), ttf.glyph_id(font, 0x0416));
+    }
 }

@@ -68,8 +68,21 @@
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm` compares two frame dumps (`tools/compare.zig`).
+//!
+//! ## 6. Fonts
+//! `add_font_module(patchwork_builder, ranges)` builds `tools/subset.zig` for the host, runs it
+//! once per face in `src/text/fonts/` with `ranges` (`src/text/subset.zig`), and writes the
+//! three outputs beside a generated `fonts.zig` that embeds them: the `patchwork_fonts` module
+//! every library module imports. It has no target, so one module serves the native and wasm
+//! libraries, and the default ranges' module is made once per builder. Null ranges copy the
+//! full faces instead. The tool's runs are cached, so a build with unchanged faces and ranges
+//! runs it zero times.
 
 const std = @import("std");
+const subset = @import("src/text/subset.zig");
+
+/// The codepoints an app's faces cover unless it passes `font_ranges` (`src/text/subset.zig`).
+pub const default_font_ranges: []const [2]u21 = &subset.default_ranges;
 
 /// Options for `addApp`. `target` applies to the native executable and the tests, and
 /// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
@@ -82,6 +95,9 @@ pub const AppOptions = struct {
     optimize: std.lang.Optimize,
     /// Directory holding `libwgpu_native.so`. Null uses the `wgpu_native` package.
     wgpu_lib_dir: ?[]const u8 = null,
+    /// Codepoint ranges the embedded faces keep, on both targets (section 6). Null embeds
+    /// the full faces.
+    font_ranges: ?[]const [2]u21 = default_font_ranges,
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -109,8 +125,10 @@ pub fn addApp(
     options: AppOptions,
 ) AppSteps {
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const native_library = add_library_module(patchwork_builder, options.target, options.optimize);
-    const wasm_library = add_library_module(patchwork_builder, wasm_target, options.optimize);
+    const fonts = add_font_module(patchwork_builder, options.font_ranges);
+    const optimize = options.optimize;
+    const native_library = add_library_module(patchwork_builder, options.target, optimize, fonts);
+    const wasm_library = add_library_module(patchwork_builder, wasm_target, optimize, fonts);
     const native_app = add_app_module(b, options, options.target, native_library);
     const wasm_app = add_app_module(b, options, wasm_target, wasm_library);
 
@@ -153,12 +171,102 @@ fn add_library_module(
     patchwork_builder: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    fonts: *std.Build.Module,
 ) *std.Build.Module {
-    return patchwork_builder.createModule(.{
+    const module = patchwork_builder.createModule(.{
         .root_source_file = patchwork_builder.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    module.addImport("patchwork_fonts", fonts);
+    return module;
+}
+
+/// The faces in `src/text/fonts/`, by the name `patchwork_fonts` gives them.
+const faces = [_]struct { name: []const u8, source: []const u8 }{
+    .{ .name = "sans", .source = "src/text/fonts/NotoSans-Regular.ttf" },
+    .{ .name = "sans_bold", .source = "src/text/fonts/NotoSans-Bold.ttf" },
+    .{ .name = "mono", .source = "src/text/fonts/NotoSansMono-Regular.ttf" },
+};
+
+/// The default ranges' module, made once per Patchwork builder and shared by every app and
+/// both targets.
+var default_fonts: ?struct { builder: *std.Build, module: *std.Build.Module } = null;
+
+/// The generated `patchwork_fonts` module (section 6): the three faces subset to `ranges` by
+/// `tools/subset.zig` (or copied whole when `ranges` is null), and `fonts.zig`, which embeds
+/// them. It has no target of its own, so the native and wasm libraries share it.
+pub fn add_font_module(patchwork_builder: *std.Build, ranges: ?[]const [2]u21) *std.Build.Module {
+    const b = patchwork_builder;
+    const is_default = if (ranges) |list| list.ptr == default_font_ranges.ptr else false;
+    if (is_default) {
+        if (default_fonts) |made| {
+            if (made.builder == b) return made.module;
+        }
+    }
+    const files = b.addWriteFiles();
+    if (ranges) |list| {
+        const tool = b.addExecutable(.{
+            .name = "subset",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/subset.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+            }),
+        });
+        tool.root_module.addImport("subset", b.createModule(.{
+            .root_source_file = b.path("src/text/subset.zig"),
+        }));
+        const spec = ranges_arg(b, list);
+        for (faces) |face| {
+            const run = b.addRunArtifact(tool);
+            run.addFileArg(b.path(face.source));
+            const output = run.addOutputFileArg(b.fmt("{s}.ttf", .{face.name}));
+            run.addArg(spec);
+            _ = files.addCopyFile(output, b.fmt("{s}.ttf", .{face.name}));
+        }
+    } else {
+        for (faces) |face| {
+            _ = files.addCopyFile(b.path(face.source), b.fmt("{s}.ttf", .{face.name}));
+        }
+    }
+    _ = files.add("fonts.zig", fonts_source(b, ranges));
+    const root = files.getDirectory().path(b, "fonts.zig");
+    const module = b.createModule(.{ .root_source_file = root });
+    if (is_default) default_fonts = .{ .builder = b, .module = module };
+    return module;
+}
+
+/// `ranges` as the tool's argument: `20-7E,A0-FF,...` in hex.
+fn ranges_arg(b: *std.Build, ranges: []const [2]u21) []const u8 {
+    std.debug.assert(ranges.len >= 1);
+    var spec: []const u8 = "";
+    for (ranges, 0..) |range, index| {
+        const separator = if (index == 0) "" else ",";
+        spec = b.fmt("{s}{s}{X}-{X}", .{ spec, separator, range[0], range[1] });
+    }
+    return spec;
+}
+
+/// The generated `fonts.zig` of `patchwork_fonts`.
+fn fonts_source(b: *std.Build, ranges: ?[]const [2]u21) []const u8 {
+    const everything: []const [2]u21 = &.{.{ 0, 0x10FFFF }};
+    var list: []const u8 = "";
+    for (ranges orelse everything) |range| {
+        list = b.fmt("{s}    .{{ 0x{X}, 0x{X} }},\n", .{ list, range[0], range[1] });
+    }
+    return b.fmt(
+        \\//! Generated by Patchwork's `build.zig` (`add_font_module`): the faces `text.zig` embeds.
+        \\pub const sans = @embedFile("sans.ttf");
+        \\pub const sans_bold = @embedFile("sans_bold.ttf");
+        \\pub const mono = @embedFile("mono.ttf");
+        \\/// False when the faces are the full files.
+        \\pub const subset = {};
+        \\/// The codepoints kept.
+        \\pub const ranges: []const [2]u21 = &.{{
+        \\{s}}};
+        \\
+    , .{ ranges != null, list });
 }
 
 /// The consumer's app file, compiled against the library module of the same target.
@@ -326,6 +434,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    library.addImport("patchwork_fonts", add_font_module(b, default_font_ranges));
 
     const rack = addApp(b, b, .{
         .name = "rack",
