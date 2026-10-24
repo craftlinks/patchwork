@@ -26,6 +26,29 @@
 //! is `null`, and widgets draw nothing under it (`visible`). Every instance and area copies
 //! the clip in effect when it was made.
 //!
+//! ## 3a. Canvases
+//! `begin_canvas(id, walk, layout, *CanvasState, layers)` opens a pan/zoom canvas
+//! (`ui/canvas.zig`). It records the canvas's own wheel area over the viewport in screen pixels,
+//! gives each of `layers` the state's view this frame (`draw.Context.view`), and switches to
+//! the first. Inside, until `end_canvas`, everything is in world pixels:
+//! ```text
+//! clip     T^-1(parent clip ∩ viewport):  x0' = (x0 - view.x) / zoom, likewise each edge
+//! turtle   a root over T^-1(viewport), the visible world rect (`remaining`)
+//! visible  the usual cull test, against the world clip
+//! area     mapped forward: rect' = (view.x + zoom * x, view.y + zoom * y, zoom * w,
+//!          zoom * h), radius' = zoom * radius, clip' = T(world clip), Area.zoom = zoom
+//! shift    snapped to 1 / text.device_scale(); areas move by delta * zoom
+//! ```
+//! Instances keep world rects and clips, which the renderer draws through the layer's view;
+//! areas are on the screen, so resolution, capture, and `Press.rect` need no inverse. The glyph
+//! zoom (`text.zoom`) is the rung nearest the zoom while the canvas is open and 1 after.
+//! Canvases do not nest.
+//!
+//! ## 3b. Free Placement
+//! `begin_at(rect, layout)` opens a container at a fixed `rect` in the current coordinates
+//! without placing it in its parent's flow, so a canvas places modules at their world rects.
+//! Its `end` aligns its children as usual but neither shifts it nor advances the parent.
+//!
 //! ## 4. Alignment After the Fact
 //! At `end`, `turtle.main_shift` (main-axis alignment of the children) and then
 //! `turtle.self_shift` (a fit container's own cross alignment) each give one delta. The delta
@@ -120,6 +143,7 @@ const theme = @import("../theme.zig");
 const turtle = @import("turtle.zig");
 const areas = @import("areas.zig");
 const view = @import("view.zig");
+const canvas = @import("canvas.zig");
 
 pub const Rect = draw.Rect;
 pub const Clip = draw.Clip;
@@ -128,6 +152,7 @@ pub const Area = areas.Area;
 pub const Flags = areas.Flags;
 pub const Cursor = areas.Cursor;
 pub const ViewState = view.ViewState;
+pub const CanvasState = canvas.CanvasState;
 
 /// Bytes `copy` keeps for the host to offer: one paste-sized buffer per context.
 pub const clipboard_cap: u32 = 65536;
@@ -208,6 +233,16 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         viewport: Rect,
         outer_walk: turtle.Walk,
         outer_rect: Rect,
+        /// Set for a canvas (section 3a): `end_canvas` closes it.
+        is_canvas: bool,
+        /// Set for a container `begin_at` placed (section 3b): it does not take part in its
+        /// parent's flow.
+        free: bool,
+    };
+    // The open canvas (section 3a).
+    const Canvas = struct {
+        view: draw.View,
+        layer_before: draw.Layer,
     };
     return struct {
         const Self = @This();
@@ -273,6 +308,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         audio_on: bool,
         /// Blocks the audio queue refused so far; the hosts copy it after each drain.
         audio_dropped: u32,
+        /// The canvas being drawn, if any (section 3a).
+        canvas_open: ?Canvas,
 
         pub const DrawContext = Draw;
         pub const capacity: u32 = area_cap;
@@ -321,6 +358,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.has_audio = false;
             self.audio_on = false;
             self.audio_dropped = 0;
+            self.canvas_open = null;
             assert(self.phase == .idle);
             assert(self.dirty);
         }
@@ -492,9 +530,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.depth >= 2);
             const entry = &self.stack[self.depth - 1];
             assert(entry.view == null);
+            assert(!entry.is_canvas);
             _ = self.shift_since(entry, turtle.main_shift(&entry.turtle));
             var rect = turtle.close(&entry.turtle);
             self.depth -= 1;
+            // A free container keeps its rect and leaves its parent's flow alone (section 3b).
+            if (entry.free) return rect;
             const parent = self.top();
             const moved = self.shift_since(entry, turtle.self_shift(
                 &parent.turtle,
@@ -619,6 +660,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         pub fn end_view(self: *Self) void {
             assert(self.depth >= 2);
             const entry = &self.stack[self.depth - 1];
+            assert(!entry.is_canvas);
             const state = entry.view.?;
             state.content_h = @max(0, entry.turtle.extent[1] - entry.turtle.rect.y);
             self.depth -= 1;
@@ -644,6 +686,104 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.area(entry.view_id.derive(view.thumb_salt), thumb, 0, plain);
         }
 
+        // ------------------------------------------------------------- canvases
+
+        /// Opens a canvas for `child` (section 3a): `layout.padding` insets the viewport, the
+        /// canvas's own wheel and pan area `id` covers it, and `layers` (1 to 4, none the base
+        /// layer) get `state`'s view this frame. Until `end_canvas`, appends go to those layers
+        /// (starting on the first), the turtle, clips, and `visible` work in world pixels, and
+        /// areas are mapped to the screen. Canvases do not nest. Returns the viewport.
+        pub fn begin_canvas(
+            self: *Self,
+            id: Id,
+            child: turtle.Walk,
+            layout: turtle.Layout,
+            state: *CanvasState,
+            layers: []const draw.Layer,
+        ) Rect {
+            assert(self.canvas_open == null);
+            assert(self.depth < turtle.depth_max);
+            assert(child.width != .fit);
+            assert(child.height != .fit);
+            assert(layers.len >= 1 and layers.len <= 4);
+            const parent = self.top();
+            const rect = turtle.place(&parent.turtle, child);
+            const viewport = inset(rect, layout.padding);
+            state.viewport = viewport;
+            if (viewport.width > 0 and viewport.height > 0) {
+                self.area(id, viewport, 0, wheel_flag);
+            }
+            const viewed = state.view_of(self.draw.text.scale_120);
+            state.drawn = viewed;
+            var mask: u8 = 0;
+            for (layers) |layer_value| {
+                self.draw.view(layer_value, viewed);
+                mask |= @as(u8, 1) << @intCast(@backingInt(layer_value));
+            }
+            self.draw.open_views(mask, viewed.zoom);
+            self.draw.text.zoom = canvas.glyph_zoom(viewed.zoom);
+            const screen = intersect(parent.clip, viewport);
+            const world_clip: ?Clip = if (screen) |outer| world_clip_of(viewed, outer) else null;
+            const world = world_rect_of(viewed, viewport);
+            var inner = layout;
+            inner.padding = turtle.zero_inset;
+            inner.clip = false;
+            self.clip_total += 1;
+            var entry = self.entry_of(turtle.root(world, inner), world_clip);
+            entry.is_canvas = true;
+            entry.viewport = viewport;
+            entry.outer_walk = child;
+            entry.outer_rect = rect;
+            self.stack[self.depth] = entry;
+            self.depth += 1;
+            self.canvas_open = .{ .view = viewed, .layer_before = self.draw.layer(layers[0]) };
+            assert(self.canvas_open.?.view.zoom > 0);
+            return viewport;
+        }
+
+        /// Closes the open canvas: restores the layer and the glyph zoom and advances the
+        /// parent by the canvas's walk.
+        pub fn end_canvas(self: *Self) void {
+            assert(self.depth >= 2);
+            const entry = &self.stack[self.depth - 1];
+            assert(entry.is_canvas);
+            const open = self.canvas_open.?;
+            self.depth -= 1;
+            const parent = self.top();
+            turtle.advance(&parent.turtle, entry.outer_walk, entry.outer_rect);
+            _ = self.draw.layer(open.layer_before);
+            self.draw.close_views();
+            self.draw.text.zoom = 1;
+            self.canvas_open = null;
+        }
+
+        /// The view of the open canvas, or null outside one.
+        pub fn canvas_view(self: *const Self) ?draw.View {
+            const open = self.canvas_open orelse return null;
+            return open.view;
+        }
+
+        /// Opens a container at `rect` (fixed on both axes) in the current coordinates, laid
+        /// out by `layout`, outside its parent's flow (section 3b). Close it with `end`, which
+        /// returns `rect` and leaves the parent's cursor alone.
+        pub fn begin_at(self: *Self, rect: Rect, layout: turtle.Layout) Rect {
+            assert(self.depth < turtle.depth_max);
+            assert(rect.width >= 0);
+            assert(rect.height >= 0);
+            const parent = self.top();
+            var clipped = parent.clip;
+            if (layout.clip) {
+                self.clip_total += 1;
+                clipped = intersect(parent.clip, rect);
+            }
+            var entry = self.entry_of(turtle.root(rect, layout), clipped);
+            entry.free = true;
+            self.stack[self.depth] = entry;
+            self.depth += 1;
+            assert(self.depth >= 2);
+            return rect;
+        }
+
         // ---------------------------------------------------------------- areas
 
         /// Records a hit area for `id` over `rect` with corner `radius`, under the clip in
@@ -663,7 +803,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             // 2 * area_cap slots and the probe always finds a free one.
             const fresh = self.stamps.insert(id);
             assert(fresh);
-            self.areas[self.area_count] = .{
+            var stored: Area = .{
                 .id = id,
                 .rect = .{ rect.x, rect.y, rect.width, rect.height },
                 .clip = .{ current.x0, current.y0, current.x1, current.y1 },
@@ -673,7 +813,28 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .pad = 0,
                 .first_point = 0,
                 .point_count = 0,
+                .zoom = 1,
+                .pad1 = 0,
             };
+            // Inside a canvas, mapped to the screen (section 3a).
+            if (self.canvas_open) |open| {
+                const v = open.view;
+                stored.rect = .{
+                    v.x + v.zoom * rect.x,
+                    v.y + v.zoom * rect.y,
+                    v.zoom * rect.width,
+                    v.zoom * rect.height,
+                };
+                stored.clip = .{
+                    v.x + v.zoom * current.x0,
+                    v.y + v.zoom * current.y0,
+                    v.x + v.zoom * current.x1,
+                    v.y + v.zoom * current.y1,
+                };
+                stored.radius = v.zoom * radius;
+                stored.zoom = v.zoom;
+            }
+            self.areas[self.area_count] = stored;
             self.area_count += 1;
             assert(self.area_count <= area_cap);
         }
@@ -1118,6 +1279,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .viewport = value.rect,
                 .outer_walk = value.walk,
                 .outer_rect = value.rect,
+                .is_canvas = false,
+                .free = false,
             };
         }
 
@@ -1127,20 +1290,41 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(delta[0] >= 0);
             assert(delta[1] >= 0);
             assert(entry.area_start <= self.area_count);
-            const scale = @as(f32, @floatFromInt(self.draw.text.scale_120)) / 120;
+            const scale = self.draw.text.device_scale();
             const dx = @round(delta[0] * scale) / scale;
             const dy = @round(delta[1] * scale) / scale;
             if (dx == 0 and dy == 0) return .{ 0, 0 };
             // Clips do not move, so nothing inside may have set one (section 4).
             assert(self.clip_total == entry.clip_total);
             self.draw.shift(entry.starts, dx, dy);
+            // Areas inside a canvas are in screen pixels (section 3a).
+            const area_scale: f32 = if (self.canvas_open) |open| open.view.zoom else 1;
             for (self.areas[entry.area_start..self.area_count]) |*moved| {
-                moved.rect[0] += dx;
-                moved.rect[1] += dy;
+                moved.rect[0] += dx * area_scale;
+                moved.rect[1] += dy * area_scale;
             }
             return .{ dx, dy };
         }
     };
+}
+
+/// The world clip under the screen clip `outer` through `v` (section 3a).
+fn world_clip_of(v: draw.View, outer: Clip) Clip {
+    assert(v.zoom > 0);
+    const low = v.invert(outer.x0, outer.y0);
+    const high = v.invert(outer.x1, outer.y1);
+    const out: Clip = .{ .x0 = low[0], .y0 = low[1], .x1 = high[0], .y1 = high[1] };
+    assert(out.x1 > out.x0);
+    assert(out.y1 > out.y0);
+    return out;
+}
+
+/// The world rect under the screen rect `rect` through `v`.
+fn world_rect_of(v: draw.View, rect: Rect) Rect {
+    assert(v.zoom > 0);
+    const origin = v.invert(rect.x, rect.y);
+    const width = rect.width / v.zoom;
+    return .{ .x = origin[0], .y = origin[1], .width = width, .height = rect.height / v.zoom };
 }
 
 /// The clip of a rect with positive edges.
@@ -1725,4 +1909,89 @@ test "the audio flag starts stopped and follows set_audio" {
     cx.set_audio(false);
     cx.event_end();
     try testing.expect(!cx.audio_on);
+}
+
+/// One frame of a 200 by 100 canvas at the top-left with one free module at world
+/// (10, 5, 20, 10) and its area, viewed by `state`. Returns the module's world clip.
+fn canvas_frame(context: *TestContext, state: *CanvasState) ?Clip {
+    context.begin_frame(400, 300, 120);
+    const layers = [_]draw.Layer{ @fromBackingInt(1), @fromBackingInt(2) };
+    const walk = sized(.{ .fixed = 200 }, .{ .fixed = 100 });
+    _ = context.begin_canvas(areas.id("canvas", 0), walk, flow_of(.down), state, &layers);
+    const module = rect_at(10, 5, 20, 10);
+    const clipped = context.visible(module);
+    if (clipped != null) {
+        _ = context.begin_at(module, flow_of(.right));
+        box(context, module);
+        context.area(areas.id("module", 0), module, 0, plain);
+        _ = context.end();
+    }
+    context.end_canvas();
+    _ = context.end_frame();
+    return clipped;
+}
+
+// Locks canvases (section 3a): at zoom 2 from (50, 40) the canvas's clip is the world clip
+// (-25, -20)..(75, 30), the cull test runs in world pixels, the module draws at its world rect
+// while its area is mapped to (70, 50, 40, 20) on the screen, glyphs zoom inside only, the
+// layer comes back, and `begin_at` leaves the canvas cursor where it was.
+test "a canvas clips and culls in world pixels and maps its areas to the screen" {
+    const context = new_context();
+    var state = CanvasState.init(50, 40, 2);
+    context.begin_frame(400, 300, 120);
+    const layers = [_]draw.Layer{ @fromBackingInt(1), @fromBackingInt(2) };
+    const walk = sized(.{ .fixed = 200 }, .{ .fixed = 100 });
+    const canvas_id = areas.id("canvas", 0);
+    const viewport = context.begin_canvas(canvas_id, walk, flow_of(.down), &state, &layers);
+    try testing.expectEqual(rect_at(0, 0, 200, 100), viewport);
+    const world: Clip = .{ .x0 = -25, .y0 = -20, .x1 = 75, .y1 = 30 };
+    try testing.expectEqual(@as(?Clip, world), context.clip());
+    try testing.expectEqual(@as(?Clip, null), context.visible(rect_at(80, 0, 10, 10)));
+    try testing.expectEqual(@as(f32, 2), context.draw.text.zoom);
+    try testing.expectEqual(@as(f32, 2), context.draw.text.device_scale());
+    try testing.expectEqual(@as(u8, 1), @backingInt(context.draw.layer_now));
+    const before = context.remaining();
+    const module = rect_at(10, 5, 20, 10);
+    try testing.expectEqual(module, context.begin_at(module, flow_of(.right)));
+    box(context, module);
+    context.area(areas.id("module", 0), module, 0, plain);
+    try testing.expectEqual(module, context.end());
+    try testing.expectEqual(before, context.remaining());
+    context.end_canvas();
+    try testing.expectEqual(draw.Layer.base, context.draw.layer_now);
+    try testing.expectEqual(@as(f32, 1), context.draw.text.zoom);
+    _ = context.end_frame();
+    try testing.expectEqualSlices(f32, &.{ 10, 5, 20, 10 }, &context.draw.items(draw.Box)[0].rect);
+    const drawn = context.draw.items(draw.Box)[0];
+    try testing.expectEqualSlices(f32, &.{ -25, -20, 75, 30 }, &drawn.clip);
+    const mapped = context.find(areas.id("module", 0)).?;
+    try testing.expectEqualSlices(f32, &.{ 70, 50, 40, 20 }, &mapped.rect);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 200, 100 }, &mapped.clip);
+    try testing.expectEqual(@as(f32, 2), mapped.zoom);
+    try testing.expectEqual(draw.View{ .x = 50, .y = 40, .zoom = 2 }, state.drawn);
+}
+
+// Locks exact hit testing at every rung (section 3a): the press at the module's mapped center
+// hits it and a point half a logical pixel right of its mapped edge reaches the canvas instead.
+test "a canvas area hits its mapped rect at every zoom" {
+    const context = new_context();
+    const ids = [_]Id{ areas.id("module", 0), areas.id("canvas", 0) };
+    var out: [2]Hit = undefined;
+    for (canvas.rungs) |rung| {
+        var state = CanvasState.init(60, 30, rung);
+        if (canvas_frame(context, &state) == null) continue;
+        const v = state.drawn;
+        const center = v.apply(20, 10);
+        const middle: input.Point = .{ .x = center[0], .y = center[1] };
+        send(context, .{ .pointer_down = input.left_at(middle) }, &ids, &out);
+        try testing.expect(out[0] == .down);
+        send(context, .{ .pointer_up = input.left_at(middle) }, &ids, &out);
+        const edge = v.apply(30, 10);
+        if (edge[0] + 0.5 >= 200) continue;
+        const outside: input.Point = .{ .x = edge[0] + 0.5, .y = edge[1] };
+        send(context, .{ .pointer_down = input.left_at(outside) }, &ids, &out);
+        try testing.expect(out[0] != .down);
+        try testing.expect(out[1] == .down);
+        send(context, .{ .pointer_up = input.left_at(outside) }, &ids, &out);
+    }
 }

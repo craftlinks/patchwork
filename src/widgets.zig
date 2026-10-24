@@ -742,7 +742,7 @@ pub const TextField = struct {
         };
         text.place(cx.drawing(), self.style, all, line, inner_clip, field_text_options);
         if (focused) {
-            const scale = @as(f32, @floatFromInt(cx.drawing().text.scale_120)) / 120;
+            const scale = cx.drawing().text.device_scale();
             const caret_x = origin + text.measure(self.style, all[0..self.edit.caret]);
             const caret: Rect = .{
                 .x = @round(caret_x * scale) / scale,

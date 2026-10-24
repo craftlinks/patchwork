@@ -56,6 +56,19 @@
 //! Worked values: see tests "ortho maps the four corners and the center" and "ortho maps
 //! logical pixels to device pixels at a fractional scale".
 //!
+//! ## 3a. Views
+//! A layer with a pan/zoom view (`draw/pools.zig`, section 5c) is drawn with `M · T`, where `T`
+//! takes world points to logical screen points, `s = x + zoom * w`, with columns
+//! `[zoom,0,0,0], [0,zoom,0,0], [0,0,1,0], [x,y,0,1]`. `M` has only `M00`, `M11`, `M30`, `M31`
+//! (and the depth 1) set, so the product changes four floats:
+//! ```text
+//! M00' = M00 * zoom      M30' = M00 * x + M30
+//! M11' = M11 * zoom      M31' = M11 * y + M31
+//! ```
+//! `local` and `pos` stay in world units, so every distance field is evaluated in world units
+//! and `coverage` divides by world units per device pixel: edges stay one device pixel wide.
+//! Test "view_ortho maps world points through the view" locks it.
+//!
 //! ## 4. Uniform Size
 //! The frame uniform holds the projection matrix, the time slot (`time_offset`, read by
 //! animated draw types), and `theme.Theme`; `uniform_bytes` is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
@@ -122,6 +135,8 @@ pub const DrawType = registry.DrawType;
 pub const Registry = registry.Registry;
 pub const Context = pools.Context;
 pub const Layer = pools.Layer;
+/// A layer's pan/zoom view (`draw/pools.zig`, section 5c).
+pub const View = pools.View;
 pub const Batch = pools.Batch;
 pub const layer_count = pools.layer_count;
 pub const Textures = textures_module.Textures;
@@ -251,6 +266,21 @@ pub fn ortho_y_down(out: *[16]f32, width_px: u32, height_px: u32, scale_120: u32
     assert(out[5] < 0);
 }
 
+/// Writes the projection of a layer drawn through `view`: `ortho · T`, where `T` maps world
+/// points to logical screen points (`View.apply`). See the module guide, section 3a.
+pub fn view_ortho(out: *[16]f32, ortho: *const [16]f32, view: View) void {
+    assert(view.zoom > 0);
+    assert(ortho[0] > 0);
+    assert(ortho[5] < 0);
+    out.* = ortho.*;
+    out[0] = ortho[0] * view.zoom;
+    out[5] = ortho[5] * view.zoom;
+    out[12] = ortho[0] * view.x + ortho[12];
+    out[13] = ortho[5] * view.y + ortho[13];
+    assert(out[0] > 0);
+    assert(out[5] < 0);
+}
+
 comptime {
     assert(quad_bytes == @sizeOf(@TypeOf(unit_quad)));
     assert(unit_quad.len == 2 * vertex_count);
@@ -322,6 +352,26 @@ test "ortho maps logical pixels to device pixels at a fractional scale" {
     const right = project(matrix, 1601.0 / 1.5, 600);
     try std.testing.expectApproxEqAbs(@as(f32, 1), right[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, -1), right[1], 0.0001);
+}
+
+// Locks the view projection: world (0, 0) and (100, 50) at zoom 2 from (20, 10) land where the
+// window projection puts (20, 10) and (220, 110).
+test "view_ortho maps world points through the view" {
+    var window: [16]f32 = undefined;
+    ortho_y_down(&window, 400, 200, 120);
+    var viewed: [16]f32 = undefined;
+    view_ortho(&viewed, &window, .{ .x = 20, .y = 10, .zoom = 2 });
+    const origin = project(viewed, 0, 0);
+    const corner = project(viewed, 100, 50);
+    const want_origin = project(window, 20, 10);
+    const want_corner = project(window, 220, 110);
+    try std.testing.expectApproxEqAbs(want_origin[0], origin[0], 1e-6);
+    try std.testing.expectApproxEqAbs(want_origin[1], origin[1], 1e-6);
+    try std.testing.expectApproxEqAbs(want_corner[0], corner[0], 1e-6);
+    try std.testing.expectApproxEqAbs(want_corner[1], corner[1], 1e-6);
+    var same: [16]f32 = undefined;
+    view_ortho(&same, &window, View.identity);
+    try std.testing.expectEqualSlices(f32, &window, &same);
 }
 
 const Record = extern struct {

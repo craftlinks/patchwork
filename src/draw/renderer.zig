@@ -38,6 +38,8 @@
 //! buffer_write points [range]     when the point revision moved and points changed
 //! buffer_write uniform time       16 bytes at `draw.time_offset`, while animating and the
 //!                                 time moved (section 4b)
+//! [buffer_create, bind_group_create] per viewed layer at its first view (section 4d)
+//! buffer_write view uniform       per viewed layer whose uniform changed (section 4d)
 //! then, by the frame's kind (section 4a), nothing (skipped), present_copy (copied), or:
 //! [target_create]                 the kept target, at its first use or a new size
 //! pass_begin                      the surface (direct), or the kept target, cleared (full)
@@ -45,6 +47,7 @@
 //!   per rect (cached only): scissor_set, pipeline_set clear, vertex_buffer_set 0, draw
 //!   bind_group_set 0, vertex_buffer_set 0                   once, when any batch exists
 //!   per batch, in order:
+//!     bind_group_set 0                     only when its layer's frame group (a view's) differs
 //!     pipeline_set, vertex_buffer_set 1    only when the type differs from the last batch
 //!     bind_group_set 1                     only when a textured batch changes texture
 //!     draw (6 vertices, count instances, first_instance = batch.first)
@@ -143,6 +146,24 @@
 //! are dirty, and a rendered target disables the unchanged fast path. A target never rendered
 //! yet draws nothing where it is sampled.
 //!
+//! ## 4d. Views
+//! A layer with a pan/zoom view this frame (`Context.view`, `draw/pools.zig` section 5c) draws
+//! with its own uniform buffer and frame group, created at the layer's first view. After the
+//! time write, each viewed layer's uniform is the window's with the projection `M · T`
+//! (`draw.view_ortho`), written whole (256 bytes) when it differs from what that layer's buffer
+//! holds: a pan writes it and, when no module entered or left the culled set, nothing else.
+//! ```text
+//! per viewed layer, lowest first:  [buffer_create, bind_group_create (frame)]  first use
+//!                                  buffer_write (its uniform)                  when changed
+//! in a pass, per batch:            bind_group_set 0 (its layer's frame group)  when it
+//!                                  differs from the bound one: once per layer change
+//! ```
+//! Hashing maps a viewed batch's bounds through the view, `x0 = view.x + view.zoom * x0` on
+//! every edge before the device scale, and folds the view into the batch key, so a pan or a
+//! zoom dirties exactly the tiles the canvas touches; past half the window the frame goes
+//! `direct`. A layer is never both viewed and bound to a target, so a target pass binds only
+//! its own group. An app that never calls `view` records the same stream as before views.
+//!
 //! ## 5. Lifetime
 //! Spans point into the context's pools, `Textures`' queued writes (the glyph cache's mirror
 //! among them), `Renderer.uniform`, and static data, so all of them must stay put until the
@@ -214,16 +235,23 @@ const rect_op_cap: u32 = 6;
 /// which every cached rect already counts.
 const target_op_cap: u32 = 2 + 2 + 2 + 1 + 4;
 
+/// Layers that can have a view: every layer but the base one (section 4d).
+const view_layers: u32 = pools.layer_count - 1;
+
+/// Ops one viewed layer records at most besides its binds (section 4d): its uniform buffer and
+/// frame group at its first use, and its uniform write.
+const view_op_cap: u32 = 3;
+
 /// Upper bound on the ops `frame` records: a cached frame of `rects_max` rects (module guide,
 /// sections 3 and 4a), which is longer than a direct one.
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     const texture_ops = textures.sampling_count + 2 * textures.texture_cap + textures.write_cap;
     const rects = rects_max(type_count, batch_cap);
     // Uniform, textures, one write per pool and one for the points, the time, the target,
-    // the pass, the rects with their batches, the pass end, and the present.
+    // the pass, the rects with their batches and view binds, the pass end, and the present.
     return 1 + texture_ops + type_count + 1 + 1 + 1 + 1 +
-        rects * (rect_op_cap + batch_cap * batch_op_cap) + 1 + 1 +
-        textures.target_cap * target_op_cap;
+        rects * (rect_op_cap + batch_cap * batch_op_cap + view_layers) + 1 + 1 +
+        textures.target_cap * target_op_cap + view_layers * view_op_cap;
 }
 
 /// Upper bound on the bytes `frame` records, for the same shape as `frame_op_cap`.
@@ -253,14 +281,17 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
         op_bytes(commands.BindGroupSet) + op_bytes(commands.Draw);
     const per_rect = op_bytes(commands.ScissorSet) + op_bytes(commands.PipelineSet) +
         2 * op_bytes(commands.VertexBufferSet) + op_bytes(commands.Draw) +
-        op_bytes(commands.BindGroupSet) + batch_cap * per_batch;
+        op_bytes(commands.BindGroupSet) + batch_cap * per_batch +
+        view_layers * op_bytes(commands.BindGroupSet);
+    const per_view = op_bytes(commands.BufferCreate) + op_bytes(commands.BindGroupCreate) +
+        op_bytes(commands.BufferWrite);
     const per_target = 2 * (op_bytes(commands.TargetCreate) + op_bytes(commands.BindGroupCreate)) +
         op_bytes(commands.BufferCreate) + op_bytes(commands.BindGroupCreate) +
         op_bytes(commands.BufferWrite) + op_bytes(commands.PassBegin) +
         op_bytes(commands.BindGroupSet) + op_bytes(commands.VertexBufferSet) +
         op_bytes(commands.PassEnd);
     return (3 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
-        rects * per_rect + textures.target_cap * per_target;
+        rects * per_rect + textures.target_cap * per_target + view_layers * per_view;
 }
 
 /// What a recorded frame does (module guide, section 4a).
@@ -346,6 +377,9 @@ pub fn Renderer(comptime Cx: type) type {
         bound_layers: u8,
         /// Targets the last `frame` rendered.
         rendered: u32,
+        /// The GPU side of each layer's view (section 4d), and this frame's viewed layers.
+        view_slots: [pools.layer_count]ViewSlot,
+        view_mask: u8,
 
         const no_target: u8 = 0xFF;
 
@@ -364,6 +398,17 @@ pub fn Renderer(comptime Cx: type) type {
             /// The texture its id samples; a feedback target's pass writes the other.
             front: u1,
             key: u64,
+            uniform: Uniform,
+        };
+
+        /// One layer's view uniform and frame group (section 4d).
+        const ViewSlot = struct {
+            /// Its uniform buffer and frame group exist.
+            ready: bool,
+            /// `uniform` is what the GPU holds.
+            written: bool,
+            uniform_buffer: u16,
+            frame_group: u16,
             uniform: Uniform,
         };
 
@@ -435,6 +480,11 @@ pub fn Renderer(comptime Cx: type) type {
             self.target_count = 0;
             self.bound_layers = 0;
             self.rendered = 0;
+            for (&self.view_slots) |*slot| {
+                slot.ready = false;
+                slot.written = false;
+            }
+            self.view_mask = 0;
             assert(!self.ready);
             assert(self.width_px == 0);
         }
@@ -727,6 +777,7 @@ pub fn Renderer(comptime Cx: type) type {
             const unchanged = !resized and self.same_instances(cx);
             self.flush_textures(buffer, &cx.textures);
             cx.finalize();
+            self.view_mask = cx.view_mask;
             inline for (0..R.count) |index| {
                 self.upload_pool(buffer, index, &cx.pools[index]);
             }
@@ -743,6 +794,7 @@ pub fn Renderer(comptime Cx: type) type {
                     .data = .of(std.mem.asBytes(&self.uniform.time)),
                 } });
             }
+            self.write_views(buffer, cx);
             switch (kind) {
                 .skipped => {},
                 .copied => buffer.push(.{ .present_copy = .{ .target = self.kept.? } }),
@@ -753,6 +805,59 @@ pub fn Renderer(comptime Cx: type) type {
             self.last = kind;
             assert(buffer.count <= op_cap);
             assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity));
+        }
+
+        /// Creates each viewed layer's uniform and frame group at its first use and writes its
+        /// uniform (the window's, with the view folded into the projection) when it changed
+        /// (section 4d).
+        fn write_views(self: *Self, buffer: *commands.CommandBuffer, cx: *const Cx) void {
+            assert(self.view_mask == cx.view_mask);
+            var layer: u8 = 1;
+            while (layer < pools.layer_count) : (layer += 1) {
+                const view = cx.view_of(layer) orelse continue;
+                const slot = &self.view_slots[layer];
+                if (!slot.ready) {
+                    slot.uniform_buffer = self.create_buffer(
+                        buffer,
+                        commands.usage_uniform | commands.usage_copy_dst,
+                        draw.uniform_bytes,
+                    );
+                    slot.frame_group = self.ids.take(.bind_group);
+                    var frame_bindings = std.mem.zeroes(BindGroupEntries);
+                    frame_bindings[0] = .{ .binding = 0, .resource = slot.uniform_buffer };
+                    if (uses_points) {
+                        const points = self.resources.points_buffer;
+                        frame_bindings[1] = .{ .binding = 1, .resource = points };
+                    }
+                    buffer.push(.{ .bind_group_create = .{
+                        .id = slot.frame_group,
+                        .layout = self.resources.frame_layout,
+                        .entry_count = frame_entry_count,
+                        .entries = frame_bindings,
+                    } });
+                    slot.ready = true;
+                }
+                var next = self.uniform;
+                draw.view_ortho(&next.ortho, &self.uniform.ortho, view);
+                const same = std.mem.eql(u8, std.mem.asBytes(&next), std.mem.asBytes(&slot.uniform));
+                if (slot.written and same) continue;
+                slot.uniform = next;
+                slot.written = true;
+                buffer.push(.{ .buffer_write = .{
+                    .id = slot.uniform_buffer,
+                    .offset = 0,
+                    .data = .of(std.mem.asBytes(&slot.uniform)),
+                } });
+            }
+        }
+
+        /// The frame group a batch on `layer` draws with: its view's, or `default` (section
+        /// 4d).
+        fn frame_group_of(self: *const Self, layer: u8, default: u16) u16 {
+            assert(layer < pools.layer_count);
+            if (self.view_mask & (@as(u8, 1) << @intCast(layer)) == 0) return default;
+            assert(self.view_slots[layer].ready);
+            return self.view_slots[layer].frame_group;
         }
 
         /// True when no pool or point revision moved and no texture is created or written
@@ -878,6 +983,13 @@ pub fn Renderer(comptime Cx: type) type {
             }
             // Seeded with 0: `key_of(seed, &seed)` would cancel the seed against its own word.
             var batch_key = tiles_module.key_of(0, std.mem.asBytes(&seed));
+            // A viewed batch maps its bounds through the view, which its key folds in, so a
+            // pan or zoom dirties every tile the batch touches (section 4d).
+            const view_or_null = cx.view_of(batch.layer);
+            const view = view_or_null orelse pools.View.identity;
+            if (view_or_null != null) {
+                batch_key = tiles_module.key_of(batch_key, std.mem.asBytes(&view));
+            }
             if (comptime registry.reads_points(T) and !@hasField(T, "first_point")) {
                 batch_key ^= context.points_key;
             }
@@ -888,10 +1000,20 @@ pub fn Renderer(comptime Cx: type) type {
                     shadow.keys[pool_index] = record_key(T, cx, item);
                 }
                 const key = shadow.keys[pool_index] ^ batch_key;
-                const x0 = @max(item.rect[0], item.clip[0]) * context.scale;
-                const y0 = @max(item.rect[1], item.clip[1]) * context.scale;
-                const x1 = @min(item.rect[0] + item.rect[2], item.clip[2]) * context.scale;
-                const y1 = @min(item.rect[1] + item.rect[3], item.clip[3]) * context.scale;
+                var x0 = @max(item.rect[0], item.clip[0]);
+                var y0 = @max(item.rect[1], item.clip[1]);
+                var x1 = @min(item.rect[0] + item.rect[2], item.clip[2]);
+                var y1 = @min(item.rect[1] + item.rect[3], item.clip[3]);
+                if (view_or_null != null) {
+                    x0 = view.x + view.zoom * x0;
+                    y0 = view.y + view.zoom * y0;
+                    x1 = view.x + view.zoom * x1;
+                    y1 = view.y + view.zoom * y1;
+                }
+                x0 *= context.scale;
+                y0 *= context.scale;
+                x1 *= context.scale;
+                y1 *= context.scale;
                 self.tiles.add(.{ x0, y0, x1, y1 }, key);
                 if (comptime R.animates[index]) {
                     if (self.tiles.force(.{ x0, y0, x1, y1 })) self.animating = true;
@@ -1299,10 +1421,18 @@ pub fn Renderer(comptime Cx: type) type {
             } });
             var type_bound: ?u8 = null;
             var group_bound: ?u16 = null;
+            var frame_bound: u16 = frame_group;
             for (batches) |batch| {
                 assert(batch.type_id < R.count);
                 assert(batch.count != 0);
                 if (!self.wanted(batch, filter)) continue;
+                // A viewed layer draws with its own frame group; batches are layer-sorted, so
+                // this binds at most once per layer change (section 4d).
+                const frame_wanted = self.frame_group_of(batch.layer, frame_group);
+                if (frame_wanted != frame_bound) {
+                    buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = frame_wanted } });
+                    frame_bound = frame_wanted;
+                }
                 // A target that has not rendered yet has no texture to sample (section 4c).
                 const group: ?u16 = if (R.textured[batch.type_id]) self.group_of(batch.texture) else null;
                 if (R.textured[batch.type_id] and group == null) continue;
@@ -1646,6 +1776,65 @@ test "a small change repaints one tile of the kept target" {
     Fixture.record(180);
     try testing.expectEqual(Kind.direct, Fixture.renderer.last);
     try testing.expect(!Fixture.renderer.kept_valid);
+}
+
+/// The scene, plus one box at world (0, 0) on layer 1 viewed at zoom 2 from `(x, 100)`.
+fn viewed_scene(x: f32) !void {
+    try scene(0);
+    const cx = &Fixture.context;
+    cx.view(@fromBackingInt(1), .{ .x = x, .y = 100, .zoom = 2 });
+    cx.open_views(0b10, 2);
+    _ = cx.layer(@fromBackingInt(1));
+    var world = face(0);
+    world.clip = .{ -1000, -1000, 1000, 1000 };
+    try cx.append(types.Box, null, world);
+    _ = cx.layer(.base);
+    cx.close_views();
+}
+
+// Locks views (module guide, section 4d): the first viewed frame creates the layer's uniform
+// and frame group and writes its 256 bytes, the pass binds that group before the viewed batch
+// only; a pan from x = 200 to 264 writes that uniform and no pool, and dirties the two tiles
+// the box covered (column 3, then 4, of row 1) and nothing else.
+test "a viewed layer draws with its own uniform and a pan repaints its tiles" {
+    Fixture.start();
+    try viewed_scene(200);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.direct, Fixture.renderer.last);
+    const slot = Fixture.renderer.view_slots[1];
+    try testing.expect(slot.ready);
+    var write_storage: [16]commands.BufferWrite = undefined;
+    const first = writes(&Fixture.buffer, &write_storage);
+    const last_write = first[first.len - 1];
+    try testing.expectEqual(slot.uniform_buffer, last_write.id);
+    try testing.expectEqual(draw.uniform_bytes, last_write.data.len);
+    try testing.expectEqual(@as(f32, 2.0 / 1280.0 * 2.0), slot.uniform.ortho[0]);
+    var binds: u32 = 0;
+    var reader = Fixture.buffer.reader();
+    while (reader.next()) |op| switch (op) {
+        .bind_group_set => |set| if (set.slot == 0) {
+            binds += 1;
+            if (binds == 2) try testing.expectEqual(slot.frame_group, set.id);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(u32, 2), binds);
+    try viewed_scene(200);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.skipped, Fixture.renderer.last);
+    try testing.expectEqual(@as(usize, 0), writes(&Fixture.buffer, &write_storage).len);
+    try viewed_scene(264);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.full, Fixture.renderer.last);
+    try viewed_scene(200);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.cached, Fixture.renderer.last);
+    try testing.expectEqual(@as(u32, 2), Fixture.renderer.tiles.dirty_count);
+    const pan = writes(&Fixture.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 1), pan.len);
+    try testing.expectEqual(slot.uniform_buffer, pan[0].id);
+    const scissor: commands.ScissorSet = .{ .x = 192, .y = 64, .width = 128, .height = 64 };
+    try testing.expectEqual(scissor, first_op(.scissor_set).?);
 }
 
 // Locks the unchanged fast path (module guide, section 4b): an undrawn frame repeats the last

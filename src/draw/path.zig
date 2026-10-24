@@ -23,9 +23,11 @@
 //! dirty range like the instance pools and bound once per pass (`draw/renderer.zig`).
 //!
 //! ## 3. Flattening
-//! A cubic gets `clamp(ceil(estimate / flatten_px), segments_min, segments_max)` uniform-`t`
-//! segments, where `estimate = (chord + control polygon) / 2` bounds the arc length from both
-//! sides. `plot` maps `n` samples to `x = rect.x + rect.width * i / (n - 1)` and
+//! A cubic gets `clamp(ceil(estimate * zoom / flatten_px), segments_min, segments_max)`
+//! uniform-`t` segments, where `estimate = (chord + control polygon) / 2` bounds the arc length
+//! from both sides and `zoom` is the open canvas's (`draw/pools.zig`, section 5c), 1 elsewhere:
+//! segments follow the on-screen length. `plot` maps `n` samples to
+//! `x = rect.x + rect.width * i / (n - 1)` and
 //! `y = rect.y + rect.height * (1 - clamp((v - lo) / (hi - lo), 0, 1))`.
 //!
 //! ## 4. Chunks and Seams
@@ -145,11 +147,18 @@ pub fn chunks_max(point_count: u32) u32 {
 
 /// Segments a cubic flattens to (section 3).
 pub fn cubic_segments(p0: Point, p1: Point, p2: Point, p3: Point) u32 {
+    return cubic_segments_at(p0, p1, p2, p3, 1);
+}
+
+/// Segments a cubic drawn at `zoom` screen pixels per pixel flattens to: by its on-screen
+/// length (section 3).
+pub fn cubic_segments_at(p0: Point, p1: Point, p2: Point, p3: Point, zoom: f32) u32 {
+    assert(zoom > 0);
     const chord = length(p0, p3);
     const polygon = length(p0, p1) + length(p1, p2) + length(p2, p3);
     assert(chord <= polygon + 0.001 * polygon + 0.001);
     const estimate = (chord + polygon) * 0.5;
-    const wanted = @ceil(estimate / flatten_px);
+    const wanted = @ceil(estimate * zoom / flatten_px);
     const lo: f32 = @floatFromInt(segments_min);
     const hi: f32 = @floatFromInt(segments_max);
     const segments: u32 = @intFromFloat(std.math.clamp(wanted, lo, hi));
@@ -167,7 +176,19 @@ pub fn flatten_cubic(
     p2: Point,
     p3: Point,
 ) u32 {
-    const segments = cubic_segments(p0, p1, p2, p3);
+    return flatten_cubic_at(out, p0, p1, p2, p3, 1);
+}
+
+/// `flatten_cubic` for a cubic drawn at `zoom` (`cubic_segments_at`).
+pub fn flatten_cubic_at(
+    out: *[cubic_points_max]Point,
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    p3: Point,
+    zoom: f32,
+) u32 {
+    const segments = cubic_segments_at(p0, p1, p2, p3, zoom);
     const step = 1.0 / @as(f32, @floatFromInt(segments));
     out[0] = p0;
     var index: u32 = 1;
@@ -428,10 +449,12 @@ fn append_from(
     return first;
 }
 
-/// Flattens the cubic and appends it as `polyline` does.
+/// Flattens the cubic by its on-screen length (at the open canvas's zoom, `cx.view_zoom`) and
+/// appends it as `polyline` does.
 pub fn cubic(cx: anytype, control: [4]Point, stroke: Stroke, clip: Clip) ?Placed {
     var points: [cubic_points_max]Point = undefined;
-    const count = flatten_cubic(&points, control[0], control[1], control[2], control[3]);
+    const c = control;
+    const count = flatten_cubic_at(&points, c[0], c[1], c[2], c[3], cx.view_zoom);
     assert(count >= segments_min + 1);
     return polyline(cx, points[0..count], stroke, clip);
 }
@@ -602,6 +625,9 @@ test "a cubic flattens to the clamped segment count with exact ends" {
     // estimate 316.62, so 53 segments.
     const sag = sagging(.{ 0, 0 }, .{ 300, 0 }, 60);
     try testing.expectEqual(@as(u32, 53), cubic_segments(sag[0], sag[1], sag[2], sag[3]));
+    // In a canvas the on-screen length counts: 20 segments at 1 are 40 at 2 and 10 at 0.5.
+    try testing.expectEqual(@as(u32, 40), cubic_segments_at(mid[0], mid[1], mid[2], mid[3], 2));
+    try testing.expectEqual(@as(u32, 10), cubic_segments_at(mid[0], mid[1], mid[2], mid[3], 0.5));
     const long = sagging(.{ 100, 100 }, .{ 800, 700 }, 160);
     var out: [cubic_points_max]Point = undefined;
     const count = flatten_cubic(&out, long[0], long[1], long[2], long[3]);

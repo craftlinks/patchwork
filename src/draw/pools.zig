@@ -57,6 +57,16 @@
 //! move, so an instance's `first_point` stays valid. Without such a type the pool has no
 //! storage (`point_capacity == 0`).
 //!
+//! ## 5c. Views
+//! `view(layer, view)` gives a layer a pan/zoom view for one frame: its instances are in world
+//! coordinates and land on the screen at `(view.x + view.zoom * wx, view.y + view.zoom * wy)`.
+//! The renderer draws the layer with its own frame uniform, whose projection is the window's
+//! times that map (`draw.view_ortho`), so no record and no shader changes. A layer is viewed or
+//! bound to a target, never both, and the base layer is never viewed. `open_views(mask, zoom)`
+//! and `close_views` bracket a canvas (`ui/cx.zig`): while open, every append must go to a layer
+//! of `mask`, and outside it no append may go to a viewed layer, one mask test per append.
+//! `view_zoom` is the open canvas's zoom (1 otherwise), which `draw/path.zig` flattens by.
+//!
 //! ## 6. TigerStyle Invariants
 //! - All storage is fixed arrays sized at compile time from `App.config.draw` and
 //!   `batch_cap`; the hosts keep the context in static memory (BSS on wasm).
@@ -95,6 +105,30 @@ pub const Binding = struct {
     layer: u8,
     target: textures.TextureId,
     rect: [4]f32,
+};
+
+/// A pan/zoom view of a layer (section 5c): world `(wx, wy)` lands on the logical screen point
+/// `(x + zoom * wx, y + zoom * wy)`. 16 bytes, so it folds into a tile key whole.
+pub const View = extern struct {
+    x: f32,
+    y: f32,
+    zoom: f32,
+    unused: f32 = 0,
+
+    /// The identity: what a layer without a view draws with.
+    pub const identity: View = .{ .x = 0, .y = 0, .zoom = 1 };
+
+    /// The screen point of the world point `(wx, wy)`.
+    pub fn apply(self: View, wx: f32, wy: f32) [2]f32 {
+        assert(self.zoom > 0);
+        return .{ self.x + self.zoom * wx, self.y + self.zoom * wy };
+    }
+
+    /// The world point under the screen point `(sx, sy)`.
+    pub fn invert(self: View, sx: f32, sy: f32) [2]f32 {
+        assert(self.zoom > 0);
+        return .{ (sx - self.x) / self.zoom, (sy - self.y) / self.zoom };
+    }
 };
 
 /// One draw call: `count` instances of type `type_id` starting at `first` in its pool.
@@ -192,6 +226,13 @@ pub fn Context(
         /// The layers drawn into offscreen targets this frame (`offscreen`), in call order.
         bindings: [textures.target_cap]Binding,
         binding_count: u32,
+        /// The views of this frame (section 5c), meaningful where `view_mask` has the bit.
+        views: [layer_count]View,
+        view_mask: u8,
+        /// The layers of the open canvas, 0 when none is open.
+        open_mask: u8,
+        /// The open canvas's zoom, 1 when none is open.
+        view_zoom: f32,
 
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
@@ -236,6 +277,9 @@ pub fn Context(
             self.batch_count = 0;
             self.finalized = false;
             self.binding_count = 0;
+            self.view_mask = 0;
+            self.open_mask = 0;
+            self.view_zoom = 1;
             assert(self.appearance_count == 0);
             assert(self.layer_now == .base);
         }
@@ -250,6 +294,7 @@ pub fn Context(
             assert(layer_index < layer_count);
             assert(self.textures.is_target(target));
             assert(rect[2] > 0 and rect[3] > 0);
+            assert(self.view_mask & bit_of(layer_index) == 0);
             assert(self.binding_count < textures.target_cap);
             for (self.bindings[0..self.binding_count]) |binding| {
                 assert(binding.layer != layer_index);
@@ -265,6 +310,44 @@ pub fn Context(
                 if (binding.layer == layer_index) return binding;
             }
             return null;
+        }
+
+        /// Gives `layer_value` the pan/zoom `next` for this frame (section 5c). Not the base
+        /// layer, once per layer, and never a layer bound to a target. `reset` clears it.
+        pub fn view(self: *Self, layer_value: Layer, next: View) void {
+            const layer_index: u8 = @backingInt(layer_value);
+            assert(layer_index != @backingInt(Layer.base));
+            assert(layer_index < layer_count);
+            assert(self.view_mask & bit_of(layer_index) == 0);
+            assert(self.binding_of(layer_index) == null);
+            assert(next.zoom > 0 and !std.math.isInf(next.zoom));
+            assert(finite(next.x) and finite(next.y));
+            self.views[layer_index] = next;
+            self.view_mask |= bit_of(layer_index);
+        }
+
+        /// The view of `layer_index` this frame, or null when it has none.
+        pub fn view_of(self: *const Self, layer_index: u8) ?View {
+            assert(layer_index < layer_count);
+            if (self.view_mask & bit_of(layer_index) == 0) return null;
+            return self.views[layer_index];
+        }
+
+        /// Opens a canvas over the viewed layers `mask` at `zoom` (section 5c).
+        pub fn open_views(self: *Self, mask: u8, zoom: f32) void {
+            assert(self.open_mask == 0);
+            assert(mask != 0);
+            assert(mask & self.view_mask == mask);
+            assert(zoom > 0);
+            self.open_mask = mask;
+            self.view_zoom = zoom;
+        }
+
+        /// Closes the open canvas.
+        pub fn close_views(self: *Self) void {
+            assert(self.open_mask != 0);
+            self.open_mask = 0;
+            self.view_zoom = 1;
         }
 
         /// This frame's offscreen bindings.
@@ -304,6 +387,12 @@ pub fn Context(
                 return error.PoolFull;
             }
             const layer_index: u8 = @backingInt(self.layer_now);
+            // Inside a canvas only its layers; outside it no viewed layer (section 5c).
+            if (self.open_mask != 0) {
+                assert(self.open_mask & bit_of(layer_index) != 0);
+            } else {
+                assert(self.view_mask & bit_of(layer_index) == 0);
+            }
             const key: u8 = @intCast(layer_index * P.texture_slots + slot);
             if (pool.histogram[key] == 0) {
                 if (self.appearance_count == batch_cap) {
@@ -513,6 +602,11 @@ pub fn Context(
     };
 }
 
+fn bit_of(layer_index: u8) u8 {
+    assert(layer_index < layer_count);
+    return @as(u8, 1) << @intCast(layer_index);
+}
+
 /// The hot loop of `Context.shift`, over one pool's records.
 fn shift_items(comptime T: type, items: []T, dx: f32, dy: f32) void {
     comptime assert(@offsetOf(T, "rect") == 0);
@@ -578,6 +672,9 @@ comptime {
     assert(@backingInt(Layer.overlay) < layer_count);
     // The sort key of a textured type must fit a u8.
     assert(layer_count * textures.texture_cap <= 256);
+    // One bit per layer in the view masks.
+    assert(layer_count <= 8);
+    assert(@sizeOf(View) == 16);
 }
 
 const testing = std.testing;
@@ -742,4 +839,26 @@ test "a full pool and a full batch list are counted and skipped" {
     try testing.expectError(error.BatchFull, cx.append(types.Box, null, test_box(0)));
     try testing.expectEqual(@as(u32, 1), cx.overflow_count);
     try testing.expectEqual(@as(u32, 6), cx.items(types.Box).len);
+}
+
+// Locks views (section 5c): a viewed layer keeps its view until `reset`, the maps are inverse
+// (world (10, 20) at zoom 2 from (100, 50) lands on (120, 90)), and the mask brackets a canvas.
+test "a view maps world points and lasts one frame" {
+    const cx = new_context();
+    const view: View = .{ .x = 100, .y = 50, .zoom = 2 };
+    try testing.expectEqual([2]f32{ 120, 90 }, view.apply(10, 20));
+    try testing.expectEqual([2]f32{ 10, 20 }, view.invert(120, 90));
+    cx.view(@fromBackingInt(1), view);
+    try testing.expectEqual(view, cx.view_of(1).?);
+    try testing.expectEqual(@as(?View, null), cx.view_of(2));
+    cx.open_views(0b10, 2);
+    _ = cx.layer(@fromBackingInt(1));
+    try cx.append(types.Box, null, test_box(0));
+    try testing.expectEqual(@as(f32, 2), cx.view_zoom);
+    cx.close_views();
+    _ = cx.layer(.base);
+    try cx.append(types.Box, null, test_box(1));
+    try testing.expectEqual(@as(f32, 1), cx.view_zoom);
+    cx.reset();
+    try testing.expectEqual(@as(?View, null), cx.view_of(1));
 }
