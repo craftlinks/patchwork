@@ -160,15 +160,19 @@ pub const StepMode = enum(u8) {
 };
 
 /// Color target blending, on the straight-alpha output of `fs_main` (`draw/registry.zig`,
-/// section 2c). `alpha` is source-over for color and alpha: (src_alpha, one_minus_src_alpha).
-/// `additive` adds `rgb * a`: color (src_alpha, one), alpha (zero, one). `multiply` scales the
-/// target by the output, which the shader has already mixed toward white by `1 - a`: color
-/// (dst, zero), alpha (zero, one).
+/// section 2c). `alpha` is source-over: color (src_alpha, one_minus_src_alpha), alpha (one,
+/// one_minus_src_alpha), so an offscreen target accumulates premultiplied color and correct
+/// coverage, and the opaque surface keeps alpha 1. `additive` adds `rgb * a`: color
+/// (src_alpha, one), alpha (zero, one). `multiply` scales the target by the output, which the
+/// shader has already mixed toward white by `1 - a`: color (dst, zero), alpha (zero, one).
+/// `premultiplied` composites a premultiplied source, such as a sampled offscreen target:
+/// (one, one_minus_src_alpha) for color and alpha.
 pub const Blend = enum(u8) {
     none,
     alpha,
     additive,
     multiply,
+    premultiplied,
 };
 
 /// `r8unorm` is single-channel coverage (the glyph atlas); `rgba8unorm` is straight-alpha
@@ -326,7 +330,9 @@ pub const BindGroupCreate = extern struct {
     id: u16,
     layout: u16,
     entry_count: u16,
-    pad: u16 = 0,
+    /// 1 replaces the group `id` already names (an offscreen target's, after a resize); 0
+    /// creates it, and the id must be new.
+    replace: u16 = 0,
     entries: [bind_group_entry_cap]BindGroupEntry,
 };
 

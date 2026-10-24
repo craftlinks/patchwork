@@ -18,6 +18,7 @@
 //! draw/pools.zig      Context: per-type pools, the point pool, layers, sort, sticky batches
 //! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
 //! draw/wave.zig       Waveform and Ring types, the waveform appender, the zoom pyramid
+//! draw/fx.zig         offscreen targets: device rects, projection, Composite and Blur
 //! draw/textures.zig   Textures: queued creates and writes, TextureId, Format
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
@@ -85,6 +86,9 @@ const types = @import("draw/types.zig");
 /// Stroked paths: `path.cubic`, `path.polyline`, `path.plot`, and their CPU twins.
 pub const path = @import("draw/path.zig");
 
+/// Offscreen effects: target device rects, `fx.composite`, `fx.blur`, and their types.
+pub const fx = @import("draw/fx.zig");
+
 /// Waveforms and rings: `wave.append`, `wave.Pyramid`, and the `Waveform` and `Ring` types.
 pub const wave = @import("draw/wave.zig");
 
@@ -137,6 +141,9 @@ pub const Image = types.Image;
 pub const Path = types.Path;
 pub const Waveform = wave.Waveform;
 pub const Ring = wave.Ring;
+pub const Composite = fx.Composite;
+pub const Blur = fx.Blur;
+pub const TargetKind = textures_module.TargetKind;
 pub const Point = pools.Point;
 pub const point_cap_max = pools.point_cap_max;
 pub const sdf_box = types.sdf_box;
@@ -271,6 +278,7 @@ test {
     _ = types;
     _ = path;
     _ = wave;
+    _ = fx;
     _ = @import("draw/tiles.zig");
 }
 

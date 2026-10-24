@@ -120,6 +120,29 @@
 //! and `time_s` differs from the uploaded value; a registry without animated types never writes
 //! it. A resize frame writes the whole uniform first and the time after it.
 //!
+//! ## 4c. Offscreen Targets
+//! A layer bound to a target this frame (`Context.offscreen`, `draw/fx.zig`) is drawn in the
+//! target's own pass, recorded after the uploads and before the main frame, and never in the
+//! main pass, its tiles, or its cached rects. Targets render in layer order, so a target may
+//! sample targets of lower layers as they are this frame:
+//! ```text
+//! per bound layer, lowest first:
+//!   content = fold of its batches' seeds (layer-local index, type, texture, the revision of
+//!             any sampled texture but the atlas) and record keys, the device rect, the scale,
+//!             and the time when an animated instance is there
+//!   single target, same content, same device rect     nothing: it keeps its pixels
+//!   otherwise  [buffer_create, bind_group_create (frame)]    at its first render
+//!              [target_create, bind_group_create [replace]] per texture, at a new size
+//!              buffer_write (its uniform: the target's projection, time, theme)
+//!              pass_begin (its back texture, cleared transparent), its batches, pass_end
+//!              revision += 1; a feedback target swaps front and back
+//! ```
+//! A target's id samples its front texture: on a feedback target's own layer, during its
+//! pass, that is last frame's (the pass writes the back one); everywhere else, after the
+//! swap, this frame's. The revision feeds the batch seed of every composite, so their tiles
+//! are dirty, and a rendered target disables the unchanged fast path. A target never rendered
+//! yet draws nothing where it is sampled.
+//!
 //! ## 5. Lifetime
 //! Spans point into the context's pools, `Textures`' queued writes (the glyph cache's mirror
 //! among them), `Renderer.uniform`, and static data, so all of them must stay put until the
@@ -135,6 +158,7 @@ const registry = @import("registry.zig");
 const textures = @import("textures.zig");
 const theme = @import("../theme.zig");
 const tiles_module = @import("tiles.zig");
+const fx = @import("fx.zig");
 const types = @import("types.zig");
 
 /// Straight (non-premultiplied) RGBA color with components in `[0, 1]`.
@@ -184,6 +208,12 @@ const batch_op_cap: u32 = 4;
 /// buffer and draw, and the frame group and unit quad that `draw_batches` binds.
 const rect_op_cap: u32 = 6;
 
+/// Ops one offscreen target records besides its batches (section 4c): two target creates and
+/// their bind groups, its uniform buffer and frame group, the uniform write, and the pass
+/// begin, frame group, unit quad, and end. Its batches are among the frame's `batch_cap`,
+/// which every cached rect already counts.
+const target_op_cap: u32 = 2 + 2 + 2 + 1 + 4;
+
 /// Upper bound on the ops `frame` records: a cached frame of `rects_max` rects (module guide,
 /// sections 3 and 4a), which is longer than a direct one.
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
@@ -192,7 +222,8 @@ pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     // Uniform, textures, one write per pool and one for the points, the time, the target,
     // the pass, the rects with their batches, the pass end, and the present.
     return 1 + texture_ops + type_count + 1 + 1 + 1 + 1 +
-        rects * (rect_op_cap + batch_cap * batch_op_cap) + 1 + 1;
+        rects * (rect_op_cap + batch_cap * batch_op_cap) + 1 + 1 +
+        textures.target_cap * target_op_cap;
 }
 
 /// Upper bound on the bytes `frame` records, for the same shape as `frame_op_cap`.
@@ -223,8 +254,13 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
     const per_rect = op_bytes(commands.ScissorSet) + op_bytes(commands.PipelineSet) +
         2 * op_bytes(commands.VertexBufferSet) + op_bytes(commands.Draw) +
         op_bytes(commands.BindGroupSet) + batch_cap * per_batch;
+    const per_target = 2 * (op_bytes(commands.TargetCreate) + op_bytes(commands.BindGroupCreate)) +
+        op_bytes(commands.BufferCreate) + op_bytes(commands.BindGroupCreate) +
+        op_bytes(commands.BufferWrite) + op_bytes(commands.PassBegin) +
+        op_bytes(commands.BindGroupSet) + op_bytes(commands.VertexBufferSet) +
+        op_bytes(commands.PassEnd);
     return (3 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
-        rects * per_rect;
+        rects * per_rect + textures.target_cap * per_target;
 }
 
 /// What a recorded frame does (module guide, section 4a).
@@ -301,6 +337,42 @@ pub fn Renderer(comptime Cx: type) type {
         /// The last `frame` folded its instances into tiles, rather than repeating the last
         /// frame's (section 4b).
         hashed: bool,
+        /// Offscreen targets in `Textures` order, and each `Textures` index's slot or
+        /// `no_target` (section 4c).
+        targets: [textures.target_cap]Target,
+        target_slots: [textures.texture_cap]u8,
+        target_count: u32,
+        /// One bit per layer bound to a target this frame.
+        bound_layers: u8,
+        /// Targets the last `frame` rendered.
+        rendered: u32,
+
+        const no_target: u8 = 0xFF;
+
+        /// One offscreen target's GPU state (section 4c).
+        const Target = struct {
+            index: u32,
+            kind: textures.TargetKind,
+            /// Its textures, groups, uniform buffer, and frame group exist.
+            ready: bool,
+            gpu_textures: [2]u16,
+            groups: [2]u16,
+            uniform_buffer: u16,
+            frame_group: u16,
+            device: fx.DeviceRect,
+            scale_120: u32,
+            /// The texture its id samples; a feedback target's pass writes the other.
+            front: u1,
+            key: u64,
+            uniform: Uniform,
+        };
+
+        /// Which batches `draw_batches` draws: the main pass's (every layer not bound to a
+        /// target) or one bound layer's.
+        const Filter = union(enum) {
+            main,
+            layer: u8,
+        };
 
         /// Most ops one `frame` records.
         pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity);
@@ -359,6 +431,10 @@ pub fn Renderer(comptime Cx: type) type {
             self.keys_valid = false;
             self.animating = false;
             self.hashed = false;
+            self.target_slots = @splat(no_target);
+            self.target_count = 0;
+            self.bound_layers = 0;
+            self.rendered = 0;
             assert(!self.ready);
             assert(self.width_px == 0);
         }
@@ -554,6 +630,27 @@ pub fn Renderer(comptime Cx: type) type {
             const r = &self.resources;
             while (table.created < table.count) : (table.created += 1) {
                 const index = table.created;
+                if (table.formats[index] == .target) {
+                    // Sized and created when a layer first renders it (section 4c).
+                    assert(self.target_count < textures.target_cap);
+                    self.target_slots[index] = @intCast(self.target_count);
+                    self.targets[self.target_count] = .{
+                        .index = index,
+                        .kind = table.kinds[index],
+                        .ready = false,
+                        .gpu_textures = .{ 0, 0 },
+                        .groups = .{ 0, 0 },
+                        .uniform_buffer = 0,
+                        .frame_group = 0,
+                        .device = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                        .scale_120 = 0,
+                        .front = 0,
+                        .key = 0,
+                        .uniform = self.uniform,
+                    };
+                    self.target_count += 1;
+                    continue;
+                }
                 r.textures[index] = self.ids.take(.texture);
                 buffer.push(.{ .texture_create = .{
                     .id = r.textures[index],
@@ -634,7 +731,10 @@ pub fn Renderer(comptime Cx: type) type {
                 self.upload_pool(buffer, index, &cx.pools[index]);
             }
             if (uses_points) self.upload_points(buffer, cx);
-            const kind = self.choose(cx, size, resized, unchanged);
+            var targets_animating = false;
+            self.rendered = self.render_targets(buffer, cx, size, time_s, &targets_animating);
+            const kind = self.choose(cx, size, resized, unchanged and self.rendered == 0);
+            if (targets_animating) self.animating = true;
             if (R.any_animated and self.animating and self.uniform.time[0] != time_s) {
                 self.uniform.time[0] = time_s;
                 buffer.push(.{ .buffer_write = .{
@@ -724,6 +824,7 @@ pub fn Renderer(comptime Cx: type) type {
             else
                 0;
             for (cx.batch_list(), 0..) |batch, batch_index| {
+                if (self.is_bound(batch.layer)) continue;
                 inline for (0..R.count) |index| {
                     if (batch.type_id == index) {
                         self.hash_batch(index, cx, batch, @intCast(batch_index), .{
@@ -775,7 +876,8 @@ pub fn Renderer(comptime Cx: type) type {
             if (R.textured[index] and batch.texture != .atlas) {
                 seed ^= @as(u64, cx.textures.revision_of(batch.texture)) << 40;
             }
-            var batch_key = tiles_module.key_of(seed, std.mem.asBytes(&seed));
+            // Seeded with 0: `key_of(seed, &seed)` would cancel the seed against its own word.
+            var batch_key = tiles_module.key_of(0, std.mem.asBytes(&seed));
             if (comptime registry.reads_points(T) and !@hasField(T, "first_point")) {
                 batch_key ^= context.points_key;
             }
@@ -836,7 +938,7 @@ pub fn Renderer(comptime Cx: type) type {
                 .target = commands.surface_target,
                 .load = .clear,
             } });
-            self.draw_batches(buffer, cx.batch_list());
+            self.draw_batches(buffer, cx.batch_list(), self.resources.frame_group, .main);
             buffer.push(.{ .pass_end_present = .{} });
         }
 
@@ -859,7 +961,7 @@ pub fn Renderer(comptime Cx: type) type {
                 .load = load,
             } });
             if (load == .clear) {
-                self.draw_batches(buffer, cx.batch_list());
+                self.draw_batches(buffer, cx.batch_list(), self.resources.frame_group, .main);
             } else {
                 var rects: [rect_count_max]tiles_module.Rect = undefined;
                 const count = self.tiles.rects(&rects);
@@ -872,7 +974,7 @@ pub fn Renderer(comptime Cx: type) type {
                         .height = rect.height,
                     } });
                     self.draw_clear(buffer);
-                    self.draw_batches(buffer, cx.batch_list());
+                    self.draw_batches(buffer, cx.batch_list(), self.resources.frame_group, .main);
                 }
             }
             buffer.push(.{ .pass_end = .{} });
@@ -981,17 +1083,215 @@ pub fn Renderer(comptime Cx: type) type {
             assert(shadow.count == cx.point_count);
         }
 
+        fn is_bound(self: *const Self, layer: u8) bool {
+            assert(layer < pools.layer_count);
+            return self.bound_layers & (@as(u8, 1) << @intCast(layer)) != 0;
+        }
+
+        fn wanted(self: *const Self, batch: pools.Batch, filter: Filter) bool {
+            return switch (filter) {
+                .main => !self.is_bound(batch.layer),
+                .layer => |layer| batch.layer == layer,
+            };
+        }
+
+        /// The bind group a textured batch of `id` binds, or null for a target that has not
+        /// rendered yet (section 4c).
+        fn group_of(self: *const Self, id: textures.TextureId) ?u16 {
+            const index = @backingInt(id);
+            const slot = self.target_slots[index];
+            if (slot == no_target) return self.resources.texture_groups[index];
+            const target = &self.targets[slot];
+            if (!target.ready) return null;
+            return target.groups[target.front];
+        }
+
+        /// Records every bound layer's target pass that its content or size asks for, lowest
+        /// layer first, and returns how many (section 4c). Sets `animating` when a bound
+        /// layer holds an animated instance.
+        fn render_targets(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            cx: *Cx,
+            size: Size,
+            time_s: f32,
+            animating: *bool,
+        ) u32 {
+            self.bound_layers = 0;
+            for (cx.binding_list()) |binding| {
+                self.bound_layers |= @as(u8, 1) << @intCast(binding.layer);
+            }
+            var rendered: u32 = 0;
+            var layer: u8 = 1;
+            while (layer < pools.layer_count) : (layer += 1) {
+                const binding = cx.binding_of(layer) orelse continue;
+                const index = @backingInt(binding.target);
+                const slot = self.target_slots[index];
+                assert(slot != no_target);
+                const target = &self.targets[slot];
+                const device = fx.device_rect(binding.rect, size.scale_120);
+                var layer_animated = false;
+                const key = self.content_key(cx, layer, device, size.scale_120, time_s, &layer_animated);
+                if (layer_animated) animating.* = true;
+                const same_device = target.ready and std.meta.eql(target.device, device) and
+                    target.scale_120 == size.scale_120;
+                if (target.kind == .single and same_device and target.key == key) continue;
+                self.prepare_target(buffer, target, device);
+                target.scale_120 = size.scale_120;
+                fx.ortho(&target.uniform.ortho, device, size.scale_120);
+                target.uniform.time = self.uniform.time;
+                target.uniform.time[0] = time_s;
+                buffer.push(.{ .buffer_write = .{
+                    .id = target.uniform_buffer,
+                    .offset = 0,
+                    .data = .of(std.mem.asBytes(&target.uniform)),
+                } });
+                const back: u1 = if (target.kind == .feedback) 1 - target.front else 0;
+                buffer.push(.{ .pass_begin = .{
+                    .width_px = device.width,
+                    .height_px = device.height,
+                    .clear = .{ 0, 0, 0, 0 },
+                    .target = target.gpu_textures[back],
+                    .load = .clear,
+                } });
+                self.draw_batches(buffer, cx.batch_list(), target.frame_group, .{ .layer = layer });
+                buffer.push(.{ .pass_end = .{} });
+                target.front = back;
+                target.key = key;
+                cx.textures.revisions[index] +%= 1;
+                rendered += 1;
+            }
+            assert(rendered <= textures.target_cap);
+            return rendered;
+        }
+
+        /// Creates a target's resources at its first render and its textures again at a new
+        /// size (section 4c).
+        fn prepare_target(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            target: *Target,
+            device: fx.DeviceRect,
+        ) void {
+            const r = &self.resources;
+            const count: u32 = if (target.kind == .feedback) 2 else 1;
+            const first = !target.ready;
+            if (first) {
+                target.uniform_buffer = self.create_buffer(
+                    buffer,
+                    commands.usage_uniform | commands.usage_copy_dst,
+                    draw.uniform_bytes,
+                );
+                target.frame_group = self.ids.take(.bind_group);
+                var frame_bindings = std.mem.zeroes(BindGroupEntries);
+                frame_bindings[0] = .{ .binding = 0, .resource = target.uniform_buffer };
+                if (uses_points) frame_bindings[1] = .{ .binding = 1, .resource = r.points_buffer };
+                buffer.push(.{ .bind_group_create = .{
+                    .id = target.frame_group,
+                    .layout = r.frame_layout,
+                    .entry_count = frame_entry_count,
+                    .entries = frame_bindings,
+                } });
+                for (0..count) |which| {
+                    target.gpu_textures[which] = self.ids.take(.texture);
+                    target.groups[which] = self.ids.take(.bind_group);
+                }
+            } else if (target.device.width == device.width and target.device.height == device.height) {
+                target.device = device;
+                return;
+            }
+            for (0..count) |which| {
+                buffer.push(.{ .target_create = .{
+                    .id = target.gpu_textures[which],
+                    .width = device.width,
+                    .height = device.height,
+                } });
+                var bindings = std.mem.zeroes(BindGroupEntries);
+                bindings[0] = .{ .binding = 0, .resource = target.gpu_textures[which] };
+                bindings[1] = .{ .binding = 1, .resource = self.sampler_for(buffer, .{}) };
+                buffer.push(.{ .bind_group_create = .{
+                    .id = target.groups[which],
+                    .layout = r.texture_layouts[@backingInt(textures.Class.filterable)],
+                    .entry_count = 2,
+                    .replace = if (first) 0 else 1,
+                    .entries = bindings,
+                } });
+            }
+            target.ready = true;
+            target.front = 0;
+            target.device = device;
+        }
+
+        /// The content key of bound `layer` (section 4c). Refreshes the shadow keys of its
+        /// records, as `hash_batch` does for the main layers.
+        fn content_key(
+            self: *Self,
+            cx: *const Cx,
+            layer: u8,
+            device: fx.DeviceRect,
+            scale_120: u32,
+            time_s: f32,
+            animated: *bool,
+        ) u64 {
+            var key = tiles_module.key_of(0, std.mem.asBytes(&[4]u32{ device.x, device.y, device.width, device.height }));
+            key = tiles_module.key_of(key, std.mem.asBytes(&@as(u64, scale_120)));
+            if (whole_points_key) key = tiles_module.key_of(key, std.mem.sliceAsBytes(cx.point_items()));
+            var local: u32 = 0;
+            for (cx.batch_list()) |batch| {
+                if (batch.layer != layer) continue;
+                inline for (0..R.count) |index| {
+                    if (batch.type_id == index) {
+                        if (R.animates[index]) animated.* = true;
+                        key = self.fold_batch(index, cx, batch, local, key);
+                    }
+                }
+                local += 1;
+            }
+            if (animated.*) key = tiles_module.key_of(key, std.mem.asBytes(&@as(u64, @as(u32, @bitCast(time_s)))));
+            return key;
+        }
+
+        fn fold_batch(
+            self: *Self,
+            comptime index: u32,
+            cx: *const Cx,
+            batch: pools.Batch,
+            local: u32,
+            key_in: u64,
+        ) u64 {
+            const T = R.Type(index);
+            var seed: u64 = (@as(u64, local) << 32) | (@as(u64, index) << 16) |
+                @backingInt(batch.texture);
+            if (R.textured[index] and batch.texture != .atlas) {
+                seed ^= @as(u64, cx.textures.revision_of(batch.texture)) << 40;
+            }
+            var key = tiles_module.key_of(key_in, std.mem.asBytes(&seed));
+            const shadow = &self.shadows[index];
+            const items = cx.items(T)[batch.first..][0..batch.count];
+            for (items, batch.first..) |*item, pool_index| {
+                if (!self.keys_valid or self.key_stale(T, shadow, item, @intCast(pool_index))) {
+                    shadow.keys[pool_index] = record_key(T, cx, item);
+                }
+                key = tiles_module.key_of(key, std.mem.asBytes(&shadow.keys[pool_index]));
+            }
+            return key;
+        }
+
         fn draw_batches(
             self: *const Self,
             buffer: *commands.CommandBuffer,
             batches: []const pools.Batch,
+            frame_group: u16,
+            filter: Filter,
         ) void {
             assert(batches.len <= Cx.batch_capacity);
-            if (batches.len == 0) {
+            var any = false;
+            for (batches) |batch| any = any or self.wanted(batch, filter);
+            if (!any) {
                 return;
             }
             const r = &self.resources;
-            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = r.frame_group } });
+            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = frame_group } });
             buffer.push(.{ .vertex_buffer_set = .{
                 .slot = 0,
                 .buffer = r.unit_buffer,
@@ -1002,6 +1302,10 @@ pub fn Renderer(comptime Cx: type) type {
             for (batches) |batch| {
                 assert(batch.type_id < R.count);
                 assert(batch.count != 0);
+                if (!self.wanted(batch, filter)) continue;
+                // A target that has not rendered yet has no texture to sample (section 4c).
+                const group: ?u16 = if (R.textured[batch.type_id]) self.group_of(batch.texture) else null;
+                if (R.textured[batch.type_id] and group == null) continue;
                 if (type_bound != batch.type_id) {
                     buffer.push(.{ .pipeline_set = .{ .id = r.pipelines[batch.type_id] } });
                     buffer.push(.{ .vertex_buffer_set = .{
@@ -1011,11 +1315,10 @@ pub fn Renderer(comptime Cx: type) type {
                     } });
                     type_bound = batch.type_id;
                 }
-                if (R.textured[batch.type_id]) {
-                    const group = r.texture_groups[@backingInt(batch.texture)];
-                    if (group_bound != group) {
-                        buffer.push(.{ .bind_group_set = .{ .slot = 1, .id = group } });
-                        group_bound = group;
+                if (group) |id| {
+                    if (group_bound != id) {
+                        buffer.push(.{ .bind_group_set = .{ .slot = 1, .id = id } });
+                        group_bound = id;
                     }
                 }
                 buffer.push(.{ .draw = .{
@@ -1600,6 +1903,183 @@ test "textures get their class layout and their mode's sampler, created once" {
         }
     }
     try testing.expectEqual(@as(u32, 3), groups);
+}
+
+// Locks that a texture's revision reaches the tiles that sample it (module guide, section 4a):
+// an image drawn twice unchanged is skipped the second time, and rewriting its texture, with
+// no record changed, repaints the image's tile. Until step 25 the batch key cancelled its own
+// seed, so this frame was skipped.
+test "a texture write repaints the tiles that sample it" {
+    const static = struct {
+        var context: DataContext = undefined;
+        var renderer: Renderer(DataContext) = undefined;
+        var buffer: commands.CommandBuffer = undefined;
+        const texels: [16]u8 = @splat(0x80);
+    };
+    const cx = &static.context;
+    cx.init();
+    const image = cx.textures.create(.rgba8, 2, 2);
+    static.renderer.init();
+    static.buffer = .init();
+    static.renderer.setup(&static.buffer, cx);
+    const size: Size = .{ .width_logical = 256, .height_logical = 256, .width_px = 256, .height_px = 256, .scale_120 = 120 };
+    for (0..3) |frame_index| {
+        cx.text.scale_120 = 120;
+        cx.reset();
+        cx.append(types.Image, image, .{
+            .rect = .{ 70, 70, 20, 20 },
+            .clip = .{ 0, 0, 256, 256 },
+            .uv = .{ 0, 0, 1, 1 },
+            .tint = .{ 1, 1, 1, 1 },
+        }) catch unreachable;
+        if (frame_index == 2) cx.textures.write(image, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, &static.texels);
+        static.buffer.reset();
+        static.renderer.frame(&static.buffer, cx, size, 0);
+        if (frame_index == 1) try testing.expectEqual(Kind.skipped, static.renderer.last);
+    }
+    try testing.expect(static.renderer.last != .skipped);
+    try testing.expectEqual(@as(u32, 1), static.renderer.tiles.dirty_count);
+}
+
+const target_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 8 },
+    .{ .type = fx.Composite, .cap = 4 },
+};
+
+const TargetContext = draw.Context(&target_draw, 16, 0);
+
+const Targets = struct {
+    var context: TargetContext = undefined;
+    var renderer: Renderer(TargetContext) = undefined;
+    var buffer: commands.CommandBuffer = undefined;
+    var single: textures.TextureId = undefined;
+    var feedback: textures.TextureId = undefined;
+
+    fn start() void {
+        context.init();
+        single = context.textures.create_target(.single);
+        feedback = context.textures.create_target(.feedback);
+        renderer.init();
+        buffer = .init();
+        renderer.setup(&buffer, &context);
+    }
+
+    /// Layer 1 into `target` over `rect`: a box at `box_x`, and with `echo` the target's own
+    /// last frame first; then on the base layer a composite of the target at `rect`.
+    fn scene(target: textures.TextureId, rect: [4]f32, box_x: f32, echo: bool) void {
+        const cx = &context;
+        cx.text.scale_120 = 120;
+        cx.reset();
+        cx.offscreen(@fromBackingInt(@intCast(1)), target, rect);
+        _ = cx.layer(@fromBackingInt(@intCast(1)));
+        if (echo) fx.composite(cx, target, rect, rect, rect_clip(rect), 0.9, 1, 0);
+        cx.append(types.Box, null, face(box_x)) catch unreachable;
+        _ = cx.layer(.base);
+        fx.composite(cx, target, rect, rect, rect_clip(rect), 0.5, 1, 0);
+    }
+
+    fn rect_clip(rect: [4]f32) [4]f32 {
+        return .{ rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3] };
+    }
+
+    fn record() void {
+        buffer.reset();
+        renderer.frame(&buffer, &context, .{
+            .width_logical = 640,
+            .height_logical = 480,
+            .width_px = 640,
+            .height_px = 480,
+            .scale_120 = 120,
+        }, 0);
+    }
+
+    fn passes(out: []u16) []u16 {
+        var reader = buffer.reader();
+        var count: usize = 0;
+        while (reader.next()) |op| {
+            if (op == .pass_begin) {
+                out[count] = op.pass_begin.target;
+                count += 1;
+            }
+        }
+        return out[0..count];
+    }
+};
+
+// Locks a single target (module guide, section 4c): its first frame creates its uniform buffer,
+// frame group, texture, and group, and renders its pass before the main pass, which draws only
+// the base layer (one box would be two draws otherwise); an identical frame renders nothing and
+// skips the main pass; a moved box re-renders the target and repaints the composite's tile; a
+// new size re-creates the texture and replaces its group.
+test "a single target renders when its content changes and keeps its pixels otherwise" {
+    Targets.start();
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 1), Targets.renderer.rendered);
+    const target = &Targets.renderer.targets[0];
+    var storage: [8]u16 = undefined;
+    const first = Targets.passes(&storage);
+    try testing.expectEqual(@as(usize, 2), first.len);
+    try testing.expectEqual(target.gpu_textures[0], first[0]);
+    try testing.expectEqual(commands.surface_target, first[1]);
+    var reader = Targets.buffer.reader();
+    var draws: u32 = 0;
+    var main = false;
+    while (reader.next()) |op| switch (op) {
+        .pass_begin => |pass| main = pass.target == commands.surface_target,
+        .draw => if (main) {
+            draws += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(u32, 1), draws);
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 0), Targets.renderer.rendered);
+    try testing.expectEqual(Kind.skipped, Targets.renderer.last);
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 30, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 1), Targets.renderer.rendered);
+    try testing.expect(Targets.renderer.last == .full or Targets.renderer.last == .cached);
+    Targets.scene(Targets.single, .{ 10, 10, 120, 50 }, 30, false);
+    Targets.record();
+    reader = Targets.buffer.reader();
+    var replaced = false;
+    var created = false;
+    while (reader.next()) |op| switch (op) {
+        .target_create => |create| created = create.width == 120,
+        .bind_group_create => |group| replaced = replaced or group.replace == 1,
+        else => {},
+    };
+    try testing.expect(created and replaced);
+}
+
+// Locks a feedback target (section 4c): it renders every frame it is bound, alternating its two
+// textures, and its own layer's composite samples the texture the pass does not write.
+test "a feedback target renders every frame over its own last frame" {
+    Targets.start();
+    var storage: [8]u16 = undefined;
+    var written: [3]u16 = undefined;
+    for (&written) |*texture| {
+        Targets.scene(Targets.feedback, .{ 0, 0, 64, 64 }, 0, true);
+        Targets.record();
+        try testing.expectEqual(@as(u32, 1), Targets.renderer.rendered);
+        texture.* = Targets.passes(&storage)[0];
+        const target = &Targets.renderer.targets[1];
+        var reader = Targets.buffer.reader();
+        var in_target = false;
+        while (reader.next()) |op| switch (op) {
+            .pass_begin => |pass| in_target = pass.target == target.gpu_textures[0] or
+                pass.target == target.gpu_textures[1],
+            .bind_group_set => |set| if (in_target and set.slot == 1) {
+                // Front is already swapped: the group the pass bound is the back one now.
+                try testing.expectEqual(target.groups[1 - target.front], set.id);
+            },
+            else => {},
+        };
+    }
+    try testing.expect(written[0] != written[1]);
+    try testing.expectEqual(written[0], written[2]);
 }
 
 // Locks the bound that keeps the worst cached frame in one command buffer: an app of few

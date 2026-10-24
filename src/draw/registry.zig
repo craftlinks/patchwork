@@ -74,7 +74,7 @@
 //! prelude.wgsl                         Frame, vs_main, fs_main, coverage, sdf_*, clip_mask
 //! struct Theme { ... }                 one vec4 per `theme.Theme` field, in order
 //! bound_texture, bound_sampler         @group(1), textured types only, with sample_texture,
-//!                                      load_texture, and texture_size
+//!                                      sample_texture_level, load_texture, texture_size
 //! points                               @group(0) @binding(1), `reads_points` types only
 //! struct Instance { g0 .. gN-1 }       @location(1 .. N) vec4<f32>
 //! struct Varyings                      position, local, and every group @interpolate(flat)
@@ -381,7 +381,7 @@ pub fn source(comptime T: type) []const u8 {
 fn blend_wgsl(comptime T: type) []const u8 {
     return switch (comptime blend_of(T)) {
         .none => unreachable,
-        .alpha, .additive => "\nfn blend_out(c: vec4<f32>) -> vec4<f32> {\n" ++
+        .alpha, .additive, .premultiplied => "\nfn blend_out(c: vec4<f32>) -> vec4<f32> {\n" ++
             "    return c;\n}\n",
         .multiply => "\nfn blend_out(c: vec4<f32>) -> vec4<f32> {\n" ++
             "    return vec4<f32>(mix(vec3<f32>(1.0, 1.0, 1.0), c.rgb, c.a), c.a);\n}\n",
@@ -423,6 +423,12 @@ const texture_wgsl: []const u8 =
     \\// Samples the type's texture. Call it in uniform control flow (prelude, section 3).
     \\fn sample_texture(uv: vec2<f32>) -> vec4<f32> {
     \\    return textureSample(bound_texture, bound_sampler, uv);
+    \\}
+    \\
+    \\// Samples at mip level 0, with no derivatives, so it may run under branches and in
+    \\// loops of instance-dependent length.
+    \\fn sample_texture_level(uv: vec2<f32>) -> vec4<f32> {
+    \\    return textureSampleLevel(bound_texture, bound_sampler, uv, 0.0);
     \\}
     \\
     \\// Reads one texel, no filter and no derivatives, so it may run under branches.

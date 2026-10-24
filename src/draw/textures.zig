@@ -21,6 +21,13 @@
 //! bind through a second layout with a non-filtering sampler, and `create_sampled` asserts
 //! they are sampled `nearest`.
 //!
+//! ## 2b. Offscreen Targets
+//! `create_target(kind)` reserves an id with format `.target`: the surface format, filterable,
+//! sampled linear and clamped. A target has no size and nothing to write: the renderer sizes
+//! and renders it when a layer is bound to it (`draw/fx.zig`, `draw/renderer.zig`, section
+//! 4c). A `.feedback` target is two textures behind one id, so a layer can draw over its own
+//! last frame. At most `target_cap` targets exist, counted against `texture_cap`.
+//!
 //! ## 2a. Sampling
 //! Each texture has a `Sampling`: its filter and its address mode per axis (clamp to the
 //! edge, or repeat). `create` takes the default (linear, clamp, clamp). There are
@@ -73,7 +80,20 @@ pub const Format = enum(u8) {
     rg16float,
     r32float,
     rg32float,
+    /// An offscreen target in the surface format (section 2b).
+    target,
 };
+
+/// How an offscreen target keeps its pixels (section 2b).
+pub const TargetKind = enum(u8) {
+    /// Re-rendered when its content changes.
+    single,
+    /// Re-rendered every frame it is bound, over its own last frame.
+    feedback,
+};
+
+/// Offscreen targets one app may create.
+pub const target_cap: u32 = 4;
 
 /// Which texture bind group layout a format binds through (module guide, section 2).
 pub const Class = enum(u8) {
@@ -129,6 +149,9 @@ pub const Textures = struct {
     widths: [texture_cap]u32,
     heights: [texture_cap]u32,
     samplings: [texture_cap]Sampling,
+    /// The kind of each `.target` entry; meaningless for the others.
+    kinds: [texture_cap]TargetKind,
+    target_count: u32,
     writes: [write_cap]Write,
     write_count: u32,
     /// Moves on every queued write of a texture: the pixel cache folds it into the tiles that
@@ -140,6 +163,7 @@ pub const Textures = struct {
         self.count = 0;
         self.created = 0;
         self.write_count = 0;
+        self.target_count = 0;
         self.revisions = @splat(0);
         assert(self.count == 0);
         assert(self.write_count == 0);
@@ -149,6 +173,27 @@ pub const Textures = struct {
     /// clamped. The GPU texture and its bind group are created in the next recorded stream.
     pub fn create(self: *Textures, format: Format, width: u32, height: u32) TextureId {
         return self.create_sampled(format, width, height, .{});
+    }
+
+    /// Reserves the next id for an offscreen target of `kind` (module guide, section 2b).
+    pub fn create_target(self: *Textures, kind: TargetKind) TextureId {
+        assert(self.count < texture_cap);
+        assert(self.target_count < target_cap);
+        const index = self.count;
+        self.formats[index] = .target;
+        self.widths[index] = 0;
+        self.heights[index] = 0;
+        self.samplings[index] = .{};
+        self.kinds[index] = kind;
+        self.count += 1;
+        self.target_count += 1;
+        assert(self.count == index + 1);
+        return @fromBackingInt(@intCast(index));
+    }
+
+    /// True when `id` is an offscreen target.
+    pub fn is_target(self: *const Textures, id: TextureId) bool {
+        return self.format_of(id) == .target;
     }
 
     /// `create` with a sampling mode (module guide, section 2a). An unfilterable format must
@@ -163,6 +208,7 @@ pub const Textures = struct {
         assert(self.count < texture_cap);
         assert(width != 0);
         assert(height != 0);
+        assert(format != .target);
         if (class_of(format) == .unfilterable) assert(sampling.filter == .nearest);
         const index = self.count;
         self.formats[index] = format;
@@ -180,6 +226,7 @@ pub const Textures = struct {
     pub fn write(self: *Textures, id: TextureId, region: Region, data: []const u8) void {
         const index = @backingInt(id);
         assert(index < self.count);
+        assert(self.formats[index] != .target);
         assert(self.write_count < write_cap);
         assert(region.width != 0);
         assert(region.height != 0);
@@ -209,6 +256,7 @@ pub const Textures = struct {
     ) void {
         const index = @backingInt(id);
         assert(index < self.count);
+        assert(self.formats[index] != .target);
         assert(self.write_count < write_cap);
         assert(region.width != 0);
         assert(region.height != 0);
@@ -343,6 +391,7 @@ pub fn bytes_per_texel(format: Format) u32 {
         .rg16float => 4,
         .r32float => 4,
         .rg32float => 8,
+        .target => 4,
     };
 }
 
@@ -355,13 +404,15 @@ pub fn gpu_format(format: Format) commands.TextureFormat {
         .rg16float => .rg16float,
         .r32float => .r32float,
         .rg32float => .rg32float,
+        // Targets are created by `target_create`, which carries no format.
+        .target => unreachable,
     };
 }
 
 /// The layout class of `format` (module guide, section 2).
 pub fn class_of(format: Format) Class {
     return switch (format) {
-        .r8, .rgba8, .r16float, .rg16float => .filterable,
+        .r8, .rgba8, .r16float, .rg16float, .target => .filterable,
         .r32float, .rg32float => .unfilterable,
     };
 }
@@ -372,6 +423,7 @@ comptime {
     assert(texture_cap + 1 <= commands.caps.get(.bind_group));
     assert(write_cap >= 1);
     assert(@backingInt(TextureId.atlas) == 0);
+    assert(target_cap <= texture_cap);
     // Every sampling mode gets its own sampler.
     assert(sampling_count <= commands.caps.get(.sampler));
     assert(sampling_count == 2 * 2 * 2);

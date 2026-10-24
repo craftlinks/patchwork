@@ -365,13 +365,22 @@ pub fn build(b: *std.Build) void {
         .wgpu_lib_dir = wgpu_lib_dir,
     });
     b.getInstallStep().dependOn(data.install);
+    const fx = addApp(b, b, .{
+        .name = "fx",
+        .root_source_file = b.path("examples/fx/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
     b.getInstallStep().dependOn(wave.install);
+    b.getInstallStep().dependOn(fx.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
     add_example_steps(b, "-data", "the data textures", data);
     add_example_steps(b, "-wave", "the wave views", wave);
-    add_test_steps(b, library, .{ rack, column, live, data, wave });
+    add_example_steps(b, "-fx", "the offscreen effects", fx);
+    add_test_steps(b, library, .{ rack, column, live, data, wave, fx });
     add_compare_step(b, library);
 }
 
@@ -425,7 +434,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [5]AppSteps,
+    examples: [6]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
