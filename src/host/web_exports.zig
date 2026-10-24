@@ -212,6 +212,7 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.timer_on, .{ .name = "timer_on" });
     @export(&Web.timer, .{ .name = "timer" });
     @export(&Web.tick, .{ .name = "tick" });
+    @export(&Web.overflow_take, .{ .name = "overflow_take" });
     @export(&Web.audio_on, .{ .name = "audio_on" });
     if (app_contract.has_audio(App)) {
         @export(&Web.audio_inbox_ptr, .{ .name = "audio_inbox_ptr" });
@@ -250,6 +251,9 @@ fn WebApp(comptime App: type) type {
         var audio_inbox: [realtime.post_blocks]realtime.Block = undefined;
         var audio_source: Source = undefined;
         var audio_rendered: realtime.Block = undefined;
+        /// The last overflow report, and whether `overflow_take` has yet to hand it out.
+        var overflow_counts: [3]u32 = @splat(0);
+        var overflow_pending: bool = false;
         /// Key names and pastes from `shell.js` (section 4a).
         var input_buffer: [input_cap]u8 = undefined;
 
@@ -485,6 +489,14 @@ fn WebApp(comptime App: type) type {
             return 1;
         }
 
+        /// The address of the last overflow report's three counts (instances, areas, glyphs)
+        /// once, or 0: `shell.js` logs it after `tick` (`ui/cx.zig`, section 10).
+        fn overflow_take() callconv(.c) u32 {
+            if (!overflow_pending) return 0;
+            overflow_pending = false;
+            return @intCast(@intFromPtr(&overflow_counts));
+        }
+
         /// 1 while the app wants its audio source running (`cx.audio_on`), else 0 (section 4b).
         fn audio_on() callconv(.c) u32 {
             if (!has_audio) assert(!context.audio_on);
@@ -577,6 +589,12 @@ fn WebApp(comptime App: type) type {
                 scale_120,
             );
             assert(context.draw.text.drawn_scale_120 == scale_120);
+            if (std.debug.runtime_safety) {
+                if (context.overflow_report()) |refused| {
+                    overflow_counts = .{ refused.instances, refused.areas, refused.glyphs };
+                    overflow_pending = true;
+                }
+            }
             // Spans must outlive the host call; module guide section 3 explains why static
             // storage is enough.
             state.commands.reset();

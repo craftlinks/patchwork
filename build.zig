@@ -592,8 +592,7 @@ fn add_test_steps(
         },
         .{
             .path = "test/contract_ragged_type.zig",
-            .expected = "contract_ragged_type.Ragged: @sizeOf must be a multiple of 16 " ++
-                "(one vec4 per 16 bytes)",
+            .expected = "contract_ragged_type.Ragged: field `count` must be f32, [2]f32, or [4]f32",
         },
         .{
             .path = "test/contract_frozen_time.zig",

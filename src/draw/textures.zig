@@ -59,7 +59,7 @@
 //!
 //! ## 4. TigerStyle Invariants
 //! - `texture_cap` bounds the table and `write_cap` bounds the queued writes per stream; both
-//!   are asserted, and `layer_count * texture_cap` must fit the `u8` sort key in `pools.zig`.
+//!   are asserted, and `layer_count * texture_cap` must fit the `u16` sort key in `pools.zig`.
 //! - Ids are never freed: every texture lives for the whole program.
 
 const std = @import("std");
@@ -67,7 +67,7 @@ const assert = std.debug.assert;
 const commands = @import("../gpu/commands.zig");
 
 /// Textures one app may create, the glyph atlas included.
-pub const texture_cap: u32 = 32;
+pub const texture_cap: u32 = 64;
 
 /// Writes that may be queued between two recorded streams.
 pub const write_cap: u32 = 16;
@@ -421,6 +421,8 @@ comptime {
     assert(texture_cap <= commands.caps.get(.texture));
     // One bind group per texture plus the frame group.
     assert(texture_cap + 1 <= commands.caps.get(.bind_group));
+    // Every texture, a feedback target's second texture, and the kept target.
+    assert(texture_cap + target_cap + 1 <= commands.caps.get(.texture));
     assert(write_cap >= 1);
     assert(@backingInt(TextureId.atlas) == 0);
     assert(target_cap <= texture_cap);

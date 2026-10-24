@@ -465,6 +465,12 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   Shift+Tab go to its widget instead of moving focus; the editor indents), and `cursor` (the pointer shape over the
   area: `default`, `pointer`, `text`, `grab`, `grabbing`, `ew_resize`, `ns_resize`). A right
   press on the hot area is `Hit.secondary` and never captures.
+- **Routing.** `App.event` calls each widget's `handle`, which is how it learns what changed.
+  For widgets whose result it does not need, `ui.route(cx, event, target)` calls every widget
+  a target names: a widget, a slice or array of them, or each widget field of a struct (so
+  `ui.route(cx, event, app)` cannot forget one). It returns how many acted.
+- **Widget sizes.** `widgets.Knob.init(...).sized(40)` sets one knob's ring (the labels follow
+  it), and `Meter.track_h` one meter's track; the defaults are the shared constants.
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
   the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
   and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
@@ -667,8 +673,9 @@ and in Chromium.
 
 ### 8. Pan and Zoom Canvas (`examples/canvas/app.zig`)
 
-A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, and a knob
-with its value) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
+A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, and a
+`widgets.Knob` with a 40 px ring, all 1,000 routed by one `ui.route` call and draggable at any
+zoom) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
 rung (2^(1/4)) about the pointer from 25% to 400%, dragging the background pans, pressing a
 module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
 center, and `0` resets. Modules and cables are culled in world pixels, below 50% a module is
@@ -892,9 +899,11 @@ adds its own (the rack's `Led`).
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
   pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
-  follow. Every field is `f32` or `[4]f32`, the size is a multiple of 16, and each 16 bytes is
-  one `float32x4` attribute at locations 1 to 8. `app.check` fails the build naming the type
-  otherwise (`zig build test-contract` locks one case).
+  follow. Every field is `f32`, `[2]f32` (at an 8-byte boundary), or `[4]f32` (at a 16-byte
+  one), and the size is any multiple of 4, so no hand padding: each full 16 bytes is one
+  `float32x4` attribute at locations 1 to 8, and a last partial group is `float32`,
+  `float32x2`, or `float32x3` (the rack's `Led` is 52 bytes). `app.check` fails the build
+  naming the type and field otherwise (`zig build test-contract` locks one case).
 - **WGSL assembly.** `draw/registry.zig` concatenates `draw/prelude.wgsl` (the `Frame`
   uniform, a shared `vs_main`, an `fs_main` that applies the clip mask, and `coverage`,
   `stroke`, `sdf_box`, `sdf_circle`, `sdf_segment`, `sdf_arc`), a `Theme` struct generated from
@@ -935,11 +944,22 @@ adds its own (the rack's `Led`).
   `fn ring_color(value, px)`.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
   layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
-  batch list refuses the instance and counts it in `cx.draw.overflow_count`.
+  batch list refuses the instance and counts it in `cx.draw.overflow_count`; in builds with
+  runtime safety both hosts log refused instances, areas, and glyphs once per change
+  (`cx.overflow_report()`).
 - **Sticky batches.** At frame end each pool is stably sorted by (layer, texture) with a
   counting sort, skipped when appends were already in order, and each (layer, type, texture)
   run is one draw call. Layers draw in order; within a layer, batches draw in order of first
   appearance. Box, glyph, box, glyph in one layer is two draw calls, not four.
+- **Draw order inside a layer.** Because a batch draws where its first instance appeared, a
+  Box appended after any Glyph on the same layer draws under every glyph: a panel face drawn
+  after a title hides nothing, but the title's batch already opened, so labels placed on that
+  face draw under it. Append faces before any text on the layer, or put what must cover on a
+  higher layer. The sort key is 16 bits (`layer * 64 + texture`), so up to 64 textures and the
+  8 layers no longer bound each other.
+- **Uploads.** Each pool uploads up to four ranges of changed records (`draw.dirty_ranges`),
+  bridging gaps of up to 8 unchanged records, so changes at both ends of a pool write two short
+  ranges: a key typed into the live stress text uploads 6.9 KB instead of 72 KB.
 - **Textures.** `textures.create(format, width, height)` returns a `TextureId` and
   `textures.write(id, region, bytes)` queues pixels (`write_strided` takes a row stride, for a
   sub-rectangle of a larger image); both are recorded into the next stream, each texture with

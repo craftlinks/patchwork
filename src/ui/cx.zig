@@ -133,7 +133,9 @@
 //! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, the clipboard, and the
 //!   duplicate stamps of safe builds. Per-frame work is proportional to instances, areas, and
 //!   depth; nothing capacity-sized is cleared per frame or per event.
-//! - Overflowing areas are counted in `area_overflow` and are not hittable.
+//! - Overflowing areas are counted in `area_overflow` and are not hittable. `overflow()` gathers
+//!   them with the refused instances and glyphs, and `overflow_report()` returns that only when
+//!   it changed and is not zero, which both hosts log after a draw in safe builds.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -179,6 +181,16 @@ pub const Up = struct {
     x: f32,
     y: f32,
     inside: bool,
+};
+
+/// What the last draw refused for lack of room (module guide, section 10): instances
+/// (`draw.overflow_count`), areas (`area_overflow`), and glyphs the atlas could not fit.
+pub const Overflow = struct {
+    instances: u32,
+    areas: u32,
+    glyphs: u32,
+
+    pub const zero: Overflow = .{ .instances = 0, .areas = 0, .glyphs = 0 };
 };
 
 /// What one event means for one id. See the module guide, section 5.
@@ -310,6 +322,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         audio_dropped: u32,
         /// The canvas being drawn, if any (section 3a).
         canvas_open: ?Canvas,
+        /// What `overflow_report` last returned or saw (section 10).
+        overflow_seen: Overflow,
 
         pub const DrawContext = Draw;
         pub const capacity: u32 = area_cap;
@@ -359,6 +373,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.audio_on = false;
             self.audio_dropped = 0;
             self.canvas_open = null;
+            self.overflow_seen = .zero;
             assert(self.phase == .idle);
             assert(self.dirty);
         }
@@ -398,6 +413,27 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.has_audio);
             self.audio_on = on;
             assert(self.audio_on == on);
+        }
+
+        /// What the last draw refused (section 10). Not during a draw.
+        pub fn overflow(self: *const Self) Overflow {
+            assert(self.phase != .draw);
+            return .{
+                .instances = self.draw.overflow_count,
+                .areas = self.area_overflow,
+                .glyphs = self.draw.text.overflow_count,
+            };
+        }
+
+        /// The last draw's overflow when it differs from what this last saw and is not all
+        /// zero, else null, so a persistent overflow is reported once and again whenever it
+        /// changes. The hosts log it after each draw in builds with runtime safety.
+        pub fn overflow_report(self: *Self) ?Overflow {
+            const now = self.overflow();
+            if (std.meta.eql(now, self.overflow_seen)) return null;
+            self.overflow_seen = now;
+            if (std.meta.eql(now, Overflow.zero)) return null;
+            return now;
         }
 
         /// Marks a draw as owed. Not during a draw.
@@ -1994,4 +2030,22 @@ test "a canvas area hits its mapped rect at every zoom" {
         try testing.expect(out[1] == .down);
         send(context, .{ .pointer_up = input.left_at(outside) }, &ids, &out);
     }
+}
+
+// Locks the overflow report (section 10): a frame that refuses two instances is reported, the
+// same overflow on the next frame is not, a frame without overflow is not but resets the
+// memory, and the same overflow after it is reported again.
+test "an overflow is reported once per change" {
+    const context = new_context();
+    try testing.expectEqual(@as(?Overflow, null), context.overflow_report());
+    context.draw.overflow_count = 2;
+    const two: Overflow = .{ .instances = 2, .areas = 0, .glyphs = 0 };
+    try testing.expectEqual(@as(?Overflow, two), context.overflow_report());
+    try testing.expectEqual(@as(?Overflow, null), context.overflow_report());
+    context.draw.overflow_count = 0;
+    try testing.expectEqual(@as(?Overflow, null), context.overflow_report());
+    context.draw.overflow_count = 2;
+    context.area_overflow = 1;
+    const three: Overflow = .{ .instances = 2, .areas = 1, .glyphs = 0 };
+    try testing.expectEqual(@as(?Overflow, three), context.overflow_report());
 }

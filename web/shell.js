@@ -133,7 +133,12 @@ let encoder = null;
 let pass = null;
 
 /** WebGPU vocabulary for the Zig payload enums, keyed by Zig tag name (guide, section 2). */
-const VERTEX_FORMAT_TABLE = { float32x2: "float32x2", float32x4: "float32x4" };
+const VERTEX_FORMAT_TABLE = {
+    float32: "float32",
+    float32x2: "float32x2",
+    float32x3: "float32x3",
+    float32x4: "float32x4",
+};
 const STEP_MODE_TABLE = { vertex: "vertex", instance: "instance" };
 const TEXTURE_FORMAT_TABLE = {
     r8unorm: "r8unorm",
@@ -611,6 +616,20 @@ function load_table() {
 }
 
 /**
+ * Logs the draw's overflow report once per change, in builds with runtime safety (the wasm
+ * returns 0 otherwise): instances, areas, and glyphs refused for lack of room.
+ */
+function log_overflow() {
+    const at = wasm.overflow_take();
+    if (at === 0) {
+        return;
+    }
+    const counts = new Uint32Array(wasm.memory.buffer, at, 3);
+    console.warn(`overflow: ${counts[0]} instances, ${counts[1]} areas, ${counts[2]} glyphs ` +
+        "refused this frame (raise App.config caps)");
+}
+
+/**
  * Schedules an animation frame if one is not already queued.
  */
 function schedule() {
@@ -621,6 +640,7 @@ function schedule() {
         raf = 0;
         // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5).
         const live = wasm.tick(Math.floor(now));
+        log_overflow();
         sync_cursor();
         sync_timer();
         sync_audio();

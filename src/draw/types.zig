@@ -293,7 +293,10 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
 /// `(px, py)` is in local logical pixels, origin at the face top-left, Y down. `thickness` is
 /// the stroke width and `sweep_fraction` in `[0, 1]` scales `theme.arc_sweep`. Angles follow
 /// the convention in `theme.zig`. Round caps fall out of measuring the distance to the swept
-/// centerline, clamped at the sweep end, and subtracting half the thickness.
+/// centerline, clamped to the nearer end, and subtracting half the thickness: a point in the
+/// gap's half next to the start measures against the start, so the field is continuous there
+/// and the start cap is round (before step 29 it measured against the far end, which cut the
+/// cap flat and left a dotted ray where `fwidth` spiked).
 ///
 /// ```text
 /// center = size * 0.5
@@ -301,7 +304,7 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
 /// mid    = min(center.x, center.y) - thickness * 0.5
 /// sweep  = sweep_fraction * arc_sweep
 /// rel    = wrap(atan2(p.y, p.x) - arc_start, 0, tau)
-/// ang    = min(rel, sweep)
+/// ang    = rel > sweep + (tau - sweep) / 2 ? 0 : min(rel, sweep)
 /// dir    = (cos(arc_start + ang), sin(arc_start + ang))
 /// dist   = length(p - dir * mid) - thickness * 0.5
 /// ```
@@ -326,7 +329,8 @@ pub fn sdf_arc(
     const sweep = sweep_fraction * theme.arc_sweep;
     const turned = std.math.atan2(local_y, local_x) - theme.arc_start;
     const rel = wrap_tau(turned);
-    const ang = @min(rel, sweep);
+    const gap_middle = sweep + (std.math.tau - sweep) * 0.5;
+    const ang = if (rel > gap_middle) 0 else @min(rel, sweep);
     const dir_x = @cos(theme.arc_start + ang);
     const dir_y = @sin(theme.arc_start + ang);
     const dx = local_x - dir_x * mid;
@@ -478,6 +482,15 @@ test "sdf arc locks the open ring" {
     try std.testing.expectApproxEqAbs(@as(f32, -2), cap, 0.0001);
     const away = sdf_arc(28, 28, size, size, thickness, 0);
     try std.testing.expect(away > 0);
+    // 0.05 rad before the start on the centerline: inside the round start cap, at the chord
+    // 2 * mid * sin(0.025) = 1.2999 from its center, so -0.7001; it used to measure the far end.
+    const before = theme.arc_start - 0.05;
+    const before_x = size * 0.5 + @cos(before) * mid;
+    const before_y = size * 0.5 + @sin(before) * mid;
+    for ([_]f32{ 1, 0.5, 0 }) |fraction| {
+        const near = sdf_arc(before_x, before_y, size, size, thickness, fraction);
+        try std.testing.expectApproxEqAbs(@as(f32, -0.7001), near, 0.001);
+    }
 }
 
 // Locks that a sharp box includes its edges and a rounded box rejects the pixel just inside

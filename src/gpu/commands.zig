@@ -109,9 +109,9 @@ pub const caps = std.EnumArray(Kind, u16).init(.{
     .layout = 16,
     .pipeline = 32,
     .buffer = 64,
-    .texture = 40,
+    .texture = 80,
     .sampler = 8,
-    .bind_group = 64,
+    .bind_group = 96,
 });
 
 /// Op codes. Zero is reserved so a zeroed header is never a valid op.
@@ -152,6 +152,9 @@ pub const BindingKind = enum(u8) {
 pub const VertexFormat = enum(u8) {
     float32x2,
     float32x4,
+    /// The last partial group of a draw type (`draw/registry.zig`, section 2).
+    float32,
+    float32x3,
 };
 
 pub const StepMode = enum(u8) {

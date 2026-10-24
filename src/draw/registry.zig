@@ -14,9 +14,12 @@
 //! offset 16  clip: [4]f32   exclusive-max x0, y0, x1, y1             location 2
 //! offset 32  up to 6 more 16-byte parameter groups                   locations 3 to 8
 //! ```
-//! Every field is `f32` or `[4]f32`, and a `[4]f32` starts on a 16-byte boundary, so each
-//! 16-byte group is exactly one `float32x4` attribute. `@sizeOf(T)` must be a multiple of 16
-//! and at most `group_cap * 16`. The type declares `pub const pixel: []const u8` (its WGSL
+//! Every field is `f32`, `[2]f32`, or `[4]f32`; a `[4]f32` starts on a 16-byte boundary and a
+//! `[2]f32` on an 8-byte one, so no field straddles a 16-byte group. `@sizeOf(T)` must be a
+//! multiple of 4 and at most `group_cap * 16`, so no hand padding is needed. Each full 16-byte
+//! group is one `float32x4` attribute; a last partial group of `w` floats is `float32`,
+//! `float32x2`, or `float32x3`, and its WGSL type is `f32` or `vec2`/`vec3` (`last_width`).
+//! The type declares `pub const pixel: []const u8` (its WGSL
 //! function) and `pub const texture: ?textures.Format` (null for an untextured type). Field
 //! names must not shadow the prelude's `local`, `size`, or `pos`. `check` returns the first
 //! violation as a message that starts with the type's name, so `app.check` can fail the build
@@ -130,10 +133,8 @@ pub fn check(comptime T: type) ?[]const u8 {
         if (info.@"struct".layout != .@"extern") {
             return name ++ ": a draw type must be an extern struct";
         }
-        if (@sizeOf(T) % 16 != 0) {
-            return name ++ ": @sizeOf must be a multiple of 16 (one vec4 per 16 bytes)";
-        }
-        if (@sizeOf(T) / 16 > group_cap) return name ++ ": at most 8 vec4 groups";
+        if (@sizeOf(T) % 4 != 0) return name ++ ": @sizeOf must be a multiple of 4";
+        if (group_count(T) > group_cap) return name ++ ": at most 8 vec4 groups";
         const field_names = info.@"struct".field_names;
         const field_types = info.@"struct".field_types;
         if (field_names.len < 2) return name ++ ": the first fields must be `rect` and `clip`";
@@ -185,11 +186,39 @@ fn field_problem(comptime T: type, comptime name: []const u8, comptime F: type) 
         if (std.mem.eql(u8, name, word)) return "shadows a prelude name";
     }
     if (F == f32) return null;
+    if (F == [2]f32) {
+        if (@offsetOf(T, name) % 8 != 0) return "must start on an 8-byte boundary";
+        return null;
+    }
     if (F == [4]f32) {
         if (@offsetOf(T, name) % 16 != 0) return "must start on a 16-byte boundary";
         return null;
     }
-    return "must be f32 or [4]f32";
+    return "must be f32, [2]f32, or [4]f32";
+}
+
+/// Attribute groups of `T`: one per started 16 bytes (module guide, section 2).
+pub fn group_count(comptime T: type) u32 {
+    return (@sizeOf(T) + 15) / 16;
+}
+
+/// Floats in `T`'s last group, 1 to 4.
+pub fn last_width(comptime T: type) u32 {
+    const width = (@sizeOf(T) - 16 * (group_count(T) - 1)) / 4;
+    assert(width >= 1 and width <= 4);
+    return width;
+}
+
+/// The WGSL type of group `group` of `T`.
+fn group_wgsl(comptime T: type, comptime group: u32) []const u8 {
+    if (group + 1 < group_count(T)) return "vec4<f32>";
+    return switch (last_width(T)) {
+        1 => "f32",
+        2 => "vec2<f32>",
+        3 => "vec3<f32>",
+        4 => "vec4<f32>",
+        else => unreachable,
+    };
 }
 
 /// True when `T` declares `reads_points = true` (module guide, section 2).
@@ -344,13 +373,22 @@ pub fn Registry(comptime entries: []const DrawType) type {
     };
 }
 
-/// Vertex buffer 1 for `T`: one `float32x4` per 16-byte group, at locations 1 to N.
+/// Vertex buffer 1 for `T`: one `float32x4` per full 16-byte group and the last group's
+/// width (module guide, section 2), at locations 1 to N.
 pub fn instance_layout(comptime T: type) commands.VertexBuffer {
     comptime assert(check(T) == null);
-    const groups: u32 = @sizeOf(T) / 16;
+    const groups: u32 = comptime group_count(T);
     var attributes = std.mem.zeroes([commands.attribute_cap]commands.VertexAttribute);
     inline for (0..groups) |group| {
-        attributes[group] = .{ .location = group + 1, .format = .float32x4, .offset = 16 * group };
+        const width = comptime if (group + 1 < groups) 4 else last_width(T);
+        const format: commands.VertexFormat = switch (width) {
+            1 => .float32,
+            2 => .float32x2,
+            3 => .float32x3,
+            4 => .float32x4,
+            else => unreachable,
+        };
+        attributes[group] = .{ .location = group + 1, .format = format, .offset = 16 * group };
     }
     const layout: commands.VertexBuffer = .{
         .stride = @sizeOf(T),
@@ -451,7 +489,7 @@ const points_wgsl: []const u8 =
 
 fn io_wgsl(comptime T: type) []const u8 {
     comptime {
-        const groups: u32 = @sizeOf(T) / 16;
+        const groups: u32 = group_count(T);
         var instance: []const u8 = "\nstruct Instance {\n";
         var varyings: []const u8 = "struct Varyings {\n" ++
             "    @builtin(position) position: vec4<f32>,\n" ++
@@ -461,9 +499,10 @@ fn io_wgsl(comptime T: type) []const u8 {
         for (0..groups) |group| {
             const g = std.fmt.comptimePrint("g{d}", .{group});
             const at = std.fmt.comptimePrint("{d}", .{group + 1});
-            instance = instance ++ "    @location(" ++ at ++ ") " ++ g ++ ": vec4<f32>,\n";
+            const wgsl = group_wgsl(T, group);
+            instance = instance ++ "    @location(" ++ at ++ ") " ++ g ++ ": " ++ wgsl ++ ",\n";
             varyings = varyings ++ "    @location(" ++ at ++ ") @interpolate(flat) " ++ g ++
-                ": vec4<f32>,\n";
+                ": " ++ wgsl ++ ",\n";
             carry = carry ++ "    out." ++ g ++ " = i." ++ g ++ ";\n";
         }
         var pixel: []const u8 = "struct Pixel {\n" ++
@@ -474,15 +513,21 @@ fn io_wgsl(comptime T: type) []const u8 {
         const info = @typeInfo(T).@"struct";
         for (info.field_names, info.field_types) |field_name, field_type| {
             const offset = @offsetOf(T, field_name);
-            const g = std.fmt.comptimePrint("v.g{d}", .{offset / 16});
-            if (field_type == [4]f32) {
-                pixel = pixel ++ "    " ++ field_name ++ ": vec4<f32>,\n";
-                unpack = unpack ++ "    px." ++ field_name ++ " = " ++ g ++ ";\n";
-            } else {
-                const lane = "xyzw"[(offset % 16) / 4 ..][0..1];
-                pixel = pixel ++ "    " ++ field_name ++ ": f32,\n";
-                unpack = unpack ++ "    px." ++ field_name ++ " = " ++ g ++ "." ++ lane ++ ";\n";
-            }
+            const group = offset / 16;
+            const g = std.fmt.comptimePrint("v.g{d}", .{group});
+            // A field that fills its whole group reads the group bare; otherwise its lanes.
+            const whole = offset % 16 == 0 and
+                @sizeOf(field_type) == 4 * (if (group + 1 < groups) 4 else last_width(T));
+            const lanes = "xyzw"[(offset % 16) / 4 ..][0 .. @sizeOf(field_type) / 4];
+            const read = if (whole) g else g ++ "." ++ lanes;
+            const wgsl = switch (@sizeOf(field_type)) {
+                4 => "f32",
+                8 => "vec2<f32>",
+                16 => "vec4<f32>",
+                else => unreachable,
+            };
+            pixel = pixel ++ "    " ++ field_name ++ ": " ++ wgsl ++ ",\n";
+            unpack = unpack ++ "    px." ++ field_name ++ " = " ++ read ++ ";\n";
         }
         return instance ++ "}\n\n" ++ varyings ++ "}\n\n" ++ pixel ++ "}\n\n" ++ carry ++
             "    return out;\n}\n\n" ++ unpack ++ "    return px;\n}\n";
@@ -511,7 +556,31 @@ const Probe = extern struct {
 const Unaligned = extern struct {
     rect: [4]f32,
     clip: [4]f32,
+    count: u32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+};
+
+/// No padding: a `[2]f32` in lanes zw of group 2 and a last group of one float, 52 bytes.
+const Compact = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
     weight: f32,
+    spread: f32,
+    offset: [2]f32,
+    level: f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const pixel: []const u8 = "";
+};
+
+/// A `[2]f32` that would straddle lanes y and z.
+const Skewed = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+    weight: f32,
+    offset: [2]f32,
 
     pub const texture: ?textures.Format = null;
     pub const pixel: []const u8 = "";
@@ -641,6 +710,28 @@ test "source declares locations 1 to N and names every field" {
     try testing.expectEqual(@as(u8, 4), layout.attributes[3].location);
 }
 
+// Locks layouts without padding (section 2): a 52-byte type has groups of 4, 4, 4, and 1
+// floats, its last attribute is `float32` and its WGSL type `f32` read bare, and its `[2]f32`
+// reads lanes zw; a `[2]f32` across lanes y and z is refused.
+test "a type in 4-byte steps gets a partial last group" {
+    try testing.expect(comptime check(Compact) == null);
+    try testing.expectEqual(@as(u32, 4), comptime group_count(Compact));
+    try testing.expectEqual(@as(u32, 1), comptime last_width(Compact));
+    const layout = comptime instance_layout(Compact);
+    try testing.expectEqual(@as(u16, 52), layout.stride);
+    try testing.expectEqual(commands.VertexFormat.float32x4, layout.attributes[2].format);
+    try testing.expectEqual(commands.VertexFormat.float32, layout.attributes[3].format);
+    const text = comptime source(Compact);
+    try testing.expect(std.mem.find(u8, text, "@location(4) g3: f32,") != null);
+    try testing.expect(std.mem.find(u8, text, "px.offset = v.g2.zw;") != null);
+    try testing.expect(std.mem.find(u8, text, "offset: vec2<f32>,") != null);
+    try testing.expect(std.mem.find(u8, text, "px.level = v.g3;") != null);
+    try testing.expect(std.mem.find(u8, text, "px.spread = v.g2.y;") != null);
+    const skewed = comptime check(Skewed).?;
+    const boundary = "`offset` must start on an 8-byte boundary";
+    try testing.expect(std.mem.find(u8, skewed, boundary) != null);
+}
+
 // Locks the vertex contract (section 2a): a type without `vertex` gets the axis-aligned quad,
 // a type with one gets it called through `carry` and `unpack`, and a mistyped one is named.
 test "vertex_local is the rect quad or the type's own vertex" {
@@ -695,7 +786,7 @@ test "check names the type and the violation" {
     try testing.expect(comptime check(Probe) == null);
     const unaligned = comptime check(Unaligned).?;
     try testing.expect(std.mem.find(u8, unaligned, "Unaligned") != null);
-    try testing.expect(std.mem.find(u8, unaligned, "multiple of 16") != null);
+    try testing.expect(std.mem.find(u8, unaligned, "must be f32, [2]f32, or [4]f32") != null);
     const straddle = comptime check(Straddle).?;
     try testing.expect(std.mem.find(u8, straddle, "`tint`") != null);
     const no_clip = comptime check(NoClip).?;

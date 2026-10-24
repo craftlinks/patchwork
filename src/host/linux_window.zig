@@ -1358,6 +1358,18 @@ fn Host(comptime App: type) type {
                 scale_120,
             );
             assert(context.draw.text.drawn_scale_120 == scale_120);
+            if (std.debug.runtime_safety) {
+                if (context.overflow_report()) |refused| log_overflow(refused);
+            }
+        }
+
+        /// One line per changed overflow (`ui/cx.zig`, section 10).
+        fn log_overflow(refused: ui.cx.Overflow) void {
+            std.debug.print(
+                "overflow: {d} instances, {d} areas, {d} glyphs refused this frame " ++
+                    "(raise App.config caps)\n",
+                .{ refused.instances, refused.areas, refused.glyphs },
+            );
         }
 
         /// Blocks until the compositor writes, the app timer fires, or the latched

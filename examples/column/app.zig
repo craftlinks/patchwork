@@ -95,6 +95,11 @@ pub const App = struct {
         .area_cap = area_cap,
     };
 
+    /// The screen at rest, for the bench and dump comparisons.
+    pub const scenarios: []const patchwork.bench.Scenario = &.{
+        .{ .name = "still", .setup = &.{.{ .wait = 5 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 60 },
+    };
+
     /// The column draws no images, so it creates no textures.
     pub fn init(app: *App, textures: *quads.Textures) void {
         assert(textures.count >= 1);
@@ -114,8 +119,8 @@ pub const App = struct {
 
     /// Routes the event to every knob, every toggle, and the view.
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
-        for (&app.knobs) |*knob| _ = knob.handle(cx, event_value);
-        for (&app.toggles) |*toggle| _ = toggle.handle(cx, event_value);
+        // Every widget field (knobs, meter, toggles); the view takes its id, so it goes by hand.
+        _ = ui.route(cx, event_value, app);
         _ = app.view.handle(cx, view_id, event_value);
         assert(app.view.scroll_y >= 0);
     }

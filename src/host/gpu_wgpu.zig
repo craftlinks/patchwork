@@ -231,7 +231,9 @@ const texture_success_suboptimal: SurfaceGetCurrentTextureStatus = 0x00000002;
 const depth_slice_undefined: u32 = 0xFFFFFFFF;
 const wait_max: u32 = 8000;
 const format_cap: u32 = 32;
+const vertex_float32: VertexFormat = 0x0000001C;
 const vertex_float32x2: VertexFormat = 0x0000001D;
+const vertex_float32x3: VertexFormat = 0x0000001E;
 const vertex_float32x4: VertexFormat = 0x0000001F;
 const step_vertex: VertexStepMode = 0x00000001;
 const step_instance: VertexStepMode = 0x00000002;
@@ -1156,7 +1158,9 @@ fn pipeline_create(self: *Gpu, p: commands.PipelineCreate) void {
             slot.* = .{
                 .next_in_chain = null,
                 .format = switch (attribute.format) {
+                    .float32 => vertex_float32,
                     .float32x2 => vertex_float32x2,
+                    .float32x3 => vertex_float32x3,
                     .float32x4 => vertex_float32x4,
                 },
                 .offset = attribute.offset,

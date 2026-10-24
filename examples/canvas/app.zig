@@ -15,8 +15,8 @@
 //!
 //! ## 2. The Grid
 //! `columns * rows` modules in a 40 by 25 grid. Module `i` has a face, a header with its title
-//! ("osc 17"), an input port on the left, an output port on the right, and a knob with its
-//! value. Cables run from each module's output to the next module's input in its row, and
+//! ("osc 17"), an input port on the left, an output port on the right, and a `widgets.Knob`
+//! with a 40 px ring (`Knob.sized`), its name, and its value. Cables run from each module's output to the next module's input in its row, and
 //! from every third column to the module below. Below zoom 0.5 a module is its face and header
 //! only, and text is placed only when its on-screen em is at least `label_min_px` (level of
 //! detail; `ui/canvas.zig`, section 3).
@@ -25,6 +25,7 @@
 //! ```text
 //! wheel on the canvas     one zoom rung about the pointer       drag the background  pans
 //! press a module          selects it                            drag its header      moves it
+//! drag or wheel a knob    turns it (`widgets.Knob`, routed with `ui.route`, at any zoom)
 //! arrows                  pan by pan_step                       = and -              a rung about
 //! 0                       back to the start view                                     the center
 //! ```
@@ -43,6 +44,7 @@ const input = patchwork.input;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const widgets = patchwork.widgets;
 const canvas = ui.canvas;
 
 const Rect = quads.Rect;
@@ -62,7 +64,9 @@ pub const pitch_y: f32 = 144;
 pub const margin: f32 = 16;
 pub const header_height: f32 = 24;
 pub const port_size: f32 = 10;
-pub const knob_size: f32 = 48;
+/// Each module's knob: a `widgets.Knob` with a 40 px ring, 8 px below the header.
+pub const knob_ring: f32 = 40;
+pub const knob_top: f32 = 8;
 /// The port row, from a module's top.
 pub const port_y: f32 = 64;
 /// Smallest on-screen em, in logical pixels, that is placed (section 2).
@@ -94,7 +98,6 @@ const canvas_color: [4]f32 = .{ 0.07, 0.08, 0.10, 1 };
 const face_color: [4]f32 = .{ 0.16, 0.18, 0.22, 1 };
 const header_color: [4]f32 = .{ 0.22, 0.26, 0.34, 1 };
 const port_color: [4]f32 = .{ 0.55, 0.60, 0.68, 1 };
-const knob_color: [4]f32 = .{ 0.95, 0.65, 0.25, 1 };
 const select_color: [4]f32 = .{ 1.0, 0.80, 0.30, 1 };
 const cable_colors = [_][4]f32{
     .{ 0.35, 0.75, 1.0, 0.85 },
@@ -105,12 +108,12 @@ const cable_colors = [_][4]f32{
 const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
 const status_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
 const header_style: text.Style = .{ .face = .sans_bold, .size = 13, .color = theme.chrome.text };
-const value_style: text.Style = .{ .face = .sans, .size = 11, .color = theme.chrome.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
 /// A zoomed-out frame draws the face and header of every module, plus the canvas face.
 const box_cap: u32 = 2 * module_count + 64;
-const arc_cap: u32 = 256;
+/// Two arcs per knob, for the modules visible at the detail zoom.
+const arc_cap: u32 = 512;
 const glyph_cap: u32 = 4096;
 const path_cap: u32 = 2 * cable_count + 64;
 const point_cap: u32 = 16384;
@@ -135,6 +138,8 @@ pub const App = struct {
     view: ui.CanvasState,
     /// Each module's world origin.
     origins: [module_count]Point,
+    /// Each module's knob, routed with `ui.route` (section 3).
+    knobs: [module_count]widgets.Knob,
     selected: ?u32,
     drag: ?Drag,
     /// What the last frame drew, for the status line.
@@ -191,7 +196,12 @@ pub const App = struct {
     pub fn init(app: *App, textures: *quads.Textures) void {
         _ = textures;
         app.view = .init(start_x, start_y, 1);
-        for (&app.origins, 0..) |*origin, index| origin.* = home_of(@intCast(index));
+        for (&app.origins, &app.knobs, 0..) |*origin, *knob, index_usize| {
+            const index: u32 = @intCast(index_usize);
+            origin.* = home_of(index);
+            const accent = widgets.accents[index % widgets.accents.len];
+            knob.* = widgets.Knob.init(knob_id(index), "gain", value_of(index), accent).sized(knob_ring);
+        }
         app.selected = null;
         app.drag = null;
         app.visible = 0;
@@ -203,6 +213,8 @@ pub const App = struct {
             .key_down => |press| app.key(cx, press),
             else => {},
         }
+        // Every knob, then selection and header drags, then the background (section 3).
+        _ = ui.route(cx, event_value, &app.knobs);
         if (app.route_modules(cx, event_value)) return;
         _ = app.view.handle(cx, canvas_id, event_value);
     }
@@ -314,30 +326,25 @@ pub const App = struct {
         column.padding = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         _ = cx.begin_at(rect, column);
         const header = cx.walk(ui.sized(.fill, .{ .fixed = header_height }));
-        const body = cx.walk(ui.sized(.fill, .fill));
         append_box(cx, rect, face_color, clip, 8, if (selected) 2 else 0, if (selected) select_color else null);
         append_box(cx, header, header_color, clip, 8, 0, null);
+        // The face's area first, so the knob's, recorded later on the same layer, wins over it.
+        cx.area(module_id(index), rect, 8, ui.cx.plain);
         if (zoom >= detail_zoom) {
             const in_port: Rect = .{ .x = rect.x - port_size / 2, .y = rect.y + port_y, .width = port_size, .height = port_size };
             const out_port: Rect = .{ .x = rect.x + rect.width - port_size / 2, .y = rect.y + port_y, .width = port_size, .height = port_size };
             if (cx.visible(in_port)) |port_clip| append_box(cx, in_port, port_color, port_clip, port_size / 2, 0, null);
             if (cx.visible(out_port)) |port_clip| append_box(cx, out_port, port_color, port_clip, port_size / 2, 0, null);
-            const knob: Rect = .{ .x = body.x + 16, .y = body.y + (body.height - knob_size) / 2, .width = knob_size, .height = knob_size };
-            if (cx.visible(knob)) |knob_clip| append_arc(cx, knob, knob_clip, value_of(index));
+            var knob_walk = ui.sized(.fill, .{ .fixed = widgets.knob_height });
+            knob_walk.margin.top = knob_top;
+            app.knobs[index].draw(cx, knob_walk);
             if (zoom * header_style.size >= label_min_px) {
                 var buffer: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&buffer, "osc {d}", .{index}) catch unreachable;
                 const label: Rect = .{ .x = header.x + 10, .y = header.y, .width = header.width - 20, .height = header.height };
                 text.place(cx.drawing(), header_style, name, label, clip, left);
             }
-            if (zoom * value_style.size >= label_min_px) {
-                var buffer: [16]u8 = undefined;
-                const value = std.fmt.bufPrint(&buffer, "{d:.2}", .{value_of(index)}) catch unreachable;
-                const at: Rect = .{ .x = knob.x + knob_size + 12, .y = knob.y, .width = 64, .height = knob_size };
-                text.place(cx.drawing(), value_style, value, at, clip, left);
-            }
         }
-        cx.area(module_id(index), rect, 8, ui.cx.plain);
         cx.area(header_id(index), header, 8, grab_flags);
         _ = cx.end();
     }
@@ -413,6 +420,10 @@ pub fn header_id(index: u32) ui.Id {
     return ui.id("header", index);
 }
 
+pub fn knob_id(index: u32) ui.Id {
+    return ui.id("knob", index);
+}
+
 /// The start origin of module `index` (section 2).
 pub fn home_of(index: u32) Point {
     assert(index < module_count);
@@ -436,21 +447,6 @@ fn append_box(cx: *Context, rect: Rect, color: [4]f32, clip: quads.Clip, radius:
         .border_width = border,
         .hover = 0,
         .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
-
-fn append_arc(cx: *Context, rect: Rect, clip: quads.Clip, value: f32) void {
-    cx.append(quads.Arc, null, .{
-        .rect = .{ rect.x, rect.y, rect.width, rect.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
-        .color = knob_color,
-        .thickness = 5,
-        .sweep = @max(value, 0.02),
-        .hover = 0,
-        .pad = 0,
     }) catch |err| switch (err) {
         error.PoolFull, error.BatchFull => {},
         error.EdgeNotPositive, error.ClipUnordered => unreachable,
@@ -532,6 +528,26 @@ test "a header drag moves its module by the world delta" {
     try std.testing.expectEqual(home_of(0)[0] + 15, app.origins[0][0]);
     try std.testing.expectEqual(home_of(0)[1], app.origins[0][1]);
     try std.testing.expectEqual(@as(?Drag, null), app.drag);
+}
+
+// Locks a widget inside the canvas (section 3): at zoom 2 module 0's knob area is its 40 px
+// ring mapped to an 80 px disc, and a drag 30 screen pixels up through `ui.route` turns it by
+// 30 / drag_span_px = 0.25, the same as outside a canvas, while the module does not move.
+test "a knob in the canvas turns by screen pixels at any zoom" {
+    const app = new_app();
+    app.view = .init(start_x, start_y, 2);
+    _ = frame_at(app);
+    const ring = fixture.context.find(knob_id(0)).?;
+    try std.testing.expectEqual(@as(f32, 80), ring.rect[2]);
+    try std.testing.expectEqual(@as(f32, 40), ring.radius);
+    const x = ring.rect[0] + 40;
+    const y = ring.rect[1] + 40;
+    send(app, .{ .pointer_move = .{ .x = x, .y = y } });
+    send(app, .{ .pointer_down = input.left_at(.{ .x = x, .y = y }) });
+    send(app, .{ .pointer_move = .{ .x = x, .y = y - 30 } });
+    send(app, .{ .pointer_up = input.left_at(.{ .x = x, .y = y - 30 }) });
+    try std.testing.expectEqual(@as(f32, 0.25), app.knobs[0].value);
+    try std.testing.expectEqual(home_of(0)[0], app.origins[0][0]);
 }
 
 // Locks the zoom cycle against the glyph cache (`text/cache.zig`, section 2a): a full sweep of
