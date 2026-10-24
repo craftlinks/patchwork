@@ -11,7 +11,8 @@
 //! file keeps the toolchain at Zig alone, with no Python, Node, or Go server needed.
 //!
 //! ## 2. Contract
-//! - Command line: three file paths, in order, for the page, `shell.js`, and the wasm.
+//! - Command line: four file paths, in order, for the page, `shell.js`, the wasm, and
+//!   `worklet.js` (the AudioWorklet processor, `web/worklet.js`).
 //!   `build.zig` (`add_serve`) passes them. Relative paths resolve against the working
 //!   directory.
 //! - Routes are exact path matches after the query string is dropped. Anything else gets 404.
@@ -39,6 +40,7 @@ const Paths = struct {
     index: []const u8,
     shell: []const u8,
     wasm: []const u8,
+    worklet: []const u8,
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -56,7 +58,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try serve_forever(io, paths);
 }
 
-/// Reads the three required file paths from the command line, in the order the module guide
+/// Reads the four required file paths from the command line, in the order the module guide
 /// states.
 fn parse_paths(args: std.process.Args) !Paths {
     var it = std.process.Args.Iterator.init(args);
@@ -65,8 +67,9 @@ fn parse_paths(args: std.process.Args) !Paths {
     const index = it.next() orelse return error.MissingIndexHtml;
     const shell = it.next() orelse return error.MissingShellJs;
     const wasm = it.next() orelse return error.MissingWasm;
+    const worklet = it.next() orelse return error.MissingWorkletJs;
     assert(index.len != 0);
-    return .{ .index = index, .shell = shell, .wasm = wasm };
+    return .{ .index = index, .shell = shell, .wasm = wasm, .worklet = worklet };
 }
 
 fn serve_forever(io: std.Io, paths: Paths) !void {
@@ -124,6 +127,10 @@ fn respond_target(
     }
     if (std.mem.eql(u8, path, "/shell.js")) {
         try respond_file(io, request, paths.shell, "text/javascript; charset=utf-8");
+        return;
+    }
+    if (std.mem.eql(u8, path, "/worklet.js")) {
+        try respond_file(io, request, paths.worklet, "text/javascript; charset=utf-8");
         return;
     }
     if (std.mem.eql(u8, path, "/patchwork.wasm")) {

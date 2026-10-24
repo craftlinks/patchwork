@@ -126,17 +126,22 @@
 //! while hovered advances `envelope_phase` by `dt / playhead_loop_ms`, calls
 //! `cx.keep_animating()` and `cx.redraw()`, and the dot is drawn at the envelope's point on the
 //! cable layer. It therefore moves once per displayed frame (the display's refresh rate, 60
-//! Hz on most displays), and leaving the display stops the frames: an unhovered rack asks for
-//! none (the meters' timer still wakes it). Tests: "the playhead runs only while the display
+//! Hz on most displays), and leaving the display stops the frames: an unhovered rack with the
+//! tone stopped asks for none and sleeps. Tests: "the playhead runs only while the display
 //! is hovered" and "the envelope polyline follows the four knobs".
 //!
 //! ## 4. Meter Data Flow
-//! The host calls `App.timer(cx, now_ms)` every `config.timer_period_ms`:
+//! The rack declares `Audio = realtime.TestTone` (`app.zig`, section 4a), which the host runs off
+//! the UI thread; Space (when no title is being renamed) starts and stops it, and the status
+//! line says "tone on" or "tone off". The host calls `App.audio` once per block:
 //! ```text
-//! levels.sample(now_ms) -> Meter.set_value per meter -> cx.redraw() only if a value changed
+//! realtime.levels(block) -> peaks of L, R, mid -> meter_of -> Ballistics per meter
+//!   -> Meter.set_value -> cx.redraw() only if a value changed
 //! ```
-//! `draw` reads only the stored `meter.value`, and knob gestures never write meter values;
-//! test "timer writes the sample and a knob drag does not" locks both.
+//! The osc, filter, and amp meters show L, R, and mid. A stop zeroes them, so a rack at rest
+//! draws empty meters and nothing wakes it (before step 26 a 30 Hz timer drove procedural
+//! levels forever). `draw` reads only the stored `meter.value`, and knob gestures never write
+//! meter values; test "audio blocks write the meters and a knob drag does not" locks both.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Widget arrays are fixed at `panel_count`, `meter_panel_count`, `knob_count`, and
@@ -156,7 +161,7 @@ const input = patchwork.input;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
-const levels = @import("levels.zig");
+const realtime = patchwork.realtime;
 const led = @import("led.zig");
 const badge = @import("badge.zig");
 
@@ -377,11 +382,13 @@ const knob_table = [_]struct { name: []const u8, value: f32 }{
 
 const Context = patchwork.app.Context(App);
 
-/// The rack app: panels of knobs and meters. `timer` writes the procedural meter levels at
-/// the period in `config`.
+/// The rack app: panels of knobs and meters. `audio` writes the test tone's levels onto the
+/// meters (section 4).
 pub const App = struct {
     knobs: [knob_count]widgets.Knob,
     meters: [meter_panel_count]widgets.Meter,
+    /// The meters' ballistics, fed by `audio`: L, R, and mid peaks.
+    bars: [meter_panel_count]realtime.Ballistics,
     /// Panel titles, the shared rename field, and the panel it renames (section 2b).
     titles: [panel_count]Title,
     rename: widgets.TextField,
@@ -410,9 +417,11 @@ pub const App = struct {
     envelope_hovered: bool,
     envelope_phase: f32,
 
+    pub const Audio = realtime.TestTone;
+
     pub const config: patchwork.app.Config = .{
         .title = "patchwork",
-        .timer_period_ms = levels.meter_period_ms,
+        .timer_period_ms = 0,
         .draw = &.{
             .{ .type = quads.Box, .cap = box_cap },
             .{ .type = quads.Arc, .cap = arc_cap },
@@ -443,7 +452,8 @@ pub const App = struct {
             const id = ui.id("knob", @intCast(index));
             knob.* = widgets.Knob.init(id, spec.name, spec.value, accent);
         }
-        for (&app.meters) |*meter| meter.* = .{ .name = "", .value = 0.5 };
+        for (&app.meters) |*meter| meter.* = .{ .name = "", .value = 0 };
+        app.bars = @splat(.zero);
         for (&app.titles, panel_names) |*title, name| title.* = Title.of(name);
         app.rename = widgets.TextField.init(rename_id, title_cap, title_style);
         app.renaming = null;
@@ -498,18 +508,43 @@ pub const App = struct {
                 .none, .down, .drag, .wheel, .secondary => {},
             }
         }
+        if (app.renaming == null and event_value == .key_down) {
+            const press = event_value.key_down;
+            if (press.key == .other and std.mem.eql(u8, press.typed(), " ")) app.toggle_tone(cx);
+        }
         app.retarget_dwell(cx);
         if (event_value == .frame) app.step_dwell(cx, event_value.frame);
         assert(app.dwell_knob == null or app.dwell.target == 1);
     }
 
-    /// Writes the latest samples onto the meters. Owes a draw only when one changes.
+    /// The rack has no timer.
     pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
-        const sampled = levels.sample(now_ms);
-        for (&app.meters, sampled) |*meter, value| {
-            if (meter.set_value(value)) cx.redraw();
-            assert(meter.value == value);
+        _ = app;
+        _ = cx;
+        _ = now_ms;
+    }
+
+    /// One block of the tone: its L, R, and mid peaks through the ballistics onto the meters.
+    /// Owes a draw only when a meter changes (section 4).
+    pub fn audio(app: *App, cx: *Context, block: *const realtime.Block) void {
+        const levels = realtime.levels(block);
+        for (&app.meters, &app.bars, 0..) |*meter, *bar, channel| {
+            bar.step(realtime.meter_of(levels.peak[channel]));
+            if (meter.set_value(bar.value)) cx.redraw();
+            assert(meter.value == bar.value);
         }
+    }
+
+    /// Starts or stops the tone; a stop zeroes the meters (section 4).
+    fn toggle_tone(app: *App, cx: *Context) void {
+        const on = !cx.audio_on;
+        cx.set_audio(on);
+        if (!on) {
+            app.bars = @splat(.zero);
+            for (&app.meters) |*meter| _ = meter.set_value(0);
+        }
+        app.set_status(&.{if (on) "tone on" else "tone off"});
+        cx.redraw();
     }
 
     /// Draws the header, the panels, the preset column, the playhead and cables on the cable
@@ -1367,7 +1402,7 @@ comptime {
     assert(env_panel == meter_panel_count);
     assert(knobs_per_panel == 4);
     assert(knob_count == 16);
-    assert(levels.meter_count == meter_panel_count);
+    assert(realtime.mid + 1 == meter_panel_count);
     // Worst-case boxes: one face per panel, two per meter, the tooltip, the header bar, the
     // preset panel, the selected and the hovered row, the thumb, the rename field's face,
     // selection, and caret, one hub per knob, the display face, and the playhead.
@@ -1441,6 +1476,7 @@ const fixture = struct {
 /// A fresh app, initialized against a fresh context the way a host does.
 fn new_app() *App {
     fixture.context.init();
+    patchwork.app.start_timer(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }
@@ -1463,9 +1499,8 @@ fn send(app: *App, event: input.Event) bool {
     return cx.dirty;
 }
 
-// Pulls the levels, LED, and badge modules' tests into this app's test run.
+// Pulls the LED and badge modules' tests into this app's test run.
 test {
-    _ = levels;
     _ = led;
     _ = badge;
 }
@@ -1573,11 +1608,11 @@ test "rack layout at 1280 by 720" {
     try expect_rect(app.presets.viewport, 1032, 84, 224, 580);
     try std.testing.expectEqual(@as(f32, 24000), app.presets.content_h);
     try std.testing.expectEqual(ui.List.Range{ .first = 0, .end = 25 }, app.preset_range);
-    // Boxes: the header, 4 panels, 3 meters * 2 faces, the preset panel, its thumb, 16 hubs,
-    // and the display face. Arcs: 16 knobs * 2 minus the zero-valued knob's arc. Glyphs:
+    // Boxes: the header, 4 panels, 3 meter tracks (empty: the tone is stopped), the preset
+    // panel, its thumb, 16 hubs, and the display face. Arcs: 16 knobs * 2 minus the zero-valued knob's arc. Glyphs:
     // titles 3 + 6 + 3 + 3, knob names 68, values 16 * 4, the tempo 6 + 3, the author 17
     // (its two spaces have no ink), 25 preset names (10 * 7 + 15 * 8 = 190), and "ready" (5).
-    try std.testing.expectEqual(@as(usize, 30), cx.draw.items(quads.Box).len);
+    try std.testing.expectEqual(@as(usize, 27), cx.draw.items(quads.Box).len);
     try std.testing.expectEqual(@as(usize, 31), cx.draw.items(quads.Arc).len);
     try std.testing.expectEqual(@as(usize, 368), cx.draw.items(quads.Glyph).len);
     try std.testing.expectEqual(@as(usize, 4), cx.draw.items(quads.Image).len);
@@ -1617,29 +1652,53 @@ test "rack layout at 800 by 600" {
     try expect_rect(meter_cell(cx, 0).?, 448, 108, 80, 81);
 }
 
-// Locks that `timer` writes meters only when a sample changes and knob drags never do.
-test "timer writes the sample and a knob drag does not" {
+/// Feeds `count` blocks of the tone the way a host drains them.
+fn feed(app: *App, tone: *realtime.TestTone, count: u32) void {
+    var block: realtime.Block = undefined;
+    for (0..count) |_| {
+        tone.render(&block);
+        App.audio(app, &fixture.context, &block);
+    }
+}
+
+fn press_space(app: *App) void {
+    _ = send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+}
+
+// Locks the meter data flow (section 4): Space starts the tone ("tone on"); blocks write the
+// L, R, and mid peaks through the ballistics onto the meters, and a block of silence after a
+// peak only lets them fall by `fall_per_block`; a knob drag never writes a meter; Space stops
+// the tone and zeroes them.
+test "audio blocks write the meters and a knob drag does not" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
+    press_space(app);
+    try std.testing.expect(cx.audio_on);
+    try std.testing.expectEqualStrings("tone on", app.status_text());
+    var tone: realtime.TestTone = undefined;
+    tone.init(realtime.sample_rate);
     cx.dirty = false;
-    App.timer(app, cx, 0);
-    try std.testing.expect(!cx.dirty);
-    try std.testing.expectEqual(@as(f32, 0.5), app.meters[0].value);
-    App.timer(app, cx, 500);
+    feed(app, &tone, 200);
     try std.testing.expect(cx.dirty);
-    const sampled = levels.sample(500);
-    try std.testing.expectEqual(@as(f32, 1), sampled[0]);
-    try std.testing.expect(sampled[1] != 1);
-    for (app.meters, sampled) |meter, value| try std.testing.expectEqual(value, meter.value);
+    for (app.meters, app.bars) |meter, bar| {
+        try std.testing.expect(meter.value > realtime.meter_of(0.05));
+        try std.testing.expectEqual(bar.value, meter.value);
+    }
     const amp = app.meters[2].value;
+    App.audio(app, cx, &realtime.Block.silent);
+    try std.testing.expectApproxEqAbs(amp - realtime.fall_per_block, app.meters[2].value, 1e-6);
+    const held = app.meters[2].value;
+    _ = frame_at(app, 1280, 720);
     const center = ring_grip(cx, app, 8);
     try std.testing.expect(send(app, .{ .pointer_down = input.left_at(center) }));
     try std.testing.expect(send(app, .{ .pointer_move = .{ .x = center.x, .y = center.y - 60 } }));
     try std.testing.expectEqual(@as(f32, 1), app.knobs[8].value);
-    try std.testing.expectEqual(amp, app.meters[2].value);
-    cx.dirty = false;
-    App.timer(app, cx, 500);
-    try std.testing.expect(!cx.dirty);
+    try std.testing.expectEqual(held, app.meters[2].value);
+    _ = send(app, .{ .pointer_up = input.left_at(.{ .x = center.x, .y = center.y - 60 }) });
+    press_space(app);
+    try std.testing.expect(!cx.audio_on);
+    try std.testing.expectEqualStrings("tone off", app.status_text());
+    for (app.meters) |meter| try std.testing.expectEqual(@as(f32, 0), meter.value);
 }
 
 // Locks ring drag and ring wheel through dispatch, and that a wheel off the ring is ignored.
@@ -1945,7 +2004,10 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
 test "badges clear the title and leds follow the meters" {
     const app = new_app();
     const cx = &fixture.context;
-    App.timer(app, cx, 500);
+    press_space(app);
+    var tone: realtime.TestTone = undefined;
+    tone.init(realtime.sample_rate);
+    feed(app, &tone, 100);
     _ = frame_at(app, 1280, 720);
     const images = cx.draw.items(quads.Image);
     try std.testing.expectEqual(@as(usize, panel_count), images.len);
