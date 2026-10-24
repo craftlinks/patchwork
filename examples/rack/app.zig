@@ -1764,7 +1764,7 @@ fn record(app: *App, scale_120: u32) void {
         .width_px = patchwork.frame.pixel_size(1280, scale_120),
         .height_px = patchwork.frame.pixel_size(720, scale_120),
         .scale_120 = scale_120,
-    });
+    }, 0);
 }
 
 /// The `texture_write` ops of the last recorded stream.

@@ -43,7 +43,8 @@ pub const App = struct {
 turtle stack, the hit areas of the last frame, and pointer, hover, and capture state. There
 is no layout call and no dirty or live query: `cx.redraw()` marks a draw as owed, and
 `cx.keep_animating()` (called by a widget whose animator is still moving) keeps frame
-callbacks coming. A window resize only marks a draw as owed, because layout happens while
+callbacks coming. So does an animated draw type on screen (see Animated Types), with no call
+at all; the app stops it by not drawing it. A window resize only marks a draw as owed, because layout happens while
 drawing.
 
 **Timer.** With `timer_period_ms` nonzero the host timer runs from startup when
@@ -122,7 +123,7 @@ patchwork/
 │   ├── text/layout.zig         # UTF-8, alignment, ellipsis, device-pixel snapping
 │   ├── text/mono.zig           # Monospace grid: per-frame ASCII table, direct glyph appends
 │   ├── text/fonts/             # Noto Sans Regular and Bold, Noto Sans Mono (SIL OFL, OFL.txt)
-│   ├── animator.zig            # Scalar animator transitions (Animator, Clock)
+│   ├── animator.zig            # Scalar animator transitions and animation time (Animator, Clock, Time)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
 │   ├── theme.zig               # Theme uniform record packed behind the projection matrix
@@ -546,8 +547,11 @@ values are UI state that lives in the text. It demonstrates:
 - **Uploads.** The panel draws before the editor and the header last, so a typed key writes
   the glyphs from the edited line on; tests "uploads of a scrolled frame and a typed key" and
   "transport ticks upload the playhead and one recorded point" lock the byte counts.
+- **Record glow** (`glow.zig`). While record is armed, an animated `Glow` breathes around
+  the record icon once a second from the frame's time, playing or paused; armed and paused,
+  every frame is animation-only. Disarmed and paused, the screen sleeps.
 - **Bench scenarios** (`bench.zig`). `idle` (every frame skipped by the pixel cache),
-  `transport`, `typing`, `transport-stress`, and `typing-stress`, replayed headless by test
+  `pulse` (record armed while paused: animation-only frames), `transport`, `typing`, `transport-stress`, and `typing-stress`, replayed headless by test
   "the bench scenarios replay headless".
 
 ## Bench Mode
@@ -608,6 +612,7 @@ Renderer.frame  (every drawn frame)
   buffer_write (uniform, if the device size or scale changed)
   queued texture ops (the glyph cache's dirty atlas rectangle, one strided texture_write)
   buffer_write* (pools)  [buffer_write (points)]
+  [buffer_write (uniform time, 16 bytes, while an animated type is on screen)]
   then by the frame's kind (see Pixel Cache):
   direct   pass_begin (surface)  bind_group_set 0  vertex_buffer_set 0
            per batch: [pipeline_set vertex_buffer_set 1] [bind_group_set 1] draw
@@ -668,6 +673,29 @@ what changed (`src/draw/tiles.zig`, `src/draw/renderer.zig` section 4a):
   0.14 ms on the RTX 3060; most of a cached frame is the full-window copy, which WebGPU cannot
   avoid (no buffer age). Hashing adds about 40 microseconds of CPU per frame, 60 to 90 on the
   stress text.
+- **Unchanged frames.** When no pool, point, or texture revision moved and the size held, the
+  instances are the last frame's, so the renderer skips hashing and repeats the last frame's
+  tiles: an idle frame records in under a microsecond (was about 38).
+
+### Animated Types
+
+A draw type that declares `pub const animated = true` may read the frame uniform's time slot
+(`frame.time.x`, seconds, or the prelude's `time_seconds()` and `time_pulse(hz)`). The
+uniform is the projection, then the time `vec4` at byte 64, then the theme: 256 bytes. The
+registry rejects a type that reads time without the declaration, because the cache would keep
+its pixels (`zig build test-contract` locks it). The renderer forces an animated instance's
+tiles dirty every frame and reports `animating`, and both hosts then keep presenting and
+advance `animator.Time`: whole milliseconds of the clock's clamped deltas, counted only while
+something animates, wrapped at one hour (seamless for any multiple of 1/3600 Hz, such as every
+integer BPM). Time stands still while nothing animates and while the window is hidden. A frame
+with an animated type on screen and nothing else changed runs no `App.draw` and no hashing,
+writes 16 bytes of time, and repaints only the animated tiles. In bench mode, time is exactly
+1/60 s per presented frame, so dumps compare across runs.
+
+Measured at 2856 by 2514 with the live screen's `pulse`: every frame cached, none drew, none
+hashed; recording takes 1.9 microseconds on the RTX 3060 and 3.4 on the UHD 770, and the GPU
+frame is 0.13 ms and 1.4 ms (the cached `typing` frame is 0.13 and 1.5). Dumps with the cache
+on and off are identical on both GPUs.
 
 ## Draw Types, Layers, and Batches
 
@@ -699,6 +727,8 @@ adds its own (the rack's `Led`).
   and fragment stages). The renderer creates that buffer and binds it with the frame uniform,
   once per pass;
   a registry without such a type has no point buffer.
+- **Animated.** A type that declares `pub const animated = true` may read the frame's time
+  (see Animated Types).
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
   layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
   batch list refuses the instance and counts it in `cx.draw.overflow_count`.

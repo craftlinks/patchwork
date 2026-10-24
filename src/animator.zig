@@ -1,4 +1,4 @@
-//! Linear animators and a host-timestamp clock.
+//! Linear animators, a host-timestamp clock, and the animation time shaders read.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -21,6 +21,15 @@
 //! baseline. The caller resets the clock once no animator is live. Each wake costs exactly one
 //! frame of latency, after which motion is continuous.
 //!
+//! ### Animation Time
+//! Animated draw types read one clock from the frame uniform (`draw.time_offset`). `Time`
+//! accumulates the clock's clamped deltas while the renderer reports an animated instance on
+//! screen, so it stands still while nothing animates and while the window is hidden (no frame
+//! callbacks, no rAF): a pulse resumes at its phase instead of jumping. It counts whole
+//! milliseconds in a `u64`, so accumulation is exact; `seconds` wraps at `time_wrap_ms`, where
+//! an `f32` still resolves 2^-12 s (about 0.24 ms). The wrap is seamless for any frequency that
+//! is a multiple of 1/3600 Hz, which covers whole hertz and every integer BPM.
+//!
 //! ## 2. Units & Equations
 //! `value` and `target` are normalized to `[0, 1]`. Timestamps are `u32` milliseconds; deltas
 //! are `f32` milliseconds.
@@ -36,8 +45,13 @@
 //! gap = now_ms -% last_ms
 //! dt  = min(gap, dt_max_ms)            (the discarded excess is not replayed)
 //! ```
-//! Worked values: see test "clock deltas wrap and clamp, and reset rearms" and test "step
-//! reaches the midpoint and clamps on the target".
+//! Animation time, in seconds:
+//! ```text
+//! ms      += dt                                (only while animating)
+//! seconds  = (ms mod time_wrap_ms) / 1000
+//! ```
+//! Worked values: see test "clock deltas wrap and clamp, and reset rearms", test "step
+//! reaches the midpoint and clamps on the target", and test "time wraps at an hour".
 //!
 //! ## 3. State Machines
 //! ```text
@@ -67,6 +81,9 @@ const assert = std.debug.assert;
 /// Largest delta `Clock.advance` will return, in milliseconds.
 /// A single stalled frame cannot move an animator by more than this gap.
 pub const dt_max_ms: u32 = 100;
+
+/// Period at which `Time.seconds` wraps: one hour, in milliseconds.
+pub const time_wrap_ms: u64 = 3_600_000;
 
 /// A float moving toward `target` at `rate_per_ms`. `value` and `target` stay in `[0, 1]`.
 pub const Animator = struct {
@@ -199,8 +216,40 @@ pub const Clock = struct {
     }
 };
 
+/// Animation time for animated draw types (module guide, "Animation Time").
+pub const Time = struct {
+    ms: u64,
+
+    pub fn init() Time {
+        const time: Time = .{ .ms = 0 };
+        assert(time.ms == 0);
+        return time;
+    }
+
+    /// Adds one clock delta: whole milliseconds, already clamped by `Clock.advance`.
+    pub fn advance(self: *Time, dt_ms: f32) void {
+        assert(dt_ms >= 0);
+        assert(dt_ms <= @as(f32, @floatFromInt(dt_max_ms)));
+        const before = self.ms;
+        self.ms += @intFromFloat(dt_ms);
+        assert(self.ms >= before);
+    }
+
+    /// Seconds since time started, wrapped at `time_wrap_ms`.
+    pub fn seconds(self: Time) f32 {
+        const wrapped = self.ms % time_wrap_ms;
+        const value = @as(f32, @floatFromInt(wrapped)) / 1000.0;
+        assert(value >= 0);
+        assert(value < @as(f32, @floatFromInt(time_wrap_ms / 1000)));
+        return value;
+    }
+};
+
 comptime {
     assert(dt_max_ms == 100);
+    assert(time_wrap_ms == 3600 * 1000);
+    // Below the wrap an f32 keeps at least 12 fractional bits of a second.
+    assert(time_wrap_ms / 1000 < 1 << (std.math.floatMantissaBits(f32) + 1 - 12));
     assert(@sizeOf(Animator) == 12);
     assert(@sizeOf(Clock) == 8);
 }
@@ -236,4 +285,21 @@ test "clock deltas wrap and clamp, and reset rearms" {
     try std.testing.expectEqual(@as(f32, 100), wrapped.advance(8 + 500));
     wrapped.reset();
     try std.testing.expectEqual(@as(f32, 0), wrapped.advance(8 + 500));
+}
+
+// Locks animation time: deltas accumulate exactly in whole milliseconds, `seconds` reads them
+// in seconds, and 3,599,990 ms plus 20 ms wraps to 10 ms.
+test "time wraps at an hour" {
+    var time = Time.init();
+    try std.testing.expectEqual(@as(f32, 0), time.seconds());
+    time.advance(17);
+    time.advance(16);
+    try std.testing.expectEqual(@as(u64, 33), time.ms);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.033), time.seconds(), 1.0e-6);
+    time.ms = 1_234_567;
+    try std.testing.expectApproxEqAbs(@as(f32, 1234.567), time.seconds(), 1.0e-4);
+    time.ms = time_wrap_ms - 10;
+    time.advance(20);
+    try std.testing.expectEqual(@as(u64, time_wrap_ms + 10), time.ms);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.010), time.seconds(), 1.0e-6);
 }

@@ -4,13 +4,13 @@
 //!
 //! ## 1. Why the Theme Rides in the Frame Uniform
 //! Every draw type's pipeline binds one uniform at `@group(0) @binding(0)` whose WGSL type is
-//! `Frame { ortho: mat4x4<f32>, theme: Theme }` (`draw/prelude.wgsl`). Placing `Theme`
-//! directly after the projection matrix lets all pipelines share one bind group layout and one
-//! bind group, and keeps color and arc-angle literals out of WGSL: widgets read `chrome` on the CPU
+//! `Frame { ortho: mat4x4<f32>, time: vec4<f32>, theme: Theme }` (`draw/prelude.wgsl`). Placing
+//! `Theme` in the frame uniform lets all pipelines share one bind group layout and one bind group, and keeps color and arc-angle literals out of WGSL: widgets read `chrome` on the CPU
 //! to fill per-instance colors, while the fragment shader reads `lighten`, `darken`, and `arc`
 //! from the uniform.
 //!
-//! The frame record is `draw.matrix_bytes + bytes` long and must equal `draw.uniform_bytes`;
+//! The frame record is `draw.matrix_bytes + draw.time_bytes + bytes` long and must equal
+//! `draw.uniform_bytes`;
 //! see the `comptime` block in `draw.zig` and the alignment rationale on `draw.uniform_bytes`.
 //!
 //! ## 2. Angle Convention
@@ -30,8 +30,8 @@
 //! no uninitialized bytes when copied to the GPU.
 //!
 //! ## 4. Upload Flow
-//! `draw/renderer.zig` keeps a `Uniform` record of the projection matrix at offset 0 followed by
-//! `Theme` at offset `draw.matrix_bytes`, initialized from `chrome`. When the logical size
+//! `draw/renderer.zig` keeps a `Uniform` record of the projection matrix at offset 0, the time
+//! slot at `draw.time_offset`, and `Theme` at `draw.theme_offset`, initialized from `chrome`. When the logical size
 //! changes it records one `buffer_write` of the whole record, which both hosts replay. `chrome`
 //! is a `comptime`-known constant, so the theme never changes at runtime and needs no
 //! allocation.
@@ -41,10 +41,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 /// Number of `vec4` slots in `Theme`. Asserted equal to the field count.
-pub const slot_count: u32 = 12;
+pub const slot_count: u32 = 11;
 
 /// Byte size of `Theme`. Asserted equal to `@sizeOf(Theme)`.
-pub const bytes: u32 = 192;
+pub const bytes: u32 = 176;
 
 /// Start angle of the open ring, in the angle convention of the module guide.
 pub const arc_start: f32 = 2.0 * std.math.pi / 3.0;
@@ -68,7 +68,6 @@ pub const Theme = extern struct {
     arc: [4]f32,
     pad0: [4]f32,
     pad1: [4]f32,
-    pad2: [4]f32,
 };
 
 /// Straight (non-premultiplied) RGBA chrome. Knob accents are per-instance fills, not slots.
@@ -84,14 +83,13 @@ pub const chrome: Theme = .{
     .arc = .{ arc_start, arc_sweep, 0, 0 },
     .pad0 = .{ 0, 0, 0, 0 },
     .pad1 = .{ 0, 0, 0, 0 },
-    .pad2 = .{ 0, 0, 0, 0 },
 };
 
 comptime {
-    assert(@sizeOf(Theme) == 192);
+    assert(@sizeOf(Theme) == 176);
     assert(@alignOf(Theme) >= 4);
     assert(bytes == @sizeOf(Theme));
-    assert(slot_count == 12);
+    assert(slot_count == 11);
     // WGSL lays each vec4<f32> out at 16 bytes, so slot i must start at byte 16 * i. Checking
     // every field catches a reordered or retyped field that the total size alone would miss.
     const info = @typeInfo(Theme).@"struct";
@@ -106,14 +104,13 @@ comptime {
     assert(chrome.arc[3] == 0);
     assert(chrome.pad0[0] == 0);
     assert(chrome.pad1[0] == 0);
-    assert(chrome.pad2[0] == 0);
     assert(chrome.lighten[0] == 1);
     assert(chrome.darken[0] == 0);
 }
 
 // Locks the `Theme` size, the arc constants, and zeroed pad and arc tail slots.
-test "theme is 192 bytes and the arc is the open ring" {
-    try std.testing.expectEqual(@as(usize, 192), @sizeOf(Theme));
+test "theme is 176 bytes and the arc is the open ring" {
+    try std.testing.expectEqual(@as(usize, 176), @sizeOf(Theme));
     try std.testing.expectApproxEqAbs(2.0 * std.math.pi / 3.0, chrome.arc[0], 0.0001);
     try std.testing.expectApproxEqAbs(3.0 * std.math.pi / 2.0, chrome.arc[1], 0.0001);
     try std.testing.expectEqual(@as(f32, 0), chrome.arc[2]);
@@ -121,7 +118,6 @@ test "theme is 192 bytes and the arc is the open ring" {
     try std.testing.expectEqual(@as(f32, 0), chrome.pad0[0]);
     try std.testing.expectEqual(@as(f32, 0), chrome.pad0[3]);
     try std.testing.expectEqual(@as(f32, 0), chrome.pad1[1]);
-    try std.testing.expectEqual(@as(f32, 0), chrome.pad2[2]);
 }
 
 // Locks the open-ring geometry: a three-quarter sweep leaves a quarter-turn gap, and the

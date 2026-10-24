@@ -464,6 +464,9 @@ pub const Sample = struct {
     drew: bool,
     /// What the renderer recorded (`draw/renderer.zig`, section 4a).
     kind: renderer.Kind,
+    /// The renderer folded the instances into tiles; false when it repeated the last frame's
+    /// (`draw/renderer.zig`, section 4b).
+    hashed: bool,
 };
 
 pub const Summary = struct {

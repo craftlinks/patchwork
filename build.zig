@@ -439,6 +439,11 @@ fn add_test_steps(
             .expected = "contract_ragged_type.Ragged: @sizeOf must be a multiple of 16 " ++
                 "(one vec4 per 16 bytes)",
         },
+        .{
+            .path = "test/contract_frozen_time.zig",
+            .expected = "contract_frozen_time.Frozen: reads time but does not declare " ++
+                "`animated = true`",
+        },
     };
     for (contracts) |case| {
         const contract = b.createModule(.{

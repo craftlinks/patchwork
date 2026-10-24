@@ -17,8 +17,11 @@
 //! begin(width_px, height_px)   grid = ceil(size / side_px); a new grid has no previous frame
 //! add(bounds, key) per instance, in draw order:
 //!     every tile the bounds touch:  hash = (hash ^ key) * prime
-//! finish()                     dirty = hash != previous (all, without a previous frame);
-//!                              previous = hash
+//! force(bounds) per animated instance: every tile the bounds touch is dirty this frame
+//! finish()                     dirty = hash != previous (all, without a previous frame)
+//!                              or forced; previous = hash
+//! repeat()                     instead of begin/add/finish, for a frame whose instances are
+//!                              the last frame's: dirty = the last frame's forced tiles
 //! rects(out)                   dirty runs per row, merged down rows with equal spans, at most
 //!                              `out.len` rects, else one bounding rect; device pixels
 //! ```
@@ -28,8 +31,13 @@
 //! instance touches. A draw type leaves every pixel outside its `rect` untouched (registry
 //! guide, section 2a), so the bounds are exact up to that pixel.
 //!
+//! An animated instance (`draw/registry.zig`, section 2b) changes pixels without changing its
+//! key, so its tiles are forced dirty every frame. When the renderer knows the instances are
+//! exactly the last frame's (no record, point, texture, or size changed), the hashes would equal
+//! `previous` by construction, and `repeat` skips folding them.
+//!
 //! ## 3. TigerStyle Invariants
-//! - Fixed storage: `tile_cap` hashes twice and a bit set, about 260 KiB; a target with more
+//! - Fixed storage: `tile_cap` hashes twice and two bit sets, about 260 KiB; a target with more
 //!   tiles than that is not cached (`begin` returns false).
 //! - `add` is linear in the tiles an instance touches; `finish` and `rects` in the tile count.
 
@@ -78,6 +86,8 @@ pub const Tiles = struct {
     /// One bit per tile, set when dirty. Plain words read through `self`, because
     /// `std.StaticBitSet`'s methods take the set by value and copied 2 KiB per query.
     dirty: [tile_cap / 64]u64,
+    /// One bit per tile an animated instance touched in the last `begin` .. `finish`.
+    forced: [tile_cap / 64]u64,
     columns: u32,
     rows: u32,
     width_px: u32,
@@ -116,6 +126,7 @@ pub const Tiles = struct {
             return false;
         }
         @memset(self.hashes[0 .. columns * rows], 0);
+        @memset(&self.forced, 0);
         assert(self.columns * self.rows <= tile_cap);
         return true;
     }
@@ -129,22 +140,43 @@ pub const Tiles = struct {
     /// Folds `key` into every tile `bounds` touches (x0, y0, x1, y1 in device pixels, grown
     /// by one pixel here). Empty or off-target bounds touch nothing.
     pub fn add(self: *Tiles, bounds: [4]f32, key: u64) void {
+        const box = self.touched(bounds) orelse return;
+        var row = box[2];
+        while (row <= box[3]) : (row += 1) {
+            const base = row * self.columns;
+            for (self.hashes[base + box[0] .. base + box[1] + 1]) |*hash| {
+                hash.* = (hash.* ^ key) *% prime;
+            }
+        }
+    }
+
+    /// Marks every tile `bounds` touches dirty for this frame, whatever its hash (an animated
+    /// instance). Returns true when it touched any.
+    pub fn force(self: *Tiles, bounds: [4]f32) bool {
+        const box = self.touched(bounds) orelse return false;
+        var row = box[2];
+        while (row <= box[3]) : (row += 1) {
+            var index = row * self.columns + box[0];
+            while (index <= row * self.columns + box[1]) : (index += 1) {
+                self.forced[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            }
+        }
+        return true;
+    }
+
+    /// The tile box (first column, last column, first row, last row; inclusive) that `bounds`
+    /// touches after the one-pixel growth, or null when none.
+    fn touched(self: *const Tiles, bounds: [4]f32) ?[4]u32 {
         assert(self.columns * self.rows <= tile_cap);
         const x0 = bounds[0] - 1;
         const y0 = bounds[1] - 1;
         const x1 = bounds[2] + 1;
         const y1 = bounds[3] + 1;
-        if (!(x1 > x0 and y1 > y0)) return;
-        if (x1 <= 0 or y1 <= 0) return;
-        const span = tile_span(x0, x1, self.columns) orelse return;
-        const rows = tile_span(y0, y1, self.rows) orelse return;
-        var row = rows[0];
-        while (row <= rows[1]) : (row += 1) {
-            const base = row * self.columns;
-            for (self.hashes[base + span[0] .. base + span[1] + 1]) |*hash| {
-                hash.* = (hash.* ^ key) *% prime;
-            }
-        }
+        if (!(x1 > x0 and y1 > y0)) return null;
+        if (x1 <= 0 or y1 <= 0) return null;
+        const span = tile_span(x0, x1, self.columns) orelse return null;
+        const rows = tile_span(y0, y1, self.rows) orelse return null;
+        return .{ span[0], span[1], rows[0], rows[1] };
     }
 
     /// Compares this frame's hashes with the last frame's, records the dirty tiles, and keeps
@@ -155,12 +187,33 @@ pub const Tiles = struct {
         @memset(&self.dirty, 0);
         var count: u32 = 0;
         for (0..total) |index| {
-            if (self.valid and self.hashes[index] == self.previous[index]) continue;
-            self.dirty[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            const bit = @as(u64, 1) << @intCast(index % 64);
+            const forced = self.forced[index / 64] & bit != 0;
+            if (!forced and self.valid and self.hashes[index] == self.previous[index]) continue;
+            self.dirty[index / 64] |= bit;
             count += 1;
         }
         @memcpy(self.previous[0..total], self.hashes[0..total]);
         self.valid = true;
+        self.dirty_count = count;
+        assert(count <= total);
+        return count;
+    }
+
+    /// For a frame whose instances equal the last frame's, in place of `begin`, `add`, and
+    /// `finish`: the last frame's forced tiles are this frame's dirty tiles, and `previous` and
+    /// `forced` stay as they are. Returns the dirty count. Needs a last frame on this grid.
+    pub fn repeat(self: *Tiles) u32 {
+        assert(self.valid);
+        const total = self.columns * self.rows;
+        assert(total <= tile_cap);
+        const words = std.math.divCeil(u32, total, 64) catch unreachable;
+        var count: u32 = 0;
+        for (self.dirty[0..words], self.forced[0..words]) |*dirty, forced| {
+            dirty.* = forced;
+            count += @popCount(forced);
+        }
+        @memset(self.dirty[words..], 0);
         self.dirty_count = count;
         assert(count <= total);
         return count;
@@ -338,6 +391,35 @@ test "moves, changes, reorders, and edges dirty the right tiles" {
     tiles.add(.{ 0, 0, 63.5, 10 }, 9);
     try testing.expect(tiles.hashes[1] != 0);
     try testing.expectEqual(@as(u64, 0), tiles.hashes[2]);
+}
+
+// Locks animated tiles: a forced tile is dirty with an unchanged hash, `repeat` returns exactly
+// the last frame's forced tiles as dirty (and nothing when none was forced), and `begin` clears
+// them. Bounds off the target force nothing.
+test "forced tiles are dirty every frame and repeat keeps them" {
+    const tiles = new_tiles();
+    _ = tiles.begin(256, 128);
+    tiles.add(.{ 10, 10, 20, 20 }, 1);
+    tiles.add(.{ 140, 70, 150, 80 }, 2);
+    _ = tiles.finish();
+    _ = tiles.begin(256, 128);
+    tiles.add(.{ 10, 10, 20, 20 }, 1);
+    tiles.add(.{ 140, 70, 150, 80 }, 2);
+    try testing.expect(tiles.force(.{ 140, 70, 150, 80 }));
+    try testing.expect(!tiles.force(.{ 300, 10, 320, 20 }));
+    try testing.expectEqual(@as(u32, 1), tiles.finish());
+    try testing.expect(tiles.is_dirty(4 + 2));
+    try testing.expectEqual(@as(u32, 1), tiles.repeat());
+    try testing.expect(tiles.is_dirty(4 + 2));
+    try testing.expect(!tiles.is_dirty(0));
+    var out: [rect_cap]Rect = undefined;
+    try testing.expectEqual(@as(u32, 1), tiles.rects(&out));
+    try testing.expectEqual(Rect{ .x = 128, .y = 64, .width = 64, .height = 64 }, out[0]);
+    _ = tiles.begin(256, 128);
+    tiles.add(.{ 10, 10, 20, 20 }, 1);
+    tiles.add(.{ 140, 70, 150, 80 }, 2);
+    try testing.expectEqual(@as(u32, 0), tiles.finish());
+    try testing.expectEqual(@as(u32, 0), tiles.repeat());
 }
 
 // Locks the key's sensitivity: every single-bit change of any word, and a different seed,

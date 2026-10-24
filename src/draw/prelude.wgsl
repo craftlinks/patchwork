@@ -46,9 +46,17 @@
 // ## 5. Distance Fields
 // `sdf_box` and `sdf_arc` are twins of `draw.sdf_box` and `draw.sdf_arc`, whose CPU tests lock
 // the math; arc angles come from `frame.theme.arc` (see `theme.zig`).
+//
+// ## 6. Time
+// `frame.time.x` is the animation time in seconds, wrapped at one hour (`animator.Time`). Only
+// a type that declares `animated = true` may read it, through `frame.time` or the helpers
+// below; the registry rejects any other (`draw/registry.zig`, section 2b), because the pixel
+// cache would keep its stale pixels. `time_pulse(hz)` rises from 0 to 1 and back once per
+// period, and wraps seamlessly for any `hz` that is a multiple of 1/3600.
 
 struct Frame {
     ortho: mat4x4<f32>,
+    time: vec4<f32>,
     theme: Theme,
 }
 
@@ -102,6 +110,15 @@ fn sdf_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     let ba = b - a;
     let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0);
     return length(pa - ba * h);
+}
+
+fn time_seconds() -> f32 {
+    return frame.time.x;
+}
+
+// 0 at whole periods, 1 halfway through: `0.5 - 0.5 * cos(tau * hz * t)`.
+fn time_pulse(hz: f32) -> f32 {
+    return 0.5 - 0.5 * cos(6.283185307179586 * hz * frame.time.x);
 }
 
 // Wraps an angle into [0, tau). The input is within one turn of that range.

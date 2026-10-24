@@ -446,7 +446,7 @@ fn record_at(
         .width_px = patchwork.frame.pixel_size(1280, scale_120),
         .height_px = patchwork.frame.pixel_size(720, scale_120),
         .scale_120 = scale_120,
-    });
+    }, 0);
 }
 
 // Locks the scale rules for a settled column: a present at the same scale draws nothing and

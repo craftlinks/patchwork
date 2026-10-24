@@ -30,6 +30,8 @@
 //!                                 glyph cache queued its dirty atlas rectangle (one write)
 //! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed
 //! buffer_write points [range]     when the point revision moved and points changed
+//! buffer_write uniform time       16 bytes at `draw.time_offset`, while animating and the
+//!                                 time moved (section 4b)
 //! then, by the frame's kind (section 4a), nothing (skipped), present_copy (copied), or:
 //! [target_create]                 the kept target, at its first use or a new size
 //! pass_begin                      the surface (direct), or the kept target, cleared (full)
@@ -89,6 +91,29 @@
 //! checks it (`--no-cache`). A uniform change (size or scale) dirties every tile. The rect
 //! count is bounded per app by `rects_max`, so the worst frame still fits one command buffer.
 //!
+//! ## 4b. Animated Types and Time
+//! An animated type (`draw/registry.zig`, section 2b) changes its pixels with the time slot,
+//! not its records, so hashing alone would never repaint it. `hash_batch` forces the tiles of
+//! every animated instance dirty (`Tiles.force`), and `animating` reports that one touched a
+//! tile: the hosts then keep frame callbacks coming and advance `animator.Time`, and a frame
+//! with no animated instance on screen ends the chain. With the cache off, `animating` is true
+//! whenever the finalized frame holds an animated batch.
+//!
+//! A frame whose instances are exactly the last frame's (no pool or point revision moved, no
+//! texture write or create, no uniform change, and the last frame hashed on this grid) would
+//! fold the same hashes, so `choose` skips the fold: `Tiles.repeat` makes the last frame's
+//! forced tiles dirty, and `animating` keeps its value (`hashed` is false). That is the idle
+//! frame (skipped) and the animation-only frame (the animated tiles, cached).
+//! ```text
+//! animation-only frame:  buffer_write uniform time (16 B)
+//!                        pass_begin kept target, load
+//!                          per rect: scissor_set, clear, every batch
+//!                        pass_end, present_copy
+//! ```
+//! The time write is recorded when the registry has an animated type, this frame is animating,
+//! and `time_s` differs from the uploaded value; a registry without animated types never writes
+//! it. A resize frame writes the whole uniform first and the time after it.
+//!
 //! ## 5. Lifetime
 //! Spans point into the context's pools, `Textures`' queued writes (the glyph cache's mirror
 //! among them), `Renderer.uniform`, and static data, so all of them must stay put until the
@@ -124,9 +149,11 @@ pub const clear_color: Color = .{
     .a = 1.0,
 };
 
-/// The frame uniform: projection followed by the theme, `draw.uniform_bytes` in all.
+/// The frame uniform: projection, time, and the theme, `draw.uniform_bytes` in all.
+/// `time[0]` is the animation time in seconds; the other lanes stay zero.
 pub const Uniform = extern struct {
     ortho: [16]f32,
+    time: [4]f32,
     theme: theme.Theme,
 };
 
@@ -156,9 +183,9 @@ const rect_op_cap: u32 = 6;
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     const texture_ops = 2 * textures.texture_cap + textures.write_cap;
     const rects = rects_max(type_count, batch_cap);
-    // Uniform, textures, one write per pool and one for the points, the target, the pass,
-    // the rects with their batches, the pass end, and the present.
-    return 1 + texture_ops + type_count + 1 + 1 + 1 +
+    // Uniform, textures, one write per pool and one for the points, the time, the target,
+    // the pass, the rects with their batches, the pass end, and the present.
+    return 1 + texture_ops + type_count + 1 + 1 + 1 + 1 +
         rects * (rect_op_cap + batch_cap * batch_op_cap) + 1 + 1;
 }
 
@@ -189,7 +216,7 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
     const per_rect = op_bytes(commands.ScissorSet) + op_bytes(commands.PipelineSet) +
         2 * op_bytes(commands.VertexBufferSet) + op_bytes(commands.Draw) +
         op_bytes(commands.BindGroupSet) + batch_cap * per_batch;
-    return (2 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
+    return (3 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
         rects * per_rect;
 }
 
@@ -262,6 +289,11 @@ pub fn Renderer(comptime Cx: type) type {
         kept_valid: bool,
         /// The shadows' tile keys belong to the last frame (module guide, section 4a).
         keys_valid: bool,
+        /// An animated instance is on screen: the host keeps presenting (section 4b).
+        animating: bool,
+        /// The last `frame` folded its instances into tiles, rather than repeating the last
+        /// frame's (section 4b).
+        hashed: bool,
 
         /// Most ops one `frame` records.
         pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity);
@@ -294,7 +326,7 @@ pub fn Renderer(comptime Cx: type) type {
         /// Out-pointer init so a static renderer needs no stack copy.
         pub fn init(self: *Self) void {
             self.ids = .init();
-            self.uniform = .{ .ortho = undefined, .theme = theme.chrome };
+            self.uniform = .{ .ortho = undefined, .time = @splat(0), .theme = theme.chrome };
             self.width_px = 0;
             self.height_px = 0;
             self.scale_120 = 0;
@@ -316,6 +348,8 @@ pub fn Renderer(comptime Cx: type) type {
             self.point_shadow.count = 0;
             self.point_shadow.revision = 0;
             self.keys_valid = false;
+            self.animating = false;
+            self.hashed = false;
             assert(!self.ready);
             assert(self.width_px == 0);
         }
@@ -514,12 +548,14 @@ pub fn Renderer(comptime Cx: type) type {
         }
 
         /// Records one frame of `cx` into an empty `buffer`. Finalizes the context (sorting
-        /// and batching it if it changed) and updates the shadows. See the module guide.
+        /// and batching it if it changed) and updates the shadows. `time_s` is the animation
+        /// time (`animator.Time.seconds`) animated types read. See the module guide.
         pub fn frame(
             self: *Self,
             buffer: *commands.CommandBuffer,
             cx: *Cx,
             size: Size,
+            time_s: f32,
         ) void {
             assert(self.ready);
             assert(buffer.len == 0);
@@ -544,14 +580,24 @@ pub fn Renderer(comptime Cx: type) type {
                 self.height_px = size.height_px;
                 self.scale_120 = size.scale_120;
             }
+            assert(time_s >= 0);
             cx.text.queue_upload(&cx.textures);
+            const unchanged = !resized and self.same_instances(cx);
             self.flush_textures(buffer, &cx.textures);
             cx.finalize();
             inline for (0..R.count) |index| {
                 self.upload_pool(buffer, index, &cx.pools[index]);
             }
             if (uses_points) self.upload_points(buffer, cx);
-            const kind = self.choose(cx, size, resized);
+            const kind = self.choose(cx, size, resized, unchanged);
+            if (R.any_animated and self.animating and self.uniform.time[0] != time_s) {
+                self.uniform.time[0] = time_s;
+                buffer.push(.{ .buffer_write = .{
+                    .id = self.resources.uniform_buffer,
+                    .offset = draw.time_offset,
+                    .data = .of(std.mem.asBytes(&self.uniform.time)),
+                } });
+            }
             switch (kind) {
                 .skipped => {},
                 .copied => buffer.push(.{ .present_copy = .{ .target = self.kept.? } }),
@@ -564,24 +610,50 @@ pub fn Renderer(comptime Cx: type) type {
             assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity));
         }
 
-        /// Hashes the frame into tiles and picks its kind (module guide, section 4a).
-        fn choose(self: *Self, cx: *Cx, size: Size, resized: bool) Kind {
+        /// True when no pool or point revision moved and no texture is created or written
+        /// this frame, so the finalized instances are the last frame's. Called before the
+        /// uploads, which take the revisions into the shadows.
+        fn same_instances(self: *const Self, cx: *const Cx) bool {
+            if (cx.textures.write_count != 0) return false;
+            if (cx.textures.created != cx.textures.count) return false;
+            inline for (0..R.count) |index| {
+                if (self.shadows[index].revision != cx.pools[index].revision) return false;
+            }
+            if (uses_points and self.point_shadow.revision != cx.point_revision) return false;
+            return true;
+        }
+
+        /// Hashes the frame into tiles, or repeats the last frame's when its instances are
+        /// unchanged, and picks its kind (module guide, sections 4a and 4b).
+        fn choose(self: *Self, cx: *Cx, size: Size, resized: bool, unchanged: bool) Kind {
             const forced = self.present_next;
             self.present_next = false;
+            self.hashed = false;
             if (!self.cache) {
                 self.kept_valid = false;
                 self.keys_valid = false;
+                self.animating = shows_animated(cx);
                 return .direct;
             }
-            if (!self.tiles.begin(size.width_px, size.height_px)) {
-                self.kept_valid = false;
-                self.keys_valid = false;
-                return .direct;
+            var dirty: u32 = 0;
+            if (unchanged and self.keys_valid and self.tiles.valid) {
+                assert(self.tiles.width_px == size.width_px);
+                assert(self.tiles.height_px == size.height_px);
+                dirty = self.tiles.repeat();
+            } else {
+                if (!self.tiles.begin(size.width_px, size.height_px)) {
+                    self.kept_valid = false;
+                    self.keys_valid = false;
+                    self.animating = shows_animated(cx);
+                    return .direct;
+                }
+                if (resized) self.tiles.invalidate();
+                self.animating = false;
+                self.hash_frame(cx, size.scale_120);
+                self.keys_valid = true;
+                self.hashed = true;
+                dirty = self.tiles.finish();
             }
-            if (resized) self.tiles.invalidate();
-            self.hash_frame(cx, size.scale_120);
-            self.keys_valid = true;
-            const dirty = self.tiles.finish();
             if (dirty == 0) {
                 if (!forced) return .skipped;
                 return if (self.kept_valid) .copied else .direct;
@@ -616,6 +688,15 @@ pub fn Renderer(comptime Cx: type) type {
                     }
                 }
             }
+        }
+
+        /// True when the finalized frame holds an instance of an animated type.
+        fn shows_animated(cx: *const Cx) bool {
+            if (comptime !R.any_animated) return false;
+            for (cx.batch_list()) |batch| {
+                if (R.animates[batch.type_id]) return true;
+            }
+            return false;
         }
 
         /// True when some type reads points without naming its range (`first_point`), so
@@ -665,6 +746,9 @@ pub fn Renderer(comptime Cx: type) type {
                 const x1 = @min(item.rect[0] + item.rect[2], item.clip[2]) * context.scale;
                 const y1 = @min(item.rect[1] + item.rect[3], item.clip[3]) * context.scale;
                 self.tiles.add(.{ x0, y0, x1, y1 }, key);
+                if (comptime R.animates[index]) {
+                    if (self.tiles.force(.{ x0, y0, x1, y1 })) self.animating = true;
+                }
             }
         }
 
@@ -934,7 +1018,8 @@ fn unit_layout() commands.VertexBuffer {
 
 comptime {
     assert(@sizeOf(Uniform) == draw.uniform_bytes);
-    assert(@offsetOf(Uniform, "theme") == draw.matrix_bytes);
+    assert(@offsetOf(Uniform, "time") == draw.time_offset);
+    assert(@offsetOf(Uniform, "theme") == draw.theme_offset);
     assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
     assert(batch_op_cap == 4);
 }
@@ -1009,7 +1094,7 @@ const Fixture = struct {
             .width_px = 1280 * scale_120 / 120,
             .height_px = 720 * scale_120 / 120,
             .scale_120 = scale_120,
-        });
+        }, 0);
     }
 };
 
@@ -1214,6 +1299,162 @@ test "a small change repaints one tile of the kept target" {
     try testing.expect(!Fixture.renderer.kept_valid);
 }
 
+// Locks the unchanged fast path (module guide, section 4b): an undrawn frame repeats the last
+// frame's tiles without hashing, while a texture create or write on an otherwise undrawn frame
+// hashes again; a registry without animated types never animates or writes time.
+test "an undrawn frame repeats its tiles unless a texture changed" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(120);
+    try testing.expect(Fixture.renderer.hashed);
+    Fixture.record(120);
+    try testing.expect(!Fixture.renderer.hashed);
+    try testing.expectEqual(Kind.skipped, Fixture.renderer.last);
+    const cx = &Fixture.context;
+    const id = cx.textures.create(.rgba8, 2, 2);
+    Fixture.record(120);
+    try testing.expect(Fixture.renderer.hashed);
+    const texels: [16]u8 = @splat(0xFF);
+    cx.textures.write(id, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, &texels);
+    Fixture.record(120);
+    try testing.expect(Fixture.renderer.hashed);
+    try testing.expectEqual(Kind.skipped, Fixture.renderer.last);
+    Fixture.record(120);
+    try testing.expect(!Fixture.renderer.hashed);
+    try testing.expect(!Fixture.renderer.animating);
+    try testing.expectEqual(@as(f32, 0), Fixture.renderer.uniform.time[0]);
+}
+
+/// An animated test type: its alpha follows `time_pulse`.
+const Pulse = extern struct {
+    rect: [4]f32,
+    clip: [4]f32,
+
+    pub const texture: ?textures.Format = null;
+    pub const animated = true;
+    pub const pixel: []const u8 =
+        \\fn pixel(px: Pixel) -> vec4<f32> {
+        \\    return vec4<f32>(1.0, 1.0, 1.0, time_pulse(1.0));
+        \\}
+        \\
+    ;
+};
+
+const animated_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 8 },
+    .{ .type = Pulse, .cap = 4 },
+};
+
+const AnimatedContext = draw.Context(&animated_draw, 8, 0);
+
+const Animated = struct {
+    var context: AnimatedContext = undefined;
+    var renderer: Renderer(AnimatedContext) = undefined;
+    var buffer: commands.CommandBuffer = undefined;
+
+    fn start() void {
+        context.init();
+        renderer.init();
+        buffer = .init();
+        renderer.setup(&buffer, &context);
+    }
+
+    /// A box in tile 0 and, when `pulsing`, a pulse in tile 4 (x 256 to 320).
+    fn scene(pulsing: bool) !void {
+        context.text.scale_120 = 120;
+        context.reset();
+        try context.append(types.Box, null, face(0));
+        if (pulsing) {
+            try context.append(Pulse, null, .{
+                .rect = .{ 290, 10, 10, 10 },
+                .clip = .{ 0, 0, 1280, 720 },
+            });
+        }
+    }
+
+    /// Records one 1280 by 720 frame at scale 1 and animation time `time_s`.
+    fn record(time_s: f32) void {
+        buffer.reset();
+        renderer.frame(&buffer, &context, .{
+            .width_logical = 1280,
+            .height_logical = 720,
+            .width_px = 1280,
+            .height_px = 720,
+            .scale_120 = 120,
+        }, time_s);
+    }
+
+    /// The first op of `kind` in the last recording.
+    fn first(comptime kind: commands.Code) ?@FieldType(commands.Op, @tagName(kind)) {
+        var reader = buffer.reader();
+        while (reader.next()) |op| {
+            if (op == kind) return @field(op, @tagName(kind));
+        }
+        return null;
+    }
+};
+
+// Locks the animation-only frame (module guide, section 4b): with a pulse on screen and no
+// draw, a frame writes 16 bytes of time at offset 64, hashes nothing, and repaints the pulse's
+// tile under a scissor; a frame at the same time writes no time but still repaints; dropping
+// the pulse repaints its tile once and stops animating, and the next frame is skipped.
+test "an animation-only frame writes the time and repaints the animated tiles" {
+    Animated.start();
+    try Animated.scene(true);
+    Animated.record(0);
+    try testing.expectEqual(Kind.direct, Animated.renderer.last);
+    try testing.expect(Animated.renderer.animating);
+    try testing.expect(Animated.renderer.hashed);
+    Animated.record(0.5);
+    try testing.expectEqual(Kind.full, Animated.renderer.last);
+    try testing.expect(!Animated.renderer.hashed);
+    Animated.record(1.0);
+    try testing.expectEqual(Kind.cached, Animated.renderer.last);
+    try testing.expect(!Animated.renderer.hashed);
+    var write_storage: [8]commands.BufferWrite = undefined;
+    const recorded = writes(&Animated.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqual(Animated.renderer.resources.uniform_buffer, recorded[0].id);
+    try testing.expectEqual(draw.time_offset, recorded[0].offset);
+    try testing.expectEqual(@as(usize, draw.time_bytes), recorded[0].data.len);
+    try testing.expectEqual(@as(f32, 1.0), Animated.renderer.uniform.time[0]);
+    var storage: [64]commands.Code = undefined;
+    const ops = codes(&Animated.buffer, &storage);
+    try testing.expectEqual(commands.Code.buffer_write, ops[0]);
+    try testing.expectEqual(commands.Code.pass_begin, ops[1]);
+    const scissor: commands.ScissorSet = .{ .x = 256, .y = 0, .width = 64, .height = 64 };
+    try testing.expectEqual(scissor, Animated.first(.scissor_set).?);
+    Animated.record(1.0);
+    try testing.expectEqual(Kind.cached, Animated.renderer.last);
+    try testing.expectEqual(@as(usize, 0), writes(&Animated.buffer, &write_storage).len);
+    try Animated.scene(false);
+    Animated.record(1.0);
+    try testing.expect(Animated.renderer.hashed);
+    try testing.expect(!Animated.renderer.animating);
+    try testing.expectEqual(Kind.cached, Animated.renderer.last);
+    try testing.expectEqual(scissor, Animated.first(.scissor_set).?);
+    Animated.record(2.0);
+    try testing.expectEqual(Kind.skipped, Animated.renderer.last);
+    try testing.expectEqual(@as(u32, 0), Animated.buffer.count);
+    try testing.expect(!Animated.renderer.hashed);
+}
+
+// Locks animation with the cache off: every frame is direct, and `animating` follows whether
+// the finalized frame holds a pulse.
+test "with the cache off, animating follows the animated batches" {
+    Animated.start();
+    Animated.renderer.cache = false;
+    try Animated.scene(true);
+    Animated.record(0);
+    try testing.expect(Animated.renderer.animating);
+    Animated.record(0.25);
+    try testing.expectEqual(Kind.direct, Animated.renderer.last);
+    try testing.expectEqual(draw.time_offset, Animated.first(.buffer_write).?.offset);
+    try Animated.scene(false);
+    Animated.record(0.25);
+    try testing.expect(!Animated.renderer.animating);
+}
+
 // Locks the bound that keeps the worst cached frame in one command buffer: an app of few
 // batches gets every rect, the default `batch_cap` of 256 fewer, and never zero.
 test "the rect count fits the command buffer" {
@@ -1316,7 +1557,7 @@ const PathFixture = struct {
             .width_px = 1280,
             .height_px = 720,
             .scale_120 = 120,
-        });
+        }, 0);
     }
 
     /// One sagging cable at `hover`, ending at `end_x`.

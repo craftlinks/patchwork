@@ -74,8 +74,11 @@
 //!   events. After each dispatch the clipboard requests are served (section 5a); after the
 //!   queue, a finished paste is dispatched and the cursor is sent.
 //! - `sync_clock`: runs only after a `wl_callback.done`. It steps animators from the callback
-//!   timestamp through `ui.animate`, requests a redraw while a widget keeps animating, resets
-//!   the clock when settled, and calls `schedule_present`.
+//!   timestamp through `ui.animate`, advances `animator.Time` while the renderer reports an
+//!   animated instance on screen (`draw/renderer.zig`, section 4b), requests a redraw while a
+//!   widget keeps animating or the renderer is animating, resets the clock when both settled,
+//!   and calls `schedule_present`. An animation-only frame draws nothing (the context is
+//!   clean) and records the time write and the animated tiles.
 //! - `present_if_dirty`: presents only when a redraw is owed, the surface is configured, no
 //!   frame callback is in flight, and the latched deadline has passed. Otherwise it leaves
 //!   `redraw` set so pointer motion that arrives during the wait is drawn by the commit.
@@ -212,6 +215,8 @@ pub const State = struct {
     commands: commands.CommandBuffer,
     /// Host timestamps from `wl_callback.done`. Reset when no animator is live.
     clock: animator.Clock,
+    /// Animation time for animated draw types; advanced while the renderer is animating.
+    time: animator.Time,
     /// Pointer events queued by callbacks and drained once per wake.
     queue: input.EventQueue,
     /// Last surface position. Button events carry no coordinates.
@@ -557,6 +562,7 @@ fn initial_state() State {
         .gpu = undefined,
         .commands = .init(),
         .clock = animator.Clock.init(),
+        .time = animator.Time.init(),
         .queue = input.EventQueue.init(),
         .last_x = 0,
         .last_y = 0,
@@ -702,6 +708,8 @@ fn Host(comptime App: type) type {
             options: bench.Options,
             /// No step runs before the first frame recorded its areas.
             presented_any: bool,
+            /// Frames presented so far, setup included: the synthetic time (`bench_time`).
+            presented: u64,
             draw_ns: u64,
             drew: bool,
             count: u32,
@@ -715,6 +723,7 @@ fn Host(comptime App: type) type {
             .replay = undefined,
             .options = .off,
             .presented_any = false,
+            .presented = 0,
             .draw_ns = 0,
             .drew = false,
             .count = 0,
@@ -780,6 +789,14 @@ fn Host(comptime App: type) type {
             assert(state.frame.redraw);
         }
 
+        /// Animation time in bench mode: exactly 1/60 s per presented frame, so frame N reads
+        /// the same time in every run and dumps with the cache on and off compare exactly.
+        fn bench_time() f32 {
+            assert(bench_run.active);
+            const time: animator.Time = .{ .ms = bench_run.presented * 1000 / 60 };
+            return time.seconds();
+        }
+
         /// Asks the GPU to copy this frame when it is the last measured one and `--dump`
         /// was given.
         fn bench_request_image(state: *State) void {
@@ -798,6 +815,7 @@ fn Host(comptime App: type) type {
         fn bench_presented(state: *State, timing: bench.Sample) void {
             assert(bench_run.active);
             bench_run.presented_any = true;
+            bench_run.presented += 1;
             if (!bench_run.replay.presented(&bench_run.scenario)) return;
             var sample = timing;
             const scale_120 = state.frame.scale_120;
@@ -889,7 +907,8 @@ fn Host(comptime App: type) type {
             });
         }
 
-        /// Measured frames per renderer kind (`draw/renderer.zig`, section 4a).
+        /// Measured frames per renderer kind (`draw/renderer.zig`, section 4a), and how many
+        /// folded their instances into tiles rather than repeating the last frame's (4b).
         fn bench_report_kinds() void {
             var counts = std.EnumArray(renderer.Kind, u32).initFill(0);
             for (bench_samples[0..bench_run.count]) |sample| {
@@ -899,7 +918,12 @@ fn Host(comptime App: type) type {
             for (std.enums.values(renderer.Kind)) |kind| {
                 std.debug.print(" {s} {d}", .{ @tagName(kind), counts.get(kind) });
             }
-            std.debug.print(" (cache {s})\n", .{if (render.cache) "on" else "off"});
+            var hashed: u32 = 0;
+            for (bench_samples[0..bench_run.count]) |sample| hashed += @intFromBool(sample.hashed);
+            std.debug.print(" (cache {s}), {d} hashed\n", .{
+                if (render.cache) "on" else "off",
+                hashed,
+            });
         }
 
         fn bench_report_rows() void {
@@ -984,6 +1008,7 @@ fn Host(comptime App: type) type {
             // `finalize` is idempotent, so bench mode runs it first to time it alone.
             if (bench_run.active) context.draw.finalize();
             if (bench_run.active) bench_request_image(state);
+            const time_s = if (bench_run.active) bench_time() else state.time.seconds();
             const record_start_ns = monotonic_ns();
             render.frame(&state.commands, &context.draw, .{
                 .width_logical = state.frame.width_logical,
@@ -991,7 +1016,7 @@ fn Host(comptime App: type) type {
                 .width_px = state.frame.width_px,
                 .height_px = state.frame.height_px,
                 .scale_120 = state.frame.scale_120,
-            });
+            }, time_s);
             const submit_start_ns = monotonic_ns();
             const presents = render.last != .skipped;
             // Both requests attach to the next commit. A presenting frame's commit is the
@@ -1013,6 +1038,7 @@ fn Host(comptime App: type) type {
                 .area_windows = 0,
                 .drew = bench_run.drew,
                 .kind = render.last,
+                .hashed = render.hashed,
             });
             state.frame.mark_presented();
             assert(!state.frame.redraw);
@@ -1089,9 +1115,10 @@ fn Host(comptime App: type) type {
         }
 
         /// Steps animators from the frame-callback timestamp. The first sample after
-        /// idle has dt 0, so a hover pays one frame before it moves. A live app
-        /// requests another present even when this step did not move a value. If a
-        /// redraw is owed, the commit is scheduled just before the next refresh so
+        /// idle has dt 0, so a hover pays one frame before it moves. A live app, or a
+        /// renderer with an animated instance on screen, requests another present even when
+        /// this step did not move a value; the latter also advances the animation time. If
+        /// a redraw is owed, the commit is scheduled just before the next refresh so
         /// pointer motion during the wait is included. A settled app resets the clock.
         fn sync_clock(self: *Self) void {
             const state = self.state;
@@ -1102,7 +1129,8 @@ fn Host(comptime App: type) type {
             state.frame_done = false;
             note_refresh(state);
             const dt_ms = state.clock.advance(state.frame_time_ms);
-            const animating = ui.animate(App, self.app, &context, dt_ms);
+            if (render.animating) state.time.advance(dt_ms);
+            const animating = ui.animate(App, self.app, &context, dt_ms) or render.animating;
             if (context.dirty) {
                 state.frame.request_redraw();
             }

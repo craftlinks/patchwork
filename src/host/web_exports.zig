@@ -37,9 +37,12 @@
 //!   never steps animators or chains rAF. `timer_on` reports `cx.timer_on`; `shell.js` reads
 //!   it after every call (where it syncs the cursor, in the interval callback, and after
 //!   `start`) and sets or clears its one interval to match, so a stopped timer wakes nothing.
-//! - `tick` is the rAF callback: it advances `animator.Clock`, forwards the delta as
-//!   `.frame` through `ui.animate`, presents if dirty, and returns 1 while a widget keeps
-//!   animating (`cx.keep_animating`) or while a redraw is still owed (the glyph cache skipped
+//! - `tick` is the rAF callback: it advances `animator.Clock`, advances `animator.Time` while
+//!   the renderer has an animated instance on screen (`draw/renderer.zig`, section 4b),
+//!   forwards the delta as `.frame` through `ui.animate`, presents if dirty or animating, and
+//!   returns 1 while a widget keeps animating (`cx.keep_animating`), while the renderer is
+//!   animating after the present (so a click that shows the first animated instance starts
+//!   the chain), or while a redraw is still owed (the glyph cache skipped
 //!   glyphs for its per-frame budget or a full atlas, or the hover a draw re-resolved owes
 //!   another). Returning 0 ends the rAF chain, and `clock.reset` makes the next sample after
 //!   idle report a zero delta.
@@ -205,6 +208,8 @@ fn WebApp(comptime App: type) type {
             frame: frame.Frame,
             commands: commands.CommandBuffer,
             clock: animator.Clock,
+            /// Animation time for animated draw types; advanced while the renderer animates.
+            time: animator.Time,
         };
 
         // Module guide, section 5: `undefined` keeps these in BSS; `start` initializes them.
@@ -224,6 +229,7 @@ fn WebApp(comptime App: type) type {
         fn start() callconv(.c) u32 {
             state.frame = frame.Frame.init();
             state.clock = animator.Clock.init();
+            state.time = animator.Time.init();
             state.commands.len = 0;
             state.commands.count = 0;
             context.init();
@@ -419,22 +425,28 @@ fn WebApp(comptime App: type) type {
             return dirty_flag();
         }
 
-        /// Steps animators from `now_ms`, presents if the frame is dirty, and returns 1 while
-        /// an animator is live or a redraw is still owed, so `shell.js` chains another rAF.
-        /// The first sample after idle has dt 0 (see `animator.Clock.advance`).
+        /// Steps animators and the animation time from `now_ms`, presents if the frame is
+        /// dirty or animating, and returns 1 while an animator is live, the renderer is
+        /// animating, or a redraw is still owed, so `shell.js` chains another rAF. The first
+        /// sample after idle has dt 0 (see `animator.Clock.advance`).
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             const dt_ms = state.clock.advance(now_ms);
+            if (render.animating) {
+                state.time.advance(dt_ms);
+                state.frame.request_redraw();
+            }
             const animating = ui.animate(App, &app, &context, dt_ms);
             if (context.dirty) {
                 state.frame.request_redraw();
             }
             present_frame();
-            if (!animating) {
+            // After the present: the frame just drawn may be the first with an animated type.
+            if (!animating and !render.animating) {
                 state.clock.reset();
                 return dirty_flag();
             }
-            assert(animating);
+            assert(animating or render.animating);
             return 1;
         }
 
@@ -483,7 +495,7 @@ fn WebApp(comptime App: type) type {
                 .width_px = state.frame.width_px,
                 .height_px = state.frame.height_px,
                 .scale_120 = scale_120,
-            });
+            }, state.time.seconds());
             // A skipped frame (`draw/renderer.zig`, section 4a) may record nothing at all; the
             // canvas keeps showing the last frame.
             if (state.commands.len != 0) {
