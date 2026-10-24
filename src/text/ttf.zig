@@ -105,6 +105,11 @@ pub const Load = enum {
 /// Parses `bytes` at compile time. See the module guide, sections 1 and 2.
 pub fn parse(comptime bytes: []const u8) Font {
     @setEvalBranchQuota(200_000);
+    return comptime read(bytes);
+}
+
+/// `parse` at run time, for tests that read a face built at run time (`text/subset.zig`).
+pub fn read(bytes: []const u8) Font {
     const head = table(bytes, "head");
     const hhea = table(bytes, "hhea");
     const maxp = table(bytes, "maxp");
@@ -523,12 +528,19 @@ comptime {
 }
 
 const testing = std.testing;
-const text = @import("../text.zig");
+
+/// The full faces from the repo, not the build's subsets (`text/subset.zig`): these tests
+/// exercise tables a subset drops, such as the format 4 `cmap` and supplementary planes.
+const full = struct {
+    const sans = parse(@embedFile("fonts/NotoSans-Regular.ttf"));
+    const sans_bold = parse(@embedFile("fonts/NotoSans-Bold.ttf"));
+    const mono = parse(@embedFile("fonts/NotoSansMono-Regular.ttf"));
+};
 
 // Locks the format 12 path: the faces' map covers codepoints past the BMP, which a format 4
 // table cannot hold, and agrees with the format 4 table for BMP codepoints outside ASCII.
 test "cmap 12 maps a supplementary codepoint and agrees with format 4" {
-    const font = text.font_of(.sans);
+    const font = &full.sans;
     try testing.expectEqual(@as(u16, 12), font.cmap_format);
     // U+1DF00 (Latin Small Letter Retroflex Click) is in Noto Sans's format 12 table.
     try testing.expect(glyph_id(font, 0x1DF00) != 0);
@@ -569,7 +581,7 @@ const scratch = struct {
 // Locks composite flattening: "e acute" is a composite of "e" and an offset acute accent, and
 // its decoded box is exactly the union of the base's box and the accent's offset box.
 test "composite e bounds are the union of base and accent" {
-    const font = text.font_of(.sans);
+    const font = &full.sans;
     const composite = glyph_id(font, 0xE9);
     const at = font.glyf + glyph_range(font, composite).start;
     try testing.expect(read_i16(font.bytes, at) < 0);
@@ -601,8 +613,8 @@ test "composite e bounds are the union of base and accent" {
 // Locks the monospace face: every printable ASCII glyph advances 600 units, and the
 // proportional face does not.
 test "mono advance is identical for all printable ASCII" {
-    const mono = text.font_of(.mono);
-    const sans = text.font_of(.sans);
+    const mono = &full.mono;
+    const sans = &full.sans;
     var codepoint: u21 = ' ';
     while (codepoint <= '~') : (codepoint += 1) {
         try testing.expectEqual(@as(u32, 600), advance(mono, glyph_id(mono, codepoint)));
@@ -613,7 +625,7 @@ test "mono advance is identical for all printable ASCII" {
 // Locks the empty and replacement paths: space has no outline, and glyph 0 (`.notdef`) is a
 // drawable two-contour box.
 test "space is empty and the replacement glyph is a box" {
-    const font = text.font_of(.sans_bold);
+    const font = &full.sans_bold;
     try testing.expectEqual(Load.empty, load(font, glyph_id(font, ' '), &scratch.outline));
     try testing.expectEqual(Load.ready, load(font, replacement, &scratch.outline));
     try testing.expectEqual(@as(u32, 2), scratch.outline.contour_count);

@@ -124,6 +124,7 @@ patchwork/
 │   ├── draw/renderer.zig       # Records setup and frame command streams; frame kinds, kept target
 │   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
 │   ├── text/ttf.zig            # Comptime TrueType reader: cmap 12/4, hmtx, glyf, composites
+│   ├── text/subset.zig         # Build-time subsetter: glyph closure, renumbered ids, no hinting
 │   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
 │   ├── text/cache.zig          # Glyph cache: hash table, shelf-packed atlas, CPU mirror, budget
 │   ├── text/layout.zig         # UTF-8, alignment, ellipsis, device-pixel snapping
@@ -186,7 +187,8 @@ patchwork/
 │   └── canvas/                 # Pan and zoom
 │       └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
 ├── tools/
-│   └── compare.zig             # `zig build compare`: how two frame dumps differ
+│   ├── compare.zig             # `zig build compare`: how two frame dumps differ
+│   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   ├── shell.js                # Generic command interpreter, Wasm bridge, and input handler
@@ -338,6 +340,10 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(steps.install);
 }
 ```
+
+`AppOptions.font_ranges` sets the codepoints the embedded faces keep, on both targets (see
+Text). It defaults to `patchwork.default_font_ranges`; pass wider ranges for other scripts,
+or `null` for the full faces.
 
 `addApp` links `libwayland-client` and `libxkbcommon` into the native executable, so a
 consumer's build machine needs both (with their pkg-config files) as described under Build
@@ -1067,6 +1073,15 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
 Sans Bold), and `.mono` (Noto Sans Mono Regular), all SIL OFL 1.1 (`src/text/fonts/OFL.txt`).
 Both targets `@embedFile` them, so the browser fetches no font files and a project using
 `addApp` gets them with the library. The TrueType tables are parsed at compile time.
+
+- **Subset at build time.** The build runs `tools/subset.zig` (`src/text/subset.zig`) once
+  per range set and embeds the results through a generated `patchwork_fonts` module. By
+  default the faces keep Basic Latin, Latin-1, Latin Extended-A, the punctuation and symbols
+  UI text uses (dashes, quotes, the ellipsis, arrows, €, ™, ≤, ≥), and U+FFFD: about 365
+  glyphs and 23 KB a face, without hinting instructions, which the rasterizer never ran.
+  Native and wasm embed the same bytes, so they draw the same. A ReleaseSmall `live.wasm`
+  went from 2.04 MB to 254 KB. A codepoint outside the ranges draws `.notdef`;
+  `AppOptions.font_ranges` widens them, and `null` embeds the full faces.
 
 ```zig
 const style: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 } };
