@@ -43,14 +43,17 @@
 //!   `value = clamp((x - rect.x - knob_radius) / span, 0, 1)`; a non-positive span yields 0.
 //!   The hit area is the rect rounded by `knob_radius`. Test "slider value at the worked
 //!   pointer".
-//! - **Knob:** `ring_of(row)` is a `ring_size` square at `row.x + ring_inset`, centered
-//!   vertically; the hit area is the disc inscribed in it and takes the wheel. Drag and
+//! - **Knob:** `ring_sized(row, knob.ring)` is a `knob.ring` square (default `ring_size`, set
+//!   per instance with `sized`) at `row.x + ring_inset`, centered vertically; the labels start
+//!   `label_gap` past it (`ring.x + 64` by default); the hit area is the disc inscribed in it
+//!   and takes the wheel. Drag and
 //!   wheel are relative: `value' = clamp(value - delta / drag_span_px, 0, 1)` with
 //!   `delta = y - drag_y` for drags and `delta = wheel.dy` for the wheel. A row shorter than
 //!   the ring draws nothing. The ring area shows the grab cursor (`knob_flags`). Test "knob
 //!   drag is relative and clamped".
 //! - **Value text:** hundredths as `d.dd` in the fixed `[8]u8` `value_text`, tail zeroed.
-//! - **Meter:** the track is `meter_track_w` by `meter_track_h`, centered over the ring
+//! - **Meter:** the track is `meter_track_w` by `meter.track_h` (default `meter_track_h`),
+//!   centered over the ring
 //!   column and vertically in `row`; the fill grows up from the track bottom and is omitted at
 //!   0. The track may be taller than a short row, so a caller that needs it contained opens a
 //!   clipping container for it. Test "meter fill grows upward from the track bottom".
@@ -148,6 +151,10 @@ pub const ring_thickness: f32 = 4;
 
 /// Inset of the ring and the pill from the row's left edge.
 pub const ring_inset: f32 = 8;
+/// Smallest ring `Knob.sized` takes.
+pub const ring_min: f32 = 24;
+/// Space between a ring and its labels.
+pub const label_gap: f32 = 8;
 
 // Row heights and face metrics, in logical pixels. `ring_of`, `meter_track`, and `pill_of`
 // place the faces inside a row of the matching height; `label_line_px` is the height of one
@@ -407,6 +414,8 @@ pub const Knob = struct {
     accent: Paint,
     hover: animator.Animator,
     drag_y: f32,
+    /// The ring's side in logical pixels (section 3); `sized` sets another.
+    ring: f32 = ring_size,
 
     pub const Action = union(enum) {
         none,
@@ -432,6 +441,15 @@ pub const Knob = struct {
         };
         knob.set_value(value);
         assert(knob.value == value);
+        return knob;
+    }
+
+    /// This knob with a ring of `side` logical pixels, at least `ring_min`.
+    pub fn sized(self: Knob, side: f32) Knob {
+        assert(side >= ring_min);
+        var knob = self;
+        knob.ring = side;
+        assert(knob.ring == side);
         return knob;
     }
 
@@ -482,17 +500,17 @@ pub const Knob = struct {
         assert(self.value >= 0);
         assert(self.value <= 1);
         const row = cx.walk(walk);
-        if (row.height < ring_size) return;
+        if (row.height < self.ring) return;
         const clip = cx.visible(row) orelse return;
-        const ring = ring_of(row);
-        cx.area(self.id, ring, ring_size * 0.5, knob_flags);
+        const ring = ring_sized(row, self.ring);
+        cx.area(self.id, ring, self.ring * 0.5, knob_flags);
         append_arc(cx, ring, paint_of(theme.chrome.track, ring_thickness), 0, 1, clip);
         if (self.value > 0) {
             const weight = mix_weight(self.hover.value, hover_lighten);
             append_arc(cx, ring, self.accent, weight, self.value, clip);
         }
-        place_text(cx, name_style, self.name, name_box(row), clip);
-        place_text(cx, value_style, self.value_text[0..4], value_box(row), clip);
+        place_text(cx, name_style, self.name, name_box(row, self.ring), clip);
+        place_text(cx, value_style, self.value_text[0..4], value_box(row, self.ring), clip);
     }
 
     pub fn set_value(self: *Knob, value: f32) void {
@@ -518,6 +536,8 @@ pub const Knob = struct {
 pub const Meter = struct {
     name: []const u8,
     value: f32,
+    /// The track's height in logical pixels (section 3).
+    track_h: f32 = meter_track_h,
 
     /// Writes `value` when it differs. Returns true when it changed.
     pub fn set_value(self: *Meter, value: f32) bool {
@@ -534,7 +554,7 @@ pub const Meter = struct {
         assert(self.value <= 1);
         const row = cx.walk(walk);
         const clip = cx.visible(row) orelse return;
-        const track = meter_track(row);
+        const track = meter_track_sized(row, self.track_h);
         face(cx, track, paint_of(theme.chrome.track, meter_radius), 0, 0, clip);
         if (self.value > 0) {
             var fill = track;
@@ -948,15 +968,21 @@ pub fn settled(rate: f32, at_end: bool) animator.Animator {
 }
 
 pub fn ring_of(row: Rect) Rect {
-    assert(row.height >= ring_size);
+    return ring_sized(row, ring_size);
+}
+
+/// The ring of a knob of side `side` in `row` (section 3).
+pub fn ring_sized(row: Rect, side: f32) Rect {
+    assert(side >= ring_min);
+    assert(row.height >= side);
     const ring: Rect = .{
         .x = row.x + ring_inset,
-        .y = row.y + (row.height - ring_size) * 0.5,
-        .width = ring_size,
-        .height = ring_size,
+        .y = row.y + (row.height - side) * 0.5,
+        .width = side,
+        .height = side,
     };
-    assert(ring.width == ring_size);
-    assert(ring.height == ring_size);
+    assert(ring.width == side);
+    assert(ring.height == side);
     return ring;
 }
 
@@ -975,21 +1001,24 @@ pub fn write_hundredths(out: *[8]u8, value: f32) void {
     if (out[0] != '0') assert(out[0] == '1');
 }
 
-fn name_box(row: Rect) Rect {
-    const ring = ring_of(row);
+/// The name's line beside a ring of `side`: `side + label_gap` past the ring's left edge, so
+/// `ring.x + 64` for the default ring.
+fn name_box(row: Rect, side: f32) Rect {
+    const ring = ring_sized(row, side);
+    const x = ring.x + side + label_gap;
     const box: Rect = .{
-        .x = ring.x + 64,
+        .x = x,
         .y = row.y,
-        .width = row.x + row.width - (ring.x + 64),
+        .width = row.x + row.width - x,
         .height = label_line_px,
     };
-    assert(box.x == ring.x + 64);
+    assert(box.x == ring.x + side + label_gap);
     assert(box.height == label_line_px);
     return box;
 }
 
-fn value_box(row: Rect) Rect {
-    var box = name_box(row);
+fn value_box(row: Rect, side: f32) Rect {
+    var box = name_box(row, side);
     box.y = row.y + label_line_px;
     assert(box.y == row.y + label_line_px);
     assert(box.height == label_line_px);
@@ -1012,15 +1041,21 @@ fn side_box(row: Rect) Rect {
 }
 
 pub fn meter_track(row: Rect) Rect {
+    return meter_track_sized(row, meter_track_h);
+}
+
+/// A meter track `height` tall in `row`, centered over the ring column (section 3).
+pub fn meter_track_sized(row: Rect, height: f32) Rect {
+    assert(height > 0);
     const center_x = row.x + ring_inset + ring_size * 0.5;
     const track: Rect = .{
         .x = center_x - meter_track_w * 0.5,
-        .y = row.y + (row.height - meter_track_h) * 0.5,
+        .y = row.y + (row.height - height) * 0.5,
         .width = meter_track_w,
-        .height = meter_track_h,
+        .height = height,
     };
     assert(track.width == meter_track_w);
-    assert(track.height == meter_track_h);
+    assert(track.height == height);
     return track;
 }
 
@@ -1090,7 +1125,8 @@ fn append_arc(
     assert(hover >= 0);
     assert(sweep >= 0);
     assert(sweep <= 1);
-    assert(rect.width == ring_size);
+    assert(rect.width >= ring_min);
+    assert(rect.width == rect.height);
     push(cx, quads.Arc, .{
         .rect = .{ rect.x, rect.y, rect.width, rect.height },
         .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
@@ -1143,6 +1179,8 @@ comptime {
     // The literal 64 in `name_box` and `side_box` is the label column offset: the ring plus
     // its inset. `toggle_thumb` hardcodes the thumb travel as 20.
     assert(ring_inset + ring_size == 64);
+    // The default knob's labels start where they always did: ring.x + 64.
+    assert(ring_size + label_gap == 64);
     assert(pill_w - thumb_side - 2 * thumb_inset == 20);
     // Capsules: the corner radius is half the short side.
     assert(track_radius * 2 == track_height);
@@ -1282,6 +1320,29 @@ test "slider drag sets an absolute value" {
     try testing.expectEqual(@as(usize, 2), cx.draw.items(quads.Box).len);
     const released = send(cx, &slider, .{ .pointer_up = input.left_at(.{ .x = 28, .y = 628 }) });
     try testing.expectEqual(Slider.Action.released, released);
+}
+
+// Locks per-instance sizes (section 3): a 40 px knob in a 200 by 72 row has its ring at
+// (8, 16), its disc area of radius 20 centered at (28, 36), and its labels at x = 56; a 96 px
+// meter track is centered in a 160 px row at y = 32, under the default ring column.
+test "a knob and a meter take their own sizes" {
+    const cx = test_context();
+    const knob = Knob.init(ui.id("small", 0), "k", 0.5, accents[0]).sized(40);
+    draw_one(cx, &knob, at(0, 0, 200, knob_height));
+    const area = cx.find(ui.id("small", 0)).?;
+    try testing.expectEqualSlices(f32, &.{ 8, 16, 40, 40 }, &area.rect);
+    try testing.expectEqual(@as(f32, 20), area.radius);
+    const glyphs = cx.draw.items(quads.Glyph);
+    try testing.expect(glyphs.len >= 1);
+    for (glyphs) |glyph| try testing.expect(glyph.rect[0] >= 56);
+    const row: Rect = .{ .x = 0, .y = 0, .width = 200, .height = 72 };
+    try testing.expectEqual(@as(f32, 56), name_box(row, 40).x);
+    const track = meter_track_sized(.{ .x = 0, .y = 0, .width = 100, .height = meter_height }, 96);
+    try testing.expectEqual(@as(f32, 32), track.y);
+    try testing.expectEqual(meter_track(.{ .x = 0, .y = 0, .width = 100, .height = 1 }).x, track.x);
+    const meter: Meter = .{ .name = "m", .value = 0.5, .track_h = 96 };
+    draw_one(cx, &meter, at(0, 0, 100, meter_height));
+    try testing.expectEqual(@as(f32, 96), cx.draw.items(quads.Box)[0].rect[3]);
 }
 
 /// A point on the knob ring's vertical center line at `y`.

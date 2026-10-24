@@ -34,8 +34,9 @@
 //! buffer_write uniform            only when the device size or scale changed (or first frame)
 //! texture_create, bind_group_create, texture_write   whatever `Textures` queued, after the
 //!                                 glyph cache queued its dirty atlas rectangle (one write)
-//! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed
-//! buffer_write points [range]     when the point revision moved and points changed
+//! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed, up
+//!                                 to `draw.upload_range_cap` ranges (section 4)
+//! buffer_write points [range]     when the point revision moved and points changed, likewise
 //! buffer_write uniform time       16 bytes at `draw.time_offset`, while animating and the
 //!                                 time moved (section 4b)
 //! [buffer_create, bind_group_create] per viewed layer at its first view (section 4d)
@@ -62,11 +63,13 @@
 //! - Revision equal to the shadow's: nothing, without looking at the records. This is the
 //!   idle path: a frame the host did not draw takes it for every pool.
 //! - Revision moved: the finalized (sorted) records are compared with the shadow, and
-//!   `draw.dirty_range` returns the smallest record range covering every change plus every
-//!   record past the shadow's count. An identical rebuild writes nothing, and a hover that
-//!   changes one arc writes one record of the arc pool only.
-//! Only the written range is copied into the shadow, because records outside it are equal by
-//! construction. The point pool follows the same rule with its own shadow and revision, so a
+//!   `draw.dirty_ranges` returns up to four record ranges covering every change plus every
+//!   record past the shadow's count, one `buffer_write` each. An identical rebuild writes
+//!   nothing, a hover that changes one arc writes one record of the arc pool only, and changes
+//!   at both ends of a pool write two short ranges, not the pool.
+//! Only the written ranges are copied into the shadow, because records outside them are equal
+//! by construction; `changed` is their covering span, which the tile keys refresh.
+//! The point pool follows the same rule with its own shadow and revision, so a
 //! rebuilt path writes no points when its shape is unchanged, and a recolored path writes its
 //! `Path` records only. The counting sort is stable by key and overlays sort last, so content that
 //! appears on a higher layer lands at the tail of its pool and keeps ranges small.
@@ -247,9 +250,10 @@ const view_op_cap: u32 = 3;
 pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     const texture_ops = textures.sampling_count + 2 * textures.texture_cap + textures.write_cap;
     const rects = rects_max(type_count, batch_cap);
-    // Uniform, textures, one write per pool and one for the points, the time, the target,
+    // Uniform, textures, up to `upload_range_cap` writes per pool and for the points, the
+    // time, the target,
     // the pass, the rects with their batches and view binds, the pass end, and the present.
-    return 1 + texture_ops + type_count + 1 + 1 + 1 + 1 +
+    return 1 + texture_ops + (type_count + 1) * draw.upload_range_cap + 1 + 1 + 1 +
         rects * (rect_op_cap + batch_cap * batch_op_cap + view_layers) + 1 + 1 +
         textures.target_cap * target_op_cap + view_layers * view_op_cap;
 }
@@ -290,7 +294,8 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
         op_bytes(commands.BufferWrite) + op_bytes(commands.PassBegin) +
         op_bytes(commands.BindGroupSet) + op_bytes(commands.VertexBufferSet) +
         op_bytes(commands.PassEnd);
-    return (3 + type_count) * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
+    const write_count = 2 + (type_count + 1) * draw.upload_range_cap;
+    return write_count * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
         rects * per_rect + textures.target_cap * per_target + view_layers * per_view;
 }
 
@@ -1165,14 +1170,16 @@ pub fn Renderer(comptime Cx: type) type {
                 return;
             }
             const records = pool.items[0..pool.count];
-            if (draw.dirty_range(T, shadow.items[0..shadow.count], records)) |range| {
-                shadow.changed = range;
+            var ranges: [draw.upload_range_cap]draw.Range = undefined;
+            const count = draw.dirty_ranges(T, shadow.items[0..shadow.count], records, &ranges);
+            if (count > 0) shadow.changed = span_of(ranges[0..count]);
+            for (ranges[0..count]) |range| {
                 buffer.push(.{ .buffer_write = .{
                     .id = self.resources.instance_buffers[index],
                     .offset = range.first * @sizeOf(T),
                     .data = .of(std.mem.sliceAsBytes(records[range.first..range.end])),
                 } });
-                // Records outside the range already equal the shadow (module guide, 4).
+                // Records outside the ranges already equal the shadow (module guide, 4).
                 @memcpy(shadow.items[range.first..range.end], records[range.first..range.end]);
             }
             shadow.count = pool.count;
@@ -1191,8 +1198,10 @@ pub fn Renderer(comptime Cx: type) type {
             }
             const points = cx.points[0..cx.point_count];
             const old = shadow.items[0..shadow.count];
-            if (draw.dirty_range(pools.Point, old, points)) |range| {
-                shadow.changed = range;
+            var ranges: [draw.upload_range_cap]draw.Range = undefined;
+            const count = draw.dirty_ranges(pools.Point, old, points, &ranges);
+            if (count > 0) shadow.changed = span_of(ranges[0..count]);
+            for (ranges[0..count]) |range| {
                 buffer.push(.{ .buffer_write = .{
                     .id = self.resources.points_buffer,
                     .offset = range.first * @sizeOf(pools.Point),
@@ -1460,6 +1469,12 @@ pub fn Renderer(comptime Cx: type) type {
             }
         }
     };
+}
+
+/// The covering span of upload ranges in order.
+fn span_of(ranges: []const draw.Range) draw.Range {
+    assert(ranges.len >= 1);
+    return .{ .first = ranges[0].first, .end = ranges[ranges.len - 1].end };
 }
 
 fn Shadow(comptime T: type, comptime cap: u32) type {

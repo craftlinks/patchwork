@@ -435,6 +435,11 @@ pub const App = struct {
         .point_cap = point_cap,
     };
 
+    /// The screen at rest, for the bench and dump comparisons.
+    pub const scenarios: []const patchwork.bench.Scenario = &.{
+        .{ .name = "still", .setup = &.{.{ .wait = 5 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 60 },
+    };
+
     /// Builds every widget and generates the badge texture.
     pub fn init(app: *App, textures: *quads.Textures) void {
         badge.fill(&app.badge_pixels);

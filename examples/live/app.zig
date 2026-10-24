@@ -1811,9 +1811,11 @@ fn start_gpu() void {
 
 // Locks the upload ranges on the stress text at 1280 by 720, scrolled to line 960 (the long
 // lines from 975 are in view): a settled redraw writes nothing; a one-line wheel scroll
-// rewrites 41 boxes (3,280 bytes) and 1,955 glyph records (125,120 bytes); a key typed on
-// line 982, 21 lines down the viewport, writes 29 boxes and the 1,093 glyphs from that line
-// on (69,952 bytes). The panel draws before the editor, so its records never move.
+// rewrites 41 boxes (3,280 bytes) and 1,898 glyph records (121,472 bytes); a key typed on
+// line 982, 21 lines down the viewport, writes 3 boxes and 104 glyphs (6,896 bytes), because
+// up to four ranges skip the records that came out equal at their index (one covering range
+// wrote 29 boxes and 1,093 glyphs, 72,272 bytes, before step 29). The panel draws before the
+// editor, so its records never move.
 test "uploads of a scrolled frame and a typed key" {
     const app = new_app();
     start_gpu();
@@ -1824,13 +1826,13 @@ test "uploads of a scrolled frame and a typed key" {
     try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 0, 0, 0 }, record(app));
     _ = send(app, .{ .wheel = .{ .x = 600, .y = 400, .dx = 0, .dy = 21 } });
     const scrolled = record(app);
-    try std.testing.expectEqual([7]u64{ 3_280, 125_120, 0, 0, 0, 0, 0 }, scrolled);
+    try std.testing.expectEqual([7]u64{ 3_280, 121_472, 0, 0, 0, 0, 0 }, scrolled);
     click(app, 49.5 + 4 * 9, 40 + 4 + 10.5 + 20 * 21);
     _ = record(app);
     _ = key(app, .other, .none, "q");
     const typed = record(app);
     try std.testing.expectEqual(@as(u32, 981), app.editor.caret_position()[0]);
-    try std.testing.expectEqual([7]u64{ 2_320, 69_952, 0, 0, 0, 0, 0 }, typed);
+    try std.testing.expectEqual([7]u64{ 240, 6_656, 0, 0, 0, 0, 0 }, typed);
 }
 
 // Locks the transport's uploads on the patch at 1280 by 720: an idle redraw writes nothing;

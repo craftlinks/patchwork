@@ -58,16 +58,24 @@ const prime: u64 = 0x100000001b3;
 /// The odd multiplier of `key_of` (2^64 divided by the golden ratio).
 const golden: u64 = 0x9E3779B97F4A7C15;
 
-/// A key for `bytes` (a whole number of 8-byte words, as every record and point list is),
+/// A key for `bytes` (a whole number of 4-byte words, as every record and point list is),
 /// cheaper than a general hash. Each step `h = mix(h ^ word)` is a bijection of `h`, so
 /// changing any one word changes the key; several changes collide with probability about
-/// 2^-64.
+/// 2^-64. Bytes are folded 8 at a time; a 4-byte tail (a draw type in 4-byte steps,
+/// `draw/registry.zig` section 2) is one more word, zero-extended, so a whole number of
+/// 8-byte words keys exactly as before.
 pub fn key_of(seed: u64, bytes: []const u8) u64 {
-    assert(bytes.len % 8 == 0);
+    assert(bytes.len % 4 == 0);
     var hash = seed ^ (@as(u64, bytes.len) *% golden);
+    const whole = bytes.len - bytes.len % 8;
     var index: usize = 0;
-    while (index < bytes.len) : (index += 8) {
+    while (index < whole) : (index += 8) {
         const product = (hash ^ std.mem.readInt(u64, bytes[index..][0..8], .little)) *% golden;
+        hash = product ^ (product >> 29);
+    }
+    if (whole < bytes.len) {
+        const tail: u64 = std.mem.readInt(u32, bytes[whole..][0..4], .little);
+        const product = (hash ^ tail) *% golden;
         hash = product ^ (product >> 29);
     }
     return hash;

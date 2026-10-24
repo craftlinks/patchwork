@@ -77,11 +77,15 @@
 //! valid if it is ever bound at an offset. `draw/renderer.zig` owns the record and its uploads.
 //!
 //! ## 5. Dirty Ranges
-//! `dirty_range` returns the smallest record range `[first, end)` that covers every record
-//! of `new` that differs from `old` at the same index, plus every record past `old.len`.
-//! A shrunk list needs no write: the draw count bounds what the GPU reads. Comparison is by
-//! bytes, so it is exact and never misses a change. The renderer runs it per pool against a
-//! shadow of the last upload; see `draw/renderer.zig`, section 4.
+//! `dirty_ranges` returns up to `upload_range_cap` record ranges `[first, end)` that cover
+//! every record of `new` that differs from `old` at the same index, plus every record past
+//! `old.len`: one pass finds the runs of such records, a run starting within `merge_gap`
+//! records of the previous range joins it (a short gap costs less than another write), and
+//! the last range grows to cover any runs past the cap. So a change at both ends of a pool (a
+//! playhead first, a meter last) writes two records, not the whole pool. `dirty_range` is
+//! their covering span. A shrunk list needs no write: the draw count bounds what the GPU
+//! reads. Comparison is by bytes, so it is exact and never misses a change. The renderer runs
+//! it per pool against a shadow of the last upload; see `draw/renderer.zig`, section 4.
 //!
 //! ## 6. TigerStyle Invariants
 //! - Layout facts are `comptime` asserts, so an ABI mismatch with WGSL or the web shell fails
@@ -214,32 +218,62 @@ pub const Range = struct {
     end: u32,
 };
 
-/// The smallest range covering every record of `new` that differs from `old` at the same
-/// index, plus every record of `new` past `old.len`. Null when there is none, including when
-/// `new` is a prefix of `old`. Records compare by bytes.
-pub fn dirty_range(comptime T: type, old: []const T, new: []const T) ?Range {
+/// Ranges one pool upload may write (module guide, section 5).
+pub const upload_range_cap: u32 = 4;
+
+/// Unchanged records a range may bridge: a gap this short costs less to write than another op.
+pub const merge_gap: u32 = 8;
+
+/// The ranges to upload so that every record of `new` that differs from `old` at the same
+/// index, and every record past `old.len`, is written: the runs of such records in order,
+/// a run starting at most `merge_gap` records after the previous range joining it, and once
+/// `upload_range_cap` ranges exist the last one growing to cover the rest. Returns how many it
+/// wrote into `out`; 0 when `new` equals `old` or is a prefix of it. Records compare by bytes.
+pub fn dirty_ranges(
+    comptime T: type,
+    old: []const T,
+    new: []const T,
+    out: *[upload_range_cap]Range,
+) u32 {
     assert(old.len <= std.math.maxInt(u32));
     assert(new.len <= std.math.maxInt(u32));
     const shared: u32 = @intCast(@min(old.len, new.len));
     const count: u32 = @intCast(new.len);
-    var first: u32 = 0;
-    while (first < shared) : (first += 1) {
-        if (!same_record(T, &old[first], &new[first])) break;
-    }
-    if (first == count) {
-        return null;
-    }
-    // A grown list always writes through its new count; otherwise trim unchanged records off
-    // the back of the shared prefix.
-    var end: u32 = count;
-    if (count <= shared) {
-        while (end > first + 1) : (end -= 1) {
-            if (!same_record(T, &old[end - 1], &new[end - 1])) break;
+    var ranges: u32 = 0;
+    var index: u32 = 0;
+    while (index < count) {
+        if (index < shared and same_record(T, &old[index], &new[index])) {
+            index += 1;
+            continue;
         }
+        // A run: records that differ, and every record past the shared prefix.
+        var end = index + 1;
+        while (end < count) : (end += 1) {
+            if (end < shared and same_record(T, &old[end], &new[end])) break;
+        }
+        const joins = ranges > 0 and
+            (index - out[ranges - 1].end <= merge_gap or ranges == upload_range_cap);
+        if (joins) {
+            out[ranges - 1].end = end;
+        } else {
+            out[ranges] = .{ .first = index, .end = end };
+            ranges += 1;
+        }
+        index = end;
     }
-    assert(first < end);
-    assert(end <= count);
-    return .{ .first = first, .end = end };
+    assert(ranges <= upload_range_cap);
+    if (ranges > 0) assert(out[ranges - 1].end <= count);
+    return ranges;
+}
+
+/// The smallest range covering every record `dirty_ranges` writes, or null when there is none.
+pub fn dirty_range(comptime T: type, old: []const T, new: []const T) ?Range {
+    var ranges: [upload_range_cap]Range = undefined;
+    const count = dirty_ranges(T, old, new, &ranges);
+    if (count == 0) return null;
+    const span: Range = .{ .first = ranges[0].first, .end = ranges[count - 1].end };
+    assert(span.first < span.end);
+    return span;
 }
 
 fn same_record(comptime T: type, a: *const T, b: *const T) bool {
@@ -398,6 +432,34 @@ test "dirty_range is null for identical and shrunk lists and whole for a first u
     const whole: Range = .{ .first = 0, .end = 4 };
     try std.testing.expectEqual(whole, dirty_range(Record, &.{}, &same).?);
     try std.testing.expectEqual(@as(?Range, null), dirty_range(Record, &.{}, &.{}));
+}
+
+// Locks the ranges (section 5): changes at both ends of 40 records are two one-record ranges;
+// a gap of 8 unchanged records is bridged and a gap of 9 is not; a grown tail joins the run
+// before it or starts its own; five separate runs become four ranges, the last covering two.
+test "dirty_ranges splits far changes and bridges short gaps" {
+    var out: [upload_range_cap]Range = undefined;
+    const old = records(40, null);
+    var ends = records(40, 0);
+    ends[39].y = 1;
+    try std.testing.expectEqual(@as(u32, 2), dirty_ranges(Record, &old, &ends, &out));
+    try std.testing.expectEqual(Range{ .first = 0, .end = 1 }, out[0]);
+    try std.testing.expectEqual(Range{ .first = 39, .end = 40 }, out[1]);
+    try std.testing.expectEqual(Range{ .first = 0, .end = 40 }, dirty_range(Record, &old, &ends).?);
+    var bridged = records(40, 10);
+    bridged[19].y = 1;
+    try std.testing.expectEqual(@as(u32, 1), dirty_ranges(Record, &old, &bridged, &out));
+    try std.testing.expectEqual(Range{ .first = 10, .end = 20 }, out[0]);
+    var apart = records(40, 10);
+    apart[20].y = 1;
+    try std.testing.expectEqual(@as(u32, 2), dirty_ranges(Record, &old, &apart, &out));
+    var grown = records(44, 2);
+    try std.testing.expectEqual(@as(u32, 2), dirty_ranges(Record, &old, &grown, &out));
+    try std.testing.expectEqual(Range{ .first = 40, .end = 44 }, out[1]);
+    var five = records(40, null);
+    for ([_]usize{ 0, 10, 20, 30, 39 }) |at| five[at].y = 1;
+    try std.testing.expectEqual(@as(u32, 4), dirty_ranges(Record, &old, &five, &out));
+    try std.testing.expectEqual(Range{ .first = 30, .end = 40 }, out[3]);
 }
 
 // Locks that one changed record writes exactly that record, two changed records write the

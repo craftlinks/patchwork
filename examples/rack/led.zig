@@ -10,7 +10,8 @@
 //! it like any library type.
 //!
 //! ## 2. Instance Layout and Pixel
-//! `rect`, `clip`, `color`, then `brightness` and three zero pads: 64 bytes, four groups. With
+//! `rect`, `clip`, `color`, then `brightness`: 52 bytes, three full groups and a last group of
+//! one float, with no hand padding (`draw/registry.zig`, section 2). With
 //! `center = size / 2`, `radius = min(center)`, and a core of `core_fraction * radius`:
 //! ```text
 //! dist  = sdf_circle(local, center, core)             the lit core, antialiased by coverage
@@ -36,9 +37,6 @@ pub const Led = extern struct {
     clip: [4]f32,
     color: [4]f32,
     brightness: f32,
-    pad0: f32,
-    pad1: f32,
-    pad2: f32,
 
     pub const texture: ?draw.TextureFormat = null;
     pub const pixel: []const u8 =
@@ -69,28 +67,25 @@ pub fn at(center_x: f32, center_y: f32, color: [4]f32, brightness: f32, clip: [4
         .clip = clip,
         .color = color,
         .brightness = brightness,
-        .pad0 = 0,
-        .pad1 = 0,
-        .pad2 = 0,
     };
     assert(led.rect[2] == side_px);
-    assert(led.pad0 == 0);
+    assert(led.brightness == brightness);
     return led;
 }
 
 comptime {
     assert(draw.check_type(Led) == null);
-    assert(@sizeOf(Led) == 64);
+    assert(@sizeOf(Led) == 52);
     assert(@offsetOf(Led, "brightness") == 48);
 }
 
-// Locks the generated interface of an app-defined type: four groups at locations 1 to 4, and
-// `brightness` unpacked from the first lane of the fourth group.
+// Locks the generated interface of an app-defined type: four groups at locations 1 to 4, the
+// fourth a bare `f32` holding `brightness` (no padding).
 test "led assembles against the prelude" {
     const text = comptime draw.type_source(Led);
-    try std.testing.expect(std.mem.find(u8, text, "@location(4) g3: vec4<f32>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "@location(4) g3: f32") != null);
     try std.testing.expect(std.mem.find(u8, text, "@location(5) g4") == null);
-    try std.testing.expect(std.mem.find(u8, text, "px.brightness = v.g3.x;") != null);
+    try std.testing.expect(std.mem.find(u8, text, "px.brightness = v.g3;") != null);
     try std.testing.expect(std.mem.find(u8, text, "fn pixel(px: Pixel)") != null);
     const led = at(100, 50, .{ 0.4, 0.8, 0.4, 1 }, 0.5, .{ 0, 0, 200, 200 });
     try std.testing.expectEqual(@as(f32, 90), led.rect[0]);

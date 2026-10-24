@@ -1,29 +1,30 @@
 //! Negative build test for the draw type convention. This file must NOT compile.
 //!
 //! `zig build test-contract` compiles it and passes only when the compiler reports
-//! "contract_ragged_type.Ragged: @sizeOf must be a multiple of 16 ..." (the `expect_errors`
-//! string in `build.zig`). It locks that a draw type whose size is not a whole number of
-//! 16-byte vertex attribute groups fails the app's build with a message naming the type,
-//! instead of failing in a host when the pipeline is created. The pure checks are tested in
+//! "contract_ragged_type.Ragged: field `count` must be f32, [2]f32, or [4]f32" (the
+//! `expect_errors` string in `build.zig`). It locks that a draw type with a field the vertex
+//! layout cannot carry fails the app's build with a message naming the type and the field,
+//! instead of failing in a host when the pipeline is created. (Before step 29 the case was a
+//! 36-byte type; sizes in 4-byte steps are valid now.) The pure checks are tested in
 //! `src/draw/registry.zig`.
 
 const patchwork = @import("patchwork");
 
-/// Nine floats: 36 bytes, not a multiple of 16.
+/// An integer field: the layout carries only f32 lanes.
 const Ragged = extern struct {
     rect: [4]f32,
     clip: [4]f32,
-    weight: f32,
+    count: u32,
 
     pub const texture: ?patchwork.draw.TextureFormat = null;
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
-        \\    return vec4<f32>(px.weight);
+        \\    return vec4<f32>(1.0);
         \\}
     ;
 };
 
-/// Satisfies the whole contract except the draw type's size.
+/// Satisfies the whole contract except the draw type's field.
 const RaggedApp = struct {
     pub const config: patchwork.app.Config = .{
         .title = "ragged type",

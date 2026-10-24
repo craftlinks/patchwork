@@ -136,14 +136,16 @@ fn wrap_tau(angle: f32) -> f32 {
 }
 
 // Open ring inscribed in `size`, swept clockwise from `frame.theme.arc.x` by
-// `sweep_fraction * frame.theme.arc.y`, with round caps.
+// `sweep_fraction * frame.theme.arc.y`, with round caps at both ends.
 fn sdf_arc(p_local: vec2<f32>, size: vec2<f32>, thickness: f32, sweep_fraction: f32) -> f32 {
     let center = size * 0.5;
     let p = p_local - center;
     let mid = min(center.x, center.y) - thickness * 0.5;
     let sweep = sweep_fraction * frame.theme.arc.y;
     let rel = wrap_tau(atan2(p.y, p.x) - frame.theme.arc.x);
-    let ang = min(rel, sweep);
+    // The nearer end: the gap's half next to the start measures against the start cap.
+    let gap_middle = sweep + 0.5 * (6.283185307179586 - sweep);
+    let ang = select(min(rel, sweep), 0.0, rel > gap_middle);
     let dir = vec2<f32>(cos(frame.theme.arc.x + ang), sin(frame.theme.arc.x + ang));
     return length(p - dir * mid) - thickness * 0.5;
 }

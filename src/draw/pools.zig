@@ -11,6 +11,13 @@
 //! and layers draw in order. Within a layer, batches draw in order of the first appearance of
 //! each (type, texture) pair in the frame; within a batch, instances keep append order.
 //!
+//! The consequence that surprises: a Box appended after any Glyph on the same layer draws
+//! under every glyph of that layer, because the Glyph batch appeared first. An app that places
+//! a title, then a panel face, then labels on the face sees the labels vanish under the face.
+//! Append faces before any text on a layer, or put what must cover on a higher layer (the
+//! audio example orders its faces first for this reason). There is no runtime warning: the
+//! only symptom is overlap, and finding it would cost a pass over every pair of batches.
+//!
 //! ## 2. Data Flow
 //! ```text
 //! reset                 empty every pool, layer = base, and   (the host, before App.draw)
@@ -28,7 +35,9 @@
 //!
 //! ## 3. Keys
 //! `texture_slots` is 1 for an untextured type and `textures.texture_cap` for a textured one,
-//! so a key is `layer` or `layer * texture_cap + texture` and fits a `u8` (asserted). Sorting
+//! so a key is `layer` or `layer * texture_cap + texture` and fits a `u16` (asserted), so the
+//! layer count and the texture slots no longer bound each other (they shared a `u8` before
+//! step 29: 8 layers × 32 textures). Sorting
 //! by key groups each (layer, texture) run contiguously, which is what lets one draw call
 //! with `first_instance` cover a batch.
 //!
@@ -134,7 +143,7 @@ pub const View = extern struct {
 /// One draw call: `count` instances of type `type_id` starting at `first` in its pool.
 pub const Batch = struct {
     type_id: u8,
-    key: u8,
+    key: u16,
     layer: u8,
     /// The texture of a textured type's batch, else `TextureId.atlas` (unused).
     texture: textures.TextureId,
@@ -144,7 +153,7 @@ pub const Batch = struct {
 
 const Appearance = struct {
     type_id: u8,
-    key: u8,
+    key: u16,
     layer: u8,
 };
 
@@ -153,17 +162,17 @@ fn Pool(comptime T: type, comptime cap: u32) type {
     const slots: u32 = if (T.texture == null) 1 else textures.texture_cap;
     const key_total: u32 = layer_count * slots;
     comptime {
-        assert(key_total <= 256);
+        assert(key_total <= 65536);
         assert(cap >= 1);
     }
     return struct {
         items: [cap]T,
-        keys: [cap]u8,
+        keys: [cap]u16,
         histogram: [key_total]u32,
         starts: [key_total]u32,
         count: u32,
         revision: u64,
-        last_key: u8,
+        last_key: u16,
         /// True while every key appended since the last sort is at least the one before.
         ordered: bool,
 
@@ -393,7 +402,7 @@ pub fn Context(
             } else {
                 assert(self.view_mask & bit_of(layer_index) == 0);
             }
-            const key: u8 = @intCast(layer_index * P.texture_slots + slot);
+            const key: u16 = @intCast(layer_index * P.texture_slots + slot);
             if (pool.histogram[key] == 0) {
                 if (self.appearance_count == batch_cap) {
                     self.overflow_count += 1;
@@ -670,8 +679,8 @@ fn clip_ordered(clip: [4]f32) bool {
 comptime {
     assert(layer_count == 8);
     assert(@backingInt(Layer.overlay) < layer_count);
-    // The sort key of a textured type must fit a u8.
-    assert(layer_count * textures.texture_cap <= 256);
+    // The sort key of a textured type must fit a u16.
+    assert(layer_count * textures.texture_cap <= 65536);
     // One bit per layer in the view masks.
     assert(layer_count <= 8);
     assert(@sizeOf(View) == 16);
@@ -861,4 +870,31 @@ test "a view maps world points and lasts one frame" {
     try testing.expectEqual(@as(f32, 1), cx.view_zoom);
     cx.reset();
     try testing.expectEqual(@as(?View, null), cx.view_of(1));
+}
+
+// Locks the u16 key (section 3): with all 64 texture slots taken, an image of the last texture
+// on layer 7 gets key 7 * 64 + 63 = 511, past what a u8 held, and batches with that texture
+// after the image of texture 1 on the base layer.
+test "64 textures batch on the top layer with keys past 255" {
+    const cx = new_context();
+    var last: textures.TextureId = .atlas;
+    while (cx.textures.count < textures.texture_cap) last = cx.textures.create(.rgba8, 2, 2);
+    try testing.expectEqual(@as(u8, 63), @backingInt(last));
+    const image: types.Image = .{
+        .rect = .{ 0, 0, 2, 2 },
+        .clip = .{ 0, 0, 10, 10 },
+        .uv = .{ 0, 0, 1, 1 },
+        .tint = .{ 1, 1, 1, 1 },
+    };
+    _ = cx.layer(@fromBackingInt(7));
+    try cx.append(types.Image, last, image);
+    _ = cx.layer(.base);
+    try cx.append(types.Image, @fromBackingInt(1), image);
+    cx.finalize();
+    const batches = cx.batch_list();
+    try testing.expectEqual(@as(usize, 2), batches.len);
+    try testing.expectEqual(@as(u16, 1), batches[0].key);
+    try testing.expectEqual(@as(u16, 511), batches[1].key);
+    try testing.expectEqual(last, batches[1].texture);
+    try testing.expectEqual(@as(u8, 7), batches[1].layer);
 }

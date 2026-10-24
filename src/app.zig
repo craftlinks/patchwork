@@ -268,11 +268,11 @@ const test_draw = [_]quads.DrawType{
     .{ .type = quads.Glyph, .cap = 4 },
 };
 
-/// A draw type whose size is not a multiple of 16 bytes.
+/// A draw type with a field type the convention does not carry.
 const Ragged = extern struct {
     rect: [4]f32,
     clip: [4]f32,
-    weight: f32,
+    count: u32,
 
     pub const texture: ?quads.TextureFormat = null;
     pub const pixel: []const u8 = "";
@@ -523,7 +523,7 @@ test "scenarios of the wrong type or with a zero wait are rejected" {
 test "a ragged draw type and an oversized batch cap are rejected" {
     const ragged = comptime conformance(RaggedApp).?;
     try std.testing.expect(std.mem.find(u8, ragged, "Ragged") != null);
-    try std.testing.expect(std.mem.find(u8, ragged, "multiple of 16") != null);
+    try std.testing.expect(std.mem.find(u8, ragged, "must be f32, [2]f32, or [4]f32") != null);
     const huge = comptime conformance(HugeBatches).?;
     try std.testing.expect(std.mem.find(u8, huge, "batch_cap") != null);
 }
