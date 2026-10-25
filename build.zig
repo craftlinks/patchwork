@@ -64,6 +64,12 @@
 //!   on a device with no window and fails naming the first broken draw type
 //!   (`src/host/gpu_wgpu.zig`, section 10). It needs a GPU, so it is not part of `test`; in
 //!   this repo `zig build check` checks every example.
+//! - `regress` runs the installed native executable with `--regress` and the arguments after
+//!   `--` (`--adapter high|low|both`, `--bless`, `--only <scenario>`, `--keep`), from the
+//!   build root: it renders every regressed scenario with no window, cache on and off, and
+//!   compares each frame's hash with `test/golden/<adapter>/<name>.txt`
+//!   (`src/host/headless.zig`). It needs a GPU, so it is not part of `test`; in this repo
+//!   `zig build regress` runs every example's, in parallel, each printing its report once.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests and the native-only tests
 //!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
@@ -73,7 +79,9 @@
 //!   and passes only if the compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
-//! - `zig build compare -- a.ppm b.ppm` compares two frame dumps (`tools/compare.zig`).
+//! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
+//!   compares two frame dumps, and writes a diff picture or a cropped PNG of the first
+//!   (`tools/compare.zig`).
 //!
 //! ## 6. Fonts
 //! `add_font_module(patchwork_builder, ranges)` builds `tools/subset.zig` for the host, runs it
@@ -123,6 +131,10 @@ pub const AppSteps = struct {
     /// shader and pipeline on a device with no window and fails on the first error. Needs a
     /// GPU, so it is not part of `test`.
     check: *std.Build.Step,
+    /// Runs the installed native executable with `--regress` plus the arguments, from the
+    /// build root: every regressed scenario with no window, against the golden files. Needs a
+    /// GPU, so it is not part of `test`.
+    regress: *std.Build.Step,
     /// Runs the app's own unit tests.
     tests: *std.Build.Step,
 };
@@ -164,6 +176,7 @@ pub fn addApp(
         .run = add_run(b, options, &install.step, "run", &.{}),
         .bench = add_run(b, options, &install.step, "bench", &.{"--bench"}),
         .check = add_run(b, options, &install.step, "check", &.{"--check"}),
+        .regress = add_regress(b, options, &install.step),
         .wasm = &wasm_install.step,
         .serve = add_serve(b, patchwork_builder, options, wasm, &wasm_install.step),
         .tests = &b.addRunArtifact(tests).step,
@@ -322,6 +335,16 @@ fn add_run(
     run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(install);
     return &run_cmd.step;
+}
+
+/// `add_run` for `regress`, from the build root, where `test/golden` and `zig-out/regress`
+/// resolve.
+fn add_regress(b: *std.Build, options: AppOptions, install: *std.Build.Step) *std.Build.Step {
+    const step = add_run(b, options, install, "regress", &.{"--regress"});
+    const run_cmd: *std.Build.Step.Run = @fieldParentPtr("step", step);
+    run_cmd.setCwd(b.path("."));
+    run_cmd.stdio = .inherit;
+    return step;
 }
 
 /// Native Wayland + WebGPU executable.
@@ -531,6 +554,7 @@ pub fn build(b: *std.Build) void {
     const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
+    add_regress_step(b, &examples);
     add_compare_step(b, library);
 }
 
@@ -539,6 +563,13 @@ pub fn build(b: *std.Build) void {
 fn add_check_step(b: *std.Build, examples: []const AppSteps) void {
     const step = b.step("check", "Compile every example's shaders and pipelines with no window");
     for (examples) |example| step.dependOn(example.check);
+}
+
+/// `regress`: every example's headless regress run, with the arguments after `--`
+/// (`zig build regress -Doptimize=ReleaseFast -- --bless`).
+fn add_regress_step(b: *std.Build, examples: []const AppSteps) void {
+    const step = b.step("regress", "Render every example's scenarios headless against the goldens");
+    for (examples) |example| step.dependOn(example.regress);
 }
 
 /// `compare`: the frame-dump diff tool, run with the arguments after `--`.

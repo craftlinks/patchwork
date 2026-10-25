@@ -1,0 +1,11 @@
+# patchwork regress golden v1
+# adapter: Intel(R) Graphics (RPL-S)
+# driver: Mesa 26.2.5-arch1.1
+# size: 1280x720 @120
+scenario          hash
+idle              5a286b0def9fa9f4
+pulse             b09d8dec037b7fd0
+transport         94d471330ccf611b
+transport-stress  159b67e15296de9e
+typing            01d3785fec6982ba
+typing-stress     204adf50c5968ac2
