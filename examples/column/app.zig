@@ -135,7 +135,7 @@ pub const App = struct {
     /// The panel on the right, its view, and one row per control.
     pub fn draw(app: *App, cx: *Context) void {
         _ = cx.begin(ui.sized(.fill, .fill), .{ .flow = .down, .padding = frame_padding, .alignment = .{ .x = 1, .y = 0 } });
-        const panel: widgets.Panel = .{ .paint = widgets.paint_of(theme.chrome.panel, 0) };
+        const panel: widgets.Panel = .{ .paint = widgets.paint_of(cx.theme().colors.panel, 0) };
         _ = panel.begin(cx, ui.sized(.{ .fixed = panel_width_px }, .fill), .{ .flow = .down, .padding = panel_padding });
         _ = cx.begin_view(view_id, ui.sized(.fill, .fill), ui.flow_of(.down), &app.view);
         for (&app.knobs) |*knob| knob.draw(cx, row(widgets.knob_height));

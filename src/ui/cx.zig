@@ -129,6 +129,15 @@
 //! (`realtime.zig`). Setting it on an app without a source is a programming error (asserted).
 //! After each drain the hosts copy the queue's drop count into `audio_dropped`.
 //!
+//! ## 9b. The Theme
+//! `scheme` is the app's `theme.Scheme` and `draw.theme` its GPU record (`theme.zig`, section
+//! 1). `theme_setup(scheme)` (from `app.start`, once) copies `App.config.theme`; until then
+//! both are `theme.dark`. `theme()` returns it in any phase, and widgets read their colors,
+//! text styles, and hover and press weights from it at draw time; the scrollbar thumb is
+//! `colors.control`. `set_theme(scheme)` during an event or a timer call stores a different
+//! scheme, writes its record into `draw.theme`, and calls `redraw`; the same scheme again is
+//! no change and owes nothing. The renderer sees the new record as a uniform change.
+//!
 //! ## 10. TigerStyle Invariants
 //! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, the clipboard, and the
 //!   duplicate stamps of safe builds. Per-frame work is proportional to instances, areas, and
@@ -141,7 +150,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("../draw.zig");
 const input = @import("../input.zig");
-const theme = @import("../theme.zig");
+const theme_module = @import("../theme.zig");
 const turtle = @import("turtle.zig");
 const areas = @import("areas.zig");
 const view = @import("view.zig");
@@ -322,6 +331,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         audio_dropped: u32,
         /// The canvas being drawn, if any (section 3a).
         canvas_open: ?Canvas,
+        /// The app's scheme (section 9b); `draw.theme` is its record.
+        scheme: theme_module.Scheme,
         /// What `overflow_report` last returned or saw (section 10).
         overflow_seen: Overflow,
 
@@ -374,6 +385,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.audio_dropped = 0;
             self.canvas_open = null;
             self.overflow_seen = .zero;
+            self.scheme = theme_module.dark;
+            self.draw.theme = self.scheme.record();
             assert(self.phase == .idle);
             assert(self.dirty);
         }
@@ -413,6 +426,35 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.has_audio);
             self.audio_on = on;
             assert(self.audio_on == on);
+        }
+
+        /// Records the app's starting scheme; the hosts call it once after `init` (section 9b).
+        /// The first draw is already owed, so it marks nothing.
+        pub fn theme_setup(self: *Self, scheme: theme_module.Scheme) void {
+            assert(self.phase == .idle);
+            assert(self.dirty);
+            self.scheme = scheme;
+            self.draw.theme = scheme.record();
+        }
+
+        /// The app's scheme, which widgets read their colors, text styles, and weights from
+        /// (section 9b). Any phase.
+        pub fn theme(self: *const Self) *const theme_module.Scheme {
+            assert(self.depth <= turtle.depth_max);
+            return &self.scheme;
+        }
+
+        /// Switches the app's scheme: stores it, gives the draw context its record, and owes a
+        /// draw, which the renderer turns into one uniform write and a full repaint (section
+        /// 9b). The current scheme again does nothing. Not during a draw.
+        pub fn set_theme(self: *Self, scheme: theme_module.Scheme) void {
+            assert(self.phase != .draw);
+            if (std.meta.eql(scheme, self.scheme)) return;
+            self.scheme = scheme;
+            self.draw.theme = scheme.record();
+            self.redraw();
+            assert(self.dirty);
+            assert(std.meta.eql(self.scheme, scheme));
         }
 
         /// What the last draw refused (section 10). Not during a draw.
@@ -707,7 +749,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             const thumb = state.thumb_rect();
             const outer = parent.clip orelse return;
             const look: draw.BoxLook = .{
-                .fill = theme.chrome.control,
+                .fill = self.scheme.colors.control,
                 .radius = view.thumb_radius,
             };
             self.append(draw.Box, null, .of(thumb, outer, look)) catch |err| switch (err) {
@@ -1932,6 +1974,41 @@ test "the audio flag starts stopped and follows set_audio" {
     cx.set_audio(false);
     cx.event_end();
     try testing.expect(!cx.audio_on);
+}
+
+// Locks the theme (section 9b): a fresh context holds `theme.dark` and its record; setting it
+// again is a no-op that owes no draw; `theme.light` stores it, writes its record into
+// `draw.theme` (its track in slot 2, its background in slot 9), and owes a draw; and the
+// scrollbar thumb is drawn in the scheme's `control`.
+test "set_theme stores a new scheme and owes a draw, the same one nothing" {
+    const cx = new_context();
+    const dark_record = theme_module.dark.record();
+    try testing.expect(std.meta.eql(theme_module.dark, cx.theme().*));
+    const held = std.mem.asBytes(&cx.draw.theme);
+    try testing.expect(std.mem.eql(u8, std.mem.asBytes(&dark_record), held));
+    cx.begin_frame(200, 100, 120);
+    _ = cx.end_frame();
+    try testing.expect(!cx.dirty);
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_theme(theme_module.dark);
+    try testing.expect(!cx.dirty);
+    cx.set_theme(theme_module.light);
+    cx.event_end();
+    try testing.expect(cx.dirty);
+    try testing.expectEqual(theme_module.light.colors.track, cx.draw.theme.track);
+    try testing.expectEqual(theme_module.light.colors.background, cx.draw.theme.background);
+    try testing.expectEqual(theme_module.light.colors.text, cx.theme().colors.text);
+    var state = ViewState.init();
+    cx.begin_frame(200, 100, 120);
+    const view_id = areas.id("view", 0);
+    const port: turtle.Walk = .{ .width = .fill, .height = .{ .fixed = 50 } };
+    _ = cx.begin_view(view_id, port, .{ .flow = .down }, &state);
+    _ = cx.walk(.{ .width = .fill, .height = .{ .fixed = 400 } });
+    cx.end_view();
+    _ = cx.end_frame();
+    const thumb = cx.draw.items(draw.Box);
+    try testing.expectEqual(@as(usize, 1), thumb.len);
+    try testing.expectEqual(theme_module.light.colors.control, thumb[0].fill);
 }
 
 /// One frame of a 200 by 100 canvas at the top-left with one free module at world

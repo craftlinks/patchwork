@@ -69,8 +69,8 @@ const card_colors = [3][4]f32{
     .{ 0.30, 0.70, 0.95, 0.6 },
     .{ 0.95, 0.85, 0.30, 0.6 },
 };
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
-const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.dark.colors.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
 const one_id = ui.id("fade", 0);
@@ -263,7 +263,7 @@ fn draw_panel(cx: *Context, rect: Rect, alpha: f32) void {
     const ring_look: quads.ArcLook = .{ .color = scale_alpha(.{ 0.55, 0.85, 0.45, 0.8 }, alpha), .thickness = 10, .sweep = 0.7 };
     cx.append(quads.Arc, null, .of(ring, clip_of(rect), ring_look)) catch {};
     var style = label_style;
-    style.color = scale_alpha(theme.chrome.text, alpha);
+    style.color = scale_alpha(cx.theme().colors.text, alpha);
     text.place(cx.drawing(), style, "translucent cards", .{ .x = rect.x + 16, .y = rect.y + 8, .width = rect.width - 32, .height = 24 }, clip_of(rect), left);
 }
 
@@ -290,7 +290,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

@@ -612,6 +612,10 @@ fn add_test_steps(
             .path = "test/contract_audio_without_sink.zig",
             .expected = "App declares `Audio` but is missing `pub fn audio`",
         },
+        .{
+            .path = "test/contract_theme_range.zig",
+            .expected = "App.config.theme.colors.panel: a component is outside [0, 1]",
+        },
     };
     for (contracts) |case| {
         const contract = b.createModule(.{

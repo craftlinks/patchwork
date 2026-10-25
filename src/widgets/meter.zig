@@ -52,14 +52,15 @@ pub const Meter = struct {
         const row = cx.walk(walk);
         const clip = cx.visible(row) orelse return;
         const track = meter_track_sized(row, self.track_h);
-        kit.face(cx, track, clip, .{ .fill = theme.chrome.track, .radius = meter_radius });
+        const scheme = cx.theme();
+        kit.face(cx, track, clip, .{ .fill = scheme.colors.track, .radius = meter_radius });
         if (self.value > 0) {
             var fill = track;
             fill.height = self.value * track.height;
             fill.y = track.y + track.height - fill.height;
-            kit.face(cx, fill, clip, .{ .fill = theme.chrome.meter, .radius = meter_radius });
+            kit.face(cx, fill, clip, .{ .fill = scheme.colors.meter, .radius = meter_radius });
         }
-        kit.label(cx, kit.name_style, self.name, knob_file.side_box(row), clip, kit.centered);
+        kit.label(cx, scheme.name, self.name, knob_file.side_box(row), clip, kit.centered);
     }
 };
 

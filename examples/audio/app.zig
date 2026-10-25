@@ -82,9 +82,9 @@ const trace_colors = [realtime.channels][4]f32{
     .{ 0.40, 0.70, 1.0, 1 },
 };
 const xy_color: [4]f32 = .{ 0.35, 1.0, 0.55, 1 };
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
-const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
-const mark_style: text.Style = .{ .face = .sans, .size = 11, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.dark.colors.text };
+const mark_style: text.Style = .{ .face = .sans, .size = 11, .color = theme.dark.colors.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 const centered: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
 
@@ -231,7 +231,7 @@ pub const App = struct {
         const draw_cx = cx.drawing();
         for (app.bars, bar_x, [_][]const u8{ "L", "R" }) |bar, x, name| {
             const track: Rect = .{ .x = x, .y = track_top, .width = bar_width, .height = track_height };
-            append_box(cx, track, theme.chrome.track, meters_rect, 3);
+            append_box(cx, track, cx.theme().colors.track, meters_rect, 3);
             if (bar.rms.value > 0) {
                 const height = bar.rms.value * track_height;
                 const fill: Rect = .{ .x = x, .y = track_top + track_height - height, .width = bar_width, .height = height };
@@ -340,7 +340,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

@@ -79,14 +79,16 @@ pub const Slider = struct {
         const rect = cx.walk(walk);
         const clip = cx.visible(rect) orelse return;
         cx.area(self.id, rect, knob_radius, ui.cx.plain);
+        const scheme = cx.theme();
         const track = track_rect(rect);
-        kit.face(cx, track, clip, self.track.look(self.hover.value, 0));
+        kit.face(cx, track, clip, self.track.look(scheme, self.hover.value, 0));
         if (self.value > 0) {
             var fill_rect = track;
             fill_rect.width = self.value * track.width;
-            kit.face(cx, fill_rect, clip, self.fill.look(self.hover.value, 0));
+            kit.face(cx, fill_rect, clip, self.fill.look(scheme, self.hover.value, 0));
         }
-        kit.face(cx, knob_rect(rect, self.value), clip, self.knob.look(self.hover.value, 0));
+        const knob = knob_rect(rect, self.value);
+        kit.face(cx, knob, clip, self.knob.look(scheme, self.hover.value, 0));
     }
 
     fn set_at(self: *Slider, cx: anytype, press: ui.Press) Action {

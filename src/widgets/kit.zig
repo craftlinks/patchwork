@@ -18,9 +18,10 @@
 //! weight(amount, scale)            an animator value scaled to a shader mix weight
 //! clicked(cx, id, event)           a row that clicks on an inside release
 //! respond / Interaction            the hover and press table (section 3)
+//! accent(cx, index)                the app scheme's accent `index` as a `Paint`
 //! ```
-//! It sits under `widgets` because it carries the widgets' look constants (`hover_lighten`,
-//! `Paint`); `ui` and `draw` never import it and use `draw.Box.of` with their own skip.
+//! It sits under `widgets` because it carries the widgets' look (`Paint`, the dark defaults);
+//! `ui` and `draw` never import it and use `draw.Box.of` with their own skip.
 //!
 //! ## 2. Appending
 //! `append` skips an instance whose pool or batch list is full; the draw context counts the
@@ -31,11 +32,13 @@
 //! ## 3. Hover and Press
 //! An `Animator` travels over `[0, 1]`; a widget scales it before writing an instance:
 //! ```text
-//! hover_weight = hover.value * hover_lighten
-//! down_weight  = down.value  * down_darken      (applied after the hover mix)
+//! hover_weight = hover.value * scheme.hover_lighten
+//! down_weight  = down.value  * scheme.down_darken      (applied after the hover mix)
 //! ```
-//! `Paint.look(hover, down)` applies both. `respond(cx, hit, hover, down)` aims the pair from
-//! one hit; `Interaction` stores the pair and calls it:
+//! `Paint.look(scheme, hover, down)` applies both, with the app's `cx.theme()` as `scheme`;
+//! `hover_lighten` and `down_darken` are the dark scheme's, kept for code that names them.
+//! `respond(cx, hit, hover, down)` aims the pair from one hit; `Interaction` stores the pair
+//! and calls it:
 //! ```text
 //! hit          hover   down
 //! hover_in     1       -
@@ -70,11 +73,16 @@ pub const Animator = animator.Animator;
 pub const BoxLook = draw.BoxLook;
 pub const ArcLook = draw.ArcLook;
 
-/// Shader mix toward white at animator value 1.
-pub const hover_lighten: f32 = 0.18;
+/// The dark scheme's shader mix toward white at animator value 1. Widgets read the app's
+/// (`cx.theme().hover_lighten`).
+pub const hover_lighten: f32 = theme.dark.hover_lighten;
 
-/// Shader mix toward black at animator value 1. Applied after the lighten.
-pub const down_darken: f32 = 0.30;
+/// The dark scheme's shader mix toward black at animator value 1, applied after the lighten.
+/// Widgets read the app's (`cx.theme().down_darken`).
+pub const down_darken: f32 = theme.dark.down_darken;
+
+/// The corner radius of an accent `Paint`: the knob ring's stroke, which `knob.zig` asserts.
+pub const accent_radius: f32 = 4;
 
 /// Wall time for hover to travel the unit range.
 pub const hover_duration_ms: f32 = 100;
@@ -97,32 +105,26 @@ pub const Paint = struct {
     radius: f32,
 
     /// The box look of this paint at the animator values `hover` and `down`, each scaled to
-    /// its mix weight (section 3).
-    pub fn look(self: Paint, hover: f32, down: f32) BoxLook {
+    /// its mix weight in `scheme` (section 3).
+    pub fn look(self: Paint, scheme: *const theme.Scheme, hover: f32, down: f32) BoxLook {
         assert(self.radius >= 0);
         assert(self.a >= 0);
         return .{
             .fill = .{ self.r, self.g, self.b, self.a },
             .radius = self.radius,
-            .hover = weight(hover, hover_lighten),
-            .down = weight(down, down_darken),
+            .hover = weight(hover, scheme.hover_lighten),
+            .down = weight(down, scheme.down_darken),
         };
     }
 };
 
-/// Control names beside a ring, meter, or pill.
-pub const name_style: text.Style = .{
-    .face = .sans,
-    .size = 16,
-    .color = theme.chrome.text,
-};
+/// The dark scheme's control names beside a ring, meter, or pill. Widgets read the app's
+/// (`cx.theme().name`).
+pub const name_style: text.Style = theme.dark.name;
 
-/// Knob value readouts: monospace, so the digits do not shift as the value changes.
-pub const value_style: text.Style = .{
-    .face = .mono,
-    .size = 16,
-    .color = theme.chrome.text,
-};
+/// The dark scheme's knob value readouts: monospace, so the digits do not shift as the value
+/// changes. Widgets read the app's (`cx.theme().value`).
+pub const value_style: text.Style = theme.dark.value;
 
 /// Text centered on both axes, without an ellipsis.
 pub const centered: text.Options = .{
@@ -143,6 +145,17 @@ pub fn paint_of(color: [4]f32, radius: f32) Paint {
     };
     assert(paint.radius == radius);
     assert(paint.a == color[3]);
+    return paint;
+}
+
+/// The app scheme's accent `index` (cycled modulo `theme.accent_count`) as a paint with
+/// `accent_radius`, for an app that wants its knob accents to follow the theme. Reads
+/// `cx.theme()`, so it works in any phase.
+pub fn accent(cx: anytype, index: u32) Paint {
+    const scheme = cx.theme();
+    const paint = paint_of(scheme.accents[index % theme.accent_count], accent_radius);
+    assert(paint.radius == accent_radius);
+    assert(paint.a >= 0);
     return paint;
 }
 
@@ -415,14 +428,34 @@ test "append counts a refused instance and face skips an empty rect" {
     _ = cx.end_frame();
 }
 
-// Locks `Paint.look`: the paint's fill and radius, and the animator values scaled by
-// `hover_lighten` and `down_darken`.
+// Locks `Paint.look`: the paint's fill and radius, and the animator values scaled by the
+// scheme's weights: dark's 0.18 and 0.30 (the kit constants), light's 0.10 and 0.15.
 test "paint look scales hover and down" {
     const paint = paint_of(.{ 0.25, 0.5, 0.75, 1 }, 6);
-    const look = paint.look(1, 0.5);
+    const look = paint.look(&theme.dark, 1, 0.5);
     try testing.expectEqual([4]f32{ 0.25, 0.5, 0.75, 1 }, look.fill);
     try testing.expectEqual(@as(f32, 6), look.radius);
     try testing.expectEqual(hover_lighten, look.hover);
     try testing.expectEqual(@as(f32, 0.5) * down_darken, look.down);
     try testing.expectEqual(draw.transparent, look.border_color);
+    const lit = paint.look(&theme.light, 1, 0.5);
+    try testing.expectEqual(@as(f32, 0.10), lit.hover);
+    try testing.expectEqual(@as(f32, 0.5) * 0.15, lit.down);
+}
+
+// Locks `accent`: the app scheme's accents cycled by index with the knob stroke as radius,
+// equal to `widgets.accents` under the dark scheme and to light's under the light one.
+test "accent reads the scheme's accents" {
+    const cx = fixture.context();
+    const first = accent(cx, 0);
+    try testing.expectEqual(@as(f32, 0.62), first.r);
+    try testing.expectEqual(accent_radius, first.radius);
+    try testing.expectEqual(accent(cx, 1), accent(cx, 1 + theme.accent_count));
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_theme(theme.light);
+    cx.event_end();
+    try testing.expectEqual(theme.light.accents[2][1], accent(cx, 2).g);
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_theme(theme.dark);
+    cx.event_end();
 }

@@ -7,13 +7,15 @@
 //! written with `widgets.kit` and the layout defaults only (one-statement containers, no Box
 //! literal, no private append helper), so it is also the template for an app's own screens.
 //! Every widget reports its last action on the status line, for example "knob 1 changed 0.75".
+//! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
+//! with `cx.set_theme` (section 3a).
 //!
 //! ## 2. Layout (logical pixels)
 //! A fixed `screen_w` by `screen_h` screen from the top-left, so it fits the 1280 by 720
 //! browser viewport and a native dump and a browser screenshot compare region for region:
 //! ```text
 //! screen   1088 x 640 at (0, 0), flow down, padding 16, spacing 8
-//!   title  fill x 40        "gallery" and the status line
+//!   title  fill x 40        "gallery", the "light" toggle (160 x 40 at x 156), the status
 //!   band   fill x 152       buttons (176) | sliders (288) | knobs (fill: 4 cells of 140)
 //!   band   fill x 152       toggles (176) | meter (176)   | text field (fill; field 240 x 32)
 //!   list   fill x 240       a view of 40 rows of 28, the selected row highlighted
@@ -26,11 +28,21 @@
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
 //! to the rows it drew last through `kit.clicked`, which also repaints a row on hover.
 //!
+//! ## 3a. Theme
+//! Everything the gallery draws reads `cx.theme()`: the group faces, the text styles, the
+//! highlighted rows, and the widgets themselves. Colors stored in widgets (the sliders'
+//! paints, the knobs' accents, the field's text style) are restyled from the scheme when the
+//! toggle switches it (`restyle`), so they follow it too. The buttons keep their own blue
+//! paint and light label in both themes: an instance color wins over the scheme.
+//!
 //! ## 4. Scenarios
 //! `still`; `interact` (click button 0, drag slider 0 by +80 px, click toggle 1, drag knob 1
 //! by -30 px, click the field and type "abc", wheel the list by 3 rows, click row 5, then let
-//! the animations settle); `hover` (hover button 1, then wait for its animator to settle). The
-//! app tests replay `interact` headless and check every value it leaves.
+//! the animations settle); `hover` (hover button 1, then wait for its animator to settle);
+//! `light` (click the "light" toggle, click the field, type "abc", select it by dragging
+//! across it, then wait for the animations to settle, so the light theme shows the focus ring,
+//! the selection band, and the caret). The app tests replay `interact` and `light` headless
+//! and check every value they leave.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays, a fixed status buffer, and no allocation; every loop is bounded.
@@ -86,16 +98,16 @@ const meter_slider: u32 = 0;
 
 const view_id = ui.id("view", 0);
 const field_id = ui.id("field", 0);
+const theme_id = ui.id("theme", 0);
 
-const panel_paint: widgets.Paint = widgets.paint_of(theme.chrome.panel, 8);
+/// The "light" toggle's box in the title bar: right of "gallery", one toggle row high.
+const theme_toggle_x: f32 = 156;
+const theme_toggle_w: f32 = 160;
+
+const panel_radius: f32 = 8;
 const button_paint: widgets.Paint = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = 8 };
-const selected_fill: [4]f32 = .{ 0.26, 0.42, 0.72, 1 };
-
-const title_style: text.Style = .{ .face = .sans_bold, .size = 18, .color = theme.chrome.text };
-const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.chrome.text };
-const caption_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.chrome.text };
-const button_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.chrome.text };
-const field_style: text.Style = .{ .face = .mono, .size = 16, .color = theme.chrome.text };
+/// The buttons' label: the dark scheme's text in both themes, on their own blue (section 3a).
+const button_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.dark.colors.text };
 
 const start: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
 const end: text.Options = .{ .align_x = .end, .align_y = .center, .ellipsis = true };
@@ -123,6 +135,8 @@ const group_layout: ui.Layout = .{
 
 /// The gallery. `timer_period_ms` is 0: nothing wakes the host while the pointer rests.
 pub const App = struct {
+    /// The title bar's "light" toggle: on is `theme.light`.
+    light: widgets.Toggle,
     buttons: [button_labels.len]widgets.Button,
     sliders: [slider_names.len]widgets.Slider,
     knobs: [knob_names.len]widgets.Knob,
@@ -151,11 +165,14 @@ pub const App = struct {
         .{ .name = "still", .setup = &.{.{ .wait = 5 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 60 },
         .{ .name = "interact", .setup = &interact_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "hover", .setup = &hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "light", .setup = &light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
-    /// The widgets at their starting values; the gallery creates no textures.
+    /// The widgets at their starting values, styled from `config.theme`; the gallery creates
+    /// no textures.
     pub fn init(app: *App, textures: *quads.Textures) void {
         assert(textures.count >= 1);
+        app.light = widgets.Toggle.init(theme_id, "light", false);
         for (&app.buttons, button_labels, 0..) |*button, label, index| {
             button.* = .{
                 .id = ui.id("button", @intCast(index)),
@@ -172,9 +189,9 @@ pub const App = struct {
                 .id = ui.id("slider", @intCast(index)),
                 .hover = .init(widgets.hover_rate_per_ms),
                 .value = value,
-                .track = widgets.paint_of(theme.chrome.track, widgets.track_radius),
-                .fill = widgets.paint_of(theme.chrome.value, widgets.track_radius),
-                .knob = widgets.paint_of(theme.chrome.control, widgets.knob_radius),
+                .track = undefined,
+                .fill = undefined,
+                .knob = undefined,
             };
         }
         for (&app.knobs, knob_names, knob_values, knob_rings, 0..) |*knob, name, value, ring, index| {
@@ -185,19 +202,28 @@ pub const App = struct {
             toggle.* = widgets.Toggle.init(ui.id("toggle", @intCast(index)), name, on);
         }
         app.meter = .{ .name = "level", .value = slider_values[meter_slider], .track_h = meter_track_px };
-        app.field = widgets.TextField.init(field_id, 32, field_style);
+        app.field = widgets.TextField.init(field_id, 32, field_style(&config.theme));
         app.view = ui.ViewState.init();
         app.drawn = .{ .first = 0, .end = 0 };
         app.selected = null;
         app.status = @splat(0);
         app.status_len = 0;
         app.set_status(&.{"ready"});
+        app.restyle(&config.theme);
         assert(app.knobs[3].ring == 72);
         assert(!app.toggles[0].on);
     }
 
     /// Every widget, the view, then the rows drawn last (module guide, section 3).
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.light.handle(cx, event_value)) {
+            .toggled => |on| {
+                cx.set_theme(if (on) theme.light else theme.dark);
+                app.restyle(cx.theme());
+                app.note(cx, &.{ "theme ", if (on) "light" else "dark" });
+            },
+            .none => {},
+        }
         for (&app.buttons, 0..) |*button, index| {
             if (button.handle(cx, event_value) == .clicked) app.note(cx, &.{ "button ", digit(index), " clicked" });
         }
@@ -267,6 +293,23 @@ pub const App = struct {
         assert(cx.area_overflow == 0);
     }
 
+    /// The colors the widgets store, from `scheme` (section 3a): the sliders' paints, the knobs'
+    /// accents, and the field's text style. Under `theme.dark` they are the step 30 values.
+    fn restyle(app: *App, scheme: *const theme.Scheme) void {
+        for (&app.sliders) |*slider| {
+            slider.track = widgets.paint_of(scheme.colors.track, widgets.track_radius);
+            slider.fill = widgets.paint_of(scheme.colors.value, widgets.track_radius);
+            slider.knob = widgets.paint_of(scheme.colors.control, widgets.knob_radius);
+        }
+        for (&app.knobs, 0..) |*knob, index| {
+            const color = scheme.accents[index % theme.accent_count];
+            knob.accent = widgets.paint_of(color, widgets.kit.accent_radius);
+        }
+        app.field.style = field_style(scheme);
+        assert(app.sliders[0].track.radius == widgets.track_radius);
+        assert(app.field.style.face == .mono);
+    }
+
     /// The status line's text.
     pub fn status_text(app: *const App) []const u8 {
         assert(app.status_len <= status_cap);
@@ -276,21 +319,25 @@ pub const App = struct {
     fn draw_title(app: *const App, cx: *Context) void {
         const bar = cx.walk(ui.sized(.fill, .{ .fixed = title_px }));
         const clip = cx.visible(bar) orelse return;
-        kit.face(cx, bar, clip, panel_paint.look(0, 0));
+        kit.face(cx, bar, clip, panel_paint(cx).look(cx.theme(), 0, 0));
         const inner = ui.cx.inset(bar, .xy(title_inset_px, 0));
-        kit.label(cx, title_style, "gallery", inner, clip, start);
-        kit.label(cx, status_style, app.status_text(), inner, clip, end);
+        kit.label(cx, styled(cx, .sans_bold, 18), "gallery", inner, clip, start);
+        kit.label(cx, styled(cx, .sans, 14), app.status_text(), inner, clip, end);
+        const cell: Rect = .{ .x = bar.x + theme_toggle_x - screen_padding, .y = bar.y, .width = theme_toggle_w, .height = title_px };
+        _ = cx.begin_at(cell, .{ .flow = .down });
+        app.light.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
     }
 
     fn draw_buttons(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.{ .fixed = narrow_px }, .fill), group_layout);
         for (&app.buttons) |*button| button.draw(cx, ui.sized(.fill, .{ .fixed = button_px }));
         _ = cx.end();
     }
 
     fn draw_sliders(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.{ .fixed = sliders_px }, .fill), group_layout);
         for (&app.sliders, slider_names) |*slider, name| {
             caption(cx, name);
@@ -300,7 +347,7 @@ pub const App = struct {
     }
 
     fn draw_knobs(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         const row: ui.Layout = .{ .flow = .right, .padding = .all(group_padding), .alignment = .{ .x = 0, .y = 0.5 }, .clip = true };
         _ = face.begin(cx, ui.sized(.fill, .fill), row);
         const cell = ui.sized(.{ .fixed = knob_cell_px }, .{ .fixed = widgets.knob_height });
@@ -309,21 +356,21 @@ pub const App = struct {
     }
 
     fn draw_toggles(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.{ .fixed = narrow_px }, .fill), group_layout);
         for (&app.toggles) |*toggle| toggle.draw(cx, ui.sized(.fill, .{ .fixed = widgets.toggle_height }));
         _ = cx.end();
     }
 
     fn draw_meter(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.{ .fixed = narrow_px }, .fill), group_layout);
         app.meter.draw(cx, ui.sized(.fill, .fill));
         _ = cx.end();
     }
 
     fn draw_field(app: *const App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
         caption(cx, "name");
         app.field.draw(cx, ui.sized(.{ .fixed = field_w }, .{ .fixed = field_h }));
@@ -332,7 +379,7 @@ pub const App = struct {
 
     /// The list: a view of the visible rows only, standing in for the others with `skip`.
     fn draw_list(app: *App, cx: *Context) void {
-        const face: widgets.Panel = .{ .paint = panel_paint };
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = face.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down, .padding = .all(group_padding) });
         const port = cx.begin_view(view_id, ui.sized(.fill, .fill), .{ .flow = .down }, &app.view);
         const range = rows.visible(app.view.scroll_y, port.height);
@@ -355,11 +402,12 @@ pub const App = struct {
         cx.area(id, rect, 0, ui.cx.plain);
         const selected = app.selected != null and app.selected.? == row;
         if (selected or cx.hovered() == id) {
-            kit.face(cx, rect, clip, .{ .fill = if (selected) selected_fill else theme.chrome.track, .radius = 4 });
+            const colors = &cx.theme().colors;
+            kit.face(cx, rect, clip, .{ .fill = if (selected) colors.selection else colors.track, .radius = 4 });
         }
         var bytes: [8]u8 = undefined;
         const name = std.fmt.bufPrint(&bytes, "row {d:0>2}", .{row}) catch unreachable;
-        kit.label(cx, status_style, name, ui.cx.inset(rect, .xy(row_inset_px, 0)), clip, start);
+        kit.label(cx, styled(cx, .sans, 14), name, ui.cx.inset(rect, .xy(row_inset_px, 0)), clip, start);
     }
 
     fn select(app: *App, cx: *Context, row: u32) void {
@@ -395,7 +443,23 @@ pub const App = struct {
 fn caption(cx: *Context, words: []const u8) void {
     const line = cx.walk(ui.sized(.fill, .{ .fixed = caption_px }));
     const clip = cx.visible(line) orelse return;
-    kit.label(cx, caption_style, words, line, clip, start);
+    kit.label(cx, styled(cx, .sans, 14), words, line, clip, start);
+}
+
+/// The group faces' paint: the scheme's panel color.
+fn panel_paint(cx: *Context) widgets.Paint {
+    return widgets.paint_of(cx.theme().colors.panel, panel_radius);
+}
+
+/// Text in `face` at `size` in the scheme's text color: the title, status, captions, and rows.
+fn styled(cx: *Context, face: text.Face, size: f32) text.Style {
+    assert(size > 0);
+    return .{ .face = face, .size = size, .color = cx.theme().colors.text };
+}
+
+/// The field's text: Noto Sans Mono 16 in the scheme's text color.
+fn field_style(scheme: *const theme.Scheme) text.Style {
+    return .{ .face = .mono, .size = 16, .color = scheme.colors.text };
 }
 
 /// The decimal digit of `index`, below 10.
@@ -427,7 +491,23 @@ const hover_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `light`: switch to the light theme, focus the field and type "abc", then select it by a
+/// drag from before its first glyph (x 4 of 240) to past its last (x 64), which selects all
+/// three bytes however the press counts as a click; the pointer rests over the field.
+const light_steps = [_]bench.Step{
+    .{ .click = bench.area("theme", 0) },
+    .{ .click = bench.area("field", 0) },
+    .{ .key = .{ .key = .a, .text = "a" } },
+    .{ .key = .{ .key = .b, .text = "b" } },
+    .{ .key = .{ .key = .c, .text = "c" } },
+    .{ .drag = .{ .target = bench.area("field", 0), .from_x = 4, .from_y = 16, .dx = 60, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
 comptime {
+    // The title: the toggle sits right of "gallery" and inside the bar.
+    assert(theme_toggle_x + theme_toggle_w < screen_w - screen_padding);
+    assert(widgets.toggle_height == title_px);
     // The bands' widths: the knob group fits four cells exactly.
     const inner_w = screen_w - 2 * screen_padding;
     assert(inner_w - narrow_px - sliders_px - 2 * gap_px == 4 * knob_cell_px + 2 * group_padding);
@@ -439,12 +519,12 @@ comptime {
     assert(list_h == 240);
     assert(@ceil((list_h - 2 * group_padding) / row_px) + 1 == rows_drawn_max);
     for (knob_rings) |ring| assert(ring <= widgets.knob_height);
-    // Faces: title, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter, 3 field, 2
-    // highlighted rows, the thumb.
-    assert(1 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 1 <= box_cap);
+    // Faces: title, 7 groups, 3 buttons, 3 per slider, 2 per toggle (the title's too), 2
+    // meter, 3 field, 2 highlighted rows, the thumb.
+    assert(1 + 7 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 <= box_cap);
     assert(2 * knob_names.len <= arc_cap);
-    // Areas: every widget, the view and its thumb, and the rows drawn.
-    assert(3 + 2 + 4 + 3 + 1 + 2 + rows_drawn_max <= area_cap);
+    // Areas: every widget, the title's toggle, the view and its thumb, and the rows drawn.
+    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max <= area_cap);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
 }
 
@@ -489,6 +569,8 @@ test "gallery layout at 1280 by 720" {
     const app = new_app();
     const cx = frame(app);
     try expect_rect(area_rect(app.buttons[0].id), 24, 72, 160, 40);
+    // The title's toggle: its pill 8 px into its 160 px cell at x 156, centered in the bar.
+    try expect_rect(area_rect(theme_id), 164, 24, 44, 24);
     try expect_rect(area_rect(app.sliders[0].id), 208, 100, 272, 24);
     // Knob cells start at 16 + 176 + 8 + 288 + 8 + 8 = 504; the 72 px rows sit at
     // 64 + 8 + (136 - 72) / 2 = 104, and each ring is centered in its row.
@@ -560,6 +642,118 @@ test "the hover scenario keeps button 1 hovered" {
     _ = try bench.replay_headless(App, app, &test_context, hover, .{ 1280, 720 }, 3);
     try std.testing.expectEqual(@as(f32, 1), app.buttons[1].hover.target);
     try std.testing.expectEqual(app.buttons[1].id, test_context.hovered());
+}
+
+// Locks the `light` scenario (section 4) replayed headless: the toggle is on, the context holds
+// `theme.light` and its record, the restyled colors follow it (slider 0's track, knob 2's
+// accent, the field's text), the field keeps focus with "abc" selected, the drawn rows and
+// group faces use the light colors, and nothing overflows. Toggling back restores
+// `theme.dark` and the step 30 colors.
+test "the light scenario switches the theme and restyles the widgets" {
+    const app = new_app();
+    _ = frame(app);
+    const light = bench.find(App.scenarios, "light").?;
+    _ = try bench.replay_headless(App, app, &test_context, light, .{ 1280, 720 }, light_steps.len + 1);
+    try std.testing.expect(app.light.on);
+    try std.testing.expect(std.meta.eql(theme.light, test_context.theme().*));
+    try std.testing.expectEqual(theme.light.colors.background, test_context.draw.theme.background);
+    try std.testing.expectEqual(theme.light.colors.track[0], app.sliders[0].track.r);
+    try std.testing.expectEqual(theme.light.accents[2][0], app.knobs[2].accent.r);
+    try std.testing.expectEqual(theme.light.colors.text, app.field.style.color);
+    try std.testing.expectEqual(field_id, test_context.focus);
+    try std.testing.expectEqualStrings("abc", app.field.bytes());
+    try std.testing.expectEqual(@as(u32, 0), app.field.edit.selection().start);
+    try std.testing.expectEqual(@as(u32, 3), app.field.edit.selection().end);
+    try std.testing.expectEqualStrings("field abc", app.status_text());
+    const boxes = test_context.draw.items(quads.Box);
+    try std.testing.expectEqual(theme.light.colors.panel, boxes[0].fill);
+    var selection_band = false;
+    for (boxes) |box| selection_band = selection_band or std.meta.eql(box.fill, theme.light.colors.selection);
+    try std.testing.expect(selection_band);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    test_context.event_begin(.{ .frame = 0 });
+    app.restyle(&theme.dark);
+    test_context.set_theme(theme.dark);
+    test_context.event_end();
+    try std.testing.expectEqual(widgets.accents[2], app.knobs[2].accent);
+    try std.testing.expectEqual(theme.dark.colors.track[0], app.sliders[0].track.r);
+}
+
+const Renderer = patchwork.renderer.Renderer(Context.DrawContext);
+
+/// The frame the renderer records for the test context at 1280 by 720.
+fn record(renderer: *Renderer, buffer: *patchwork.commands.CommandBuffer) void {
+    buffer.reset();
+    renderer.frame(buffer, &test_context.draw, .{
+        .width_logical = 1280,
+        .height_logical = 720,
+        .width_px = 1280,
+        .height_px = 720,
+        .scale_120 = 120,
+    }, 0);
+}
+
+// Locks the cost of a theme switch (section 3a) as the renderer records it: the click on the
+// "light" toggle draws once and records one stream whose first write is the whole 256-byte
+// uniform and whose pass is direct (every tile changed), cleared to light's background; the
+// thumb then eases over frames that each repaint only the toggle (cached); once settled the
+// gallery records nothing.
+test "a theme switch records one uniform write and one full repaint" {
+    const static = struct {
+        var renderer: Renderer = undefined;
+        var buffer: patchwork.commands.CommandBuffer = undefined;
+    };
+    const renderer = &static.renderer;
+    const buffer = &static.buffer;
+    const app = new_app();
+    renderer.init();
+    buffer.* = .init();
+    renderer.setup(buffer, &test_context.draw);
+    _ = frame(app);
+    record(renderer, buffer);
+    record(renderer, buffer);
+    try std.testing.expectEqual(patchwork.renderer.Kind.skipped, renderer.last);
+    const pill = area_rect(theme_id);
+    const point: input.Point = .{ .x = pill.x + 10, .y = pill.y + 10 };
+    ui.dispatch(App, app, &test_context, .{ .pointer_down = input.left_at(point) });
+    ui.dispatch(App, app, &test_context, .{ .pointer_up = input.left_at(point) });
+    ui.dispatch(App, app, &test_context, .pointer_leave);
+    try std.testing.expect(ui.draw_frame(App, app, &test_context, 1280, 720, 120));
+    record(renderer, buffer);
+    try std.testing.expectEqual(patchwork.renderer.Kind.direct, renderer.last);
+    var reader = buffer.reader();
+    const first = reader.next().?.buffer_write;
+    try std.testing.expectEqual(renderer.resources.uniform_buffer, first.id);
+    try std.testing.expectEqual(@as(u32, 256), first.data.len);
+    var uniform_writes: u32 = 0;
+    var written: u32 = 0;
+    var writes: u32 = 0;
+    reader = buffer.reader();
+    while (reader.next()) |op| switch (op) {
+        .buffer_write => |write| {
+            writes += 1;
+            written += write.data.len;
+            if (write.id == renderer.resources.uniform_buffer) uniform_writes += 1;
+        },
+        .pass_begin => |pass| try std.testing.expectEqual(theme.light.colors.background, pass.clear),
+        else => {},
+    };
+    try std.testing.expectEqual(@as(u32, 1), uniform_writes);
+    // The uniform and the three pools' changed ranges: every text and face color moved.
+    try std.testing.expectEqual(@as(u32, 4), writes);
+    try std.testing.expect(written > 256);
+    var frames: u32 = 0;
+    while (ui.animate(App, app, &test_context, 1000.0 / 60.0)) : (frames += 1) {
+        _ = ui.draw_frame(App, app, &test_context, 1280, 720, 120);
+        record(renderer, buffer);
+        try std.testing.expect(renderer.last == .full or renderer.last == .cached);
+        try std.testing.expect(frames < 30);
+    }
+    _ = ui.draw_frame(App, app, &test_context, 1280, 720, 120);
+    record(renderer, buffer);
+    record(renderer, buffer);
+    try std.testing.expectEqual(patchwork.renderer.Kind.skipped, renderer.last);
+    try std.testing.expectEqual(@as(u32, 0), buffer.count);
 }
 
 comptime {
