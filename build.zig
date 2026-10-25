@@ -672,6 +672,10 @@ fn add_test_steps(
             .expected = "contract_skin_missing.Bare: missing " ++
                 "`pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`",
         },
+        .{
+            .path = "test/contract_overlays_none.zig",
+            .expected = "ui.overlays: contract_overlays_none.Bare has no overlay field",
+        },
     };
     for (contracts) |case| {
         const contract = b.createModule(.{

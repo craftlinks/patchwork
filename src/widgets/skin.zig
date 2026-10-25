@@ -4,7 +4,8 @@
 //!
 //! ## 1. Behaviour and Look
 //! A library widget is generic over a skin: `KnobOf(Skin)`, `ButtonOf(Skin)`, `SliderOf(Skin)`,
-//! `ToggleOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, and `TextFieldOf(Skin)`. The behaviour
+//! `ToggleOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, `TextFieldOf(Skin)`, `MenuOf(Skin)` (and
+//! `ContextMenuOf`), and `DropdownOf(Skin)`. The behaviour
 //! (fields, `init`, `handle`, `Action`) is written once in the widget's file. Its `draw` asks
 //! the turtle for the box, culls it, builds a look struct of plain values, and hands it to the
 //! skin, which appends the instances and returns the hit shape the behaviour records:
@@ -32,6 +33,9 @@
 //! MeterOf(S)      meter(cx, MeterLook)                 void     passive
 //! PanelOf(S)      panel(cx, PanelLook)                 void     passive
 //! TextFieldOf(S)  field(cx, FieldLook)                 void     the face and border only
+//! MenuOf(S)       menu_face(cx, MenuFaceLook)          void     the popup's face
+//!                 menu_row(cx, MenuRowLook)            void     one row: band and label
+//! DropdownOf(S)   dropdown(cx, DropdownLook)           ?Shape   the face; its list is MenuOf(S)
 //! ```
 //! - A look carries values, never the widget, so a skin cannot change state. Animator values
 //!   arrive raw in `[0, 1]`; the skin applies the scheme's weights (`cx.theme()`).
@@ -75,6 +79,8 @@ const knob_file = @import("knob.zig");
 const toggle_file = @import("toggle.zig");
 const meter_file = @import("meter.zig");
 const field_file = @import("text_field.zig");
+const menu_file = @import("menu.zig");
+const dropdown_file = @import("dropdown.zig");
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -153,8 +159,35 @@ pub const FieldLook = struct {
     focused: bool,
 };
 
-/// The widgets a skin may cover, one skin function each (the slider two).
-pub const Kind = enum { button, slider, knob, toggle, meter, panel, field };
+/// A menu's popup face: the whole popup rect.
+pub const MenuFaceLook = struct {
+    rect: Rect,
+    clip: Clip,
+};
+
+/// One menu row: its rect, its label in `style`, whether it is enabled, and whether it is the
+/// highlighted row.
+pub const MenuRowLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    style: text.Style,
+    enabled: bool,
+    highlighted: bool,
+};
+
+/// A dropdown's face: its box, the selected item's label, the raw hover value, and whether its
+/// list is open.
+pub const DropdownLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    hover: f32,
+    open: bool,
+};
+
+/// The widgets a skin may cover, one skin function each (the slider and the menu two).
+pub const Kind = enum { button, slider, knob, toggle, meter, panel, field, menu, dropdown };
 
 /// The first reason `S` cannot skin `widget`, naming `S` and the function, or null.
 pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
@@ -162,14 +195,22 @@ pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
         .@"struct", .@"union", .@"enum", .@"opaque" => {},
         else => return @typeName(S) ++ ": a skin must be a struct type",
     }
+    if (widget == .menu) {
+        const face = "pub fn menu_face(cx, widgets.MenuFaceLook) void";
+        if (problem(S, "menu_face", &.{ null, MenuFaceLook }, void, face, "void")) |message| {
+            return message;
+        }
+        const row = "pub fn menu_row(cx, widgets.MenuRowLook) void";
+        return problem(S, "menu_row", &.{ null, MenuRowLook }, void, row, "void");
+    }
     const name = @tagName(widget);
     const result = switch (widget) {
-        .button, .slider, .knob, .toggle => "?widgets.Shape",
-        .meter, .panel, .field => "void",
+        .button, .slider, .knob, .toggle, .dropdown => "?widgets.Shape",
+        .meter, .panel, .field, .menu => "void",
     };
     const Result = switch (widget) {
-        .button, .slider, .knob, .toggle => ?Shape,
-        .meter, .panel, .field => void,
+        .button, .slider, .knob, .toggle, .dropdown => ?Shape,
+        .meter, .panel, .field, .menu => void,
     };
     const look = switch (widget) {
         .button => "ButtonLook",
@@ -179,6 +220,8 @@ pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
         .meter => "MeterLook",
         .panel => "PanelLook",
         .field => "FieldLook",
+        .dropdown => "DropdownLook",
+        .menu => unreachable,
     };
     const Look = @field(@This(), look);
     const shown = "pub fn " ++ name ++ "(cx, widgets." ++ look ++ ") " ++ result;
@@ -355,6 +398,65 @@ pub const Default = struct {
             .border_width = field_file.field_border_px,
             .radius = field_file.field_radius,
         }));
+    }
+
+    /// The popup face in `colors.panel` with a one-pixel `colors.control` border.
+    pub fn menu_face(cx: anytype, look: MenuFaceLook) void {
+        assert(look.rect.width > 0);
+        assert(look.rect.height > 0);
+        const colors = &cx.theme().colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.panel,
+            .border_color = colors.control,
+            .border_width = menu_file.menu_border_px,
+            .radius = menu_file.menu_radius,
+        });
+    }
+
+    /// The highlight band in `colors.selection` (inset by `menu_band_inset`), then the label
+    /// inside `menu_pad_x`, at half alpha when disabled.
+    pub fn menu_row(cx: anytype, look: MenuRowLook) void {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        if (look.highlighted) {
+            const band = ui.cx.inset(look.rect, .xy(menu_file.menu_band_inset, 0));
+            const fill = cx.theme().colors.selection;
+            kit.face(cx, band, look.clip, .{ .fill = fill, .radius = menu_file.menu_band_radius });
+        }
+        var style = look.style;
+        if (!look.enabled) style.color[3] *= 0.5;
+        const inner = ui.cx.inset(look.rect, .xy(menu_file.menu_pad_x, 0));
+        kit.label(cx, style, look.label, inner, look.clip, menu_file.menu_text_options);
+    }
+
+    /// A button-like face in `colors.track` with a `colors.control` border (`colors.focus`
+    /// while the list is open), lightened by hover, the label at the left, and a chevron
+    /// (two `draw.Path` segments) at the right. The face is the hit shape.
+    pub fn dropdown(cx: anytype, look: DropdownLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.track,
+            .border_color = if (look.open) colors.focus else colors.control,
+            .border_width = menu_file.menu_border_px,
+            .radius = menu_file.menu_radius,
+            .hover = kit.weight(look.hover, scheme.hover_lighten),
+        });
+        const chevron = dropdown_file.chevron_points(look.rect);
+        const stroke: quads.path.Stroke = .{
+            .color = colors.text,
+            .width = dropdown_file.chevron_stroke,
+            .hover = 0,
+        };
+        _ = quads.path.polyline(cx.drawing(), &chevron, stroke, look.clip);
+        var inner = ui.cx.inset(look.rect, .xy(menu_file.menu_pad_x, 0));
+        inner.width -= dropdown_file.chevron_room;
+        if (inner.width > 0) {
+            kit.label(cx, scheme.name, look.label, inner, look.clip, menu_file.menu_text_options);
+        }
+        return .{ .rect = look.rect, .radius = menu_file.menu_radius };
     }
 };
 

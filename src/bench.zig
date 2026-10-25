@@ -25,7 +25,8 @@
 //! count is its step count. A scenario with an empty `cycle` measures the frames the app
 //! presents by itself (a transport driven by the app timer). Steps address areas of the last
 //! frame by `Target`, so they survive layout changes; an unknown target ends the run with its
-//! name. Pointer steps: `click` and `click_at` press and release, then leave the window;
+//! name. Pointer steps: `click` and `click_at` press and release, then leave the window, and
+//! `right_click` does the same with the right button (a context menu);
 //! `wheel` turns at the centre, then leaves; `hover` moves to a point and stays, so hover
 //! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
 //! pointer stays at the end point.
@@ -154,6 +155,8 @@ pub const Step = union(enum) {
     /// A left click at the target's centre, then the pointer leaves the window.
     click: Target,
     click_at: At,
+    /// A right click at the point, then the pointer leaves the window.
+    right_click: At,
     wheel: Turn,
     /// The pointer moves to the point and stays there: no leave, so the target stays hovered.
     hover: At,
@@ -209,7 +212,7 @@ fn steps_invalid(steps: []const Step) bool {
         switch (step) {
             .key => |press| if (press.text.len > input.key_text_cap) return true,
             .wait => |frames| if (frames == 0) return true,
-            .click, .click_at, .wheel, .hover, .drag => {},
+            .click, .click_at, .right_click, .wheel, .hover, .drag => {},
         }
     }
     return false;
@@ -320,11 +323,11 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[1] = .{ .key_up = key };
             return 2;
         },
-        .click, .click_at => {
+        .click, .click_at, .right_click => {
             const r = rect.?;
             const offset: [2]f32 = switch (step) {
                 .click => .{ r[2] / 2, r[3] / 2 },
-                .click_at => |at| .{ at.x, at.y },
+                .click_at, .right_click => |at| .{ at.x, at.y },
                 else => unreachable,
             };
             const x = r[0] + offset[0];
@@ -333,7 +336,7 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
                 .x = x,
                 .y = y,
                 .time_ms = time_ms,
-                .button = .left,
+                .button = if (step == .right_click) .right else .left,
                 .mods = .none,
             };
             out[0] = .{ .pointer_move = .{ .x = x, .y = y } };
@@ -384,7 +387,7 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
 pub fn step_target(step: Step) ?Target {
     return switch (step) {
         .click => |target| target,
-        .click_at => |at| at.target,
+        .click_at, .right_click => |at| at.target,
         .wheel => |turn| turn.target,
         .hover => |at| at.target,
         .drag => |drag| drag.target,
@@ -1150,6 +1153,21 @@ test "hover and drag steps dispatch exactly their events" {
     try testing.expectEqual(@as(f32, 5), out[3].pointer_up.y);
     try testing.expectEqual(input.MouseButton.left, out[3].pointer_up.button);
     try testing.expectEqual(areas.id("a", 1), step_target(drag).?.id);
+}
+
+// Locks the right click: move to the point from the target's top-left (10 + 5, 20 + 6), press
+// and release the right button there, then leave, like a click.
+test "a right click presses the right button at its point" {
+    var out: [event_cap]input.Event = undefined;
+    const rect: [4]f32 = .{ 10, 20, 40, 30 };
+    const right: Step = .{ .right_click = .{ .target = area("a", 2), .x = 5, .y = 6 } };
+    try testing.expectEqual(@as(u32, 4), step_events(right, rect, 3, &out));
+    try testing.expectEqual(input.Point{ .x = 15, .y = 26 }, out[0].pointer_move);
+    try testing.expectEqual(input.MouseButton.right, out[1].pointer_down.button);
+    try testing.expectEqual(@as(f32, 15), out[1].pointer_down.x);
+    try testing.expectEqual(input.MouseButton.right, out[2].pointer_up.button);
+    try testing.expect(out[3] == .pointer_leave);
+    try testing.expectEqual(areas.id("a", 2), step_target(right).?.id);
 }
 
 // Locks validation in both spaces: a good list passes, and each rule names the scenario.

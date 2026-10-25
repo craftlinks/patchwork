@@ -102,10 +102,14 @@ pub const point_cap_max: u32 = 65536;
 pub const layer_count: u32 = 8;
 
 /// A draw layer, `0 .. layer_count`. `base` holds ordinary content and `overlay` content that
-/// must cover it, such as tooltips; other values are free for an app's own use.
+/// must cover it, such as an app's own hover boxes; `popup` holds menus and dialogs
+/// (`ui.Context.begin_popup`) and `tooltip` tooltips, above everything else. Other values are
+/// free for an app's own use (canvases take 1 to 4).
 pub const Layer = enum(u8) {
     base = 0,
     overlay = 4,
+    popup = 6,
+    tooltip = 7,
     _,
 };
 
@@ -684,6 +688,9 @@ fn clip_ordered(clip: [4]f32) bool {
 comptime {
     assert(layer_count == 8);
     assert(@backingInt(Layer.overlay) < layer_count);
+    assert(@backingInt(Layer.overlay) < @backingInt(Layer.popup));
+    assert(@backingInt(Layer.popup) < @backingInt(Layer.tooltip));
+    assert(@backingInt(Layer.tooltip) == layer_count - 1);
     // The sort key of a textured type must fit a u16.
     assert(layer_count * textures.texture_cap <= 65536);
     // One bit per layer in the view masks.

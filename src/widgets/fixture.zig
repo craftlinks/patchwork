@@ -19,10 +19,11 @@ pub const box_cap: u32 = 16;
 const draw_types = [_]draw.DrawType{
     .{ .type = draw.Box, .cap = box_cap },
     .{ .type = draw.Arc, .cap = 16 },
-    .{ .type = draw.Glyph, .cap = 64 },
+    .{ .type = draw.Glyph, .cap = 128 },
+    .{ .type = draw.Path, .cap = 8 },
 };
 
-pub const Context = ui.Context(draw.Context(&draw_types, 16, 0), 16);
+pub const Context = ui.Context(draw.Context(&draw_types, 16, 64), 16);
 
 /// A freshly initialized static context, so tests keep the pools off the stack.
 pub fn context() *Context {

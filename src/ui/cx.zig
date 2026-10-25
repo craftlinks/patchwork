@@ -49,6 +49,24 @@
 //! without placing it in its parent's flow, so a canvas places modules at their world rects.
 //! Its `end` aligns its children as usual but neither shifts it nor advances the parent.
 //!
+//! ## 3c. Popups
+//! A popup (a menu, a dropdown's list, a dialog) is drawn by its owner at the end of
+//! `App.draw` (`ui.overlays`), when only the root is open. `begin_popup(id, rect, layout, dim)`
+//! switches to `Layer.popup`, appends a black face over the window at alpha `dim` (0 for none,
+//! a dialog's dimming otherwise), records the backdrop area `popup_backdrop(id)` over the whole
+//! window, and opens a free container (section 3b) at `rect` under the window clip, so nothing
+//! the app opened clips it; `end_popup` closes it and restores the layer. Resolution prefers
+//! the highest layer and then the last appended (`ui/areas.zig`, section 4), so the popup's own
+//! areas, recorded after the backdrop, take the pointer over them, and the backdrop takes it
+//! everywhere else: a press outside reaches no base widget, so it only dismisses. One popup per
+//! frame (`popup.popup_depth_max`), never inside a canvas, and never while the popup layer is
+//! bound offscreen (asserted).
+//!
+//! A widget that opens a popup calls `request_popup(id)`, which owes a draw. The owner's draw
+//! then meets the request with `begin_popup` (or `skip_popup` when its anchor was not drawn),
+//! and in safe builds `end_frame` panics naming the id when nothing met it: an app that forgot
+//! `ui.overlays` learns it on the first open, not by a menu that never shows.
+//!
 //! ## 4. Alignment After the Fact
 //! At `end`, `turtle.main_shift` (main-axis alignment of the children) and then
 //! `turtle.self_shift` (a fit container's own cross alignment) each give one delta. The delta
@@ -155,6 +173,7 @@ const turtle = @import("turtle.zig");
 const areas = @import("areas.zig");
 const view = @import("view.zig");
 const canvas = @import("canvas.zig");
+const popup = @import("popup.zig");
 
 pub const Rect = draw.Rect;
 pub const Clip = draw.Clip;
@@ -265,6 +284,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         view: draw.View,
         layer_before: draw.Layer,
     };
+    // The open popup (section 3c).
+    const Popup = struct {
+        id: Id,
+        layer_before: draw.Layer,
+    };
     return struct {
         const Self = @This();
 
@@ -331,6 +355,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         audio_dropped: u32,
         /// The canvas being drawn, if any (section 3a).
         canvas_open: ?Canvas,
+        /// The popup being drawn, if any, and the popups drawn this frame (section 3c).
+        popup_open: ?Popup,
+        popup_count: u32,
+        /// The popup a widget opened (`request_popup`) and the one this frame drew or skipped;
+        /// safe builds check at `end_frame` that a request was met (section 3c).
+        popup_requested: Id,
+        popup_met: Id,
         /// The app's scheme (section 9b); `draw.theme` is its record.
         scheme: theme_module.Scheme,
         /// What `overflow_report` last returned or saw (section 10).
@@ -384,6 +415,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.audio_on = false;
             self.audio_dropped = 0;
             self.canvas_open = null;
+            self.popup_open = null;
+            self.popup_count = 0;
+            self.popup_requested = .none;
+            self.popup_met = .none;
             self.overflow_seen = .zero;
             self.scheme = theme_module.dark;
             self.draw.theme = self.scheme.record();
@@ -518,6 +553,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.area_overflow = 0;
             self.stamps.next_frame();
             self.clip_total = 0;
+            self.popup_count = 0;
+            self.popup_met = .none;
             self.dirty = false;
             self.phase = .draw;
             self.stack[0] = self.entry_of(
@@ -533,8 +570,20 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         pub fn end_frame(self: *Self) bool {
             assert(self.phase == .draw);
             assert(self.depth == 1);
+            assert(self.popup_open == null);
             self.depth = 0;
             self.phase = .idle;
+            if (self.popup_requested != .none) {
+                // A widget opened a popup that no draw_overlay reached (section 3c).
+                if (std.debug.runtime_safety and self.popup_met != self.popup_requested) {
+                    std.debug.panic(
+                        "popup {x} was requested but not drawn: call ui.overlays(cx, app) " ++
+                            "at the end of App.draw",
+                        .{@backingInt(self.popup_requested)},
+                    );
+                }
+                self.popup_requested = .none;
+            }
             if (self.focus != .none) {
                 if (self.find(self.focus)) |focused_area| {
                     self.focus_rect = rect_of(focused_area.rect);
@@ -855,6 +904,80 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.depth += 1;
             assert(self.depth >= 2);
             return rect;
+        }
+
+        // --------------------------------------------------------------- popups
+
+        /// Opens popup `id` at `rect` (section 3c): switches to `Layer.popup`, appends a dimmed
+        /// face over the window when `dim > 0` (its alpha), records the backdrop area
+        /// `popup_backdrop(id)` over the whole window, and opens a free container at `rect`
+        /// laid out by `layout` under the window clip. Only at the root, outside a canvas, one
+        /// popup per frame, and never while the popup layer draws offscreen. Returns `rect`.
+        pub fn begin_popup(self: *Self, id: Id, rect: Rect, layout: turtle.Layout, dim: f32) Rect {
+            assert(self.phase == .draw);
+            assert(self.depth == 1);
+            assert(self.canvas_open == null);
+            assert(self.popup_open == null);
+            assert(self.popup_count < popup.popup_depth_max);
+            assert(dim >= 0 and dim <= 1);
+            assert(rect.width > 0 and rect.height > 0);
+            const popup_index: u8 = @backingInt(draw.Layer.popup);
+            assert(self.draw.binding_of(popup_index) == null);
+            assert(self.draw.view_of(popup_index) == null);
+            const before = self.draw.layer(.popup);
+            const window_clip = self.stack[0].clip.?;
+            if (dim > 0) {
+                const look: draw.BoxLook = .{ .fill = .{ 0, 0, 0, dim } };
+                self.append(draw.Box, null, .of(self.window, window_clip, look)) catch |err| {
+                    switch (err) {
+                        error.PoolFull, error.BatchFull => {},
+                        error.EdgeNotPositive, error.ClipUnordered => unreachable,
+                    }
+                };
+            }
+            self.area(self.popup_backdrop(id), self.window, 0, plain);
+            self.popup_open = .{ .id = id, .layer_before = before };
+            self.popup_count += 1;
+            self.popup_met = id;
+            const opened = self.begin_at(rect, layout);
+            assert(self.depth == 2);
+            return opened;
+        }
+
+        /// Closes the open popup and restores the layer it opened over.
+        pub fn end_popup(self: *Self) void {
+            assert(self.depth == 2);
+            const open = self.popup_open.?;
+            assert(self.stack[1].free);
+            _ = self.end();
+            _ = self.draw.layer(open.layer_before);
+            self.popup_open = null;
+            assert(self.depth == 1);
+            assert(self.draw.layer_now != .popup or open.layer_before == .popup);
+        }
+
+        /// The id of popup `id`'s backdrop area, which takes every press outside the popup.
+        pub fn popup_backdrop(self: *const Self, id: Id) Id {
+            assert(id != .none);
+            assert(self.depth <= turtle.depth_max);
+            return id.derive(popup.backdrop_salt);
+        }
+
+        /// Notes that popup `id` opened and owes its first draw: safe builds check at the end
+        /// of that draw that its owner drew it or skipped it (section 3c). Not during a draw.
+        pub fn request_popup(self: *Self, id: Id) void {
+            assert(self.phase != .draw);
+            assert(id != .none);
+            self.popup_requested = id;
+            self.redraw();
+        }
+
+        /// Notes that the owner of popup `id` reached it this frame but drew nothing, because
+        /// its anchor was not drawn (section 3c). Draw phase.
+        pub fn skip_popup(self: *Self, id: Id) void {
+            assert(self.phase == .draw);
+            assert(id != .none);
+            self.popup_met = id;
         }
 
         // ---------------------------------------------------------------- areas
@@ -2112,4 +2235,112 @@ test "an overflow is reported once per change" {
     context.area_overflow = 1;
     const three: Overflow = .{ .instances = 2, .areas = 1, .glyphs = 0 };
     try testing.expectEqual(@as(?Overflow, three), context.overflow_report());
+}
+
+/// One frame with a base button at (20, 20, 100, 40) and, when `open`, popup `menu` at
+/// (200, 100, 120, 60) holding one row area over its top half; `dim` as in `begin_popup`.
+fn popup_frame(context: *TestContext, open: bool, dim: f32) void {
+    const menu = areas.id("menu", 0);
+    context.begin_frame(400, 300, 120);
+    box(context, rect_at(20, 20, 100, 40));
+    context.area(areas.id("button", 0), rect_at(20, 20, 100, 40), 0, plain);
+    if (open) {
+        const rect = rect_at(200, 100, 120, 60);
+        const inside = context.begin_popup(menu, rect, .{ .flow = .down }, dim);
+        try_expect(context.draw.layer_now == .popup);
+        box(context, inside);
+        context.area(menu.derive(0), context.walk(sized(.fill, .{ .fixed = 30 })), 0, plain);
+        context.end_popup();
+    }
+    try_expect(context.draw.layer_now == .base);
+    _ = context.end_frame();
+}
+
+fn try_expect(ok: bool) void {
+    assert(ok);
+}
+
+// Locks `begin_popup` (section 3c): the backdrop is the first area on the popup layer and
+// covers the window, the popup's row follows it on the same layer, the container is the
+// popup's rect under the window clip, the layer is restored, and a `dim` of 0.4 appends one
+// black face at alpha 0.4 over the window under the popup's face.
+test "begin_popup records the backdrop first on the popup layer and restores the layer" {
+    const context = new_context();
+    const menu = areas.id("menu", 0);
+    popup_frame(context, true, 0);
+    const list = context.area_list();
+    try testing.expectEqual(@as(usize, 3), list.len);
+    try testing.expectEqual(context.popup_backdrop(menu), list[1].id);
+    try testing.expectEqual(@as(u8, 6), list[1].layer);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 400, 300 }, &list[1].rect);
+    try testing.expectEqual(menu.derive(0), list[2].id);
+    try testing.expectEqual(@as(u8, 6), list[2].layer);
+    try testing.expectEqualSlices(f32, &.{ 200, 100, 120, 30 }, &list[2].rect);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 400, 300 }, &list[2].clip);
+    try testing.expectEqual(@as(usize, 2), context.draw.items(draw.Box).len);
+    popup_frame(context, true, 0.4);
+    const boxes = context.draw.items(draw.Box);
+    try testing.expectEqual(@as(usize, 3), boxes.len);
+    try testing.expectEqualSlices(f32, &.{ 0, 0, 400, 300 }, &boxes[1].rect);
+    try testing.expectEqual([4]f32{ 0, 0, 0, 0.4 }, boxes[1].fill);
+    try testing.expectEqual(draw.Layer.popup, context.draw.layer_at(draw.Box, 1));
+    try testing.expectEqual(draw.Layer.popup, context.draw.layer_at(draw.Box, 2));
+}
+
+// Locks resolution under a popup (section 3c): a point over the base button resolves to the
+// backdrop, a point over the row to the row, and a press outside reaches the backdrop as `down`
+// while the button under it sees nothing, then the release gives the button no `up`.
+test "a popup's backdrop takes every press outside it" {
+    const context = new_context();
+    const menu = areas.id("menu", 0);
+    const button = areas.id("button", 0);
+    const backdrop = context.popup_backdrop(menu);
+    popup_frame(context, false, 0);
+    var out: [3]Hit = undefined;
+    const ids = [_]Id{ button, backdrop, menu.derive(0) };
+    send(context, .{ .pointer_move = .{ .x = 50, .y = 30 } }, &ids, &out);
+    try testing.expectEqual(Hit.hover_in, out[0]);
+    popup_frame(context, true, 0);
+    send(context, .{ .pointer_move = .{ .x = 50, .y = 30 } }, &ids, &out);
+    try testing.expectEqual(backdrop, context.hot);
+    try testing.expectEqual(Hit.hover_out, out[0]);
+    try testing.expectEqual(Hit.hover_in, out[1]);
+    send(context, .{ .pointer_move = .{ .x = 250, .y = 110 } }, &ids, &out);
+    try testing.expectEqual(menu.derive(0), context.hot);
+    try testing.expectEqual(Hit.hover_in, out[2]);
+    send(context, .{ .pointer_move = .{ .x = 250, .y = 150 } }, &ids, &out);
+    try testing.expectEqual(backdrop, context.hot);
+    const at: input.Point = .{ .x = 50, .y = 30 };
+    send(context, .{ .pointer_down = input.left_at(at) }, &ids, &out);
+    try testing.expect(out[1] == .down);
+    try testing.expectEqual(Hit.none, out[0]);
+    // The owner dismisses and the next frame has no popup; the release still ends the
+    // backdrop's capture, so the button gets no click.
+    popup_frame(context, false, 0);
+    send(context, .{ .pointer_up = input.left_at(at) }, &ids, &out);
+    try testing.expect(out[1] == .up);
+    try testing.expect(out[0] != .up);
+    try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks the request check's bookkeeping (section 3c): a request is met by `begin_popup` or
+// `skip_popup` in the next draw and cleared there, so the frame after owes nothing.
+test "a popup request is met by the next draw" {
+    const context = new_context();
+    const menu = areas.id("menu", 0);
+    popup_frame(context, false, 0);
+    context.event_begin(.{ .frame = 0 });
+    context.request_popup(menu);
+    context.event_end();
+    try testing.expect(context.dirty);
+    try testing.expectEqual(menu, context.popup_requested);
+    popup_frame(context, true, 0);
+    try testing.expectEqual(Id.none, context.popup_requested);
+    context.event_begin(.{ .frame = 0 });
+    context.request_popup(menu);
+    context.event_end();
+    context.begin_frame(400, 300, 120);
+    context.skip_popup(menu);
+    _ = context.end_frame();
+    try testing.expectEqual(Id.none, context.popup_requested);
 }
