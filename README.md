@@ -107,8 +107,18 @@ patchwork/
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
 │   ├── ui/canvas.zig           # Pan/zoom canvases: CanvasState, the zoom ladder, wheel and drag
 │   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
-│   ├── widgets.zig             # Widgets (Panel, Label, Button, Slider, Knob, Meter, Toggle,
-│   │                           #   TextField)
+│   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
+│   ├── widgets/kit.zig         # The widget kit: append, face, arc, label, step, aim, weight,
+│   │                           #   clicked, Interaction, Paint, the hover and press constants
+│   ├── widgets/label.zig       # One file per widget, with its constants, geometry, and tests:
+│   ├── widgets/panel.zig       #   Label, Panel, Button, Slider, Knob (and the shared ring and
+│   ├── widgets/button.zig      #   label-column geometry, accents), Meter, Toggle, TextField
+│   ├── widgets/slider.zig
+│   ├── widgets/knob.zig
+│   ├── widgets/meter.zig
+│   ├── widgets/toggle.zig
+│   ├── widgets/text_field.zig
+│   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
 │   ├── editor/tokenizer.zig    # Patch language tokenizer: per-line states, seven classes
@@ -184,8 +194,10 @@ patchwork/
 │   │   └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
 │   ├── audio/                  # Audio data into the UI
 │   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
-│   └── canvas/                 # Pan and zoom
-│       └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
+│   ├── canvas/                 # Pan and zoom
+│   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
+│   └── gallery/                # Every library widget on one screen (phase 6 regression app)
+│       └── app.zig             # Gallery App: built only from widgets.kit and layout defaults
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frame dumps differ
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
@@ -248,8 +260,13 @@ zig build run-canvas      # Build and run the module canvas natively
 zig build wasm-canvas     # Compile it to zig-out/bin/canvas.wasm
 zig build serve-canvas    # Serve it on localhost (prints the address)
 
+# Examples (Widget Gallery)
+zig build run-gallery     # Build and run the widget gallery natively
+zig build wasm-gallery    # Compile it to zig-out/bin/gallery.wasm
+zig build serve-gallery   # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the eight examples
+zig build test            # Run unit tests across the library and the nine examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, and an
                           # `Audio` source without `audio`
@@ -272,11 +289,12 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 zig-out/
 ├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
 │   data, wave, fx, audio,
-│   canvas
+│   canvas, gallery
 ├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
 │   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
 │   wave.wasm, fx.wasm,         #   `zig build wasm-wave`, `zig build wasm-fx`,
-│   audio.wasm, canvas.wasm     #   `zig build wasm-audio`, and `zig build wasm-canvas`
+│   audio.wasm, canvas.wasm,    #   `zig build wasm-audio`, `zig build wasm-canvas`,
+│   gallery.wasm                #   and `zig build wasm-gallery`
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -402,9 +420,7 @@ pub const App = struct {
 
     pub fn draw(app: *App, cx: *Context) void {
         const panel: widgets.Panel = .{ .paint = widgets.paint_of(theme.chrome.panel, 8) };
-        var layout = ui.flow_of(.down);
-        layout.padding = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
-        _ = panel.begin(cx, ui.sized(.fill, .fill), layout);
+        _ = panel.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down, .padding = .all(16) });
         app.gain.draw(cx, ui.sized(.{ .fixed = 144 }, .{ .fixed = widgets.knob_height }));
         _ = cx.end();
     }
@@ -441,8 +457,11 @@ Nesting is the call structure; the stack holds at most 32 open containers.
 
 - **Layout** (on the container): `flow` (`.right`, `.down`, or `.overlay`), `spacing`,
   `padding`, `alignment` per axis, and `clip`, which intersects everything inside with the
-  container's box.
-- **Walk** (on the child): `width`, `height`, and `margin`. A `Size` is `fixed`, `fill` (on
+  container's box. Only `flow` is required; the rest default to none, so a container opens
+  in one statement: `cx.begin(walk, .{ .flow = .down, .spacing = 8, .padding = .all(12) })`.
+  `Inset.all(v)`, `Inset.xy(x, y)`, and `Inset.sides(left, top, right, bottom)` build insets.
+- **Walk** (on the child): `width`, `height`, and `margin` (none by default; `ui.sized(w, h)`
+  is `.{ .width = w, .height = h }`). A `Size` is `fixed`, `fill` (on
   the main axis, what remains at placement, so a second fill gets 0), `share(n)` (one n-th of
   the inner span minus spacing: `n` siblings tile it exactly), or `fit` (containers only:
   resolved at `end` from the children's extent).
@@ -471,6 +490,18 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   `ui.route(cx, event, app)` cannot forget one). It returns how many acted.
 - **Widget sizes.** `widgets.Knob.init(...).sized(40)` sets one knob's ring (the labels follow
   it), and `Meter.track_h` one meter's track; the defaults are the shared constants.
+- **Widget kit.** The library widgets are built from `widgets.kit`, which an app's own widget
+  uses the same way: `kit.face(cx, rect, clip, look)` appends a `draw.Box` (none for an empty
+  rect), `kit.arc` a `draw.Arc`, `kit.label` places text, `kit.append` appends any draw type
+  and skips it when its pool is full (the context counts it), `kit.step` and `kit.aim` ease
+  animators and owe redraws, `kit.weight` and `Paint.look(hover, down)` turn animator values
+  into mix weights, `kit.clicked(cx, id, event)` makes a clickable row (true on a release
+  inside, a repaint on hover), and `kit.Interaction` (or `kit.respond` on a widget's own
+  animators) is the hover and press table every library widget follows. The records come from
+  `draw.Box.of(rect, clip, BoxLook)` and `draw.Arc.of(ring, clip, ArcLook)`, whose looks
+  default to no border, hover, or press and the full sweep; `ui` and `draw` use the
+  constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
+  re-exports every name.
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
   the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
   and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
@@ -685,6 +716,18 @@ the visible modules and cables, and the glyph cache's epoch, which a full zoom s
 at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), and `zoomed`
 (three rungs in and five steps right, for the browser compare).
 
+### 9. Widget Gallery (`examples/gallery/app.zig`)
+
+Every library widget on one fixed 1088 by 640 screen from the top-left, built only from
+`widgets.kit` and the one-statement layouts: three buttons, two sliders, four knobs with
+rings of 56, 40, 56, and 72, three toggles, a meter that follows slider 0, a 240 px text
+field, and a list of 40 clickable rows (`kit.clicked`) in a view, the selected one
+highlighted. The title bar's status line shows the last action ("knob 1 changed 0.75"), so
+the app handles each widget itself rather than through `ui.route`. It is the regression app
+of phases 6 and 7: each step adds a section. Scenarios: `still`, `interact` (a click, two
+drags, a toggle, typing, a wheel, and a row click, then settled), and `hover` (the pointer
+rests on button 1).
+
 ## Pan and Zoom
 
 A canvas draws content in world pixels through a view, `screen = (x, y) + zoom * world`
@@ -751,7 +794,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 - **Scenarios.** An app declares `pub const scenarios: []const bench.Scenario`: a `setup`
   list run once and a `cycle` list repeated while `frames` frames are measured. Steps are
   `key`, `click` and `click_at` (an area of the last frame, by `bench.area(name, index)`),
-  `wheel`, and `wait`. Each step runs when the host is idle and presents one frame; an empty
+  `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
+  move by a delta, release; a zero delta is refused), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
   a name lists the scenarios.

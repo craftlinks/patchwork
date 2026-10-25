@@ -161,6 +161,7 @@ const input = patchwork.input;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
+const kit = widgets.kit;
 const realtime = patchwork.realtime;
 const led = @import("led.zig");
 const badge = @import("badge.zig");
@@ -182,8 +183,8 @@ pub const knobs_per_panel: u32 = 4;
 /// Knobs in the rack, indexed `panel * knobs_per_panel + knob`.
 pub const knob_count: u32 = panel_count * knobs_per_panel;
 
-const frame_padding: quads.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
-const panel_padding: quads.Inset = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 };
+const frame_padding: quads.Inset = .all(16);
+const panel_padding: quads.Inset = .all(8);
 const panel_gap_px: f32 = 8;
 const title_band_px: f32 = 24;
 const meter_column_px: f32 = 80;
@@ -507,11 +508,7 @@ pub const App = struct {
         _ = app.presets.handle(cx, preset_view_id, event_value);
         var row = app.preset_range.first;
         while (row < app.preset_range.end) : (row += 1) {
-            switch (cx.hit(ui.id("preset", row), event_value)) {
-                .hover_in, .hover_out => cx.redraw(),
-                .up => |up| if (up.inside) app.select_preset(cx, row),
-                .none, .down, .drag, .wheel, .secondary => {},
-            }
+            if (kit.clicked(cx, ui.id("preset", row), event_value)) app.select_preset(cx, row);
         }
         if (app.renaming == null and event_value == .key_down) {
             const press = event_value.key_down;
@@ -555,19 +552,13 @@ pub const App = struct {
     /// Draws the header, the panels, the preset column, the playhead and cables on the cable
     /// layer, and the tooltip on the overlay layer.
     pub fn draw(app: *App, cx: *Context) void {
-        var frame = ui.flow_of(.down);
-        frame.padding = frame_padding;
-        frame.spacing = panel_gap_px;
+        const frame: ui.Layout = .{ .flow = .down, .spacing = panel_gap_px, .padding = frame_padding };
         _ = cx.begin(ui.sized(.fill, .fill), frame);
         draw_header(cx, cx.walk(ui.sized(.fill, .{ .fixed = header_px })));
-        var body = ui.flow_of(.right);
-        body.spacing = panel_gap_px;
-        _ = cx.begin(ui.sized(.fill, .fill), body);
+        _ = cx.begin(ui.sized(.fill, .fill), .{ .flow = .right, .spacing = panel_gap_px });
         const room = cx.remaining();
-        var column = ui.flow_of(.down);
-        column.spacing = panel_gap_px;
         const panels_w = @max(0, room.width - preset_column_px - panel_gap_px);
-        _ = cx.begin(ui.sized(.{ .fixed = panels_w }, .fill), column);
+        _ = cx.begin(ui.sized(.{ .fixed = panels_w }, .fill), .{ .flow = .down, .spacing = panel_gap_px });
         var panel_index: u32 = 0;
         while (panel_index < panel_count) : (panel_index += 1) {
             app.draw_panel(cx, panel_index);
@@ -592,9 +583,7 @@ pub const App = struct {
 
     /// The list in a panel, then the status line under it. Stores the rows it drew.
     fn draw_presets(app: *App, cx: *Context) void {
-        var column = ui.flow_of(.down);
-        column.spacing = panel_gap_px;
-        _ = cx.begin(ui.sized(.{ .fixed = preset_column_px }, .fill), column);
+        _ = cx.begin(ui.sized(.{ .fixed = preset_column_px }, .fill), .{ .flow = .down, .spacing = panel_gap_px });
         const room = cx.remaining();
         const list_h = std.math.clamp(
             room.height - status_px - panel_gap_px,
@@ -602,9 +591,7 @@ pub const App = struct {
             preset_view_max_px + panel_padding.top + panel_padding.bottom,
         );
         const face: widgets.Panel = .{ .paint = panel_paint };
-        var layout = ui.flow_of(.down);
-        layout.padding = panel_padding;
-        _ = face.begin(cx, ui.sized(.fill, .{ .fixed = list_h }), layout);
+        _ = face.begin(cx, ui.sized(.fill, .{ .fixed = list_h }), .{ .flow = .down, .padding = panel_padding });
         const fill = ui.sized(.fill, .fill);
         const port = cx.begin_view(preset_view_id, fill, ui.flow_of(.down), &app.presets);
         const range = preset_list.visible(app.presets.scroll_y, port.height);
@@ -637,21 +624,11 @@ pub const App = struct {
         const selected = app.preset_selected == row;
         if (selected or cx.hovered() == id) {
             const fill = if (selected) selected_fill else theme.chrome.track;
-            append_or_skip(cx, quads.Box, null, .{
-                .rect = .{ rect.x, rect.y, rect.width, rect.height },
-                .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
-                .fill = fill,
-                .border_color = .{ 0, 0, 0, 0 },
-                .radius = preset_radius,
-                .border_width = 0,
-                .hover = 0,
-                .down = 0,
-            });
+            kit.face(cx, rect, clip, .{ .fill = fill, .radius = preset_radius });
         }
         var bytes: [preset_name_cap]u8 = undefined;
         const name = preset_name(&bytes, row);
-        const inset: quads.Inset = .{ .left = preset_inset_px, .top = 0, .right = 0, .bottom = 0 };
-        const inner = ui.cx.inset(rect, inset);
+        const inner = ui.cx.inset(rect, .sides(preset_inset_px, 0, 0, 0));
         text.place(cx.drawing(), status_style, name, inner, clip, .{
             .align_x = .start,
             .align_y = .center,
@@ -730,9 +707,7 @@ pub const App = struct {
     fn draw_panel(app: *const App, cx: *Context, panel_index: u32) void {
         assert(panel_index < panel_count);
         const face: widgets.Panel = .{ .paint = panel_paint };
-        var layout = ui.flow_of(.down);
-        layout.padding = panel_padding;
-        layout.clip = true;
+        const layout: ui.Layout = .{ .flow = .down, .padding = panel_padding, .clip = true };
         _ = face.begin(cx, ui.sized(.fill, .{ .share = panel_count }), layout);
         const room = cx.remaining();
         const band_h = band_height(room.height);
@@ -764,9 +739,7 @@ pub const App = struct {
         _ = cx.end();
         if (!metered) app.draw_display(cx);
         if (meter_on) {
-            var cell = ui.flow_of(.down);
-            cell.clip = true;
-            _ = cx.begin(ui.sized(.{ .fixed = meter_column_px }, .fill), cell);
+            _ = cx.begin(ui.sized(.{ .fixed = meter_column_px }, .fill), .{ .flow = .down, .clip = true });
             app.meters[panel_index].draw(cx, ui.sized(.fill, .fill));
             _ = cx.end();
         }
@@ -784,16 +757,7 @@ pub const App = struct {
         const cell = cx.walk(walk);
         if (!(cell.height > 2 * display_inset_px)) return;
         const clip = cx.visible(cell) orelse return;
-        append_or_skip(cx, quads.Box, null, .{
-            .rect = .{ cell.x, cell.y, cell.width, cell.height },
-            .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
-            .fill = display_fill,
-            .border_color = .{ 0, 0, 0, 0 },
-            .radius = display_radius,
-            .border_width = 0,
-            .hover = 0,
-            .down = 0,
-        });
+        kit.face(cx, cell, clip, .{ .fill = display_fill, .radius = display_radius });
         cx.area(envelope_id, cell, display_radius, ui.cx.plain);
         var points: [envelope_point_count]quads.Point = undefined;
         envelope_points(&points, stages_of(&app.knobs), plot_of(cell));
@@ -841,16 +805,9 @@ pub const App = struct {
         const plot = plot_of(rect_of(display.rect));
         const at = point_at(stages, plot, app.envelope_phase * stages.total());
         const half = playhead_px * 0.5;
-        append_or_skip(cx, quads.Box, null, .{
-            .rect = .{ at[0] - half, at[1] - half, playhead_px, playhead_px },
-            .clip = display.clip,
-            .fill = theme.chrome.text,
-            .border_color = .{ 0, 0, 0, 0 },
-            .radius = half,
-            .border_width = 0,
-            .hover = 0,
-            .down = 0,
-        });
+        const dot: Rect = .{ .x = at[0] - half, .y = at[1] - half, .width = playhead_px, .height = playhead_px };
+        const clip: quads.Clip = .{ .x0 = display.clip[0], .y0 = display.clip[1], .x1 = display.clip[2], .y1 = display.clip[3] };
+        kit.face(cx, dot, clip, .{ .fill = theme.chrome.text, .radius = half });
     }
 
     /// Hub presses start a cable, drags move its free end, and the release connects it to
@@ -987,7 +944,7 @@ pub const App = struct {
         const clip = cx.visible(band) orelse return;
         const clip_rect: [4]f32 = .{ clip.x0, clip.y0, clip.x1, clip.y1 };
         const y = band.y + (band.height - badge_px) * 0.5;
-        append_or_skip(cx, quads.Image, app.badge_texture, .{
+        kit.append(cx, quads.Image, app.badge_texture, .{
             .rect = .{ band.x + badge_inset_px, y, badge_px, badge_px },
             .clip = clip_rect,
             .uv = .{ 0, 0, 1, 1 },
@@ -998,7 +955,7 @@ pub const App = struct {
         const center_x = meter_x + widgets.ring_inset + widgets.ring_size * 0.5;
         const center_y = band.y + band.height * 0.5;
         const level = app.meters[panel_index].value;
-        append_or_skip(cx, led.Led, null, led.at(center_x, center_y, led_color, level, clip_rect));
+        kit.append(cx, led.Led, null, led.at(center_x, center_y, led_color, level, clip_rect));
     }
 
     /// The hovered knob's name and value in a bordered box on the overlay layer, so it
@@ -1011,15 +968,11 @@ pub const App = struct {
         const box = tooltip_rect(ring.rect);
         const previous = cx.draw.layer(.overlay);
         defer _ = cx.draw.layer(previous);
-        append_or_skip(cx, quads.Box, null, .{
-            .rect = .{ box.x, box.y, box.width, box.height },
-            .clip = .{ window.x0, window.y0, window.x1, window.y1 },
+        kit.face(cx, box, window, .{
             .fill = tooltip_fill,
             .border_color = theme.chrome.text,
-            .radius = tooltip_radius,
             .border_width = tooltip_border_px,
-            .hover = 0,
-            .down = 0,
+            .radius = tooltip_radius,
         });
         var bytes: [tooltip_text_cap]u8 = undefined;
         const label = tooltip_text(&bytes, knob);
@@ -1069,23 +1022,8 @@ fn draw_header(cx: *Context, bar: Rect) void {
     if (bar.width <= 2 * header_inset_px) return;
     if (bar.y + bar.height > cx.window.height) return;
     const window = cx.clip().?;
-    append_or_skip(cx, quads.Box, null, .{
-        .rect = .{ bar.x, bar.y, bar.width, bar.height },
-        .clip = .{ window.x0, window.y0, window.x1, window.y1 },
-        .fill = theme.chrome.panel,
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = header_radius,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    });
-    const sides: quads.Inset = .{
-        .left = header_inset_px,
-        .top = 0,
-        .right = header_inset_px,
-        .bottom = 0,
-    };
-    const inner = ui.cx.inset(bar, sides);
+    kit.face(cx, bar, window, .{ .fill = theme.chrome.panel, .radius = header_radius });
+    const inner = ui.cx.inset(bar, .xy(header_inset_px, 0));
     const bar_clip = ui.cx.clip_of(bar);
     text.place_runs(cx.drawing(), &tempo_runs, inner, bar_clip, .{
         .align_x = .start,
@@ -1128,16 +1066,6 @@ fn draw_title(cx: *Context, title: []const u8, panel_index: u32) void {
     cx.area(ui.id("title", panel_index), area, 0, ui.cx.plain);
 }
 
-/// Appends through `cx`, skipping on a full pool or batch list (the context counts it).
-fn append_or_skip(cx: *Context, comptime T: type, texture: ?quads.TextureId, instance: T) void {
-    assert(instance.rect[2] > 0);
-    assert(instance.rect[3] > 0);
-    cx.append(T, texture, instance) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
-
 /// The id of `knob`'s jack hub.
 fn hub_id(knob: *const widgets.Knob) ui.Id {
     return knob.id.derive(jack_salt);
@@ -1162,15 +1090,12 @@ fn draw_hub(cx: *Context, knob: *const widgets.Knob, row: Rect) void {
         .width = 2 * hub_radius,
         .height = 2 * hub_radius,
     };
-    append_or_skip(cx, quads.Box, null, .{
-        .rect = .{ hub.x, hub.y, hub.width, hub.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+    const accent = knob.accent;
+    kit.face(cx, hub, clip, .{
         .fill = theme.chrome.panel,
-        .border_color = .{ knob.accent.r, knob.accent.g, knob.accent.b, knob.accent.a },
-        .radius = hub_radius,
+        .border_color = .{ accent.r, accent.g, accent.b, accent.a },
         .border_width = hub_border_px,
-        .hover = 0,
-        .down = 0,
+        .radius = hub_radius,
     });
     cx.area(hub_id(knob), hub, hub_radius, patch_flags);
 }

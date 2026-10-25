@@ -40,6 +40,7 @@ const input = patchwork.input;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const kit = patchwork.widgets.kit;
 const fx = quads.fx;
 
 const Rect = quads.Rect;
@@ -188,12 +189,12 @@ pub const App = struct {
         app.draw_scope(cx);
         const alpha = fades[app.fade];
         // One layer: the panel into its target, composited at alpha.
-        const one = arr(one_rect);
+        const one = one_rect.array();
         draw_cx.offscreen(panel_layer, app.panel, one);
         const previous = draw_cx.layer(panel_layer);
         draw_panel(cx, one_rect, 1);
         _ = draw_cx.layer(previous);
-        fx.composite(draw_cx, app.panel, one, one, clip_array(one_rect), alpha, 1, 0);
+        fx.composite(draw_cx, app.panel, one, one, clip_of(one_rect).array(), alpha, 1, 0);
         // Per instance: the same panel, every alpha times alpha.
         draw_panel(cx, each_rect, alpha);
         cx.area(one_id, one_rect, 0, ui.cx.plain);
@@ -210,8 +211,8 @@ pub const App = struct {
     fn draw_scope(app: *App, cx: *Context) void {
         const draw_cx = cx.drawing();
         const inner = inset(scope_rect, 8);
-        const target = arr(inner);
-        const clip = clip_array(inner);
+        const target = inner.array();
+        const clip = clip_of(inner).array();
         draw_cx.offscreen(scope_layer, app.scope, target);
         const previous = draw_cx.layer(scope_layer);
         fx.composite(draw_cx, app.scope, target, target, clip, persistence, 1, fade_bias);
@@ -258,15 +259,9 @@ fn draw_panel(cx: *Context, rect: Rect, alpha: f32) void {
         const card: Rect = .{ .x = rect.x + 28 + offset, .y = rect.y + 40 + offset, .width = 120, .height = 150 };
         append_box(cx, card, scale_alpha(color, alpha), rect, 12);
     }
-    cx.append(quads.Arc, null, .{
-        .rect = .{ rect.x + 64, rect.y + 250, 96, 96 },
-        .clip = clip_array(rect),
-        .color = scale_alpha(.{ 0.55, 0.85, 0.45, 0.8 }, alpha),
-        .thickness = 10,
-        .sweep = 0.7,
-        .hover = 0,
-        .pad = 0,
-    }) catch {};
+    const ring: Rect = .{ .x = rect.x + 64, .y = rect.y + 250, .width = 96, .height = 96 };
+    const ring_look: quads.ArcLook = .{ .color = scale_alpha(.{ 0.55, 0.85, 0.45, 0.8 }, alpha), .thickness = 10, .sweep = 0.7 };
+    cx.append(quads.Arc, null, .of(ring, clip_of(rect), ring_look)) catch {};
     var style = label_style;
     style.color = scale_alpha(theme.chrome.text, alpha);
     text.place(cx.drawing(), style, "translucent cards", .{ .x = rect.x + 16, .y = rect.y + 8, .width = rect.width - 32, .height = 24 }, clip_of(rect), left);
@@ -281,32 +276,11 @@ fn inset(rect: Rect, by: f32) Rect {
 }
 
 fn append_box(cx: *Context, rect: Rect, color: [4]f32, clip: Rect, radius: f32) void {
-    cx.append(quads.Box, null, .{
-        .rect = arr(rect),
-        .clip = clip_array(clip),
-        .fill = color,
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = radius,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
-
-fn arr(rect: Rect) [4]f32 {
-    return .{ rect.x, rect.y, rect.width, rect.height };
+    kit.append(cx, quads.Box, null, .of(rect, clip_of(clip), .{ .fill = color, .radius = radius }));
 }
 
 fn clip_of(rect: Rect) quads.Clip {
     return .{ .x0 = rect.x, .y0 = rect.y, .x1 = rect.x + rect.width, .y1 = rect.y + rect.height };
-}
-
-fn clip_array(rect: Rect) [4]f32 {
-    const clip = clip_of(rect);
-    return .{ clip.x0, clip.y0, clip.x1, clip.y1 };
 }
 
 const fixture = struct {

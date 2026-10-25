@@ -52,6 +52,7 @@ const input = patchwork.input;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const kit = patchwork.widgets.kit;
 const views = @import("views.zig");
 
 const Rect = quads.Rect;
@@ -173,16 +174,12 @@ pub const App = struct {
         text.place(draw_cx, title_style, "data textures, samplers, and blending", band, clip_of(window), left);
         for (0..panel_count) |index| {
             const panel = panel_rect(@intCast(index));
-            append(cx, quads.Box, null, .{
-                .rect = rect_array(panel),
-                .clip = clip_array(window),
+            kit.append(cx, quads.Box, null, .of(panel, clip_of(window), .{
                 .fill = theme.chrome.panel,
                 .border_color = theme.chrome.track,
-                .radius = 6,
                 .border_width = 1,
-                .hover = 0,
-                .down = 0,
-            });
+                .radius = 6,
+            }));
             const label: Rect = .{
                 .x = panel.x,
                 .y = panel.y + panel.height,
@@ -199,9 +196,9 @@ pub const App = struct {
 
     fn draw_heat(app: *App, cx: *Context) void {
         const content = content_rect(0);
-        append(cx, views.Heat, app.heat_texture, .{
-            .rect = rect_array(content),
-            .clip = clip_array(content),
+        kit.append(cx, views.Heat, app.heat_texture, .{
+            .rect = content.array(),
+            .clip = clip_of(content).array(),
         });
         const third = content.height / 3;
         const shade: Rect = .{
@@ -210,27 +207,27 @@ pub const App = struct {
             .width = content.width,
             .height = third,
         };
-        append(cx, views.Shade, null, .{
-            .rect = rect_array(shade),
-            .clip = clip_array(content),
+        kit.append(cx, views.Shade, null, .{
+            .rect = shade.array(),
+            .clip = clip_of(content).array(),
             .color = shade_color,
         });
     }
 
     fn draw_tile(app: *App, cx: *Context) void {
         const content = content_rect(1);
-        append(cx, views.Tile, app.tile_texture, .{
-            .rect = rect_array(content),
-            .clip = clip_array(content),
+        kit.append(cx, views.Tile, app.tile_texture, .{
+            .rect = content.array(),
+            .clip = clip_of(content).array(),
             .uv = tile_uv,
         });
     }
 
     fn draw_history(app: *App, cx: *Context) void {
         const content = content_rect(2);
-        append(cx, views.Bars, app.history_texture, .{
-            .rect = rect_array(content),
-            .clip = clip_array(content),
+        kit.append(cx, views.Bars, app.history_texture, .{
+            .rect = content.array(),
+            .clip = clip_of(content).array(),
             .color = bars_color,
             .head = @floatFromInt(history_head),
             .count = @floatFromInt(history_count),
@@ -251,9 +248,9 @@ fn draw_lights(cx: *Context) void {
     for (light_colors, offsets) |color, offset| {
         const x = center_x + offset[0] * light_side_px - light_side_px / 2;
         const y = center_y + offset[1] * light_side_px - light_side_px / 2;
-        append(cx, views.Light, null, .{
+        kit.append(cx, views.Light, null, .{
             .rect = .{ x, y, light_side_px, light_side_px },
-            .clip = clip_array(content),
+            .clip = clip_of(content).array(),
             .color = color,
         });
     }
@@ -281,28 +278,12 @@ pub fn content_rect(index: u32) Rect {
     };
 }
 
-fn append(cx: *Context, comptime T: type, texture: ?quads.TextureId, instance: T) void {
-    cx.append(T, texture, instance) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
-
 fn full(width: u32, height: u32) quads.TextureRegion {
     return .{ .x = 0, .y = 0, .width = width, .height = height };
 }
 
-fn rect_array(rect: Rect) [4]f32 {
-    return .{ rect.x, rect.y, rect.width, rect.height };
-}
-
 fn clip_of(rect: Rect) quads.Clip {
     return .{ .x0 = rect.x, .y0 = rect.y, .x1 = rect.x + rect.width, .y1 = rect.y + rect.height };
-}
-
-fn clip_array(rect: Rect) [4]f32 {
-    const clip = clip_of(rect);
-    return .{ clip.x0, clip.y0, clip.x1, clip.y1 };
 }
 
 /// The heat field at texel `(x, y)`, `y` from the top (module guide, section 3).

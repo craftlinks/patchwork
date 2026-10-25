@@ -97,21 +97,23 @@ pub const Size = union(enum) {
     share: u8,
 };
 
-/// One child's request: its two spans and its margins.
+/// One child's request: its two spans and its margins, none by default.
 pub const Walk = struct {
     width: Size,
     height: Size,
-    margin: Inset,
+    margin: Inset = zero_inset,
 };
 
 /// How a container places its children. `clip` intersects the clip of everything inside with
-/// the container's border box (`ui/cx.zig`), so it needs a non-fit size on both axes.
+/// the container's border box (`ui/cx.zig`), so it needs a non-fit size on both axes. Only
+/// `flow` is required: by default there is no spacing, padding, alignment, or clip, so a
+/// container opens in one statement, `.{ .flow = .down, .spacing = 8, .padding = .all(12) }`.
 pub const Layout = struct {
     flow: Flow,
-    spacing: f32,
-    padding: Inset,
-    alignment: Align,
-    clip: bool,
+    spacing: f32 = 0,
+    padding: Inset = zero_inset,
+    alignment: Align = .{ .x = 0, .y = 0 },
+    clip: bool = false,
 };
 
 /// One open container. `rect` is its border box; a fit axis holds 0 until `close`.
@@ -127,7 +129,7 @@ pub const Turtle = struct {
     count: u32,
 };
 
-pub const zero_inset: Inset = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+pub const zero_inset: Inset = .all(0);
 
 comptime {
     assert(depth_max == 32);

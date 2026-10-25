@@ -23,7 +23,10 @@
 //! count is its step count. A scenario with an empty `cycle` measures the frames the app
 //! presents by itself (a transport driven by the app timer). Steps address areas of the last
 //! frame by `Target`, so they survive layout changes; an unknown target ends the run with its
-//! name.
+//! name. Pointer steps: `click` and `click_at` press and release, then leave the window;
+//! `wheel` turns at the centre, then leaves; `hover` moves to a point and stays, so hover
+//! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
+//! pointer stays at the end point.
 //!
 //! ## 2a. Headless Replay
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
@@ -73,7 +76,8 @@ pub const sample_cap: u32 = 4096;
 /// Most command-line arguments the native host reads.
 pub const arg_cap: u32 = 16;
 
-/// Most events one step dispatches: move, press, release, leave.
+/// Most events one step dispatches: move, press, release, leave (a click), or move, press,
+/// move, release (a drag).
 pub const event_cap: u32 = 4;
 
 /// Widest image `ppm_row` converts, in pixels.
@@ -114,6 +118,16 @@ pub const Turn = struct {
     dy: f32,
 };
 
+/// A left drag: press at `(from_x, from_y)` from the target's top-left, move by `(dx, dy)`,
+/// release. Not both of `dx` and `dy` are 0.
+pub const Drag = struct {
+    target: Target,
+    from_x: f32,
+    from_y: f32,
+    dx: f32,
+    dy: f32,
+};
+
 /// One scripted action. Each step presents one frame (module guide, section 2).
 pub const Step = union(enum) {
     key: Press,
@@ -121,6 +135,10 @@ pub const Step = union(enum) {
     click: Target,
     click_at: At,
     wheel: Turn,
+    /// The pointer moves to the point and stays there: no leave, so the target stays hovered.
+    hover: At,
+    /// Move to the start, press, move by the delta, release; the pointer rests at the end.
+    drag: Drag,
     /// Frames presented without input.
     wait: u32,
 };
@@ -151,6 +169,9 @@ pub fn validate(comptime scenarios: []const Scenario) ?[]const u8 {
         if (steps_invalid(scenario.setup) or steps_invalid(scenario.cycle)) {
             return "App.scenarios." ++ name ++ ": a key types more than 4 bytes or a wait is 0";
         }
+        if (drag_still(scenario.setup) or drag_still(scenario.cycle)) {
+            return "App.scenarios." ++ name ++ ": a drag moves by 0";
+        }
         for (scenarios[0..index]) |earlier| {
             if (std.mem.eql(u8, earlier.name, name)) {
                 return "App.scenarios: duplicate name " ++ name;
@@ -165,8 +186,17 @@ fn steps_invalid(steps: []const Step) bool {
         switch (step) {
             .key => |press| if (press.text.len > input.key_text_cap) return true,
             .wait => |frames| if (frames == 0) return true,
-            .click, .click_at, .wheel => {},
+            .click, .click_at, .wheel, .hover, .drag => {},
         }
+    }
+    return false;
+}
+
+/// True when a drag of `steps` has `dx == 0` and `dy == 0`.
+fn drag_still(steps: []const Step) bool {
+    for (steps) |step| {
+        if (step != .drag) continue;
+        if (step.drag.dx == 0 and step.drag.dy == 0) return true;
     }
     return false;
 }
@@ -298,6 +328,32 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[2] = .pointer_leave;
             return 3;
         },
+        .hover => |at| {
+            const r = rect.?;
+            out[0] = .{ .pointer_move = .{ .x = r[0] + at.x, .y = r[1] + at.y } };
+            return 1;
+        },
+        .drag => |drag| {
+            assert(drag.dx != 0 or drag.dy != 0);
+            const r = rect.?;
+            const x = r[0] + drag.from_x;
+            const y = r[1] + drag.from_y;
+            const press: input.Button = .{
+                .x = x,
+                .y = y,
+                .time_ms = time_ms,
+                .button = .left,
+                .mods = .none,
+            };
+            var release = press;
+            release.x = x + drag.dx;
+            release.y = y + drag.dy;
+            out[0] = .{ .pointer_move = .{ .x = x, .y = y } };
+            out[1] = .{ .pointer_down = press };
+            out[2] = .{ .pointer_move = .{ .x = release.x, .y = release.y } };
+            out[3] = .{ .pointer_up = release };
+            return 4;
+        },
     }
 }
 
@@ -307,6 +363,8 @@ pub fn step_target(step: Step) ?Target {
         .click => |target| target,
         .click_at => |at| at.target,
         .wheel => |turn| turn.target,
+        .hover => |at| at.target,
+        .drag => |drag| drag.target,
         .key, .wait => null,
     };
 }
@@ -718,6 +776,34 @@ test "steps become events" {
     try testing.expectEqual(@as(u32, 0), step_events(.{ .wait = 3 }, null, 0, &out));
 }
 
+// Locks the pointer steps: a hover is one move to the point from the target's top-left with no
+// leave; a drag is move, press, move by (dx, dy), and release there, with no leave.
+test "hover and drag steps dispatch exactly their events" {
+    var out: [event_cap]input.Event = undefined;
+    const rect: [4]f32 = .{ 10, 20, 40, 30 };
+    const hover: Step = .{ .hover = .{ .target = area("a", 0), .x = 5, .y = 6 } };
+    try testing.expectEqual(@as(u32, 1), step_events(hover, rect, 0, &out));
+    try testing.expectEqual(input.Point{ .x = 15, .y = 26 }, out[0].pointer_move);
+    try testing.expectEqual(areas.id("a", 0), step_target(hover).?.id);
+    const drag: Step = .{ .drag = .{
+        .target = area("a", 1),
+        .from_x = 4,
+        .from_y = 15,
+        .dx = 80,
+        .dy = -30,
+    } };
+    try testing.expectEqual(@as(u32, 4), step_events(drag, rect, 9, &out));
+    try testing.expectEqual(input.Point{ .x = 14, .y = 35 }, out[0].pointer_move);
+    try testing.expectEqual(@as(f32, 14), out[1].pointer_down.x);
+    try testing.expectEqual(@as(f32, 35), out[1].pointer_down.y);
+    try testing.expectEqual(@as(u32, 9), out[1].pointer_down.time_ms);
+    try testing.expectEqual(input.Point{ .x = 94, .y = 5 }, out[2].pointer_move);
+    try testing.expectEqual(@as(f32, 94), out[3].pointer_up.x);
+    try testing.expectEqual(@as(f32, 5), out[3].pointer_up.y);
+    try testing.expectEqual(input.MouseButton.left, out[3].pointer_up.button);
+    try testing.expectEqual(areas.id("a", 1), step_target(drag).?.id);
+}
+
 // Locks validation in both spaces: a good list passes, and each rule names the scenario.
 test "scenario validation rejects bad lists by name" {
     try testing.expectEqual(@as(?[]const u8, null), comptime validate(&.{test_scenario}));
@@ -730,6 +816,16 @@ test "scenario validation rejects bad lists by name" {
         .frames = 1,
     };
     try testing.expect(std.mem.find(u8, comptime validate(&.{long_key}).?, "4 bytes") != null);
+    const target = comptime area("a", 0);
+    const nowhere: Drag = .{ .target = target, .from_x = 1, .from_y = 1, .dx = 0, .dy = 0 };
+    const still: Scenario = .{
+        .name = "still-drag",
+        .setup = &.{.{ .drag = nowhere }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+    const refused = comptime validate(&.{still}).?;
+    try testing.expectEqualStrings("App.scenarios.still-drag: a drag moves by 0", refused);
     const twice = comptime validate(&.{ test_scenario, test_scenario }).?;
     try testing.expect(std.mem.find(u8, twice, "duplicate") != null);
     try testing.expect(find(&.{test_scenario}, "type") != null);
@@ -781,16 +877,9 @@ test "shaded area sums clipped rects in device pixels" {
     };
     const cx = &static.context;
     cx.init();
-    var box: draw.Box = .{
-        .rect = .{ 0, 0, 10, 10 },
-        .clip = .{ 0, 0, 100, 100 },
-        .fill = .{ 1, 1, 1, 1 },
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    };
+    const window: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+    const square: draw.Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    var box: draw.Box = .of(square, window, .{ .fill = .{ 1, 1, 1, 1 } });
     try cx.append(draw.Box, null, box);
     box.rect = .{ 95, 0, 10, 10 };
     try cx.append(draw.Box, null, box);

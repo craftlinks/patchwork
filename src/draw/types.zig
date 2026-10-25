@@ -43,11 +43,50 @@
 //! same names, so layout and hit testing are verified without a GPU. `contains_box` is the one
 //! rounded-box point test that widget hit testing uses. The tests at the end of this file hold
 //! the worked values.
+//!
+//! ## 5. Constructors
+//! `Box.of(rect, clip, BoxLook)` and `Arc.of(ring, clip, ArcLook)` build a record from the
+//! layout types (`draw.Rect`, `draw.Clip`) and a look whose defaults are the zero fields a
+//! literal writes (no border, no hover, no press, a full sweep), so a face is one line. They
+//! write the fields in declaration order with the same values as the literal, so the record is
+//! byte-identical to it (test "constructors match the literals byte for byte"). They append
+//! nothing: `widgets.kit` appends, and `ui` and `draw` append them with their own skip. Glyphs,
+//! images, and paths have appenders instead (`text.place`, `draw.path`).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const theme = @import("../theme.zig");
 const textures = @import("textures.zig");
+const geometry = @import("../draw.zig");
+
+const Rect = geometry.Rect;
+const Clip = geometry.Clip;
+
+/// A color with zero alpha: a `Box` with no border.
+pub const transparent: [4]f32 = .{ 0, 0, 0, 0 };
+
+/// How a `Box` looks (`Box.of`). The defaults are a face with no border, hover, or press.
+pub const BoxLook = struct {
+    fill: [4]f32,
+    border_color: [4]f32 = transparent,
+    border_width: f32 = 0,
+    radius: f32 = 0,
+    /// Mix weight toward `theme.lighten`, `[0, 1]`; widgets pass an animator times
+    /// `widgets.hover_lighten`.
+    hover: f32 = 0,
+    /// Mix weight toward `theme.darken`, `[0, 1]`, applied after the hover mix.
+    down: f32 = 0,
+};
+
+/// How an `Arc` looks (`Arc.of`). The defaults are the whole sweep with no hover.
+pub const ArcLook = struct {
+    color: [4]f32,
+    thickness: f32,
+    /// The fraction of `theme.arc_sweep` drawn, `[0, 1]`.
+    sweep: f32 = 1,
+    /// Mix weight toward `theme.lighten`, `[0, 1]`.
+    hover: f32 = 0,
+};
 
 /// Why `draw.Context.append` refused an instance. `PoolFull` and `BatchFull` are also counted
 /// in `Context.overflow_count`; widgets skip the instance on either.
@@ -74,6 +113,25 @@ pub const Box = extern struct {
     down: f32,
 
     pub const texture: ?textures.Format = null;
+
+    /// The box over `rect`, clipped to `clip`, looking like `look` (module guide, section 5).
+    pub fn of(rect: Rect, clip: Clip, look: BoxLook) Box {
+        assert(look.radius >= 0);
+        assert(look.border_width >= 0);
+        assert(look.hover >= 0 and look.hover <= 1);
+        assert(look.down >= 0 and look.down <= 1);
+        return .{
+            .rect = rect.array(),
+            .clip = clip.array(),
+            .fill = look.fill,
+            .border_color = look.border_color,
+            .radius = look.radius,
+            .border_width = look.border_width,
+            .hover = look.hover,
+            .down = look.down,
+        };
+    }
+
     // `select` instead of a branch keeps both `coverage` calls in uniform control flow.
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
@@ -100,6 +158,25 @@ pub const Arc = extern struct {
     pad: f32,
 
     pub const texture: ?textures.Format = null;
+
+    /// The ring inscribed in the square `ring`, clipped to `clip`, looking like `look`
+    /// (module guide, section 5). `pad` is written as 0.
+    pub fn of(ring: Rect, clip: Clip, look: ArcLook) Arc {
+        assert(ring.width == ring.height);
+        assert(look.thickness >= 0);
+        assert(look.sweep >= 0 and look.sweep <= 1);
+        assert(look.hover >= 0 and look.hover <= 1);
+        return .{
+            .rect = ring.array(),
+            .clip = clip.array(),
+            .color = look.color,
+            .thickness = look.thickness,
+            .sweep = look.sweep,
+            .hover = look.hover,
+            .pad = 0,
+        };
+    }
+
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
         \\    let dist = sdf_arc(px.local, px.size, px.thickness, px.sweep);
@@ -503,4 +580,64 @@ test "contains_box accepts the sharp edge and rejects a rounded corner" {
     // (1144, 680) is the rectangle center.
     try std.testing.expect(contains_box(1024, 656, 240, 48, 24, 1144, 680));
     try std.testing.expect(!contains_box(1024, 656, 240, 48, 24, 1025, 657));
+}
+
+// Locks the constructors against the literals they replace, byte for byte: a default look (no
+// border, hover, or press; a full sweep) and a fully set one.
+test "constructors match the literals byte for byte" {
+    const rect: Rect = .{ .x = 8, .y = 16, .width = 56, .height = 56 };
+    const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 90 };
+    const plain_box: Box = .{
+        .rect = .{ 8, 16, 56, 56 },
+        .clip = .{ 0, 0, 100, 90 },
+        .fill = .{ 0.1, 0.2, 0.3, 1 },
+        .border_color = .{ 0, 0, 0, 0 },
+        .radius = 0,
+        .border_width = 0,
+        .hover = 0,
+        .down = 0,
+    };
+    const built_box = Box.of(rect, clip, .{ .fill = .{ 0.1, 0.2, 0.3, 1 } });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_box), std.mem.asBytes(&built_box));
+    const full_box: Box = .{
+        .rect = .{ 8, 16, 56, 56 },
+        .clip = .{ 0, 0, 100, 90 },
+        .fill = .{ 0.1, 0.2, 0.3, 1 },
+        .border_color = .{ 0.9, 0.8, 0.7, 0.5 },
+        .radius = 6,
+        .border_width = 1.5,
+        .hover = 0.18,
+        .down = 0.3,
+    };
+    const built_full = Box.of(rect, clip, .{
+        .fill = .{ 0.1, 0.2, 0.3, 1 },
+        .border_color = .{ 0.9, 0.8, 0.7, 0.5 },
+        .border_width = 1.5,
+        .radius = 6,
+        .hover = 0.18,
+        .down = 0.3,
+    });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_box), std.mem.asBytes(&built_full));
+    const plain_arc: Arc = .{
+        .rect = .{ 8, 16, 56, 56 },
+        .clip = .{ 0, 0, 100, 90 },
+        .color = .{ 1, 1, 1, 1 },
+        .thickness = 4,
+        .sweep = 1,
+        .hover = 0,
+        .pad = 0,
+    };
+    const built_arc = Arc.of(rect, clip, .{ .color = .{ 1, 1, 1, 1 }, .thickness = 4 });
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_arc), std.mem.asBytes(&built_arc));
+    var full_arc = plain_arc;
+    full_arc.sweep = 0.7;
+    full_arc.hover = 0.18;
+    const built_swept = Arc.of(rect, clip, .{
+        .color = .{ 1, 1, 1, 1 },
+        .thickness = 4,
+        .sweep = 0.7,
+        .hover = 0.18,
+    });
+    const swept_bytes = std.mem.asBytes(&built_swept);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_arc), swept_bytes);
 }

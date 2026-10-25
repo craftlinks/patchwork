@@ -46,6 +46,7 @@ const input = patchwork.input;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const kit = patchwork.widgets.kit;
 const track = @import("track.zig");
 
 const Rect = quads.Rect;
@@ -261,9 +262,9 @@ pub const App = struct {
         cx.area(sample_id, sample_rect, 0, ui.cx.wheel_flag);
         var out: [columns]wave.Column = undefined;
         app.pyramid.columns(&app.samples, 0, track.sample_count, &out);
-        _ = wave.append(draw_cx, rect_array(overview_rect), clip_array(overview_rect), &out, overview_style);
+        _ = wave.append(draw_cx, overview_rect.array(), clip_of(overview_rect).array(), &out, overview_style);
         app.pyramid.columns(&app.samples, app.view_first, app.view_count, &out);
-        _ = wave.append(draw_cx, rect_array(sample_rect), clip_array(sample_rect), &out, sample_style);
+        _ = wave.append(draw_cx, sample_rect.array(), clip_of(sample_rect).array(), &out, sample_style);
         _ = app.dj.flush(&draw_cx.textures);
         _ = app.spectrum.flush(&draw_cx.textures);
         append_ring(cx, DjView, app.dj.id, dj_rect, app.dj.head);
@@ -338,25 +339,13 @@ fn line_at(rect: Rect, fraction: f32) Rect {
 }
 
 fn append_box(cx: *Context, rect: Rect, color: [4]f32, clip: Rect) void {
-    cx.append(quads.Box, null, .{
-        .rect = rect_array(rect),
-        .clip = clip_array(clip),
-        .fill = color,
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
+    kit.append(cx, quads.Box, null, .of(rect, clip_of(clip), .{ .fill = color }));
 }
 
 fn append_ring(cx: *Context, comptime T: type, id: quads.TextureId, rect: Rect, head: u32) void {
     cx.append(T, id, .{
-        .rect = rect_array(rect),
-        .clip = clip_array(rect),
+        .rect = rect.array(),
+        .clip = clip_of(rect).array(),
         .tint = .{ 1, 1, 1, 1 },
         .head = @floatFromInt(head),
         .pad0 = 0,
@@ -368,17 +357,8 @@ fn append_ring(cx: *Context, comptime T: type, id: quads.TextureId, rect: Rect, 
     };
 }
 
-fn rect_array(rect: Rect) [4]f32 {
-    return .{ rect.x, rect.y, rect.width, rect.height };
-}
-
 fn clip_of(rect: Rect) quads.Clip {
     return .{ .x0 = rect.x, .y0 = rect.y, .x1 = rect.x + rect.width, .y1 = rect.y + rect.height };
-}
-
-fn clip_array(rect: Rect) [4]f32 {
-    const clip = clip_of(rect);
-    return .{ clip.x0, clip.y0, clip.x1, clip.y1 };
 }
 
 const fixture = struct {

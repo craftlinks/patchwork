@@ -44,6 +44,7 @@ const input = patchwork.input;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const kit = patchwork.widgets.kit;
 const widgets = patchwork.widgets;
 const canvas = ui.canvas;
 
@@ -322,9 +323,7 @@ pub const App = struct {
         app.visible += 1;
         const zoom = app.view.drawn.zoom;
         const selected = app.selected != null and app.selected.? == index;
-        var column = ui.flow_of(.down);
-        column.padding = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        _ = cx.begin_at(rect, column);
+        _ = cx.begin_at(rect, .{ .flow = .down });
         const header = cx.walk(ui.sized(.fill, .{ .fixed = header_height }));
         append_box(cx, rect, face_color, clip, 8, if (selected) 2 else 0, if (selected) select_color else null);
         append_box(cx, header, header_color, clip, 8, 0, null);
@@ -335,9 +334,7 @@ pub const App = struct {
             const out_port: Rect = .{ .x = rect.x + rect.width - port_size / 2, .y = rect.y + port_y, .width = port_size, .height = port_size };
             if (cx.visible(in_port)) |port_clip| append_box(cx, in_port, port_color, port_clip, port_size / 2, 0, null);
             if (cx.visible(out_port)) |port_clip| append_box(cx, out_port, port_color, port_clip, port_size / 2, 0, null);
-            var knob_walk = ui.sized(.fill, .{ .fixed = widgets.knob_height });
-            knob_walk.margin.top = knob_top;
-            app.knobs[index].draw(cx, knob_walk);
+            app.knobs[index].draw(cx, .{ .width = .fill, .height = .{ .fixed = widgets.knob_height }, .margin = .sides(0, knob_top, 0, 0) });
             if (zoom * header_style.size >= label_min_px) {
                 var buffer: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&buffer, "osc {d}", .{index}) catch unreachable;
@@ -438,19 +435,12 @@ pub fn value_of(index: u32) f32 {
 }
 
 fn append_box(cx: *Context, rect: Rect, color: [4]f32, clip: quads.Clip, radius: f32, border: f32, border_color: ?[4]f32) void {
-    cx.append(quads.Box, null, .{
-        .rect = .{ rect.x, rect.y, rect.width, rect.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+    kit.append(cx, quads.Box, null, .of(rect, clip, .{
         .fill = color,
-        .border_color = border_color orelse .{ 0, 0, 0, 0 },
-        .radius = radius,
+        .border_color = border_color orelse quads.transparent,
         .border_width = border,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
+        .radius = radius,
+    }));
 }
 
 fn clip_of(rect: Rect) quads.Clip {

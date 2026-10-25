@@ -80,6 +80,7 @@ const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
+const kit = widgets.kit;
 const editor = patchwork.editor;
 const bindings = @import("bindings.zig");
 const knob = @import("knob.zig");
@@ -426,9 +427,8 @@ pub const App = struct {
     pub fn draw(app: *App, cx: *Context) void {
         assert(app.parsed_revision == app.editor.revision());
         _ = cx.begin(ui.sized(.fill, .fill), ui.flow_of(.overlay));
-        var body_walk = ui.sized(.fill, .fill);
-        body_walk.margin.top = header_px;
-        const body = cx.begin(body_walk, ui.flow_of(.overlay));
+        const body_walk: ui.Walk = .{ .width = .fill, .height = .fill, .margin = .sides(0, header_px, 0, 0) };
+        const body = cx.begin(body_walk, .{ .flow = .overlay });
         const panel_width = panel_width_of(body.width);
         app.column.shown = false;
         app.curve_count = 0;
@@ -790,7 +790,7 @@ pub const App = struct {
             .width = row.width,
             .height = row.height - 8,
         };
-        push_box(cx, face, clip, inline_fill);
+        kit.face(cx, face, clip, .{ .fill = inline_fill });
         const shape = app.parse.shapes[slot.index];
         var values: [bindings.shape_args]f32 = @splat(0);
         for (0..bindings.shape_args) |arg| {
@@ -851,11 +851,10 @@ pub const App = struct {
 
     fn draw_panel(app: *App, cx: *Context, body: Rect, panel_width: f32) void {
         assert(panel_width > 0);
-        var walk = ui.sized(.{ .fixed = panel_width }, .fill);
-        walk.margin.left = body.width - panel_width;
-        const panel = cx.begin(walk, ui.flow_of(.down));
+        const walk: ui.Walk = .{ .width = .{ .fixed = panel_width }, .height = .fill, .margin = .sides(body.width - panel_width, 0, 0, 0) };
+        const panel = cx.begin(walk, .{ .flow = .down });
         if (cx.visible(panel)) |clip| {
-            push_box(cx, panel, clip, theme.chrome.panel);
+            kit.face(cx, panel, clip, .{ .fill = theme.chrome.panel });
             const band = cx.walk(ui.sized(.fill, .{ .fixed = band_px }));
             app.draw_transport(cx, band, clip);
             app.draw_column(cx);
@@ -954,7 +953,7 @@ pub const App = struct {
                 .width = text.measure(struck_style, original),
                 .height = 1,
             };
-            push_box(cx, bar, clip, struck_style.color);
+            kit.face(cx, bar, clip, .{ .fill = struck_style.color });
         }
         text.place(cx.drawing(), label_style, label, label_box, clip, left);
         if (app.column.lane_width > 0) {
@@ -964,7 +963,7 @@ pub const App = struct {
                 .width = app.column.lane_width,
                 .height = row_px - 2 * lane_inset_px,
             };
-            push_box(cx, lane, clip, lane_fill);
+            kit.face(cx, lane, clip, .{ .fill = lane_fill });
             app.draw_lane(cx, index, lane, clip);
         }
     }
@@ -1000,7 +999,7 @@ pub const App = struct {
             .height = @min(column.viewport.height, bottom - column.viewport.y),
         };
         const previous = cx.drawing().layer(curve_layer);
-        push_box(cx, bar, clip, playhead_color);
+        kit.face(cx, bar, clip, .{ .fill = playhead_color });
         _ = cx.drawing().layer(previous);
     }
 
@@ -1094,14 +1093,8 @@ pub const App = struct {
     }
 
     fn draw_header_parts(app: *App, cx: *Context, bar: Rect, clip: Clip) void {
-        push_box(cx, bar, clip, theme.chrome.panel);
-        const sides: quads.Inset = .{
-            .left = header_inset_px,
-            .top = 0,
-            .right = header_inset_px,
-            .bottom = 0,
-        };
-        const inner = ui.cx.inset(bar, sides);
+        kit.face(cx, bar, clip, .{ .fill = theme.chrome.panel });
+        const inner = ui.cx.inset(bar, .xy(header_inset_px, 0));
         const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
         var name: [name_cap]u8 = undefined;
         const base = switch (app.shown) {
@@ -1217,24 +1210,6 @@ fn write_thousands(out: []u8, number: u32) usize {
     else
         std.fmt.bufPrint(out, "{d}", .{number});
     return (printed catch unreachable).len;
-}
-
-fn push_box(cx: *Context, rect: Rect, clip: Clip, fill: [4]f32) void {
-    if (!(rect.width > 0)) return;
-    if (!(rect.height > 0)) return;
-    cx.append(quads.Box, null, .{
-        .rect = .{ rect.x, rect.y, rect.width, rect.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
-        .fill = fill,
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
 }
 
 /// The hit rect of transport button `index` in `band`.

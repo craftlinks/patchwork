@@ -1274,7 +1274,7 @@ fn digit_count(number: u32) u32 {
 }
 
 fn push_box(cx: anytype, rect: Rect, clip: Clip, fill: [4]f32) void {
-    append_box(cx, rect, clip, fill, .{ 0, 0, 0, 0 }, 0, 0);
+    append_box(cx, rect, clip, fill, draw.transparent, 0, 0);
 }
 
 fn append_box(
@@ -1288,16 +1288,13 @@ fn append_box(
 ) void {
     if (!(rect.width > 0)) return;
     if (!(rect.height > 0)) return;
-    cx.append(draw.Box, null, .{
-        .rect = .{ rect.x, rect.y, rect.width, rect.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
+    const look: draw.BoxLook = .{
         .fill = fill,
         .border_color = border_color,
-        .radius = radius,
         .border_width = border_width,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
+        .radius = radius,
+    };
+    cx.append(draw.Box, null, .of(rect, clip, look)) catch |err| switch (err) {
         error.PoolFull, error.BatchFull => {},
         error.EdgeNotPositive, error.ClipUnordered => unreachable,
     };
