@@ -6,8 +6,9 @@
 //! All geometry is UI logical pixels, origin top-left, `+Y` down; `rect` is the box the turtle
 //! gave the slider.
 //! ```text
-//! span  = rect.width - 2 * knob_radius
-//! value = clamp((x - rect.x - knob_radius) / span, 0, 1)       a non-positive span yields 0
+//! [t0, t1] = Skin.slider_travel(rect)          default: [rect.x + knob_radius,
+//!                                                        rect.x + rect.width - knob_radius]
+//! value    = clamp((x - t0) / (t1 - t0), 0, 1)  a non-positive span yields 0
 //! ```
 //! The track is `track_height` thick, centered vertically and inset by `knob_radius` at both
 //! ends; the knob is a `2 * knob_radius` disc at `rect.x + value * (rect.width - 2 *
@@ -15,9 +16,10 @@
 //! worked pointer".
 //!
 //! ## 2. Events
-//! Press and drag set `value` from the pointer x, using the rect the press carries, so the
-//! slider stores no rect. The hover animator is the highlight for the whole gesture (the kit's
-//! table without a press channel); a release reports `released`.
+//! Press and drag set `value` from the pointer x along the skin's travel of the rect the press
+//! carries, so the slider stores no rect and a skin maps presses onto what it drew. The hover
+//! animator is the highlight for the whole gesture (the kit's table without a press channel);
+//! a release reports `released`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +27,7 @@ const animator = @import("../animator.zig");
 const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -40,74 +43,82 @@ pub const track_height: f32 = 6;
 /// Track corner radius. Half the thickness, so the track is a capsule.
 pub const track_radius: f32 = 3;
 
-/// Absolute slider: press and drag set `value` from the pointer x. The hover animator is
-/// the highlight for the whole gesture; there is no press-darken channel.
-pub const Slider = struct {
-    id: Id,
-    hover: animator.Animator,
-    value: f32,
-    track: kit.Paint,
-    fill: kit.Paint,
-    knob: kit.Paint,
+/// The default slider: `SliderOf(skins.Default)`, a capsule track with a disc knob.
+pub const Slider = SliderOf(skin.Default);
 
-    pub const Action = union(enum) {
-        none,
-        changed: f32,
-        released,
+/// An absolute slider drawn by `Skin` (`widgets/skin.zig`): press and drag set `value` from
+/// the pointer x along `Skin.slider_travel`. The hover animator is the highlight for the whole
+/// gesture; there is no press-darken channel.
+pub fn SliderOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .slider)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
+
+        id: Id,
+        hover: animator.Animator,
+        value: f32,
+        track: kit.Paint,
+        fill: kit.Paint,
+        knob: kit.Paint,
+
+        pub const Action = union(enum) {
+            none,
+            changed: f32,
+            released,
+        };
+
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.value >= 0);
+            assert(self.value <= 1);
+            if (event == .frame) {
+                kit.step(cx, &self.hover, event.frame);
+                return .none;
+            }
+            const hit = cx.hit(self.id, event);
+            kit.respond(cx, hit, &self.hover, null);
+            switch (hit) {
+                .none, .wheel, .secondary, .hover_in, .hover_out => return .none,
+                .down, .drag => |press| return self.set_at(cx, press),
+                .up => return .released,
+            }
+        }
+
+        /// Hands the box `walk` gets to the skin and records the shape it returns. The
+        /// default skin draws the track, the fill (omitted at value 0), then the knob on top.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.value >= 0);
+            assert(self.value <= 1);
+            const rect = cx.walk(walk);
+            const clip = cx.visible(rect) orelse return;
+            const shape = Skin.slider(cx, .{
+                .rect = rect,
+                .clip = clip,
+                .value = self.value,
+                .hover = self.hover.value,
+                .track = self.track,
+                .fill = self.fill,
+                .knob = self.knob,
+            }) orelse return;
+            cx.area(self.id, shape.rect, shape.radius, ui.cx.plain);
+        }
+
+        fn set_at(self: *Self, cx: anytype, press: ui.Press) Action {
+            const next = skin.travel_value(Skin.slider_travel(press.rect), press.x);
+            if (self.value == next) return .none;
+            self.value = next;
+            cx.redraw();
+            assert(self.value == next);
+            return .{ .changed = next };
+        }
     };
+}
 
-    pub fn handle(self: *Slider, cx: anytype, event: input.Event) Action {
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        if (event == .frame) {
-            kit.step(cx, &self.hover, event.frame);
-            return .none;
-        }
-        const hit = cx.hit(self.id, event);
-        kit.respond(cx, hit, &self.hover, null);
-        switch (hit) {
-            .none, .wheel, .secondary, .hover_in, .hover_out => return .none,
-            .down, .drag => |press| return self.set_at(cx, press),
-            .up => return .released,
-        }
-    }
-
-    /// Track, then fill (omitted at value 0), then the knob on top.
-    pub fn draw(self: *const Slider, cx: anytype, walk: Walk) void {
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        const rect = cx.walk(walk);
-        const clip = cx.visible(rect) orelse return;
-        cx.area(self.id, rect, knob_radius, ui.cx.plain);
-        const scheme = cx.theme();
-        const track = track_rect(rect);
-        kit.face(cx, track, clip, self.track.look(scheme, self.hover.value, 0));
-        if (self.value > 0) {
-            var fill_rect = track;
-            fill_rect.width = self.value * track.width;
-            kit.face(cx, fill_rect, clip, self.fill.look(scheme, self.hover.value, 0));
-        }
-        const knob = knob_rect(rect, self.value);
-        kit.face(cx, knob, clip, self.knob.look(scheme, self.hover.value, 0));
-    }
-
-    fn set_at(self: *Slider, cx: anytype, press: ui.Press) Action {
-        const next = value_at(press.rect, press.x);
-        if (self.value == next) return .none;
-        self.value = next;
-        cx.redraw();
-        assert(self.value == next);
-        return .{ .changed = next };
-    }
-};
-
-/// Unit position of `x` along the knob travel, clamped to `[0, 1]`.
-/// Travel is `width - 2 * knob_radius`. A non-positive travel returns 0.
+/// Unit position of `x` along the default knob travel, clamped to `[0, 1]`: the skin map
+/// (`skin.travel_value`) over `skins.Default.slider_travel(rect)`. Travel is
+/// `width - 2 * knob_radius`; a non-positive travel returns 0.
 pub fn value_at(rect: Rect, x: f32) f32 {
     assert(x == x);
-    const span = rect.width - 2.0 * knob_radius;
-    if (span <= 0) return 0;
-    const unit = std.math.clamp((x - rect.x - knob_radius) / span, 0, 1);
+    const unit = skin.travel_value(skin.Default.slider_travel(rect), x);
     assert(unit >= 0);
     assert(unit <= 1);
     return unit;

@@ -8,25 +8,31 @@
 //! literal, no private append helper), so it is also the template for an app's own screens.
 //! Every widget reports its last action on the status line, for example "knob 1 changed 0.75".
 //! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
-//! with `cx.set_theme` (section 3a).
+//! with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
+//! behaviour in the gallery's own skin (section 3b).
 //!
 //! ## 2. Layout (logical pixels)
 //! A fixed `screen_w` by `screen_h` screen from the top-left, so it fits the 1280 by 720
 //! browser viewport and a native dump and a browser screenshot compare region for region:
 //! ```text
-//! screen   1088 x 640 at (0, 0), flow down, padding 16, spacing 8
+//! screen   1088 x 704 at (0, 0), flow down, padding 16, spacing 8
 //!   title  fill x 40        "gallery", the "light" toggle (160 x 40 at x 156), the status
 //!   band   fill x 152       buttons (176) | sliders (288) | knobs (fill: 4 cells of 140)
 //!   band   fill x 152       toggles (176) | meter (176)   | text field (fill; field 240 x 32)
-//!   list   fill x 240       a view of 40 rows of 28, the selected row highlighted
+//!   row    fill x 88        hardware: 4 knob cells of 140 | 2 buttons of 96 | 2 toggles of 116
+//!   list   fill x 208       a view of 40 rows of 28, the selected row highlighted
 //! ```
 //! Each group is a `Panel` with padding 8 that clips its children. The knobs have rings of 56,
-//! 40, 56, and 72 (`Knob.sized`) in 72 px rows; the meter follows slider 0.
+//! 40, 56, and 72 (`Knob.sized`) in 72 px rows, the hardware knobs 56, 48, 64, and 72; the
+//! hardware row spaces its widgets by 8 and centers them vertically; the meter follows
+//! slider 0.
 //!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
-//! to the rows it drew last through `kit.clicked`, which also repaints a row on hover.
+//! to the rows it drew last through `kit.clicked`, which also repaints a row on hover. The
+//! default and hardware rows share one routine per widget kind (`knob_events`, ...), since a
+//! skinned widget has the default one's behaviour and actions.
 //!
 //! ## 3a. Theme
 //! Everything the gallery draws reads `cx.theme()`: the group faces, the text styles, the
@@ -35,14 +41,22 @@
 //! toggle switches it (`restyle`), so they follow it too. The buttons keep their own blue
 //! paint and light label in both themes: an instance color wins over the scheme.
 //!
+//! ## 3b. Hardware Skin
+//! `HardKnob`, `HardButton`, and `HardToggle` are `widgets.KnobOf(hardware.Skin)` and its
+//! siblings: the library behaviour with the look of `hardware.zig` (a `Dial` with a drop
+//! shadow, `Bevel` faces, the rack's `Led`), registered in `config.draw`. They take presses on
+//! the dial's body, the bevel, and the housing, and report as "hardware knob 0 changed 0.83".
+//! Their accents are restyled with the default knobs'.
+//!
 //! ## 4. Scenarios
 //! `still`; `interact` (click button 0, drag slider 0 by +80 px, click toggle 1, drag knob 1
 //! by -30 px, click the field and type "abc", wheel the list by 3 rows, click row 5, then let
 //! the animations settle); `hover` (hover button 1, then wait for its animator to settle);
 //! `light` (click the "light" toggle, click the field, type "abc", select it by dragging
 //! across it, then wait for the animations to settle, so the light theme shows the focus ring,
-//! the selection band, and the caret). The app tests replay `interact` and `light` headless
-//! and check every value they leave.
+//! the selection band, and the caret); `hardware` (drag hardware knob 0 up 40 px, click
+//! hardware button 1, flip hardware toggle 0, then settle). The app tests replay `interact`,
+//! `light`, and `hardware` headless and check every value they leave.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays, a fixed status buffer, and no allocation; every loop is bounded.
@@ -59,19 +73,23 @@ const ui = patchwork.ui;
 const widgets = patchwork.widgets;
 const kit = widgets.kit;
 const bench = patchwork.bench;
+const hardware = @import("hardware.zig");
 
 const Rect = quads.Rect;
 
 const screen_w: f32 = 1088;
-const screen_h: f32 = 640;
+const screen_h: f32 = 704;
 const screen_padding: f32 = 16;
 const gap_px: f32 = 8;
 const title_px: f32 = 40;
 const band_px: f32 = 152;
+const hardware_px: f32 = 88;
 const group_padding: f32 = 8;
 const narrow_px: f32 = 176;
 const sliders_px: f32 = 288;
 const knob_cell_px: f32 = 140;
+const hard_button_px: f32 = 96;
+const hard_toggle_px: f32 = 116;
 const button_px: f32 = 40;
 const slider_px: f32 = 24;
 const caption_px: f32 = 20;
@@ -93,6 +111,18 @@ const slider_values = [_]f32{ 0.25, 0.5 };
 const toggle_names = [_][]const u8{ "mute", "solo", "arm" };
 const toggle_values = [_]bool{ false, true, false };
 
+const hard_knob_rings = [_]f32{ 56, 48, 64, 72 };
+const hard_knob_names = [_][]const u8{ "freq", "res", "env", "level" };
+const hard_knob_values = [_]f32{ 0.5, 0.3, 0.7, 0.85 };
+const hard_button_labels = [_][]const u8{ "Tap", "Sync" };
+const hard_toggle_names = [_][]const u8{ "power", "bypass" };
+const hard_toggle_values = [_]bool{ false, true };
+
+/// The hardware row's widgets: the library behaviour in the gallery's skin (`hardware.zig`).
+const HardKnob = widgets.KnobOf(hardware.Skin);
+const HardButton = widgets.ButtonOf(hardware.Skin);
+const HardToggle = widgets.ToggleOf(hardware.Skin);
+
 /// The slider the meter follows.
 const meter_slider: u32 = 0;
 
@@ -108,20 +138,26 @@ const panel_radius: f32 = 8;
 const button_paint: widgets.Paint = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = 8 };
 /// The buttons' label: the dark scheme's text in both themes, on their own blue (section 3a).
 const button_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.dark.colors.text };
+/// The hardware buttons' bevel face: a dark grey that keeps its light label readable in both
+/// themes.
+const hard_button_paint: widgets.Paint = .{ .r = 0.32, .g = 0.34, .b = 0.38, .a = 1, .radius = 6 };
 
 const start: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
 const end: text.Options = .{ .align_x = .end, .align_y = .center, .ellipsis = true };
 
 /// The rows: 40 of 28 px in the list's view.
 const rows: ui.List = .{ .row_height = row_px, .count = row_count };
-/// Rows one viewport can show partly: `ceil(224 / 28) + 1`.
-const rows_drawn_max: u32 = 9;
+/// Rows one viewport can show partly: `ceil(192 / 28) + 1`.
+const rows_drawn_max: u32 = 8;
 
 /// Pool and area capacities; the comptime block checks them against the counts.
 const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
 const glyph_cap: u32 = 512;
-const area_cap: u32 = 48;
+const dial_cap: u32 = 8;
+const bevel_cap: u32 = 8;
+const led_cap: u32 = 4;
+const area_cap: u32 = 56;
 
 const Context = patchwork.app.Context(App);
 
@@ -141,6 +177,9 @@ pub const App = struct {
     sliders: [slider_names.len]widgets.Slider,
     knobs: [knob_names.len]widgets.Knob,
     toggles: [toggle_names.len]widgets.Toggle,
+    hard_knobs: [hard_knob_names.len]HardKnob,
+    hard_buttons: [hard_button_labels.len]HardButton,
+    hard_toggles: [hard_toggle_names.len]HardToggle,
     meter: widgets.Meter,
     field: widgets.TextField,
     view: ui.ViewState,
@@ -157,6 +196,9 @@ pub const App = struct {
             .{ .type = quads.Box, .cap = box_cap },
             .{ .type = quads.Arc, .cap = arc_cap },
             .{ .type = quads.Glyph, .cap = glyph_cap },
+            .{ .type = hardware.Dial, .cap = dial_cap },
+            .{ .type = hardware.Bevel, .cap = bevel_cap },
+            .{ .type = hardware.Led, .cap = led_cap },
         },
         .area_cap = area_cap,
     };
@@ -166,6 +208,7 @@ pub const App = struct {
         .{ .name = "interact", .setup = &interact_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "hover", .setup = &hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "light", .setup = &light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "hardware", .setup = &hardware_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -201,6 +244,24 @@ pub const App = struct {
         for (&app.toggles, toggle_names, toggle_values, 0..) |*toggle, name, on, index| {
             toggle.* = widgets.Toggle.init(ui.id("toggle", @intCast(index)), name, on);
         }
+        for (&app.hard_knobs, hard_knob_names, hard_knob_values, hard_knob_rings, 0..) |*knob, name, value, ring, index| {
+            const accent = widgets.accents[index % widgets.accent_count];
+            knob.* = HardKnob.init(ui.id("hknob", @intCast(index)), name, value, accent).sized(ring);
+        }
+        for (&app.hard_buttons, hard_button_labels, 0..) |*button, label, index| {
+            button.* = .{
+                .id = ui.id("hbutton", @intCast(index)),
+                .label = label,
+                .style = button_style,
+                .padding = .xy(12, 0),
+                .paint = hard_button_paint,
+                .hover = .init(widgets.hover_rate_per_ms),
+                .down = .init(widgets.down_rate_per_ms),
+            };
+        }
+        for (&app.hard_toggles, hard_toggle_names, hard_toggle_values, 0..) |*toggle, name, on, index| {
+            toggle.* = HardToggle.init(ui.id("htoggle", @intCast(index)), name, on);
+        }
         app.meter = .{ .name = "level", .value = slider_values[meter_slider], .track_h = meter_track_px };
         app.field = widgets.TextField.init(field_id, 32, field_style(&config.theme));
         app.view = ui.ViewState.init();
@@ -224,9 +285,8 @@ pub const App = struct {
             },
             .none => {},
         }
-        for (&app.buttons, 0..) |*button, index| {
-            if (button.handle(cx, event_value) == .clicked) app.note(cx, &.{ "button ", digit(index), " clicked" });
-        }
+        app.button_events(cx, "", &app.buttons, event_value);
+        app.button_events(cx, "hardware ", &app.hard_buttons, event_value);
         for (&app.sliders, 0..) |*slider, index| {
             switch (slider.handle(cx, event_value)) {
                 .changed => |value| {
@@ -238,19 +298,10 @@ pub const App = struct {
                 .none, .released => {},
             }
         }
-        for (&app.knobs, 0..) |*knob, index| {
-            switch (knob.handle(cx, event_value)) {
-                .changed => app.note(cx, &.{ "knob ", digit(index), " changed ", knob.value_text[0..4] }),
-                .reset => app.note(cx, &.{ "knob ", digit(index), " reset ", knob.value_text[0..4] }),
-                .none, .released => {},
-            }
-        }
-        for (&app.toggles, 0..) |*toggle, index| {
-            switch (toggle.handle(cx, event_value)) {
-                .toggled => |on| app.note(cx, &.{ "toggle ", digit(index), if (on) " on" else " off" }),
-                .none => {},
-            }
-        }
+        app.knob_events(cx, "", &app.knobs, event_value);
+        app.knob_events(cx, "hardware ", &app.hard_knobs, event_value);
+        app.toggle_events(cx, "", &app.toggles, event_value);
+        app.toggle_events(cx, "hardware ", &app.hard_toggles, event_value);
         switch (app.field.handle(cx, event_value)) {
             .changed => app.note(cx, &.{ "field ", app.field.bytes() }),
             .committed => app.note(cx, &.{"field committed"}),
@@ -263,6 +314,35 @@ pub const App = struct {
             if (kit.clicked(cx, ui.id("row", row), event_value)) app.select(cx, row);
         }
         assert(app.status_len <= status_cap);
+    }
+
+    /// Hands `event_value` to each button of `buttons`, default or skinned (they share the
+    /// behaviour), and reports a click on the status line after `row`.
+    fn button_events(app: *App, cx: *Context, row: []const u8, buttons: anytype, event_value: input.Event) void {
+        for (buttons, 0..) |*button, index| {
+            if (button.handle(cx, event_value) == .clicked) app.note(cx, &.{ row, "button ", digit(index), " clicked" });
+        }
+    }
+
+    /// Hands `event_value` to each knob of `knobs` and reports a change or a reset.
+    fn knob_events(app: *App, cx: *Context, row: []const u8, knobs: anytype, event_value: input.Event) void {
+        for (knobs, 0..) |*knob, index| {
+            switch (knob.handle(cx, event_value)) {
+                .changed => app.note(cx, &.{ row, "knob ", digit(index), " changed ", knob.value_text[0..4] }),
+                .reset => app.note(cx, &.{ row, "knob ", digit(index), " reset ", knob.value_text[0..4] }),
+                .none, .released => {},
+            }
+        }
+    }
+
+    /// Hands `event_value` to each toggle of `toggles` and reports a flip.
+    fn toggle_events(app: *App, cx: *Context, row: []const u8, toggles: anytype, event_value: input.Event) void {
+        for (toggles, 0..) |*toggle, index| {
+            switch (toggle.handle(cx, event_value)) {
+                .toggled => |on| app.note(cx, &.{ row, "toggle ", digit(index), if (on) " on" else " off" }),
+                .none => {},
+            }
+        }
     }
 
     /// No timer is armed, so no host calls this.
@@ -287,6 +367,7 @@ pub const App = struct {
         app.draw_meter(cx);
         app.draw_field(cx);
         _ = cx.end();
+        app.draw_hardware(cx);
         app.draw_list(cx);
         _ = cx.end();
         assert(cx.draw.overflow_count == 0);
@@ -302,6 +383,10 @@ pub const App = struct {
             slider.knob = widgets.paint_of(scheme.colors.control, widgets.knob_radius);
         }
         for (&app.knobs, 0..) |*knob, index| {
+            const color = scheme.accents[index % theme.accent_count];
+            knob.accent = widgets.paint_of(color, widgets.kit.accent_radius);
+        }
+        for (&app.hard_knobs, 0..) |*knob, index| {
             const color = scheme.accents[index % theme.accent_count];
             knob.accent = widgets.paint_of(color, widgets.kit.accent_radius);
         }
@@ -374,6 +459,19 @@ pub const App = struct {
         _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
         caption(cx, "name");
         app.field.draw(cx, ui.sized(.{ .fixed = field_w }, .{ .fixed = field_h }));
+        _ = cx.end();
+    }
+
+    /// The hardware row: four skinned knobs, two buttons, and two toggles in one panel, centered
+    /// vertically.
+    fn draw_hardware(app: *const App, cx: *Context) void {
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        const row: ui.Layout = .{ .flow = .right, .spacing = gap_px, .padding = .all(group_padding), .alignment = .{ .x = 0, .y = 0.5 }, .clip = true };
+        _ = face.begin(cx, ui.sized(.fill, .{ .fixed = hardware_px }), row);
+        const cell = ui.sized(.{ .fixed = knob_cell_px }, .{ .fixed = widgets.knob_height });
+        for (&app.hard_knobs) |*knob| knob.draw(cx, cell);
+        for (&app.hard_buttons) |*button| button.draw(cx, ui.sized(.{ .fixed = hard_button_px }, .{ .fixed = button_px }));
+        for (&app.hard_toggles) |*toggle| toggle.draw(cx, ui.sized(.{ .fixed = hard_toggle_px }, .{ .fixed = widgets.toggle_height }));
         _ = cx.end();
     }
 
@@ -504,6 +602,16 @@ const light_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `hardware`: drag hardware knob 0 (a 56 px dial) from its center up 40 px, a third of
+/// `drag_span_px` (0.50 to 0.83), click hardware button 1, flip hardware toggle 0, then let the
+/// animations settle.
+const hardware_steps = [_]bench.Step{
+    .{ .drag = .{ .target = bench.area("hknob", 0), .from_x = 19, .from_y = 19, .dx = 0, .dy = -40 } },
+    .{ .click = bench.area("hbutton", 1) },
+    .{ .click = bench.area("htoggle", 0) },
+    .{ .wait = 12 },
+};
+
 comptime {
     // The title: the toggle sits right of "gallery" and inside the bar.
     assert(theme_toggle_x + theme_toggle_w < screen_w - screen_padding);
@@ -514,17 +622,26 @@ comptime {
     // Three 40 px buttons or toggles with two gaps fill a band's inner height.
     assert(3 * button_px + 2 * gap_px == band_px - 2 * group_padding);
     assert(3 * widgets.toggle_height + 2 * gap_px == band_px - 2 * group_padding);
-    // The list takes what remains: 240 px, a 224 px viewport.
-    const list_h = screen_h - 2 * screen_padding - title_px - 2 * band_px - 3 * gap_px;
-    assert(list_h == 240);
+    // The hardware row: four knob cells, two buttons, and two toggles with seven gaps fill it.
+    assert(4 * knob_cell_px + 2 * hard_button_px + 2 * hard_toggle_px + 7 * gap_px == inner_w - 2 * group_padding);
+    assert(widgets.knob_height == hardware_px - 2 * group_padding);
+    for (hard_knob_rings) |ring| assert(ring <= widgets.knob_height);
+    // The list takes what remains: 208 px, a 192 px viewport.
+    const list_h = screen_h - 2 * screen_padding - title_px - 2 * band_px - hardware_px - 4 * gap_px;
+    assert(list_h == 208);
     assert(@ceil((list_h - 2 * group_padding) / row_px) + 1 == rows_drawn_max);
     for (knob_rings) |ring| assert(ring <= widgets.knob_height);
     // Faces: title, 7 groups, 3 buttons, 3 per slider, 2 per toggle (the title's too), 2
     // meter, 3 field, 2 highlighted rows, the thumb.
-    assert(1 + 7 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 <= box_cap);
-    assert(2 * knob_names.len <= arc_cap);
-    // Areas: every widget, the title's toggle, the view and its thumb, and the rows drawn.
-    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max <= area_cap);
+    assert(1 + 8 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 <= box_cap);
+    assert(2 * knob_names.len + hard_knob_names.len <= arc_cap);
+    // The hardware row: a dial per knob, a bevel per button and toggle, an LED per toggle.
+    assert(hard_knob_names.len <= dial_cap);
+    assert(hard_button_labels.len + hard_toggle_names.len <= bevel_cap);
+    assert(hard_toggle_names.len <= led_cap);
+    // Areas: every widget, the title's toggle, the view and its thumb, the rows drawn, and the
+    // hardware row.
+    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max + 4 + 2 + 2 <= area_cap);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
 }
 
@@ -579,12 +696,23 @@ test "gallery layout at 1280 by 720" {
     try expect_rect(area_rect(app.knobs[3].id), 932, 104, 72, 72);
     try expect_rect(area_rect(app.toggles[0].id), 32, 240, 44, 24);
     try expect_rect(area_rect(field_id), 392, 260, 240, 32);
-    try expect_rect(app.view.viewport, 24, 392, 1040, 224);
+    // The hardware row's panel starts at 16 + 40 + 8 + 2 * (152 + 8) = 384, its cells at 392:
+    // hardware knob 0's 56 px ring at (32, 400), its dial body 9 px inside it; knob 1's 48 px
+    // ring at (180, 404); the buttons after four cells and four gaps at x 616 and 720, centered
+    // in the 72 px row; the toggles' housings 8 px into their cells at 824 and 948.
+    try expect_rect(area_rect(app.hard_knobs[0].id), 41, 409, 38, 38);
+    try std.testing.expectEqual(@as(f32, 19), cx.find(app.hard_knobs[0].id).?.radius);
+    try expect_rect(area_rect(app.hard_knobs[1].id), 189, 413, 30, 30);
+    try expect_rect(area_rect(app.hard_buttons[0].id), 616, 408, 96, 40);
+    try expect_rect(area_rect(app.hard_buttons[1].id), 720, 408, 96, 40);
+    try expect_rect(area_rect(app.hard_toggles[0].id), 832, 416, 44, 24);
+    try expect_rect(area_rect(app.hard_toggles[1].id), 956, 416, 44, 24);
+    try expect_rect(app.view.viewport, 24, 488, 1040, 192);
     try std.testing.expectEqual(@as(f32, 1120), app.view.content_h);
-    try expect_rect(area_rect(ui.id("row", 0)), 24, 392, 1040 - ui.view.gutter_px, 28);
-    // 224 / 28: rows 0 to 7 fill the viewport exactly, so row 8 is not drawn.
-    try std.testing.expect(cx.find(ui.id("row", 7)) != null);
-    try std.testing.expect(cx.find(ui.id("row", 8)) == null);
+    try expect_rect(area_rect(ui.id("row", 0)), 24, 488, 1040 - ui.view.gutter_px, 28);
+    // 192 / 28: row 6 is the last one the viewport shows (partly), so row 7 is not drawn.
+    try std.testing.expect(cx.find(ui.id("row", 6)) != null);
+    try std.testing.expect(cx.find(ui.id("row", 7)) == null);
     try std.testing.expect(!cx.dirty);
     try std.testing.expect(!ui.draw_frame(App, app, cx, 1280, 720, 120));
 }
@@ -642,6 +770,52 @@ test "the hover scenario keeps button 1 hovered" {
     _ = try bench.replay_headless(App, app, &test_context, hover, .{ 1280, 720 }, 3);
     try std.testing.expectEqual(@as(f32, 1), app.buttons[1].hover.target);
     try std.testing.expectEqual(app.buttons[1].id, test_context.hovered());
+}
+
+// Locks the `hardware` scenario (section 4) replayed headless: the dial dragged up 40 px from
+// its center moves 40 / 120 from 0.50 to 0.83, hardware button 1 clicked, hardware toggle 0
+// on with its thumb (the bevel's press and the LED) aimed at 1; the default row is untouched;
+// the faces drew on layer 1 and the LEDs on layer 2, the layer is back at base, and nothing
+// overflowed.
+test "the hardware scenario drives the skinned row" {
+    const app = new_app();
+    _ = frame(app);
+    const scenario = bench.find(App.scenarios, "hardware").?;
+    _ = try bench.replay_headless(App, app, &test_context, scenario, .{ 1280, 720 }, hardware_steps.len + 1);
+    try std.testing.expectEqualStrings("0.83", app.hard_knobs[0].value_text[0..4]);
+    try std.testing.expect(app.hard_toggles[0].on);
+    try std.testing.expectEqual(@as(f32, 1), app.hard_toggles[0].thumb.target);
+    try std.testing.expectEqualStrings("hardware toggle 0 on", app.status_text());
+    try std.testing.expectEqual(knob_values[0], app.knobs[0].value);
+    try std.testing.expect(!app.toggles[0].on);
+    try std.testing.expectEqual(@as(usize, 4), test_context.draw.items(hardware.Dial).len);
+    try std.testing.expectEqual(@as(usize, 4), test_context.draw.items(hardware.Bevel).len);
+    const leds = test_context.draw.items(hardware.Led);
+    try std.testing.expectEqual(@as(usize, 2), leds.len);
+    // The replay steps no frames, so toggle 0's LED is still dark and toggle 1's (on) lit.
+    try std.testing.expectEqual(@as(f32, 0), leds[0].brightness);
+    try std.testing.expectEqual(@as(f32, 1), leds[1].brightness);
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(test_context.draw.layer_at(hardware.Dial, 0)));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(test_context.draw.layer_at(hardware.Led, 0)));
+    try std.testing.expectEqual(quads.Layer.base, test_context.draw.layer_now);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the status line of each hardware widget: a hardware button click and a wheel on a
+// hardware dial report with the row's prefix.
+test "hardware actions report on the status line" {
+    const app = new_app();
+    _ = frame(app);
+    const press = area_rect(app.hard_buttons[0].id);
+    const point: input.Point = .{ .x = press.x + 10, .y = press.y + 10 };
+    ui.dispatch(App, app, &test_context, .{ .pointer_down = input.left_at(point) });
+    ui.dispatch(App, app, &test_context, .{ .pointer_up = input.left_at(point) });
+    try std.testing.expectEqualStrings("hardware button 0 clicked", app.status_text());
+    const body = area_rect(app.hard_knobs[2].id);
+    const wheel: input.Wheel = .{ .x = body.x + body.width * 0.5, .y = body.y + body.height * 0.5, .dx = 0, .dy = 12 };
+    ui.dispatch(App, app, &test_context, .{ .wheel = wheel });
+    try std.testing.expectEqualStrings("hardware knob 2 changed 0.60", app.status_text());
 }
 
 // Locks the `light` scenario (section 4) replayed headless: the toggle is on, the context holds
@@ -739,8 +913,9 @@ test "a theme switch records one uniform write and one full repaint" {
         else => {},
     };
     try std.testing.expectEqual(@as(u32, 1), uniform_writes);
-    // The uniform and the three pools' changed ranges: every text and face color moved.
-    try std.testing.expectEqual(@as(u32, 4), writes);
+    // The uniform and the six pools' changed ranges (Box, Arc, Glyph, and the hardware row's
+    // Dial, Bevel, and Led): every text and face color moved.
+    try std.testing.expectEqual(@as(u32, 7), writes);
     try std.testing.expect(written > 256);
     var frames: u32 = 0;
     while (ui.animate(App, app, &test_context, 1000.0 / 60.0)) : (frames += 1) {
@@ -754,6 +929,10 @@ test "a theme switch records one uniform write and one full repaint" {
     record(renderer, buffer);
     try std.testing.expectEqual(patchwork.renderer.Kind.skipped, renderer.last);
     try std.testing.expectEqual(@as(u32, 0), buffer.count);
+}
+
+test {
+    _ = hardware;
 }
 
 comptime {

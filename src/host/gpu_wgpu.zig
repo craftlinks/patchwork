@@ -105,7 +105,18 @@
 //! Without it no feature is requested, the surface usage is unchanged, and none of this runs.
 //! `Options.adapter` maps to `power_preference` in either mode.
 //!
-//! ## 10. TigerStyle Invariants
+//! ## 10. Windowless Check
+//! `check` replays an app's setup stream (every shader, layout, pipeline, and resource the
+//! renderer creates at startup) on a device created without a surface: the adapter is
+//! requested with no compatible surface and `Options.adapter`'s power preference, and
+//! `format_bgra8_unorm` stands in for the surface format, which `pick_format` always picks
+//! anyway. A WGSL or pipeline error is logged exactly as a frame error is (section 5: op
+//! index, op name, the draw type's name, the message), so `zig build check` names the broken
+//! type before any window opens. The stream may hold setup ops only; a frame op would reach
+//! the missing surface and panics. The adapter may differ from a windowed run's when the
+//! preference is `default`, so the check is run with `--adapter low` and `--adapter high`.
+//!
+//! ## 11. TigerStyle Invariants
 //! Long-lived resources are created only by setup ops, into fixed tables; frame ops create
 //! and release only per-frame handles. Searches over driver-reported lists are bounded by
 //! `present_mode_cap` and `format_cap`, waiting is bounded by `wait_max`, and an error
@@ -917,6 +928,84 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gp
     };
 }
 
+/// What `check` created on the adapter it was given.
+pub const Checked = struct {
+    shaders: u32,
+    pipelines: u32,
+    adapter_name: [adapter_name_cap]u8,
+    adapter_name_len: u32,
+
+    /// The adapter's device name, as the driver reports it.
+    pub fn adapter(self: *const Checked) []const u8 {
+        assert(self.adapter_name_len <= adapter_name_cap);
+        return self.adapter_name[0..self.adapter_name_len];
+    }
+};
+
+/// The device `check` replays into; static because its tables are large and it outlives
+/// nothing but the call.
+var check_gpu: Gpu = undefined;
+
+/// Replays a renderer setup stream on a device with no surface (module guide section 10): an
+/// instance, an adapter requested with no compatible surface and `preference`, a device with
+/// `uncaptured_error` installed, and `format_bgra8_unorm` standing in for the surface format,
+/// which `pick_format` always chooses. Returns the shader and pipeline counts, or the error
+/// `execute` returns after logging the first failing op (`error.GpuValidation`).
+pub fn check(setup: *const commands.CommandBuffer, preference: bench.Adapter) !Checked {
+    assert(setup.len != 0);
+    assert(setup.count != 0);
+    var checked: Checked = .{
+        .shaders = 0,
+        .pipelines = 0,
+        .adapter_name = undefined,
+        .adapter_name_len = 0,
+    };
+    var reader = setup.reader();
+    while (reader.next()) |op| switch (op) {
+        .shader_create => checked.shaders += 1,
+        .pipeline_create => checked.pipelines += 1,
+        .layout_create, .buffer_create, .texture_create, .sampler_create => {},
+        .bind_group_create, .buffer_write, .texture_write, .target_create => {},
+        // A frame op would reach the surface, which a check does not have.
+        else => std.debug.panic("check: op {s} is not a setup op", .{@tagName(op)}),
+    };
+    const instance = try create_instance();
+    const adapter = try request_adapter(instance, null, preference);
+    const device = try request_device(instance, adapter, false, false);
+    const queue = wgpuDeviceGetQueue(device);
+    checked.adapter_name_len = adapter_name_of(adapter, &checked.adapter_name);
+    check_gpu = .{
+        .instance = instance,
+        .adapter = adapter,
+        .device = device,
+        .queue = queue,
+        .surface = undefined,
+        .format = format_bgra8_unorm,
+        .present_mode = present_fifo,
+        .configured_width = 0,
+        .configured_height = 0,
+        .shaders = @splat(null),
+        .layouts = @splat(null),
+        .layout_entries = undefined,
+        .pipelines = @splat(null),
+        .buffers = @splat(null),
+        .textures = @splat(null),
+        .views = @splat(null),
+        .samplers = @splat(null),
+        .bind_groups = @splat(null),
+        .target_sizes = @splat(.{ 0, 0 }),
+        .profile = profile_create(adapter, device, queue, .{
+            .enabled = false,
+            .timestamps = false,
+            .inside_encoders = false,
+        }),
+    };
+    try execute(&check_gpu, setup);
+    assert(checked.shaders <= cap(.shader));
+    assert(checked.pipelines <= cap(.pipeline));
+    return checked;
+}
+
 /// Per-frame handles between the first op that opens the encoder and the present. All null
 /// outside a frame. `texture` and `view` are the surface's; a pass on a render target uses
 /// the target's own view. `timed_passes` and `timed_copy` say which timestamps bench mode wrote.
@@ -1614,10 +1703,11 @@ fn create_surface(instance: Instance, display: *anyopaque, wl_surface: *anyopaqu
     return surface;
 }
 
-/// Requests an adapter compatible with `surface` and blocks (bounded) until it resolves.
-fn request_adapter(instance: Instance, surface: Surface, preference: bench.Adapter) !Adapter {
+/// Requests an adapter compatible with `surface` (any adapter for `check`, which has none)
+/// and blocks (bounded) until it resolves.
+fn request_adapter(instance: Instance, surface: ?Surface, preference: bench.Adapter) !Adapter {
     assert(@intFromPtr(instance) != 0);
-    assert(@intFromPtr(surface) != 0);
+    if (surface) |handle| assert(@intFromPtr(handle) != 0);
     var slot: AdapterSlot = .{ .adapter = null, .ok = false };
     const options: RequestAdapterOptions = .{
         .next_in_chain = null,
@@ -2130,14 +2220,7 @@ fn profile_create(
     profile.enabled = features.enabled;
     profile.inside_encoders = features.inside_encoders;
     if (!features.enabled) return profile;
-    var info: AdapterInfo = std.mem.zeroes(AdapterInfo);
-    if (wgpuAdapterGetInfo(adapter, &info) == status_success) {
-        const name = if (info.device.data) |data| data[0..info.device.length] else "";
-        const len: u32 = @intCast(@min(name.len, adapter_name_cap));
-        @memcpy(profile.adapter_name[0..len], name[0..len]);
-        profile.adapter_name_len = len;
-        wgpuAdapterInfoFreeMembers(info);
-    }
+    profile.adapter_name_len = adapter_name_of(adapter, &profile.adapter_name);
     if (!features.timestamps) return profile;
     profile.period_ns = wgpuQueueGetTimestampPeriod(queue);
     profile.query = wgpuDeviceCreateQuerySet(device, &.{
@@ -2156,6 +2239,20 @@ fn profile_create(
     assert(profile.period_ns > 0);
     assert(profile.query != null);
     return profile;
+}
+
+/// Copies the adapter's device name into `out`, cut at `adapter_name_cap`, and returns its
+/// length; 0 when the driver reports none.
+fn adapter_name_of(adapter: Adapter, out: *[adapter_name_cap]u8) u32 {
+    assert(@intFromPtr(adapter) != 0);
+    var info: AdapterInfo = std.mem.zeroes(AdapterInfo);
+    if (wgpuAdapterGetInfo(adapter, &info) != status_success) return 0;
+    const name = if (info.device.data) |data| data[0..info.device.length] else "";
+    const len: u32 = @intCast(@min(name.len, adapter_name_cap));
+    @memcpy(out[0..len], name[0..len]);
+    wgpuAdapterInfoFreeMembers(info);
+    assert(len <= adapter_name_cap);
+    return len;
 }
 
 fn create_profile_buffer(device: Device, usage: Flags, size: u64) ?Buffer {

@@ -59,12 +59,18 @@
 //!   `--`: a scenario name, `--frames`, `--adapter`, `--dump`, `--csv` (`src/bench.zig`).
 //!   Build with `-Doptimize=ReleaseFast` for numbers that mean something; the report names
 //!   the mode.
+//! - `check` runs the installed native executable with `--check` and the arguments after `--`
+//!   (`--adapter low|high`): it compiles every shader and pipeline the app creates at startup
+//!   on a device with no window and fails naming the first broken draw type
+//!   (`src/host/gpu_wgpu.zig`, section 10). It needs a GPU, so it is not part of `test`; in
+//!   this repo `zig build check` checks every example.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests and the native-only tests
 //!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
 //!   compiles an app with no `draw`, an app whose draw type is not a multiple of 16 bytes,
-//!   and an app whose draw type reads time without declaring `animated`, and passes only if
-//!   the compiler rejects each with its expected message.
+//!   an app whose draw type reads time without declaring `animated`, an app that declares
+//!   `Audio` without `audio`, a theme color out of range, and a knob whose skin lacks `knob`,
+//!   and passes only if the compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm` compares two frame dumps (`tools/compare.zig`).
@@ -113,6 +119,10 @@ pub const AppSteps = struct {
     serve: *std.Build.Step,
     /// Runs the installed native executable in bench mode (`--bench` plus the arguments).
     bench: *std.Build.Step,
+    /// Runs the installed native executable with `--check` plus the arguments: compiles every
+    /// shader and pipeline on a device with no window and fails on the first error. Needs a
+    /// GPU, so it is not part of `test`.
+    check: *std.Build.Step,
     /// Runs the app's own unit tests.
     tests: *std.Build.Step,
 };
@@ -151,8 +161,9 @@ pub fn addApp(
     const tests = b.addTest(.{ .root_module = native_app });
     return .{
         .install = &install.step,
-        .run = add_run(b, options, &install.step, &.{}),
-        .bench = add_run(b, options, &install.step, &.{"--bench"}),
+        .run = add_run(b, options, &install.step, "run", &.{}),
+        .bench = add_run(b, options, &install.step, "bench", &.{"--bench"}),
+        .check = add_run(b, options, &install.step, "check", &.{"--check"}),
         .wasm = &wasm_install.step,
         .serve = add_serve(b, patchwork_builder, options, wasm, &wasm_install.step),
         .tests = &b.addRunArtifact(tests).step,
@@ -296,15 +307,15 @@ fn wgpu_lib_path(patchwork_builder: *std.Build, options: AppOptions) std.Build.L
 }
 
 /// Runs the installed executable rather than the cached one, because its RUNPATH
-/// (`$ORIGIN/../lib`) resolves only next to the installed library. `leading` goes before the
-/// arguments after `--`.
+/// (`$ORIGIN/../lib`) resolves only next to the installed library. `what` names the step
+/// (`run`, `bench`, `check`); `leading` goes before the arguments after `--`.
 fn add_run(
     b: *std.Build,
     options: AppOptions,
     install: *std.Build.Step,
+    what: []const u8,
     leading: []const []const u8,
 ) *std.Build.Step {
-    const what = if (leading.len == 0) "run" else "bench";
     const run_cmd = std.Build.Step.Run.create(b, b.fmt("{s} {s}", .{ what, options.name }));
     run_cmd.addFileArg(b.graph.path(.install_bin, options.name));
     run_cmd.addArgs(leading);
@@ -517,8 +528,17 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(gallery.install);
     add_example_steps(b, "-gallery", "the widget gallery", gallery);
-    add_test_steps(b, library, .{ rack, column, live, data, wave, fx, audio, canvas, gallery });
+    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery };
+    add_test_steps(b, library, examples);
+    add_check_step(b, &examples);
     add_compare_step(b, library);
+}
+
+/// `check`: every example's windowless shader and pipeline check, with the arguments after
+/// `--` (`zig build check -- --adapter low`).
+fn add_check_step(b: *std.Build, examples: []const AppSteps) void {
+    const step = b.step("check", "Compile every example's shaders and pipelines with no window");
+    for (examples) |example| step.dependOn(example.check);
 }
 
 /// `compare`: the frame-dump diff tool, run with the arguments after `--`.
@@ -615,6 +635,11 @@ fn add_test_steps(
         .{
             .path = "test/contract_theme_range.zig",
             .expected = "App.config.theme.colors.panel: a component is outside [0, 1]",
+        },
+        .{
+            .path = "test/contract_skin_missing.zig",
+            .expected = "contract_skin_missing.Bare: missing " ++
+                "`pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`",
         },
     };
     for (contracts) |case| {

@@ -517,7 +517,9 @@ comptime {
 }
 
 /// Orchestrates the entire Wayland application lifecycle for one app type:
-/// 1. Checks the app contract at compile time and initializes `App`.
+/// 1. Checks the app contract at compile time and initializes `App`. With `--check` it
+///    records the setup stream, replays it on a device with no window, and returns
+///    (`Host(App).check`).
 /// 2. Connects to the Wayland display socket and binds core globals
 ///    (`wl_compositor`, `xdg_wm_base`).
 /// 3. Creates the surface and desktop window (`xdg_surface`, `xdg_toplevel`), titled with
@@ -544,6 +546,7 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     AppHost.render.init();
     AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
+    if (options.check) return AppHost.check(&state, options.adapter);
     try init_input(&state);
     defer _ = std.os.linux.close(state.repeat_fd);
     try connect(&state);
@@ -1133,6 +1136,26 @@ fn Host(comptime App: type) type {
                     entry.area_px / window_px,
                 });
             }
+        }
+
+        /// `--check`: records the setup stream exactly as `setup` does and replays it on a
+        /// device with no window (`gpu_wgpu.zig`, section 10). Prints the counts and returns,
+        /// or exits with status 1 after the backend logged the first failing op.
+        fn check(state: *State, adapter: bench.Adapter) !void {
+            state.commands.reset();
+            render.setup(&state.commands, &context.draw);
+            assert(render.ready);
+            assert(state.commands.count != 0);
+            const checked = gpu.native.check(&state.commands, adapter) catch |err| {
+                std.debug.print("check: {s}: {s}\n", .{ App.config.title, @errorName(err) });
+                std.process.exit(1);
+            };
+            std.debug.print("check: {d} shaders, {d} pipelines ok ({s}, {s})\n", .{
+                checked.shaders,
+                checked.pipelines,
+                App.config.title,
+                checked.adapter(),
+            });
         }
 
         /// Records the renderer's setup stream (every long-lived resource and the textures

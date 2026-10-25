@@ -111,6 +111,7 @@ patchwork/
 │   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
 │   ├── widgets/kit.zig         # The widget kit: append, face, arc, label, step, aim, weight,
 │   │                           #   clicked, Interaction, Paint, the hover and press constants
+│   ├── widgets/skin.zig        # Skins: the look structs, Shape, skins.check, skins.Default
 │   ├── widgets/label.zig       # One file per widget, with its constants, geometry, and tests:
 │   ├── widgets/panel.zig       #   Label, Panel, Button, Slider, Knob (and the shared ring and
 │   ├── widgets/button.zig      #   label-column geometry, accents), Meter, Toggle, TextField
@@ -198,7 +199,8 @@ patchwork/
 │   ├── canvas/                 # Pan and zoom
 │   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
 │   └── gallery/                # Every library widget on one screen (phase 6 regression app)
-│       └── app.zig             # Gallery App: built only from widgets.kit and layout defaults
+│       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
+│       └── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frame dumps differ
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
@@ -211,7 +213,8 @@ patchwork/
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
     ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
-    └── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
+    ├── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
+    └── contract_skin_missing.zig # Test verifying that a skin without `knob` fails, naming it
 ```
 
 ## Build Steps
@@ -271,7 +274,11 @@ zig build serve-gallery   # Serve it on localhost (prints the address)
 zig build test            # Run unit tests across the library and the nine examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
-                          # `Audio` source without `audio`, and a theme color of 1.5
+                          # `Audio` source without `audio`, a theme color of 1.5, and a
+                          # knob skin without `knob`
+zig build check           # Compile every example's shaders and pipelines on a GPU with no
+                          # window; fails naming the broken draw type (needs a GPU)
+zig build check -- --adapter low   # The same on the integrated GPU
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
@@ -502,7 +509,8 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   `draw.Box.of(rect, clip, BoxLook)` and `draw.Arc.of(ring, clip, ArcLook)`, whose looks
   default to no border, hover, or press and the full sweep; `ui` and `draw` use the
   constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
-  re-exports every name.
+  re-exports every name. Each widget is generic over a skin that draws it (`KnobOf(Skin)`;
+  see Make a Skin below).
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
   the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
   and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
@@ -556,6 +564,47 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 - **Making one.** Copy a preset and change fields: `var s = theme.dark; s.colors.panel =
   .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, and text
   sizes are at most `text.size_max`; `app.check` refuses anything else and names the field.
+
+## Make a Skin
+
+A widget's behaviour (its fields, `handle`, and actions) is written once; how it looks and
+where it takes presses belong to a skin, a struct of draw functions passed at compile time.
+`widgets.Knob` is `widgets.KnobOf(widgets.skins.Default)`; `ButtonOf`, `SliderOf`, `ToggleOf`,
+`MeterOf`, `PanelOf`, and `TextFieldOf` (its face and border only) work the same way. There
+is no vtable: two looks on one screen are two types, and `ui.route` routes both.
+
+A knob skin declares one function. It gets a `widgets.KnobLook` of plain values (the row, the
+clip, the ring's side, the value and its text, the raw hover value, the accent, the name),
+appends whatever it draws, and returns the hit shape the knob records, or null to draw and
+record nothing:
+
+```zig
+const Skin = struct {
+    pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
+        if (look.row.height < look.ring) return null;
+        const ring = widgets.ring_sized(look.row, look.ring);
+        const body = ui.cx.inset(ring, .all(9));
+        kit.append(cx, hardware.Dial, null, .{ ... }); // its own draw type, in config.draw
+        kit.arc(cx, ring, look.clip, .{ .color = accent, .thickness = 4, .sweep = look.value });
+        kit.label(cx, cx.theme().name, look.name, widgets.name_box(look.row, look.ring), ...);
+        return .{ .rect = body, .radius = body.width * 0.5 }; // presses on the body only
+    }
+};
+const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of widgets.Knob
+```
+
+- **The contract.** `button`, `slider` (with `slider_travel(area) [2]f32`, the x span a press
+  maps onto `[0, 1]`), `knob`, and `toggle` return `?widgets.Shape`; `meter`, `panel`, and
+  `field` return nothing. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
+  fails the build with a message naming the skin and the function, for example
+  "hardware.Skin: missing `pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`".
+- **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
+  follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
+- **Draw order.** A batch draws where its type first appeared in its layer. A skin with its
+  own face type should append faces on one layer and what goes on top (arcs, labels) on a
+  higher one, then restore the layer, as the gallery's hardware skin does.
+- **Check the shaders.** `zig build check` compiles every draw type's WGSL before a window
+  opens and names the broken type.
 
 ## Example Applications
 
@@ -743,7 +792,7 @@ at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), an
 
 ### 9. Widget Gallery (`examples/gallery/app.zig`)
 
-Every library widget on one fixed 1088 by 640 screen from the top-left, built only from
+Every library widget on one fixed 1088 by 704 screen from the top-left, built only from
 `widgets.kit` and the one-statement layouts: three buttons, two sliders, four knobs with
 rings of 56, 40, 56, and 72, three toggles, a meter that follows slider 0, a 240 px text
 field, and a list of 40 clickable rows (`kit.clicked`) in a view, the selected one
@@ -752,9 +801,15 @@ the app handles each widget itself rather than through `ui.route`. It is the reg
 of phases 6 and 7: each step adds a section. A "light" toggle in the title bar switches the
 whole app between `theme.dark` and `theme.light` (`cx.set_theme`); the widgets' stored colors
 (slider paints, knob accents, the field's text) are restyled from the scheme, while the
-buttons keep their own blue. Scenarios: `still`, `interact` (a click, two drags, a toggle,
-typing, a wheel, and a row click, then settled), `hover` (the pointer rests on button 1), and
-`light` (the toggle, then the focused field with "abc" selected, settled).
+buttons keep their own blue. Under the default widgets a hardware row draws four knobs, two
+buttons, and two toggles with the same library behaviour in the gallery's own skin
+(`examples/gallery/hardware.zig`): a `Dial` draw type with a drop shadow and a pointer, a
+`Bevel` face lit on top and shaded below, and the rack's `Led`; the status line reports both
+rows ("hardware knob 0 changed 0.83"). Scenarios: `still`, `interact` (a click, two drags, a
+toggle, typing, a wheel, and a row click, then settled), `hover` (the pointer rests on button
+1), `light` (the toggle, then the focused field with "abc" selected, settled), and `hardware`
+(hardware knob 0 dragged up 40 px, hardware button 1 clicked, hardware toggle 0 flipped,
+settled).
 
 ## Pan and Zoom
 
@@ -814,8 +869,8 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
 it runs, no GPU feature is requested, and the frame path is unchanged.
 
 ```text
-<app> [--adapter low|high] [--no-cache] [--bench [scenario] [--frames N] [--dump out.ppm]
-      [--csv out.csv]]
+<app> [--adapter low|high] [--no-cache] [--check] [--bench [scenario] [--frames N]
+      [--dump out.ppm] [--csv out.csv]]
 zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 ```
 
@@ -842,6 +897,13 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   3-8, 9-32, 33-255) and exits 1 when any differ.
 - **Adapter.** `--adapter low` asks for `low_power` (an integrated GPU), `high` for
   `high_performance`; it works without `--bench` too. `--no-cache` turns the pixel cache off.
+- **Check.** `--check` opens no window: it records the app's setup stream (every shader,
+  layout, pipeline, and startup resource), replays it on a device created with no surface
+  (`bgra8unorm` standing in for the surface format), prints `check: N shaders, M pipelines
+  ok (title, adapter)`, and exits; on a WGSL or pipeline error it logs the op, the draw type's
+  name, and the message as a frame error would, and exits 1. `zig build check` runs it for
+  every example. The browser has no such mode; with `?trace=1` the page logs one "compiled
+  shader" line per module from `getCompilationInfo`.
 - **Frame kinds.** The report counts measured frames by what the renderer recorded (skipped,
   copied, cached, full, direct); a skipped frame's GPU time is 0, and a cached frame's includes
   the copy to the surface when the adapter supports timestamps inside encoders. `gpu pass` is

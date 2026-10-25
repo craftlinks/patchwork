@@ -8,8 +8,10 @@
 //! darken go, a release outside lets both go. `.frame` eases them.
 //!
 //! ## 2. Drawing
-//! The face (`Paint.look` of the two animator values), then the label inside `padding`. The
-//! face is the hit area, rounded by the paint's radius.
+//! `ButtonOf(Skin)` hands the skin a `ButtonLook` and records the hit shape it returns
+//! (`widgets/skin.zig`); `Button` is `ButtonOf(skins.Default)`. The default look is the face
+//! (`Paint.look` of the two animator values), then the label inside `padding`; the face is the
+//! hit area, rounded by the paint's radius.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,50 +20,68 @@ const text = @import("../text.zig");
 const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 
 const Walk = kit.Walk;
 const Id = kit.Id;
 const Inset = kit.Inset;
 
-/// A clickable face with a centered label.
-pub const Button = struct {
-    id: Id,
-    label: []const u8,
-    style: text.Style,
-    padding: Inset,
-    paint: kit.Paint,
-    hover: animator.Animator,
-    down: animator.Animator,
+/// The default button: `ButtonOf(skins.Default)`, a face with a centered label.
+pub const Button = ButtonOf(skin.Default);
 
-    pub const Action = enum {
-        none,
-        clicked,
-    };
+/// A clickable button drawn by `Skin` (`widgets/skin.zig`): the behaviour below, `Skin.button`
+/// for the look and the hit shape.
+pub fn ButtonOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .button)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
 
-    pub fn handle(self: *Button, cx: anytype, event: input.Event) Action {
-        assert(self.id != .none);
-        if (event == .frame) {
-            kit.step(cx, &self.hover, event.frame);
-            kit.step(cx, &self.down, event.frame);
+        id: Id,
+        label: []const u8,
+        style: text.Style,
+        padding: Inset,
+        paint: kit.Paint,
+        hover: animator.Animator,
+        down: animator.Animator,
+
+        pub const Action = enum {
+            none,
+            clicked,
+        };
+
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.id != .none);
+            if (event == .frame) {
+                kit.step(cx, &self.hover, event.frame);
+                kit.step(cx, &self.down, event.frame);
+                return .none;
+            }
+            const hit = cx.hit(self.id, event);
+            kit.respond(cx, hit, &self.hover, &self.down);
+            if (hit == .up and hit.up.inside) return .clicked;
             return .none;
         }
-        const hit = cx.hit(self.id, event);
-        kit.respond(cx, hit, &self.hover, &self.down);
-        if (hit == .up and hit.up.inside) return .clicked;
-        return .none;
-    }
 
-    pub fn draw(self: *const Button, cx: anytype, walk: Walk) void {
-        assert(self.id != .none);
-        assert(self.label.len <= text.byte_cap);
-        const rect = cx.walk(walk);
-        const clip = cx.visible(rect) orelse return;
-        cx.area(self.id, rect, self.paint.radius, ui.cx.plain);
-        kit.face(cx, rect, clip, self.paint.look(cx.theme(), self.hover.value, self.down.value));
-        const inner = ui.cx.inset(rect, self.padding);
-        kit.label(cx, self.style, self.label, inner, clip, kit.centered);
-    }
-};
+        /// Hands the box `walk` gets to the skin and records the shape it returns.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.id != .none);
+            assert(self.label.len <= text.byte_cap);
+            const rect = cx.walk(walk);
+            const clip = cx.visible(rect) orelse return;
+            const shape = Skin.button(cx, .{
+                .rect = rect,
+                .clip = clip,
+                .label = self.label,
+                .style = self.style,
+                .padding = self.padding,
+                .paint = self.paint,
+                .hover = self.hover.value,
+                .down = self.down.value,
+            }) orelse return;
+            cx.area(self.id, shape.rect, shape.radius, ui.cx.plain);
+        }
+    };
+}
 
 const testing = std.testing;
 const fixture = @import("fixture.zig");

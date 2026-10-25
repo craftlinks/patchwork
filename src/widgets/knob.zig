@@ -28,9 +28,11 @@
 //! relative and clamped".
 //!
 //! ## 3. Drawing
-//! A track arc over the whole sweep, the value arc over `value` of it in `accent` (omitted at
-//! 0, lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed
-//! `[8]u8` `value_text`, tail zeroed.
+//! `KnobOf(Skin)` hands the skin a `KnobLook` and records the hit shape it returns
+//! (`widgets/skin.zig`); `Knob` is `KnobOf(skins.Default)`. The default look is a track arc
+//! over the whole sweep, the value arc over `value` of it in `accent` (omitted at 0,
+//! lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed `[8]u8`
+//! `value_text`, tail zeroed.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -39,6 +41,7 @@ const input = @import("../input.zig");
 const theme = @import("../theme.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -93,138 +96,140 @@ comptime {
     }
 }
 
-/// Open ring. Drag is relative: up increases `value`. Value 0 omits the value arc. A right
-/// press resets it to `default`, its value at `init`.
-pub const Knob = struct {
-    id: Id,
-    name: []const u8,
-    value_text: [8]u8,
-    value: f32,
-    default: f32,
-    accent: kit.Paint,
-    hover: animator.Animator,
-    drag_y: f32,
-    /// The ring's side in logical pixels (section 1); `sized` sets another.
-    ring: f32 = ring_size,
+/// The default knob: `KnobOf(skins.Default)`, an open ring with its labels.
+pub const Knob = KnobOf(skin.Default);
 
-    pub const Action = union(enum) {
-        none,
-        changed: f32,
-        released,
-        /// A right press set the value back to `default`.
-        reset: f32,
-    };
+/// A knob drawn by `Skin` (`widgets/skin.zig`): the behaviour below, `Skin.knob` for the look
+/// and the hit shape. Drag is relative: up increases `value`. A right press resets it to
+/// `default`, its value at `init`.
+pub fn KnobOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .knob)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
 
-    /// A knob at `value` (also its default) with its text written.
-    pub fn init(id: Id, name: []const u8, value: f32, accent: kit.Paint) Knob {
-        assert(id != .none);
-        assert(name.len <= 8);
-        var knob: Knob = .{
-            .id = id,
-            .name = name,
-            .value_text = @splat(0),
-            .value = value,
-            .default = value,
-            .accent = accent,
-            .hover = animator.Animator.init(kit.hover_rate_per_ms),
-            .drag_y = 0,
+        id: Id,
+        name: []const u8,
+        value_text: [8]u8,
+        value: f32,
+        default: f32,
+        accent: kit.Paint,
+        hover: animator.Animator,
+        drag_y: f32,
+        /// The ring's side in logical pixels (section 1); `sized` sets another.
+        ring: f32 = ring_size,
+
+        pub const Action = union(enum) {
+            none,
+            changed: f32,
+            released,
+            /// A right press set the value back to `default`.
+            reset: f32,
         };
-        knob.set_value(value);
-        assert(knob.value == value);
-        return knob;
-    }
 
-    /// This knob with a ring of `side` logical pixels, at least `ring_min`.
-    pub fn sized(self: Knob, side: f32) Knob {
-        assert(side >= ring_min);
-        var knob = self;
-        knob.ring = side;
-        assert(knob.ring == side);
-        return knob;
-    }
-
-    pub fn handle(self: *Knob, cx: anytype, event: input.Event) Action {
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        if (event == .frame) {
-            kit.step(cx, &self.hover, event.frame);
-            return .none;
+        /// A knob at `value` (also its default) with its text written.
+        pub fn init(id: Id, name: []const u8, value: f32, accent: kit.Paint) Self {
+            assert(id != .none);
+            assert(name.len <= 8);
+            var knob: Self = .{
+                .id = id,
+                .name = name,
+                .value_text = @splat(0),
+                .value = value,
+                .default = value,
+                .accent = accent,
+                .hover = animator.Animator.init(kit.hover_rate_per_ms),
+                .drag_y = 0,
+            };
+            knob.set_value(value);
+            assert(knob.value == value);
+            return knob;
         }
-        const hit = cx.hit(self.id, event);
-        kit.respond(cx, hit, &self.hover, null);
-        switch (hit) {
-            .none, .hover_in, .hover_out => return .none,
-            .down => |press| {
-                self.drag_y = press.y;
+
+        /// This knob with a ring of `side` logical pixels, at least `ring_min`.
+        pub fn sized(self: Self, side: f32) Self {
+            assert(side >= ring_min);
+            var knob = self;
+            knob.ring = side;
+            assert(knob.ring == side);
+            return knob;
+        }
+
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.value >= 0);
+            assert(self.value <= 1);
+            if (event == .frame) {
+                kit.step(cx, &self.hover, event.frame);
                 return .none;
-            },
-            .drag => |press| {
-                const dy = press.y - self.drag_y;
-                self.drag_y = press.y;
-                return self.nudge(cx, -dy / drag_span_px);
-            },
-            .up => return .released,
-            .wheel => |wheel| {
-                kit.aim(cx, &self.hover, 1);
-                return self.nudge(cx, -wheel.dy / drag_span_px);
-            },
-            .secondary => {
-                kit.aim(cx, &self.hover, 1);
-                if (self.value == self.default) return .none;
-                self.set_value(self.default);
-                cx.redraw();
-                assert(self.value == self.default);
-                return .{ .reset = self.default };
-            },
+            }
+            const hit = cx.hit(self.id, event);
+            kit.respond(cx, hit, &self.hover, null);
+            switch (hit) {
+                .none, .hover_in, .hover_out => return .none,
+                .down => |press| {
+                    self.drag_y = press.y;
+                    return .none;
+                },
+                .drag => |press| {
+                    const dy = press.y - self.drag_y;
+                    self.drag_y = press.y;
+                    return self.nudge(cx, -dy / drag_span_px);
+                },
+                .up => return .released,
+                .wheel => |wheel| {
+                    kit.aim(cx, &self.hover, 1);
+                    return self.nudge(cx, -wheel.dy / drag_span_px);
+                },
+                .secondary => {
+                    kit.aim(cx, &self.hover, 1);
+                    if (self.value == self.default) return .none;
+                    self.set_value(self.default);
+                    cx.redraw();
+                    assert(self.value == self.default);
+                    return .{ .reset = self.default };
+                },
+            }
         }
-    }
 
-    /// Draws the ring, the value arc, the name, and the value text in the box `walk` gets,
-    /// and records the ring's disc as a wheel area. A box shorter than the ring draws
-    /// nothing.
-    pub fn draw(self: *const Knob, cx: anytype, walk: Walk) void {
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        const row = cx.walk(walk);
-        if (row.height < self.ring) return;
-        const clip = cx.visible(row) orelse return;
-        const ring = ring_sized(row, self.ring);
-        cx.area(self.id, ring, self.ring * 0.5, knob_flags);
-        const scheme = cx.theme();
-        kit.arc(cx, ring, clip, .{ .color = scheme.colors.track, .thickness = ring_thickness });
-        if (self.value > 0) {
-            const accent = self.accent;
-            kit.arc(cx, ring, clip, .{
-                .color = .{ accent.r, accent.g, accent.b, accent.a },
-                .thickness = ring_thickness,
-                .sweep = self.value,
-                .hover = kit.weight(self.hover.value, scheme.hover_lighten),
-            });
+        /// Hands the box `walk` gets to the skin and records the shape it returns as a wheel
+        /// area. The default skin draws the ring, the value arc, the name, and the value text,
+        /// and nothing in a box shorter than the ring.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.value >= 0);
+            assert(self.value <= 1);
+            const row = cx.walk(walk);
+            const clip = cx.visible(row) orelse return;
+            const shape = Skin.knob(cx, .{
+                .row = row,
+                .clip = clip,
+                .ring = self.ring,
+                .value = self.value,
+                .hover = self.hover.value,
+                .accent = self.accent,
+                .name = self.name,
+                .value_text = self.value_text[0..4],
+            }) orelse return;
+            cx.area(self.id, shape.rect, shape.radius, knob_flags);
         }
-        const centered = kit.centered;
-        kit.label(cx, scheme.name, self.name, name_box(row, self.ring), clip, centered);
-        const value_text = self.value_text[0..4];
-        kit.label(cx, scheme.value, value_text, value_box(row, self.ring), clip, centered);
-    }
 
-    pub fn set_value(self: *Knob, value: f32) void {
-        assert(value >= 0);
-        assert(value <= 1);
-        self.value = value;
-        write_hundredths(&self.value_text, value);
-        assert(self.value_text[1] == '.');
-        assert(self.value == value);
-    }
+        pub fn set_value(self: *Self, value: f32) void {
+            assert(value >= 0);
+            assert(value <= 1);
+            self.value = value;
+            write_hundredths(&self.value_text, value);
+            assert(self.value_text[1] == '.');
+            assert(self.value == value);
+        }
 
-    fn nudge(self: *Knob, cx: anytype, delta: f32) Action {
-        assert(delta == delta);
-        const next = std.math.clamp(self.value + delta, 0, 1);
-        if (self.value == next) return .none;
-        self.set_value(next);
-        cx.redraw();
-        return .{ .changed = next };
-    }
-};
+        fn nudge(self: *Self, cx: anytype, delta: f32) Action {
+            assert(delta == delta);
+            const next = std.math.clamp(self.value + delta, 0, 1);
+            if (self.value == next) return .none;
+            self.set_value(next);
+            cx.redraw();
+            return .{ .changed = next };
+        }
+    };
+}
 
 pub fn ring_of(row: Rect) Rect {
     return ring_sized(row, ring_size);
@@ -276,7 +281,8 @@ pub fn name_box(row: Rect, side: f32) Rect {
     return box;
 }
 
-fn value_box(row: Rect, side: f32) Rect {
+/// The value text's line, under the name's.
+pub fn value_box(row: Rect, side: f32) Rect {
     var box = name_box(row, side);
     box.y = row.y + label_line_px;
     assert(box.y == row.y + label_line_px);
