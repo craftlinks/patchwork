@@ -441,7 +441,9 @@ fn vertex_wgsl(comptime T: type) []const u8 {
     }
 }
 
-fn theme_wgsl() []const u8 {
+/// The WGSL `Theme` struct, one `vec4<f32>` per `theme.Theme` field in order. The prelude
+/// follows it, and so does the renderer's clear pipeline (`draw/renderer.zig`, section 4a).
+pub fn theme_wgsl() []const u8 {
     comptime {
         var out: []const u8 = "struct Theme {\n";
         const info = @typeInfo(theme.Theme).@"struct";
@@ -681,6 +683,23 @@ const NoClip = extern struct {
     pub const texture: ?textures.Format = null;
     pub const pixel: []const u8 = "";
 };
+
+// Locks the generated `Theme`: eleven `vec4<f32>` members, `background` the tenth (slot 9,
+// byte 144) between `arc` and `pad1`, and no `pad0`.
+test "the generated theme names background at slot 9" {
+    const declaration = comptime theme_wgsl();
+    var lines = std.mem.splitScalar(u8, declaration, '\n');
+    try testing.expectEqualStrings("struct Theme {", lines.next().?);
+    var slot: u32 = 0;
+    while (lines.next()) |line| : (slot += 1) {
+        if (std.mem.eql(u8, line, "}")) break;
+        if (slot == 8) try testing.expectEqualStrings("    arc: vec4<f32>,", line);
+        if (slot == 9) try testing.expectEqualStrings("    background: vec4<f32>,", line);
+        if (slot == 10) try testing.expectEqualStrings("    pad1: vec4<f32>,", line);
+    }
+    try testing.expectEqual(theme.slot_count, slot);
+    try testing.expect(std.mem.find(u8, declaration, "pad0") == null);
+}
 
 // Locks the generated interface: locations 1 to N in `Instance`, flat groups in `Varyings`,
 // every field named in `Pixel` with its lane, the theme fields in order, and no texture

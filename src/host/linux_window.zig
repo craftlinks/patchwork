@@ -540,7 +540,7 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     }
     var state = initial_state();
     AppHost.context.init();
-    app_contract.start_timer(App, &AppHost.context);
+    app_contract.start(App, &AppHost.context);
     AppHost.render.init();
     AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);

@@ -116,7 +116,7 @@ const sample_style: wave.Style = .{
 };
 const playhead_color: [4]f32 = .{ 1, 1, 1, 0.9 };
 const range_color: [4]f32 = .{ 1, 1, 1, 0.12 };
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
 /// The panel faces, the overview's range and playhead, and the sample view's playhead.
@@ -256,7 +256,7 @@ pub const App = struct {
         const title = if (app.playing) "wave: playing (space pauses, wheel zooms)" else "wave: paused (space plays, wheel zooms)";
         text.place(draw_cx, title_style, title, band, clip_of(window), left);
         for ([_]Rect{ overview_rect, sample_rect, dj_rect, spectrum_rect }) |rect| {
-            append_box(cx, rect, theme.chrome.panel, window);
+            append_box(cx, rect, cx.theme().colors.panel, window);
         }
         cx.area(overview_id, overview_rect, 0, ui.cx.plain);
         cx.area(sample_id, sample_rect, 0, ui.cx.wheel_flag);
@@ -368,7 +368,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

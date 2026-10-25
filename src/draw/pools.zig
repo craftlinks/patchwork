@@ -88,6 +88,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const cache = @import("../text/cache.zig");
 const registry = @import("registry.zig");
+const theme = @import("../theme.zig");
 const textures = @import("textures.zig");
 const types = @import("types.zig");
 
@@ -242,6 +243,9 @@ pub fn Context(
         open_mask: u8,
         /// The open canvas's zoom, 1 when none is open.
         view_zoom: f32,
+        /// The theme record the renderer uploads (`theme.zig`): `theme.dark`'s from `init`,
+        /// then the app's scheme's (`ui.Context.set_theme`). `reset` keeps it.
+        theme: theme.Theme,
 
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
@@ -259,6 +263,7 @@ pub fn Context(
                 self.pools[index].revision = 0;
             }
             self.point_revision = 0;
+            self.theme = theme.dark.record();
             self.reset();
             assert(self.textures.count == 1);
             assert(self.batch_count == 0);

@@ -57,7 +57,7 @@ pub const Button = struct {
         const rect = cx.walk(walk);
         const clip = cx.visible(rect) orelse return;
         cx.area(self.id, rect, self.paint.radius, ui.cx.plain);
-        kit.face(cx, rect, clip, self.paint.look(self.hover.value, self.down.value));
+        kit.face(cx, rect, clip, self.paint.look(cx.theme(), self.hover.value, self.down.value));
         const inner = ui.cx.inset(rect, self.padding);
         kit.label(cx, self.style, self.label, inner, clip, kit.centered);
     }

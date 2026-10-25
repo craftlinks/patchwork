@@ -83,8 +83,8 @@ const light_colors = [3][4]f32{
 };
 const light_side_px: f32 = 120;
 
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
-const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.dark.colors.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 const labels = [panel_count][]const u8{
     "r32float, nearest, multiply shade",
@@ -175,8 +175,8 @@ pub const App = struct {
         for (0..panel_count) |index| {
             const panel = panel_rect(@intCast(index));
             kit.append(cx, quads.Box, null, .of(panel, clip_of(window), .{
-                .fill = theme.chrome.panel,
-                .border_color = theme.chrome.track,
+                .fill = cx.theme().colors.panel,
+                .border_color = cx.theme().colors.track,
                 .border_width = 1,
                 .radius = 6,
             }));
@@ -335,7 +335,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

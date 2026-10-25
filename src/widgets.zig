@@ -53,10 +53,14 @@
 //! Every append goes through `kit.append`, which skips an instance whose pool or batch list is
 //! full; the context counts the drop in `overflow_count`, and app tests assert it is zero.
 //!
-//! ## 5. Text Styles
-//! Control names use `name_style` (Noto Sans 16 px) and knob values `value_style` (Noto Sans
-//! Mono 16 px), so readouts keep their width as digits change. A `Label` carries its own
-//! style.
+//! ## 5. Theme and Text Styles
+//! Widgets read their colors, text styles, and hover and press weights from the app's scheme
+//! at draw time (`cx.theme()`, `theme.zig`): control names in `scheme.name` and knob values in
+//! `scheme.value` (Noto Sans and Noto Sans Mono, so readouts keep their width as digits
+//! change). A color or style the app stored in a widget (`Button.paint`, `Knob.accent`, a
+//! `Label`'s style) wins. `name_style`, `value_style`, `accents`, `hover_lighten`,
+//! `down_darken`, `field_focus_border`, and `field_selection` are `theme.dark`'s values, kept
+//! as constants for code that names them; `kit.accent(cx, i)` is the app scheme's accent.
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: label text points at app-owned bytes bounded by `text.byte_cap`; a
@@ -65,6 +69,7 @@
 
 const std = @import("std");
 const quads = @import("draw.zig");
+const theme = @import("theme.zig");
 const ui = @import("ui.zig");
 
 /// The widget-authoring kit (`widgets/kit.zig`).
@@ -185,6 +190,21 @@ const step_29_names = [_][]const u8{
     "ring_of",           "ring_sized",         "write_hundredths",  "meter_track",
     "meter_track_sized", "pill_of",            "toggle_thumb",
 };
+
+// Locks the dark defaults (section 5): the style, accent, weight, and field constants equal
+// `theme.dark`'s, so code that names them draws what the default scheme draws.
+test "the widget constants are the dark scheme's" {
+    const dark = theme.dark;
+    try std.testing.expect(std.meta.eql(dark.name, name_style));
+    try std.testing.expect(std.meta.eql(dark.value, value_style));
+    try std.testing.expectEqual(dark.hover_lighten, hover_lighten);
+    try std.testing.expectEqual(dark.down_darken, down_darken);
+    try std.testing.expectEqual(dark.colors.focus, field_focus_border);
+    try std.testing.expectEqual(dark.colors.selection, field_selection);
+    for (accents, dark.accents) |paint, color| {
+        try std.testing.expectEqual(color, [4]f32{ paint.r, paint.g, paint.b, paint.a });
+    }
+}
 
 // Locks the split's compatibility: each of the 67 public names of step 29's `widgets.zig` is
 // still declared here, so an app that compiled against step 29 compiles against step 30.

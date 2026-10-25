@@ -113,7 +113,7 @@ pub fn draw(cx: anytype, id: ui.Id, look: Look) void {
     const clip = cx.visible(look.ring) orelse return;
     const alpha: f32 = if (look.enabled) 1 else disabled_alpha;
     if (look.enabled) cx.area(id, look.ring, look.ring.width * 0.5, widgets.knob_flags);
-    var track = theme.chrome.track;
+    var track = cx.theme().colors.track;
     track[3] *= alpha;
     kit.arc(cx, look.ring, clip, .{ .color = track, .thickness = thickness });
     if (look.fraction > 0) {
@@ -123,11 +123,11 @@ pub fn draw(cx: anytype, id: ui.Id, look: Look) void {
             .color = accent,
             .thickness = thickness,
             .sweep = look.fraction,
-            .hover = kit.weight(look.lit, widgets.hover_lighten),
+            .hover = kit.weight(look.lit, cx.theme().hover_lighten),
         });
     }
     const size = look.ring.width;
-    var color = theme.chrome.text;
+    var color = cx.theme().colors.text;
     color[3] *= alpha;
     const value_style: text.Style = .{ .face = .mono, .size = value_size(size), .color = color };
     var value_box = look.ring;

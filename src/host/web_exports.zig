@@ -270,7 +270,7 @@ fn WebApp(comptime App: type) type {
             state.commands.len = 0;
             state.commands.count = 0;
             context.init();
-            app_contract.start_timer(App, &context);
+            app_contract.start(App, &context);
             if (has_audio) audio_queue.init();
             render.init();
             App.init(&app, &context.draw.textures);

@@ -60,9 +60,10 @@ pub const field_padding_x: f32 = 6;
 pub const field_radius: f32 = 4;
 pub const field_border_px: f32 = 1;
 pub const field_caret_inset: f32 = 4;
-/// The focused field's border and the selection band behind its text.
-pub const field_focus_border: [4]f32 = .{ 0.40, 0.62, 0.95, 1 };
-pub const field_selection: [4]f32 = .{ 0.26, 0.42, 0.72, 1 };
+/// The dark scheme's focused field border and selection band behind the text. The field reads
+/// the app's (`cx.theme().colors.focus` and `.selection`).
+pub const field_focus_border: [4]f32 = theme.dark.colors.focus;
+pub const field_selection: [4]f32 = theme.dark.colors.selection;
 /// Field text starts at the left and is centered vertically, never cut.
 pub const field_text_options: text.Options = .{
     .align_x = .start,
@@ -168,9 +169,10 @@ pub const TextField = struct {
         const clip = cx.visible(rect) orelse return;
         const focused = cx.focused(self.id);
         cx.area(self.id, rect, field_radius, field_flags);
-        const border = if (focused) field_focus_border else theme.chrome.control;
+        const colors = &cx.theme().colors;
+        const border = if (focused) colors.focus else colors.control;
         kit.append(cx, quads.Box, null, quads.Box.of(rect, clip, .{
-            .fill = theme.chrome.track,
+            .fill = colors.track,
             .border_color = border,
             .border_width = field_border_px,
             .radius = field_radius,
@@ -184,7 +186,7 @@ pub const TextField = struct {
             const x0 = origin + text.measure(self.style, all[0..range.start]);
             const x1 = origin + text.measure(self.style, all[0..range.end]);
             const band: Rect = .{ .x = x0, .y = inner.y, .width = x1 - x0, .height = inner.height };
-            kit.face(cx, band, inner_clip, .{ .fill = field_selection });
+            kit.face(cx, band, inner_clip, .{ .fill = colors.selection });
         }
         const line: Rect = .{
             .x = origin,
@@ -202,7 +204,7 @@ pub const TextField = struct {
                 .width = 1 / scale,
                 .height = inner.height - 2 * field_caret_inset,
             };
-            kit.face(cx, caret, inner_clip, .{ .fill = theme.chrome.text });
+            kit.face(cx, caret, inner_clip, .{ .fill = colors.text });
         }
     }
 

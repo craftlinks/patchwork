@@ -106,9 +106,9 @@ const cable_colors = [_][4]f32{
     .{ 1.0, 0.50, 0.45, 0.85 },
     .{ 0.85, 0.55, 1.0, 0.85 },
 };
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
-const status_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
-const header_style: text.Style = .{ .face = .sans_bold, .size = 13, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const status_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.dark.colors.text };
+const header_style: text.Style = .{ .face = .sans_bold, .size = 13, .color = theme.dark.colors.text };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
 /// A zoomed-out frame draws the face and header of every module, plus the canvas face.
@@ -454,7 +454,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

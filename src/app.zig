@@ -75,8 +75,9 @@
 //! With a period, the timer runs from startup when `timer_armed` is true (the default), and
 //! the app starts and stops it at run time with `cx.set_timer(on)` (`ui/cx.zig`, section 9):
 //! after each call into the app the hosts arm or disarm it to match `cx.timer_on`, so a
-//! stopped timer wakes nothing and calls no `timer`. `start_timer(App, cx)` is the one setup
-//! both hosts (and app tests) run after `cx.init`.
+//! stopped timer wakes nothing and calls no `timer`. `start(App, cx)` is the one setup both
+//! hosts (and app tests) run after `cx.init`; it records the timer, the audio flag, and the
+//! theme.
 //!
 //! ## 4a. The Optional Audio Source
 //! ```text
@@ -94,6 +95,14 @@
 //! (`ui/cx.zig`, section 9a). Start and stop are the only control: the source never reads the
 //! app. `check` requires both declarations or neither, and checks both signatures.
 //!
+//! ## 4b. The Theme
+//! `config.theme` (default `theme.dark`) is the scheme the app starts with: `start` copies it
+//! into the context, and `cx.theme()` reads it in any phase (`ui/cx.zig`, section 9b).
+//! `cx.set_theme(scheme)` in an event or a timer call switches it: the renderer writes the
+//! frame uniform once and repaints every tile (`draw/renderer.zig`, section 4). `check`
+//! refuses a color component outside `[0, 1]`, a weight outside `[0, 1]`, or a text size
+//! outside `(0, text.size_max]`, naming the field (`theme.problem`).
+//!
 //! ## 5. TigerStyle Invariants
 //! The contract is checked at compile time and costs nothing at run time. The app owns all
 //! of its storage, sized by its own comptime constants.
@@ -110,6 +119,7 @@ const areas = @import("ui/areas.zig");
 const pools = @import("draw/pools.zig");
 const bench = @import("bench.zig");
 const realtime = @import("realtime.zig");
+const theme = @import("theme.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
 pub const Config = struct {
@@ -128,6 +138,8 @@ pub const Config = struct {
     area_cap: u32 = 1024,
     /// Upper bound on path points per frame, when a registered type reads points.
     point_cap: u32 = 65536,
+    /// The scheme the app starts with (`theme.zig`); `cx.set_theme` switches it at run time.
+    theme: theme.Scheme = theme.dark,
 };
 
 /// The UI context type `App.event`, `App.timer`, and `App.draw` receive, built from
@@ -137,15 +149,19 @@ pub fn Context(comptime App: type) type {
     return ui.Context(Draw, App.config.area_cap);
 }
 
-/// Records `App.config`'s timer (section 4) and whether the app has an audio source (section
-/// 4a) in a freshly initialized context. Both hosts call it after `cx.init`; app tests call it
-/// to start where a host starts.
-pub fn start_timer(comptime App: type, cx: *Context(App)) void {
+/// Records `App.config`'s timer (section 4), whether the app has an audio source (section
+/// 4a), and its theme (section 4b) in a freshly initialized context. Both hosts call it after
+/// `cx.init`; app tests call it to start where a host starts.
+pub fn start(comptime App: type, cx: *Context(App)) void {
     cx.timer_setup(App.config.timer_period_ms, App.config.timer_armed);
     cx.audio_setup(has_audio(App));
+    cx.theme_setup(App.config.theme);
     if (App.config.timer_period_ms == 0) assert(!cx.timer_on);
     assert(!cx.audio_on);
 }
+
+/// The step 30 name of `start`, which it now is.
+pub const start_timer = start;
 
 /// Whether `App` declares an audio source (section 4a).
 pub fn has_audio(comptime App: type) bool {
@@ -195,6 +211,9 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     }
     if (App.config.point_cap > pools.point_cap_max) {
         return "App.config.point_cap must be at most 65536";
+    }
+    if (theme.problem(App.config.theme)) |message| {
+        return "App.config.theme." ++ message;
     }
     if (@hasDecl(App, "scenarios")) {
         if (@TypeOf(App.scenarios) != []const bench.Scenario) {
@@ -425,6 +444,20 @@ const NoPoints = struct {
     };
 };
 
+/// A theme whose panel green is 1.5.
+const BrightTheme = struct {
+    pub const config: Config = .{
+        .title = "bright",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .theme = blk: {
+            var scheme = theme.dark;
+            scheme.colors.panel[1] = 1.5;
+            break :blk scheme;
+        },
+    };
+};
+
 const BadScenarios = struct {
     pub const config: Config = .{ .title = "bad", .timer_period_ms = 0, .draw = &test_draw };
     pub const scenarios: []const bench.Scenario = &.{
@@ -526,6 +559,15 @@ test "a ragged draw type and an oversized batch cap are rejected" {
     try std.testing.expect(std.mem.find(u8, ragged, "must be f32, [2]f32, or [4]f32") != null);
     const huge = comptime conformance(HugeBatches).?;
     try std.testing.expect(std.mem.find(u8, huge, "batch_cap") != null);
+}
+
+// Locks the theme rule (section 4b): a panel component of 1.5 is refused with the field's full
+// name, and the default theme is `theme.dark`.
+test "a theme color out of range is rejected by name" {
+    const bright = comptime conformance(BrightTheme).?;
+    const expected = "App.config.theme.colors.panel: a component is outside [0, 1]";
+    try std.testing.expectEqualStrings(expected, bright);
+    try std.testing.expect(std.meta.eql(theme.dark, GoodApp.config.theme));
 }
 
 comptime {

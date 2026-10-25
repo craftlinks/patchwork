@@ -74,14 +74,24 @@ pub const knob_flags: ui.Flags = .{
     .cursor = .grab,
 };
 
-/// Per-knob accent fills, cycled by knob index modulo `accent_count`. Not theme slots: each
-/// knob's value arc carries its own fill.
+/// The dark scheme's per-knob accent fills, cycled by knob index modulo `accent_count`. Each
+/// knob's value arc carries its own fill (`Knob.accent`); `kit.accent(cx, index)` is the app
+/// scheme's.
 pub const accents: [accent_count]kit.Paint = .{
     .{ .r = 0.62, .g = 0.45, .b = 0.86, .a = 1, .radius = ring_thickness },
     .{ .r = 0.40, .g = 0.78, .b = 0.48, .a = 1, .radius = ring_thickness },
     .{ .r = 0.93, .g = 0.55, .b = 0.24, .a = 1, .radius = ring_thickness },
     .{ .r = 0.93, .g = 0.80, .b = 0.32, .a = 1, .radius = ring_thickness },
 };
+
+comptime {
+    assert(ring_thickness == kit.accent_radius);
+    assert(accent_count == theme.accent_count);
+    for (accents, theme.dark.accents) |paint, color| {
+        assert(paint.r == color[0] and paint.g == color[1] and paint.b == color[2]);
+        assert(paint.a == color[3]);
+    }
+}
 
 /// Open ring. Drag is relative: up increases `value`. Value 0 omits the value arc. A right
 /// press resets it to `default`, its value at `init`.
@@ -180,20 +190,21 @@ pub const Knob = struct {
         const clip = cx.visible(row) orelse return;
         const ring = ring_sized(row, self.ring);
         cx.area(self.id, ring, self.ring * 0.5, knob_flags);
-        kit.arc(cx, ring, clip, .{ .color = theme.chrome.track, .thickness = ring_thickness });
+        const scheme = cx.theme();
+        kit.arc(cx, ring, clip, .{ .color = scheme.colors.track, .thickness = ring_thickness });
         if (self.value > 0) {
             const accent = self.accent;
             kit.arc(cx, ring, clip, .{
                 .color = .{ accent.r, accent.g, accent.b, accent.a },
                 .thickness = ring_thickness,
                 .sweep = self.value,
-                .hover = kit.weight(self.hover.value, kit.hover_lighten),
+                .hover = kit.weight(self.hover.value, scheme.hover_lighten),
             });
         }
         const centered = kit.centered;
-        kit.label(cx, kit.name_style, self.name, name_box(row, self.ring), clip, centered);
+        kit.label(cx, scheme.name, self.name, name_box(row, self.ring), clip, centered);
         const value_text = self.value_text[0..4];
-        kit.label(cx, kit.value_style, value_text, value_box(row, self.ring), clip, centered);
+        kit.label(cx, scheme.value, value_text, value_box(row, self.ring), clip, centered);
     }
 
     pub fn set_value(self: *Knob, value: f32) void {
@@ -302,6 +313,7 @@ comptime {
 
 const testing = std.testing;
 const fixture = @import("fixture.zig");
+const quads = @import("../draw.zig");
 const test_context = fixture.context;
 const send = fixture.send;
 const draw_one = fixture.draw_one;
@@ -343,4 +355,23 @@ test "knob drag is relative and clamped" {
     // A wheel off the ring does nothing.
     const off_ring: input.Wheel = .{ .x = 150, .y = 36, .dx = 0, .dy = 60 };
     try testing.expectEqual(Knob.Action.none, send(cx, &knob, .{ .wheel = off_ring }));
+}
+
+// Locks the theme reader: a knob drawn under `theme.light` appends its track arc in light's
+// `colors.track` (0.80, 0.81, 0.84, 1), its hovered value arc at light's weight (0.10), and its
+// name and value in light's text styles; its accent stays the one it was given.
+test "a knob under the light theme draws in its colors" {
+    const cx = test_context();
+    var knob = Knob.init(ui.id("knob", 0), "k", 0.5, accents[1]);
+    knob.hover.value = 1;
+    cx.theme_setup(theme.light);
+    draw_one(cx, &knob, at(0, 0, 200, knob_height));
+    const arcs = cx.draw.items(quads.Arc);
+    try testing.expectEqual(@as(usize, 2), arcs.len);
+    try testing.expectEqual(theme.light.colors.track, arcs[0].color);
+    try testing.expectEqual(@as(f32, 0.10), arcs[1].hover);
+    try testing.expectEqual(accents[1].g, arcs[1].color[1]);
+    for (cx.draw.items(quads.Glyph)) |glyph| {
+        try testing.expectEqual(theme.light.colors.text, glyph.color);
+    }
 }

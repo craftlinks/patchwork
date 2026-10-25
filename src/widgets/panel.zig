@@ -26,7 +26,9 @@ pub const Panel = struct {
     pub fn begin(self: *const Panel, cx: anytype, walk: Walk, layout: ui.Layout) Rect {
         assert(self.paint.radius >= 0);
         const rect = cx.peek(walk);
-        if (cx.visible(rect)) |clip| kit.face(cx, rect, clip, self.paint.look(0, 0));
+        if (cx.visible(rect)) |clip| {
+            kit.face(cx, rect, clip, self.paint.look(cx.theme(), 0, 0));
+        }
         const opened = cx.begin(walk, layout);
         assert(opened.x == rect.x);
         assert(opened.y == rect.y);
@@ -38,6 +40,6 @@ pub const Panel = struct {
         assert(self.paint.radius >= 0);
         const rect = cx.walk(walk);
         const clip = cx.visible(rect) orelse return;
-        kit.face(cx, rect, clip, self.paint.look(0, 0));
+        kit.face(cx, rect, clip, self.paint.look(cx.theme(), 0, 0));
     }
 };

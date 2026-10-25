@@ -229,11 +229,11 @@ const tempo_value = "121.00";
 const tempo_unit = " BPM";
 const tempo_runs = [_]text.Run{
     .{
-        .style = .{ .face = .mono, .size = 32, .color = theme.chrome.text },
+        .style = .{ .face = .mono, .size = 32, .color = theme.dark.colors.text },
         .bytes = tempo_value,
     },
     .{
-        .style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text },
+        .style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text },
         .bytes = tempo_unit,
     },
 };
@@ -241,10 +241,10 @@ const tempo_runs = [_]text.Run{
 /// A non-ASCII label (composite glyphs: u and o with diaeresis, e acute, middle dot),
 /// right-aligned in the header and cut with an ellipsis when the bar is narrow.
 const patch_author = "J\u{fc}rgen K\u{f6}hler \u{b7} Caf\u{e9}";
-const author_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.chrome.text };
+const author_style: text.Style = .{ .face = .sans, .size = 16, .color = theme.dark.colors.text };
 
 /// Panel titles: bold 14 px.
-const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
 
 /// Inked glyphs the header draws at most: the tempo runs and the author label.
 const header_glyph_cap: u32 = 32;
@@ -269,7 +269,7 @@ const badge_px: f32 = 20;
 const badge_inset_px: f32 = 2;
 
 /// LED color: the theme's meter green.
-const led_color = theme.chrome.meter;
+const led_color = theme.dark.colors.meter;
 
 /// The preset column: its width, rows, and the cap on visible rows (module guide, 2a).
 const preset_column_px: f32 = 240;
@@ -298,7 +298,7 @@ const preset_glyphs: u32 = preset_name_cap - 1;
 /// The status line under the list and its fixed buffer.
 const status_px: f32 = 24;
 const status_cap: u32 = 52;
-const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.chrome.text };
+const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.dark.colors.text };
 
 /// Pool, batch, area, and point capacities. The comptime block checks each against the worst
 /// case.
@@ -623,7 +623,7 @@ pub const App = struct {
         cx.area(id, rect, 0, ui.cx.plain);
         const selected = app.preset_selected == row;
         if (selected or cx.hovered() == id) {
-            const fill = if (selected) selected_fill else theme.chrome.track;
+            const fill = if (selected) selected_fill else cx.theme().colors.track;
             kit.face(cx, rect, clip, .{ .fill = fill, .radius = preset_radius });
         }
         var bytes: [preset_name_cap]u8 = undefined;
@@ -807,7 +807,7 @@ pub const App = struct {
         const half = playhead_px * 0.5;
         const dot: Rect = .{ .x = at[0] - half, .y = at[1] - half, .width = playhead_px, .height = playhead_px };
         const clip: quads.Clip = .{ .x0 = display.clip[0], .y0 = display.clip[1], .x1 = display.clip[2], .y1 = display.clip[3] };
-        kit.face(cx, dot, clip, .{ .fill = theme.chrome.text, .radius = half });
+        kit.face(cx, dot, clip, .{ .fill = cx.theme().colors.text, .radius = half });
     }
 
     /// Hub presses start a cable, drags move its free end, and the release connects it to
@@ -970,13 +970,13 @@ pub const App = struct {
         defer _ = cx.draw.layer(previous);
         kit.face(cx, box, window, .{
             .fill = tooltip_fill,
-            .border_color = theme.chrome.text,
+            .border_color = cx.theme().colors.text,
             .border_width = tooltip_border_px,
             .radius = tooltip_radius,
         });
         var bytes: [tooltip_text_cap]u8 = undefined;
         const label = tooltip_text(&bytes, knob);
-        text.place(cx.drawing(), widgets.name_style, label, box, window, widgets.centered);
+        text.place(cx.drawing(), cx.theme().name, label, box, window, widgets.centered);
     }
 
     /// Restarts the dwell when the hovered knob changed. Owes a draw when that hid the
@@ -1007,7 +1007,7 @@ pub const App = struct {
 };
 
 /// The face of the rack's panels and the preset panel.
-const panel_paint: widgets.Paint = widgets.paint_of(theme.chrome.panel, panel_radius);
+const panel_paint: widgets.Paint = widgets.paint_of(theme.dark.colors.panel, panel_radius);
 
 /// The knob cell: 144 by 72 after an 8 px gap.
 const knob_cell: ui.Walk = .{
@@ -1022,7 +1022,7 @@ fn draw_header(cx: *Context, bar: Rect) void {
     if (bar.width <= 2 * header_inset_px) return;
     if (bar.y + bar.height > cx.window.height) return;
     const window = cx.clip().?;
-    kit.face(cx, bar, window, .{ .fill = theme.chrome.panel, .radius = header_radius });
+    kit.face(cx, bar, window, .{ .fill = cx.theme().colors.panel, .radius = header_radius });
     const inner = ui.cx.inset(bar, .xy(header_inset_px, 0));
     const bar_clip = ui.cx.clip_of(bar);
     text.place_runs(cx.drawing(), &tempo_runs, inner, bar_clip, .{
@@ -1092,7 +1092,7 @@ fn draw_hub(cx: *Context, knob: *const widgets.Knob, row: Rect) void {
     };
     const accent = knob.accent;
     kit.face(cx, hub, clip, .{
-        .fill = theme.chrome.panel,
+        .fill = cx.theme().colors.panel,
         .border_color = .{ accent.r, accent.g, accent.b, accent.a },
         .border_width = hub_border_px,
         .radius = hub_radius,
@@ -1406,7 +1406,7 @@ const fixture = struct {
 /// A fresh app, initialized against a fresh context the way a host does.
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

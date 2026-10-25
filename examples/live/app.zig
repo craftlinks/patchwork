@@ -103,11 +103,11 @@ pub const patch_source = @embedFile("patch.lpg");
 // Header (section 2). Offsets are from the header's inner left edge.
 const header_px: f32 = 40;
 const header_inset_px: f32 = 16;
-const name_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.chrome.text };
-const position_style: text.Style = .{ .face = .mono, .size = 14, .color = theme.chrome.text };
+const name_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const position_style: text.Style = .{ .face = .mono, .size = 14, .color = theme.dark.colors.text };
 const status_style: text.Style = .{ .face = .sans, .size = 14, .color = .{ 0.95, 0.55, 0.45, 1 } };
 const dim_style: text.Style = .{ .face = .sans, .size = 14, .color = .{ 0.62, 0.64, 0.68, 1 } };
-const field_style: text.Style = .{ .face = .mono, .size = 14, .color = theme.chrome.text };
+const field_style: text.Style = .{ .face = .mono, .size = 14, .color = theme.dark.colors.text };
 const name_width_px: f32 = 160;
 const status_icon_left_px: f32 = 168;
 const status_icon_px: f32 = 16;
@@ -151,7 +151,7 @@ const knob_column_px: f32 = 140;
 const lane_min_px: f32 = 120;
 const lane_inset_px: f32 = 6;
 const label_cap: u32 = 16;
-const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.chrome.text };
+const label_style: text.Style = .{ .face = .sans, .size = 13, .color = theme.dark.colors.text };
 const struck_style: text.Style = .{ .face = .mono, .size = 11, .color = .{ 0.62, 0.64, 0.68, 1 } };
 const transport_hit_px: f32 = 28;
 const transport_icon_px: f32 = 18;
@@ -854,7 +854,7 @@ pub const App = struct {
         const walk: ui.Walk = .{ .width = .{ .fixed = panel_width }, .height = .fill, .margin = .sides(body.width - panel_width, 0, 0, 0) };
         const panel = cx.begin(walk, .{ .flow = .down });
         if (cx.visible(panel)) |clip| {
-            kit.face(cx, panel, clip, .{ .fill = theme.chrome.panel });
+            kit.face(cx, panel, clip, .{ .fill = cx.theme().colors.panel });
             const band = cx.walk(ui.sized(.fill, .{ .fixed = band_px }));
             app.draw_transport(cx, band, clip);
             app.draw_column(cx);
@@ -1093,7 +1093,7 @@ pub const App = struct {
     }
 
     fn draw_header_parts(app: *App, cx: *Context, bar: Rect, clip: Clip) void {
-        kit.face(cx, bar, clip, .{ .fill = theme.chrome.panel });
+        kit.face(cx, bar, clip, .{ .fill = cx.theme().colors.panel });
         const inner = ui.cx.inset(bar, .xy(header_inset_px, 0));
         const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
         var name: [name_cap]u8 = undefined;
@@ -1292,7 +1292,7 @@ const fixture = struct {
 
 fn new_app() *App {
     fixture.context.init();
-    patchwork.app.start_timer(App, &fixture.context);
+    patchwork.app.start(App, &fixture.context);
     App.init(&fixture.app, &fixture.context.draw.textures);
     return &fixture.app;
 }

@@ -32,7 +32,7 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`. |
+| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`, `theme` (see Theme). |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
@@ -61,8 +61,9 @@ stops it, and the hosts apply the change after the call (see Audio Data below).
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
 the type), a zero capacity, a `batch_cap` whose worst frame would not fit one command
-buffer, an `area_cap` outside 1 to 65536, and a `point_cap` outside 1 to 65536 produce a
-clear `@compileError` naming the exact problem. `point_cap` (default 65,536) sizes the path
+buffer, an `area_cap` outside 1 to 65536, a `point_cap` outside 1 to 65536, and a
+`config.theme` color component outside `[0, 1]` produce a clear `@compileError` naming the
+exact problem (`App.config.theme.colors.panel: a component is outside [0, 1]`). `point_cap` (default 65,536) sizes the path
 point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
@@ -143,7 +144,7 @@ patchwork/
 │   ├── animator.zig            # Scalar animator transitions and animation time (Animator, Clock, Time)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
-│   ├── theme.zig               # Theme uniform record packed behind the projection matrix
+│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
@@ -209,7 +210,8 @@ patchwork/
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
-    └── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
+    ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
+    └── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
 ```
 
 ## Build Steps
@@ -268,8 +270,8 @@ zig build serve-gallery   # Serve it on localhost (prints the address)
 # Validation
 zig build test            # Run unit tests across the library and the nine examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
-                          # a type that reads time without declaring `animated`, and an
-                          # `Audio` source without `audio`
+                          # a type that reads time without declaring `animated`, an
+                          # `Audio` source without `audio`, and a theme color of 1.5
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
@@ -378,7 +380,6 @@ const std = @import("std");
 const patchwork = @import("patchwork");
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
-const theme = patchwork.theme;
 const quads = patchwork.draw;
 
 const Context = patchwork.app.Context(App);
@@ -419,7 +420,7 @@ pub const App = struct {
     }
 
     pub fn draw(app: *App, cx: *Context) void {
-        const panel: widgets.Panel = .{ .paint = widgets.paint_of(theme.chrome.panel, 8) };
+        const panel: widgets.Panel = .{ .paint = widgets.paint_of(cx.theme().colors.panel, 8) };
         _ = panel.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down, .padding = .all(16) });
         app.gain.draw(cx, ui.sized(.{ .fixed = 144 }, .{ .fixed = widgets.knob_height }));
         _ = cx.end();
@@ -531,6 +532,30 @@ the device scale, and only the glyph records change (see Text below).
   asks for the clipboard, which arrives as one `paste` event for the focused widget.
 - **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
 - **Repeat.** Hosts repeat keys (`KeyPress.repeat`); the library never does.
+
+## Theme
+
+The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
+
+- **What is themed.** The chrome colors (`colors.panel`, `text`, `track`, `value`, `control`,
+  `meter`), the window `background`, the text field's `focus` border and `selection` band,
+  `lighten` and `darken` (what hover and press mix toward), four `accents`, the two text
+  styles widgets label with (`name`, `value`), and the hover and press weights
+  (`hover_lighten`, `down_darken`). Every library widget, the scrollbar thumb, and the clear
+  color read it at draw time.
+- **What is not.** Sizes (they are per instance: `Knob.sized`, `Meter.track_h`, a `Walk`),
+  the open ring's angles (the CPU hit tests use the constants), and colors an app stored in
+  a widget (`Button.paint`, `Slider.track`, `Knob.accent`, `Panel.paint`, a style), which
+  win; `widgets.kit.accent(cx, i)` gives the scheme's accent for an app that wants it.
+- **Presets.** `theme.dark` is the look of steps 1 to 30 and the default; `theme.light` is
+  its light counterpart. `theme.chrome` is `dark.record()`, the GPU record.
+- **Choosing and switching.** `config.theme` picks the scheme the app starts with;
+  `cx.theme()` reads it in any phase; `cx.set_theme(scheme)` in `event` or `timer` switches
+  it. A switch is one frame: the renderer writes the 256-byte frame uniform once and repaints
+  every tile, and the same scheme again costs nothing.
+- **Making one.** Copy a preset and change fields: `var s = theme.dark; s.colors.panel =
+  .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, and text
+  sizes are at most `text.size_max`; `app.check` refuses anything else and names the field.
 
 ## Example Applications
 
@@ -724,9 +749,12 @@ rings of 56, 40, 56, and 72, three toggles, a meter that follows slider 0, a 240
 field, and a list of 40 clickable rows (`kit.clicked`) in a view, the selected one
 highlighted. The title bar's status line shows the last action ("knob 1 changed 0.75"), so
 the app handles each widget itself rather than through `ui.route`. It is the regression app
-of phases 6 and 7: each step adds a section. Scenarios: `still`, `interact` (a click, two
-drags, a toggle, typing, a wheel, and a row click, then settled), and `hover` (the pointer
-rests on button 1).
+of phases 6 and 7: each step adds a section. A "light" toggle in the title bar switches the
+whole app between `theme.dark` and `theme.light` (`cx.set_theme`); the widgets' stored colors
+(slider paints, knob accents, the field's text) are restyled from the scheme, while the
+buttons keep their own blue. Scenarios: `still`, `interact` (a click, two drags, a toggle,
+typing, a wheel, and a row click, then settled), `hover` (the pointer rests on button 1), and
+`light` (the toggle, then the focused field with "abc" selected, settled).
 
 ## Pan and Zoom
 
@@ -892,7 +920,7 @@ what changed (`src/draw/tiles.zig`, `src/draw/renderer.zig` section 4a):
   bytes and the points it names, mixed with its batch and its texture's write revision (not
   the glyph atlas's, which only grows). Keys are kept per record and recomputed only for
   records and points the upload found changed. A tile whose hash differs from the last frame's
-  is dirty; a size or scale change dirties all.
+  is dirty; a size, scale, or theme change dirties all.
 - **Frames.** No dirty tile: `skipped`, nothing presented; natively the surface still commits a
   frame callback, so animation pacing holds. More than half dirty (scrolling, resize, the first
   frame): `direct`, today's pass on the surface. Otherwise a pass on the kept target: `full`
@@ -1033,8 +1061,8 @@ children use the panel border box clip.
 
 The uniform buffer (`draw.uniform_bytes`) stores the 4x4 projection matrix first and the
 `Theme` record (`src/theme.zig`) after it, shared by every pipeline through one bind group.
-Colors live in instances and in the theme's lighten, darken, and arc slots, never in WGSL
-literals.
+Colors live in instances and in the theme's lighten, darken, background, and arc slots, never
+in WGSL literals.
 
 Memory: each pool holds `cap` records plus a renderer shadow of the same size, and one scratch
 buffer of the largest pool backs the counting sort. The context also holds the glyph cache

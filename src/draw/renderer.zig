@@ -31,7 +31,8 @@
 //!
 //! ## 3. Frame Shape
 //! ```text
-//! buffer_write uniform            only when the device size or scale changed (or first frame)
+//! buffer_write uniform            only when the device size, the scale, or the theme record
+//!                                 changed (or first frame): the whole record
 //! texture_create, bind_group_create, texture_write   whatever `Textures` queued, after the
 //!                                 glyph cache queued its dirty atlas rectangle (one write)
 //! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed, up
@@ -44,7 +45,9 @@
 //! then, by the frame's kind (section 4a), nothing (skipped), present_copy (copied), or:
 //! [target_create]                 the kept target, at its first use or a new size
 //! pass_begin                      the surface (direct), or the kept target, cleared (full)
-//!                                 or loaded (cached)
+//!                                 or loaded (cached); the clear value is the theme's
+//!                                 `background`
+//!   bind_group_set 0 (cached only)  the frame group, which the clear pipeline reads
 //!   per rect (cached only): scissor_set, pipeline_set clear, vertex_buffer_set 0, draw
 //!   bind_group_set 0, vertex_buffer_set 0                   once, when any batch exists
 //!   per batch, in order:
@@ -98,10 +101,18 @@
 //! ```
 //! Inside a scissor the kept pixels must be cleared before the batches blend over them, and
 //! WebGPU clears whole attachments only, so a small clear pipeline (no blending, one
-//! full-target quad of `clear_color`) runs first in each rect. A scissor does not change any
-//! pixel value, so a cached frame equals a direct one bit for bit; the bench's image compare
-//! checks it (`--no-cache`). A uniform change (size or scale) dirties every tile. The rect
-//! count is bounded per app by `rects_max`, so the worst frame still fits one command buffer.
+//! full-target quad) runs first in each rect. It returns `frame.theme.background`, the value
+//! every pass clears to, from the frame group bound once after the pass begins: every frame
+//! group (the window's, a view's) holds the same theme, so a batch's rebind keeps it valid. A
+//! scissor does not change any pixel value, so a cached frame equals a direct one bit for bit;
+//! the bench's image compare checks it (`--no-cache`).
+//!
+//! A uniform change (size, scale, or theme) writes the whole uniform and dirties every tile,
+//! so it is a direct frame. A theme switch is that and nothing more: the record of
+//! `Context.theme` differs from the uploaded `theme` bytes, view and target uniforms are
+//! rebuilt from the window's, and the app's redraw moves whatever instance colors changed. The
+//! rect count is bounded per app by `rects_max`, so the worst frame still fits one command
+//! buffer.
 //!
 //! ## 4b. Animated Types and Time
 //! An animated type (`draw/registry.zig`, section 2b) changes its pixels with the time slot,
@@ -135,7 +146,7 @@
 //! per bound layer, lowest first:
 //!   content = fold of its batches' seeds (layer-local index, type, texture, the revision of
 //!             any sampled texture but the atlas) and record keys, the device rect, the scale,
-//!             and the time when an animated instance is there
+//!             the theme record, and the time when an animated instance is there
 //!   single target, same content, same device rect     nothing: it keeps its pixels
 //!   otherwise  [buffer_create, bind_group_create (frame)]    at its first render
 //!              [target_create, bind_group_create [replace]] per texture, at a new size
@@ -147,7 +158,8 @@
 //! pass, that is last frame's (the pass writes the back one); everywhere else, after the
 //! swap, this frame's. The revision feeds the batch seed of every composite, so their tiles
 //! are dirty, and a rendered target disables the unchanged fast path. A target never rendered
-//! yet draws nothing where it is sampled.
+//! yet draws nothing where it is sampled. A feedback target mixes its last frame into the
+//! next, so after a theme switch its trail fades from the old colors.
 //!
 //! ## 4d. Views
 //! A layer with a pan/zoom view this frame (`Context.view`, `draw/pools.zig` section 5c) draws
@@ -193,9 +205,10 @@ pub const Color = struct {
     a: f32,
 };
 
-/// Framebuffer clear color. Deliberately neither black nor white, so a skipped clear, a failed
-/// pass, or a swapchain glitch is unmistakable in review. It also shows through wherever a
-/// fragment has zero coverage, such as outside a rounded corner.
+/// The dark theme's framebuffer clear, `theme.dark.colors.background` (asserted). The passes
+/// clear to the uploaded theme's `background`. Deliberately neither black nor white, so a
+/// skipped clear, a failed pass, or a swapchain glitch is unmistakable in review. It also shows
+/// through wherever a fragment has zero coverage, such as outside a rounded corner.
 pub const clear_color: Color = .{
     .r = 0.11,
     .g = 0.12,
@@ -251,9 +264,9 @@ pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
     const texture_ops = textures.sampling_count + 2 * textures.texture_cap + textures.write_cap;
     const rects = rects_max(type_count, batch_cap);
     // Uniform, textures, up to `upload_range_cap` writes per pool and for the points, the
-    // time, the target,
-    // the pass, the rects with their batches and view binds, the pass end, and the present.
-    return 1 + texture_ops + (type_count + 1) * draw.upload_range_cap + 1 + 1 + 1 +
+    // time, the target, the pass and its frame group (for the clear pipeline), the rects with
+    // their batches and view binds, the pass end, and the present.
+    return 1 + texture_ops + (type_count + 1) * draw.upload_range_cap + 1 + 1 + 1 + 1 +
         rects * (rect_op_cap + batch_cap * batch_op_cap + view_layers) + 1 + 1 +
         textures.target_cap * target_op_cap + view_layers * view_op_cap;
 }
@@ -280,7 +293,8 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
             (op_bytes(commands.TextureCreate) + op_bytes(commands.BindGroupCreate)) +
         textures.write_cap * op_bytes(commands.TextureWrite);
     const pass_bytes = op_bytes(commands.TargetCreate) + op_bytes(commands.PassBegin) +
-        op_bytes(commands.PassEnd) + op_bytes(commands.PresentCopy);
+        op_bytes(commands.BindGroupSet) + op_bytes(commands.PassEnd) +
+        op_bytes(commands.PresentCopy);
     const per_batch = op_bytes(commands.PipelineSet) + op_bytes(commands.VertexBufferSet) +
         op_bytes(commands.BindGroupSet) + op_bytes(commands.Draw);
     const per_rect = op_bytes(commands.ScissorSet) + op_bytes(commands.PipelineSet) +
@@ -308,19 +322,29 @@ pub const Kind = enum(u8) {
     direct,
 };
 
-/// The clear pipeline's WGSL: one full-target quad of `clear_color`, no bindings.
-const clear_wgsl: []const u8 = std.fmt.comptimePrint(
+/// The clear pipeline's WGSL: one full-target quad of the frame uniform's
+/// `theme.background`, reading the frame group (module guide, section 4a).
+const clear_wgsl: []const u8 = registry.theme_wgsl() ++
+    \\
+    \\struct Frame {
+    \\    ortho: mat4x4<f32>,
+    \\    time: vec4<f32>,
+    \\    theme: Theme,
+    \\}
+    \\
+    \\@group(0) @binding(0) var<uniform> frame: Frame;
+    \\
     \\@vertex
-    \\fn vs_main(@location(0) unit: vec2<f32>) -> @builtin(position) vec4<f32> {{
+    \\fn vs_main(@location(0) unit: vec2<f32>) -> @builtin(position) vec4<f32> {
     \\    return vec4<f32>(unit.x * 2.0 - 1.0, 1.0 - unit.y * 2.0, 0.0, 1.0);
-    \\}}
+    \\}
     \\
     \\@fragment
-    \\fn fs_main() -> @location(0) vec4<f32> {{
-    \\    return vec4<f32>({d:.6}, {d:.6}, {d:.6}, {d:.6});
-    \\}}
+    \\fn fs_main() -> @location(0) vec4<f32> {
+    \\    return frame.theme.background;
+    \\}
     \\
-, .{ clear_color.r, clear_color.g, clear_color.b, clear_color.a });
+;
 
 fn op_bytes(comptime Payload: type) u32 {
     const size: u32 = @sizeOf(Payload);
@@ -631,10 +655,10 @@ pub fn Renderer(comptime Cx: type) type {
             buffer.push(.{ .pipeline_create = .{
                 .id = r.clear_pipeline,
                 .shader = r.clear_shader,
-                .layout_count = 0,
+                .layout_count = 1,
                 .buffer_count = 1,
                 .blend = .none,
-                .layouts = .{ 0, 0, 0, 0 },
+                .layouts = .{ r.frame_layout, 0, 0, 0 },
                 .vertex = .{ unit_layout(), std.mem.zeroes(commands.VertexBuffer) },
             } });
             assert(r.clear_pipeline >= R.count);
@@ -760,8 +784,9 @@ pub fn Renderer(comptime Cx: type) type {
             assert(size.height_px != 0);
             assert(size.width_logical != 0);
             assert(size.scale_120 != 0);
-            const resized = self.uniform_dirty(size);
-            if (resized) {
+            const uniform_changed = self.uniform_dirty(size, &cx.theme);
+            if (uniform_changed) {
+                self.uniform.theme = cx.theme;
                 draw.ortho_y_down(
                     &self.uniform.ortho,
                     size.width_px,
@@ -779,7 +804,7 @@ pub fn Renderer(comptime Cx: type) type {
             }
             assert(time_s >= 0);
             cx.text.queue_upload(&cx.textures);
-            const unchanged = !resized and self.same_instances(cx);
+            const unchanged = !uniform_changed and self.same_instances(cx);
             self.flush_textures(buffer, &cx.textures);
             cx.finalize();
             self.view_mask = cx.view_mask;
@@ -789,7 +814,7 @@ pub fn Renderer(comptime Cx: type) type {
             if (uses_points) self.upload_points(buffer, cx);
             var targets_animating = false;
             self.rendered = self.render_targets(buffer, cx, size, time_s, &targets_animating);
-            const kind = self.choose(cx, size, resized, unchanged and self.rendered == 0);
+            const kind = self.choose(cx, size, uniform_changed, unchanged and self.rendered == 0);
             if (targets_animating) self.animating = true;
             if (R.any_animated and self.animating and self.uniform.time[0] != time_s) {
                 self.uniform.time[0] = time_s;
@@ -880,7 +905,7 @@ pub fn Renderer(comptime Cx: type) type {
 
         /// Hashes the frame into tiles, or repeats the last frame's when its instances are
         /// unchanged, and picks its kind (module guide, sections 4a and 4b).
-        fn choose(self: *Self, cx: *Cx, size: Size, resized: bool, unchanged: bool) Kind {
+        fn choose(self: *Self, cx: *Cx, size: Size, uniform_changed: bool, unchanged: bool) Kind {
             const forced = self.present_next;
             self.present_next = false;
             self.hashed = false;
@@ -902,7 +927,7 @@ pub fn Renderer(comptime Cx: type) type {
                     self.animating = shows_animated(cx);
                     return .direct;
                 }
-                if (resized) self.tiles.invalidate();
+                if (uniform_changed) self.tiles.invalidate();
                 self.animating = false;
                 self.hash_frame(cx, size.scale_120);
                 self.keys_valid = true;
@@ -1061,7 +1086,7 @@ pub fn Renderer(comptime Cx: type) type {
             buffer.push(.{ .pass_begin = .{
                 .width_px = size.width_px,
                 .height_px = size.height_px,
-                .clear = .{ clear_color.r, clear_color.g, clear_color.b, clear_color.a },
+                .clear = self.uniform.theme.background,
                 .target = commands.surface_target,
                 .load = .clear,
             } });
@@ -1083,13 +1108,17 @@ pub fn Renderer(comptime Cx: type) type {
             buffer.push(.{ .pass_begin = .{
                 .width_px = size.width_px,
                 .height_px = size.height_px,
-                .clear = .{ clear_color.r, clear_color.g, clear_color.b, clear_color.a },
+                .clear = self.uniform.theme.background,
                 .target = kept,
                 .load = load,
             } });
             if (load == .clear) {
                 self.draw_batches(buffer, cx.batch_list(), self.resources.frame_group, .main);
             } else {
+                // The clear pipeline reads the background from the frame group; every frame
+                // group holds the same theme, so the batches' binds keep it valid.
+                const frame_group = self.resources.frame_group;
+                buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = frame_group } });
                 var rects: [rect_count_max]tiles_module.Rect = undefined;
                 const count = self.tiles.rects(&rects);
                 assert(count >= 1);
@@ -1143,7 +1172,9 @@ pub fn Renderer(comptime Cx: type) type {
             } });
         }
 
-        fn uniform_dirty(self: *const Self, size: Size) bool {
+        /// True when the device size, the scale, or the theme differs from what the uploaded
+        /// uniform was built for (section 4a), which also holds before the first frame.
+        fn uniform_dirty(self: *const Self, size: Size, theme_now: *const theme.Theme) bool {
             assert(size.width_px != 0);
             assert(size.height_px != 0);
             if (self.width_px != size.width_px) {
@@ -1152,7 +1183,11 @@ pub fn Renderer(comptime Cx: type) type {
             if (self.height_px != size.height_px) {
                 return true;
             }
-            return self.scale_120 != size.scale_120;
+            if (self.scale_120 != size.scale_120) {
+                return true;
+            }
+            const uploaded = std.mem.asBytes(&self.uniform.theme);
+            return !std.mem.eql(u8, uploaded, std.mem.asBytes(theme_now));
         }
 
         fn upload_pool(
@@ -1270,6 +1305,7 @@ pub fn Renderer(comptime Cx: type) type {
                 self.prepare_target(buffer, target, device);
                 target.scale_120 = size.scale_120;
                 fx.ortho(&target.uniform.ortho, device, size.scale_120);
+                target.uniform.theme = self.uniform.theme;
                 target.uniform.time = self.uniform.time;
                 target.uniform.time[0] = time_s;
                 buffer.push(.{ .buffer_write = .{
@@ -1366,6 +1402,7 @@ pub fn Renderer(comptime Cx: type) type {
         ) u64 {
             var key = tiles_module.key_of(0, std.mem.asBytes(&[4]u32{ device.x, device.y, device.width, device.height }));
             key = tiles_module.key_of(key, std.mem.asBytes(&@as(u64, scale_120)));
+            key = tiles_module.key_of(key, std.mem.asBytes(&self.uniform.theme));
             if (whole_points_key) key = tiles_module.key_of(key, std.mem.sliceAsBytes(cx.point_items()));
             var local: u32 = 0;
             for (cx.batch_list()) |batch| {
@@ -1510,6 +1547,10 @@ fn unit_layout() commands.VertexBuffer {
 }
 
 comptime {
+    assert(clear_color.r == theme.dark.colors.background[0]);
+    assert(clear_color.g == theme.dark.colors.background[1]);
+    assert(clear_color.b == theme.dark.colors.background[2]);
+    assert(clear_color.a == theme.dark.colors.background[3]);
     assert(@sizeOf(Uniform) == draw.uniform_bytes);
     assert(@offsetOf(Uniform, "time") == draw.time_offset);
     assert(@offsetOf(Uniform, "theme") == draw.theme_offset);
@@ -1626,7 +1667,8 @@ fn scene(hover: f32) !void {
 }
 
 // Locks the setup recording: the frame layout and the two texture layouts, then per type a
-// shader (labelled), a buffer, and a pipeline; the atlas texture and its bind group last,
+// shader (labelled), a buffer, and a pipeline, then the clear shader (reading the theme's
+// background) and its pipeline on the frame layout; the atlas texture and its bind group last,
 // after the unit quad upload, with no texels: the glyph cache uploads what it rasterizes in
 // later frames.
 test "setup records one shader, buffer, and pipeline per type and the atlas" {
@@ -1647,6 +1689,11 @@ test "setup records one shader, buffer, and pipeline per type and the atlas" {
     while (reader.next()) |op| {
         switch (op) {
             .shader_create => |shader| {
+                if (std.mem.eql(u8, shader.label.slice(), "clear")) {
+                    const source = shader.source.slice();
+                    try testing.expect(std.mem.find(u8, source, "frame.theme.background") != null);
+                    try testing.expect(std.mem.find(u8, source, "background: vec4<f32>") != null);
+                }
                 try testing.expect(std.mem.endsWith(u8, shader.label.slice(), "Box") or
                     std.mem.endsWith(u8, shader.label.slice(), "Arc") or
                     std.mem.endsWith(u8, shader.label.slice(), "Glyph") or
@@ -1662,9 +1709,12 @@ test "setup records one shader, buffer, and pipeline per type and the atlas" {
                 if (pipelines == 2) {
                     try testing.expectEqual(@as(u8, 2), pipeline.layout_count);
                 }
-                // The clear pipeline (module guide, section 4a): no bindings, no blending.
+                // The clear pipeline (module guide, section 4a): the frame group only, for the
+                // background, and no blending.
                 if (pipelines == 3) {
-                    try testing.expectEqual(@as(u8, 0), pipeline.layout_count);
+                    try testing.expectEqual(@as(u8, 1), pipeline.layout_count);
+                    const frame_layout = Fixture.renderer.resources.frame_layout;
+                    try testing.expectEqual(frame_layout, pipeline.layouts[0]);
                     try testing.expectEqual(@as(u8, 1), pipeline.buffer_count);
                     try testing.expectEqual(commands.Blend.none, pipeline.blend);
                 }
@@ -1778,6 +1828,51 @@ test "a small change repaints one tile of the kept target" {
     Fixture.record(180);
     try testing.expectEqual(Kind.direct, Fixture.renderer.last);
     try testing.expect(!Fixture.renderer.kept_valid);
+}
+
+// Locks a theme switch (module guide, section 4a): with the instances unchanged, a new theme
+// record writes the whole uniform (256 bytes) and nothing else, repaints every tile (a direct
+// pass, cleared to the new background), and the next unchanged frame is skipped; the next
+// small change repaints the kept target in full, and the one after is cached, binding the
+// frame group once after the pass begins for the clear pipeline. With the cache off a switch
+// back is direct too.
+test "a theme switch is one uniform write and a full repaint" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(120);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.skipped, Fixture.renderer.last);
+    Fixture.context.theme = theme.light.record();
+    Fixture.record(120);
+    try testing.expectEqual(Kind.direct, Fixture.renderer.last);
+    var write_storage: [8]commands.BufferWrite = undefined;
+    const recorded = writes(&Fixture.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 1), recorded.len);
+    try testing.expectEqual(Fixture.renderer.resources.uniform_buffer, recorded[0].id);
+    try testing.expectEqual(@as(u32, 0), recorded[0].offset);
+    try testing.expectEqual(draw.uniform_bytes, recorded[0].data.len);
+    try testing.expectEqual(theme.light.colors.background, first_op(.pass_begin).?.clear);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.skipped, Fixture.renderer.last);
+    try testing.expectEqual(@as(u32, 0), Fixture.buffer.count);
+    try scene(0.18);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.full, Fixture.renderer.last);
+    try scene(0);
+    Fixture.record(120);
+    try testing.expectEqual(Kind.cached, Fixture.renderer.last);
+    var storage: [64]commands.Code = undefined;
+    const codes_now = codes(&Fixture.buffer, &storage);
+    const begin = std.mem.findScalar(commands.Code, codes_now, .pass_begin).?;
+    try testing.expectEqual(commands.Code.bind_group_set, codes_now[begin + 1]);
+    try testing.expectEqual(commands.Code.scissor_set, codes_now[begin + 2]);
+    try testing.expectEqual(theme.light.colors.background, first_op(.pass_begin).?.clear);
+    Fixture.renderer.cache = false;
+    Fixture.context.theme = theme.dark.record();
+    Fixture.record(120);
+    try testing.expectEqual(Kind.direct, Fixture.renderer.last);
+    try testing.expectEqual(@as(usize, 1), writes(&Fixture.buffer, &write_storage).len);
+    try testing.expectEqual(theme.dark.colors.background, first_op(.pass_begin).?.clear);
 }
 
 /// The scene, plus one box at world (0, 0) on layer 1 viewed at zoom 2 from `(x, 100)`.
@@ -2243,6 +2338,35 @@ test "a single target renders when its content changes and keeps its pixels othe
         else => {},
     };
     try testing.expect(created and replaced);
+}
+
+// Locks the theme in a target's content key (section 4c): an identical frame keeps the
+// target's pixels; the light theme re-renders it once, writing the light record into the
+// target's uniform; the same theme again keeps them.
+test "a target's content key changes with the theme and not otherwise" {
+    Targets.start();
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 1), Targets.renderer.rendered);
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 0), Targets.renderer.rendered);
+    Targets.context.theme = theme.light.record();
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 1), Targets.renderer.rendered);
+    const target = &Targets.renderer.targets[0];
+    try testing.expectEqual(theme.light.colors.track, target.uniform.theme.track);
+    var written = false;
+    var reader = Targets.buffer.reader();
+    while (reader.next()) |op| switch (op) {
+        .buffer_write => |write| written = written or write.id == target.uniform_buffer,
+        else => {},
+    };
+    try testing.expect(written);
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    try testing.expectEqual(@as(u32, 0), Targets.renderer.rendered);
 }
 
 // Locks a feedback target (section 4c): it renders every frame it is bound, alternating its two

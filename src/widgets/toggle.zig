@@ -86,11 +86,12 @@ pub const Toggle = struct {
         const clip = cx.visible(row) orelse return;
         const pill = pill_of(row);
         cx.area(self.id, pill, pill_radius, ui.cx.plain);
-        kit.face(cx, pill, clip, .{ .fill = theme.chrome.track, .radius = pill_radius });
+        const scheme = cx.theme();
+        kit.face(cx, pill, clip, .{ .fill = scheme.colors.track, .radius = pill_radius });
         const thumb = toggle_thumb(pill, self.thumb.value);
-        const disc = kit.paint_of(theme.chrome.control, thumb_side * 0.5);
-        kit.face(cx, thumb, clip, disc.look(self.hover.value, 0));
-        kit.label(cx, kit.name_style, self.name, knob_file.side_box(row), clip, kit.centered);
+        const disc = kit.paint_of(scheme.colors.control, thumb_side * 0.5);
+        kit.face(cx, thumb, clip, disc.look(scheme, self.hover.value, 0));
+        kit.label(cx, scheme.name, self.name, knob_file.side_box(row), clip, kit.centered);
     }
 };
 
