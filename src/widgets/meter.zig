@@ -11,13 +11,15 @@
 //! upward from the track bottom".
 //!
 //! ## 2. Events
-//! None: drawing only reads `value`, and it records no area. `set_value` reports a change so
+//! None: drawing only reads `value` and hands it to the skin (`widgets/skin.zig`; `Meter` is
+//! `MeterOf(skins.Default)`), and it records no area. `set_value` reports a change so
 //! the caller owes a draw only then.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 const knob_file = @import("knob.zig");
 
 const Rect = kit.Rect;
@@ -29,40 +31,46 @@ pub const meter_track_w: f32 = 12;
 pub const meter_track_h: f32 = 144;
 pub const meter_radius: f32 = 6;
 
-/// A level column. Passive: drawing only reads `value`.
-pub const Meter = struct {
-    name: []const u8,
-    value: f32,
-    /// The track's height in logical pixels (section 1).
-    track_h: f32 = meter_track_h,
+/// The default meter: `MeterOf(skins.Default)`, a capsule level column.
+pub const Meter = MeterOf(skin.Default);
 
-    /// Writes `value` when it differs. Returns true when it changed.
-    pub fn set_value(self: *Meter, value: f32) bool {
-        assert(value >= 0);
-        assert(value <= 1);
-        if (self.value == value) return false;
-        self.value = value;
-        assert(self.value == value);
-        return true;
-    }
+/// A level column drawn by `Skin` (`widgets/skin.zig`). Passive: drawing only reads `value`.
+pub fn MeterOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .meter)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
 
-    pub fn draw(self: *const Meter, cx: anytype, walk: Walk) void {
-        assert(self.value >= 0);
-        assert(self.value <= 1);
-        const row = cx.walk(walk);
-        const clip = cx.visible(row) orelse return;
-        const track = meter_track_sized(row, self.track_h);
-        const scheme = cx.theme();
-        kit.face(cx, track, clip, .{ .fill = scheme.colors.track, .radius = meter_radius });
-        if (self.value > 0) {
-            var fill = track;
-            fill.height = self.value * track.height;
-            fill.y = track.y + track.height - fill.height;
-            kit.face(cx, fill, clip, .{ .fill = scheme.colors.meter, .radius = meter_radius });
+        name: []const u8,
+        value: f32,
+        /// The track's height in logical pixels (section 1).
+        track_h: f32 = meter_track_h,
+
+        /// Writes `value` when it differs. Returns true when it changed.
+        pub fn set_value(self: *Self, value: f32) bool {
+            assert(value >= 0);
+            assert(value <= 1);
+            if (self.value == value) return false;
+            self.value = value;
+            assert(self.value == value);
+            return true;
         }
-        kit.label(cx, scheme.name, self.name, knob_file.side_box(row), clip, kit.centered);
-    }
-};
+
+        /// Hands the box `walk` gets to the skin; a meter records no area.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.value >= 0);
+            assert(self.value <= 1);
+            const row = cx.walk(walk);
+            const clip = cx.visible(row) orelse return;
+            Skin.meter(cx, .{
+                .row = row,
+                .clip = clip,
+                .value = self.value,
+                .track_h = self.track_h,
+                .name = self.name,
+            });
+        }
+    };
+}
 
 pub fn meter_track(row: Rect) Rect {
     return meter_track_sized(row, meter_track_h);

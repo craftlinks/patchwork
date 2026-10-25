@@ -432,6 +432,9 @@ pub const Options = struct {
     /// The renderer's pixel cache (`draw/renderer.zig`, section 4a); `--no-cache` turns it
     /// off to compare against.
     cache: bool,
+    /// `--check`: compile the app's shaders and pipelines on a device with no window, report,
+    /// and exit (`host/gpu_wgpu.zig`, section 10).
+    check: bool,
 
     pub const off: Options = .{
         .bench = false,
@@ -441,19 +444,20 @@ pub const Options = struct {
         .dump = null,
         .csv = null,
         .cache = true,
+        .check = false,
     };
 };
 
 pub const usage =
-    \\usage: <app> [--adapter low|high] [--no-cache] [--bench [scenario] [--frames N]
-    \\       [--dump out.ppm] [--csv out.csv]]
+    \\usage: <app> [--adapter low|high] [--no-cache] [--check] [--bench [scenario]
+    \\       [--frames N] [--dump out.ppm] [--csv out.csv]]
     \\
 ;
 
 pub const ParseError = error{ UnknownArgument, MissingValue, BadNumber, BadAdapter };
 
-/// Parses the arguments after the program name. `--bench` takes an optional scenario name;
-/// every other option takes one value.
+/// Parses the arguments after the program name. `--bench` takes an optional scenario name,
+/// `--no-cache` and `--check` take none, and every other option takes one value.
 pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
     assert(args.len <= arg_cap);
     var options: Options = .off;
@@ -472,6 +476,10 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
         }
         if (std.mem.eql(u8, arg, "--no-cache")) {
             options.cache = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--check")) {
+            options.check = true;
             continue;
         }
         if (index + 1 == args.len) {
@@ -832,7 +840,8 @@ test "scenario validation rejects bad lists by name" {
     try testing.expect(find(&.{test_scenario}, "none") == null);
 }
 
-// Locks the command line: values, the optional scenario after `--bench`, and each error.
+// Locks the command line: values, the optional scenario after `--bench`, the `--check` flag
+// beside `--adapter`, and each error.
 test "arguments parse into options and reject mistakes" {
     const full = try parse_args(&.{ "--adapter", "low", "--bench", "typing", "--frames", "50" });
     try testing.expect(full.bench);
@@ -846,6 +855,11 @@ test "arguments parse into options and reject mistakes" {
     try testing.expect(!(try parse_args(&.{})).bench);
     try testing.expect((try parse_args(&.{})).cache);
     try testing.expect(!(try parse_args(&.{"--no-cache"})).cache);
+    try testing.expect(!(try parse_args(&.{})).check);
+    const check = try parse_args(&.{ "--check", "--adapter", "high" });
+    try testing.expect(check.check);
+    try testing.expect(!check.bench);
+    try testing.expectEqual(Adapter.high, check.adapter);
     try testing.expectError(error.MissingValue, parse_args(&.{"--frames"}));
     try testing.expectError(error.BadNumber, parse_args(&.{ "--frames", "0" }));
     try testing.expectError(error.BadAdapter, parse_args(&.{ "--adapter", "fast" }));

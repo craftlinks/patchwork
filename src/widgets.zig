@@ -6,8 +6,9 @@
 //! ## 1. Plain Structs, Drawn in Place
 //! A widget is a struct the app owns: its id, its value, and its animators. It has no rect
 //! and no layout pass. `draw(self, cx, walk)` asks the turtle for its box (`cx.walk`), culls
-//! itself when the box is outside the clip (`cx.visible`), records its hit area
-//! (`cx.area`), and appends `draw.Box`, `draw.Arc`, and `draw.Glyph` records. `cx` is the
+//! itself when the box is outside the clip (`cx.visible`), hands the box to its skin, which
+//! appends the records (`draw.Box`, `draw.Arc`, and `draw.Glyph` for the default skin) and
+//! returns the hit shape, and records that hit area (`cx.area`; section 6). `cx` is the
 //! app's `ui.Context`; it is `anytype` because that type depends on the app's draw types,
 //! so a widget fails to compile against an app that did not register a type it draws.
 //!
@@ -35,6 +36,7 @@
 //! ```text
 //! widgets/kit.zig         append, face, arc, label, step, aim, weight, clicked, Interaction,
 //!                         Paint, the hover and press constants, the shared text styles
+//! widgets/skin.zig        the look structs, Shape, skins.check, and skins.Default
 //! widgets/label.zig       Label
 //! widgets/panel.zig       Panel
 //! widgets/button.zig      Button
@@ -45,8 +47,9 @@
 //! widgets/text_field.zig  TextField
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
-//! A widget file imports `kit.zig` (and `knob.zig` for the shared row geometry), never this
-//! file, so there is no import cycle. An app's own widget is built the same way, from
+//! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
+//! geometry), never this file; `skin.zig` imports the widget files back for their geometry,
+//! which Zig resolves lazily. An app's own widget is built the same way, from
 //! `widgets.kit`.
 //!
 //! ## 4. Capacity
@@ -62,7 +65,15 @@
 //! `down_darken`, `field_focus_border`, and `field_selection` are `theme.dark`'s values, kept
 //! as constants for code that names them; `kit.accent(cx, i)` is the app scheme's accent.
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. Skins
+//! Every widget but `Label` is generic over a skin, a struct of draw functions passed at
+//! compile time (`widgets/skin.zig`): `KnobOf(Skin)`, `ButtonOf`, `SliderOf`, `ToggleOf`,
+//! `MeterOf`, `PanelOf`, and `TextFieldOf` (its face only). The plain names are the default
+//! skin, `Knob = KnobOf(skins.Default)`, and draw exactly what they drew before skins. A skin
+//! gets a look struct of values and returns the hit shape; a missing or mistyped function is
+//! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
+//!
+//! ## 7. TigerStyle Invariants
 //! - No allocation: label text points at app-owned bytes bounded by `text.byte_cap`; a
 //!   knob's value text and a field's bytes are inline.
 //! - Geometry helpers are pure; `handle` is the only mutator.
@@ -74,6 +85,8 @@ const ui = @import("ui.zig");
 
 /// The widget-authoring kit (`widgets/kit.zig`).
 pub const kit = @import("widgets/kit.zig");
+/// Skins: the look of each widget, apart from its behaviour (`widgets/skin.zig`).
+pub const skins = @import("widgets/skin.zig");
 const label = @import("widgets/label.zig");
 const panel = @import("widgets/panel.zig");
 const button = @import("widgets/button.zig");
@@ -101,11 +114,23 @@ pub const centered = kit.centered;
 pub const paint_of = kit.paint_of;
 pub const settled = kit.settled;
 
+pub const Shape = skins.Shape;
+pub const ButtonLook = skins.ButtonLook;
+pub const SliderLook = skins.SliderLook;
+pub const KnobLook = skins.KnobLook;
+pub const ToggleLook = skins.ToggleLook;
+pub const MeterLook = skins.MeterLook;
+pub const PanelLook = skins.PanelLook;
+pub const FieldLook = skins.FieldLook;
+
 pub const Label = label.Label;
 pub const Panel = panel.Panel;
 pub const Button = button.Button;
+pub const ButtonOf = button.ButtonOf;
+pub const PanelOf = panel.PanelOf;
 
 pub const Slider = slider.Slider;
+pub const SliderOf = slider.SliderOf;
 pub const knob_radius = slider.knob_radius;
 pub const track_height = slider.track_height;
 pub const track_radius = slider.track_radius;
@@ -114,6 +139,7 @@ pub const track_rect = slider.track_rect;
 pub const knob_rect = slider.knob_rect;
 
 pub const Knob = knob.Knob;
+pub const KnobOf = knob.KnobOf;
 pub const drag_span_px = knob.drag_span_px;
 pub const ring_size = knob.ring_size;
 pub const ring_thickness = knob.ring_thickness;
@@ -128,8 +154,12 @@ pub const knob_flags = knob.knob_flags;
 pub const ring_of = knob.ring_of;
 pub const ring_sized = knob.ring_sized;
 pub const write_hundredths = knob.write_hundredths;
+pub const name_box = knob.name_box;
+pub const value_box = knob.value_box;
+pub const side_box = knob.side_box;
 
 pub const Meter = meter.Meter;
+pub const MeterOf = meter.MeterOf;
 pub const meter_height = meter.meter_height;
 pub const meter_track_w = meter.meter_track_w;
 pub const meter_track_h = meter.meter_track_h;
@@ -138,6 +168,7 @@ pub const meter_track = meter.meter_track;
 pub const meter_track_sized = meter.meter_track_sized;
 
 pub const Toggle = toggle.Toggle;
+pub const ToggleOf = toggle.ToggleOf;
 pub const toggle_height = toggle.toggle_height;
 pub const pill_w = toggle.pill_w;
 pub const pill_h = toggle.pill_h;
@@ -148,6 +179,7 @@ pub const pill_of = toggle.pill_of;
 pub const toggle_thumb = toggle.toggle_thumb;
 
 pub const TextField = text_field.TextField;
+pub const TextFieldOf = text_field.TextFieldOf;
 pub const field_flags = text_field.field_flags;
 pub const field_padding_x = text_field.field_padding_x;
 pub const field_radius = text_field.field_radius;
@@ -160,6 +192,7 @@ pub const field_inner = text_field.field_inner;
 
 test {
     _ = kit;
+    _ = skins;
     _ = label;
     _ = panel;
     _ = button;

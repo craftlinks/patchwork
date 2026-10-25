@@ -28,7 +28,8 @@
 //! visible".
 //!
 //! ## 5. Drawing
-//! The face (with the focus border), the selection band, the glyphs offset by `-scroll_x` and
+//! The face (with the focus border) is the skin's (`widgets/skin.zig`; `TextField` is
+//! `TextFieldOf(skins.Default)`); the selection band, the glyphs offset by `-scroll_x` and
 //! clipped to the inner box, and while focused a steady caret one device pixel wide snapped to
 //! the device grid. It never blinks, so a focused field keeps the host asleep. Measuring the
 //! caret is O(bytes), at most 256 per drawn frame.
@@ -42,6 +43,7 @@ const theme = @import("../theme.zig");
 const ui = @import("../ui.zig");
 const edit = @import("../ui/edit.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -71,238 +73,246 @@ pub const field_text_options: text.Options = .{
     .ellipsis = false,
 };
 
-/// A single-line text field over the editing core (`ui/edit.zig`). Its area is focusable and
-/// shows the I-beam. See the module guide.
-pub const TextField = struct {
-    id: Id,
-    edit: edit.Edit,
-    /// How far the text is scrolled left inside the field, in logical pixels.
-    scroll_x: f32,
-    style: text.Style,
+/// The default field: `TextFieldOf(skins.Default)`.
+pub const TextField = TextFieldOf(skin.Default);
 
-    pub const Action = enum {
-        none,
-        changed,
-        /// Enter, or focus moved away (a press elsewhere or Tab).
-        committed,
-        /// Escape.
-        cancelled,
-    };
+/// A single-line text field over the editing core (`ui/edit.zig`) whose face and border are
+/// drawn by `Skin` (`widgets/skin.zig`). Its area is focusable and shows the I-beam. See the
+/// module guide.
+pub fn TextFieldOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .field)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
 
-    /// An empty field holding at most `limit` bytes.
-    pub fn init(id: Id, limit: u32, style: text.Style) TextField {
-        assert(id != .none);
-        assert(limit <= edit.field_cap);
-        const field: TextField = .{
-            .id = id,
-            .edit = edit.Edit.init(limit),
-            .scroll_x = 0,
-            .style = style,
+        id: Id,
+        edit: edit.Edit,
+        /// How far the text is scrolled left inside the field, in logical pixels.
+        scroll_x: f32,
+        style: text.Style,
+
+        pub const Action = enum {
+            none,
+            changed,
+            /// Enter, or focus moved away (a press elsewhere or Tab).
+            committed,
+            /// Escape.
+            cancelled,
         };
-        assert(field.edit.len == 0);
-        return field;
-    }
 
-    /// The text.
-    pub fn bytes(self: *const TextField) []const u8 {
-        assert(self.id != .none);
-        return self.edit.text();
-    }
-
-    /// Replaces the text with `utf8` and selects all of it, scrolled to the start.
-    pub fn load(self: *TextField, utf8: []const u8) void {
-        self.edit.set(utf8);
-        self.edit.select_all();
-        self.scroll_x = 0;
-        assert(self.edit.anchor == 0);
-    }
-
-    pub fn handle(self: *TextField, cx: anytype, event: input.Event) Action {
-        assert(self.id != .none);
-        assert(self.scroll_x >= 0);
-        if (event == .frame) return .none;
-        if (cx.focus_lost(self.id)) {
-            cx.redraw();
-            return .committed;
-        }
-        switch (event) {
-            .key_down => |press| {
-                if (!cx.focused(self.id)) return .none;
-                return self.key(cx, press);
-            },
-            .paste => |pasted| {
-                if (!cx.focused(self.id)) return .none;
-                var line: [edit.field_cap]u8 = undefined;
-                const length = edit.sanitize_line(pasted, &line);
-                return self.changed_if(cx, self.edit.insert(line[0..length]));
-            },
-            else => {},
-        }
-        switch (cx.hit(self.id, event)) {
-            .down => |press| {
-                const index = self.index_at(press);
-                if (press.clicks >= 3) {
-                    self.edit.select_all();
-                } else if (press.clicks == 2) {
-                    self.edit.select_word(index);
-                } else {
-                    self.edit.move_to(index, press.mods.shift);
-                }
-                self.follow(press.rect);
-                cx.redraw();
-            },
-            .drag => |press| {
-                self.edit.move_to(self.index_at(press), true);
-                self.follow(press.rect);
-                cx.redraw();
-            },
-            else => {},
-        }
-        return .none;
-    }
-
-    /// Draws the face, the selection and the caret while focused, and the text scrolled by
-    /// `scroll_x` and clipped to the field, and records the focusable I-beam area.
-    pub fn draw(self: *const TextField, cx: anytype, walk: Walk) void {
-        assert(self.scroll_x >= 0);
-        const rect = cx.walk(walk);
-        const clip = cx.visible(rect) orelse return;
-        const focused = cx.focused(self.id);
-        cx.area(self.id, rect, field_radius, field_flags);
-        const colors = &cx.theme().colors;
-        const border = if (focused) colors.focus else colors.control;
-        kit.append(cx, quads.Box, null, quads.Box.of(rect, clip, .{
-            .fill = colors.track,
-            .border_color = border,
-            .border_width = field_border_px,
-            .radius = field_radius,
-        }));
-        const inner = field_inner(rect);
-        const inner_clip = ui.cx.intersect(clip, inner) orelse return;
-        const origin = inner.x - self.scroll_x;
-        const all = self.edit.text();
-        if (focused and self.edit.has_selection()) {
-            const range = self.edit.selection();
-            const x0 = origin + text.measure(self.style, all[0..range.start]);
-            const x1 = origin + text.measure(self.style, all[0..range.end]);
-            const band: Rect = .{ .x = x0, .y = inner.y, .width = x1 - x0, .height = inner.height };
-            kit.face(cx, band, inner_clip, .{ .fill = colors.selection });
-        }
-        const line: Rect = .{
-            .x = origin,
-            .y = inner.y,
-            .width = inner.width + self.scroll_x,
-            .height = inner.height,
-        };
-        kit.label(cx, self.style, all, line, inner_clip, field_text_options);
-        if (focused) {
-            const scale = cx.drawing().text.device_scale();
-            const caret_x = origin + text.measure(self.style, all[0..self.edit.caret]);
-            const caret: Rect = .{
-                .x = @round(caret_x * scale) / scale,
-                .y = inner.y + field_caret_inset,
-                .width = 1 / scale,
-                .height = inner.height - 2 * field_caret_inset,
+        /// An empty field holding at most `limit` bytes.
+        pub fn init(id: Id, limit: u32, style: text.Style) Self {
+            assert(id != .none);
+            assert(limit <= edit.field_cap);
+            const field: Self = .{
+                .id = id,
+                .edit = edit.Edit.init(limit),
+                .scroll_x = 0,
+                .style = style,
             };
-            kit.face(cx, caret, inner_clip, .{ .fill = colors.text });
+            assert(field.edit.len == 0);
+            return field;
         }
-    }
 
-    /// One key press while focused: shortcuts, movement, deletion, Enter, Escape, or typed
-    /// text. Tab is the library's (`ui/cx.zig`, section 7).
-    fn key(self: *TextField, cx: anytype, press: input.KeyPress) Action {
-        assert(cx.focused(self.id));
-        const shift = press.mods.shift;
-        const all = self.edit.text();
-        const caret = self.edit.caret;
-        if (press.mods.shortcut()) {
-            switch (press.key) {
-                .a => self.edit.select_all(),
-                .c => if (self.edit.has_selection()) cx.copy(self.edit.selected()),
-                .x => {
-                    if (!self.edit.has_selection()) return .none;
-                    cx.copy(self.edit.selected());
-                    return self.changed_if(cx, self.edit.delete_selection());
+        /// The text.
+        pub fn bytes(self: *const Self) []const u8 {
+            assert(self.id != .none);
+            return self.edit.text();
+        }
+
+        /// Replaces the text with `utf8` and selects all of it, scrolled to the start.
+        pub fn load(self: *Self, utf8: []const u8) void {
+            self.edit.set(utf8);
+            self.edit.select_all();
+            self.scroll_x = 0;
+            assert(self.edit.anchor == 0);
+        }
+
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.id != .none);
+            assert(self.scroll_x >= 0);
+            if (event == .frame) return .none;
+            if (cx.focus_lost(self.id)) {
+                cx.redraw();
+                return .committed;
+            }
+            switch (event) {
+                .key_down => |press| {
+                    if (!cx.focused(self.id)) return .none;
+                    return self.key(cx, press);
                 },
-                .v => cx.request_paste(),
-                .left => self.edit.move_to(edit.word_left(all, caret), shift),
-                .right => self.edit.move_to(edit.word_right(all, caret), shift),
-                .backspace => return self.changed_if(cx, self.edit.erase(.backward, true)),
-                .delete => return self.changed_if(cx, self.edit.erase(.forward, true)),
-                else => return .none,
+                .paste => |pasted| {
+                    if (!cx.focused(self.id)) return .none;
+                    var line: [edit.field_cap]u8 = undefined;
+                    const length = edit.sanitize_line(pasted, &line);
+                    return self.changed_if(cx, self.edit.insert(line[0..length]));
+                },
+                else => {},
+            }
+            switch (cx.hit(self.id, event)) {
+                .down => |press| {
+                    const index = self.index_at(press);
+                    if (press.clicks >= 3) {
+                        self.edit.select_all();
+                    } else if (press.clicks == 2) {
+                        self.edit.select_word(index);
+                    } else {
+                        self.edit.move_to(index, press.mods.shift);
+                    }
+                    self.follow(press.rect);
+                    cx.redraw();
+                },
+                .drag => |press| {
+                    self.edit.move_to(self.index_at(press), true);
+                    self.follow(press.rect);
+                    cx.redraw();
+                },
+                else => {},
+            }
+            return .none;
+        }
+
+        /// Draws the face (the skin's), the selection and the caret while focused, and the text
+        /// scrolled by `scroll_x` and clipped to the field, and records the focusable I-beam area.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.scroll_x >= 0);
+            const rect = cx.walk(walk);
+            const clip = cx.visible(rect) orelse return;
+            const focused = cx.focused(self.id);
+            cx.area(self.id, rect, field_radius, field_flags);
+            Skin.field(cx, .{ .rect = rect, .clip = clip, .focused = focused });
+            const colors = &cx.theme().colors;
+            const inner = field_inner(rect);
+            const inner_clip = ui.cx.intersect(clip, inner) orelse return;
+            const origin = inner.x - self.scroll_x;
+            const all = self.edit.text();
+            if (focused and self.edit.has_selection()) {
+                const range = self.edit.selection();
+                const x0 = origin + text.measure(self.style, all[0..range.start]);
+                const x1 = origin + text.measure(self.style, all[0..range.end]);
+                const band: Rect = .{
+                    .x = x0,
+                    .y = inner.y,
+                    .width = x1 - x0,
+                    .height = inner.height,
+                };
+                kit.face(cx, band, inner_clip, .{ .fill = colors.selection });
+            }
+            const line: Rect = .{
+                .x = origin,
+                .y = inner.y,
+                .width = inner.width + self.scroll_x,
+                .height = inner.height,
+            };
+            kit.label(cx, self.style, all, line, inner_clip, field_text_options);
+            if (focused) {
+                const scale = cx.drawing().text.device_scale();
+                const caret_x = origin + text.measure(self.style, all[0..self.edit.caret]);
+                const caret: Rect = .{
+                    .x = @round(caret_x * scale) / scale,
+                    .y = inner.y + field_caret_inset,
+                    .width = 1 / scale,
+                    .height = inner.height - 2 * field_caret_inset,
+                };
+                kit.face(cx, caret, inner_clip, .{ .fill = colors.text });
+            }
+        }
+
+        /// One key press while focused: shortcuts, movement, deletion, Enter, Escape, or typed
+        /// text. Tab is the library's (`ui/cx.zig`, section 7).
+        fn key(self: *Self, cx: anytype, press: input.KeyPress) Action {
+            assert(cx.focused(self.id));
+            const shift = press.mods.shift;
+            const all = self.edit.text();
+            const caret = self.edit.caret;
+            if (press.mods.shortcut()) {
+                switch (press.key) {
+                    .a => self.edit.select_all(),
+                    .c => if (self.edit.has_selection()) cx.copy(self.edit.selected()),
+                    .x => {
+                        if (!self.edit.has_selection()) return .none;
+                        cx.copy(self.edit.selected());
+                        return self.changed_if(cx, self.edit.delete_selection());
+                    },
+                    .v => cx.request_paste(),
+                    .left => self.edit.move_to(edit.word_left(all, caret), shift),
+                    .right => self.edit.move_to(edit.word_right(all, caret), shift),
+                    .backspace => return self.changed_if(cx, self.edit.erase(.backward, true)),
+                    .delete => return self.changed_if(cx, self.edit.erase(.forward, true)),
+                    else => return .none,
+                }
+                self.moved(cx);
+                return .none;
+            }
+            const range = self.edit.selection();
+            const collapse = self.edit.has_selection() and !shift;
+            switch (press.key) {
+                .left => {
+                    const target = if (collapse) range.start else edit.prev_boundary(all, caret);
+                    self.edit.move_to(target, shift);
+                },
+                .right => {
+                    const target = if (collapse) range.end else edit.next_boundary(all, caret);
+                    self.edit.move_to(target, shift);
+                },
+                .home, .up, .page_up => self.edit.move_to(0, shift),
+                .end, .down, .page_down => self.edit.move_to(self.edit.len, shift),
+                .backspace => return self.changed_if(cx, self.edit.erase(.backward, false)),
+                .delete => return self.changed_if(cx, self.edit.erase(.forward, false)),
+                .enter => {
+                    cx.clear_focus();
+                    cx.redraw();
+                    return .committed;
+                },
+                .escape => {
+                    cx.redraw();
+                    return .cancelled;
+                },
+                .tab => return .none,
+                else => {
+                    if (press.len == 0) return .none;
+                    return self.changed_if(cx, self.edit.insert(press.typed()));
+                },
             }
             self.moved(cx);
             return .none;
         }
-        const range = self.edit.selection();
-        const collapse = self.edit.has_selection() and !shift;
-        switch (press.key) {
-            .left => {
-                const target = if (collapse) range.start else edit.prev_boundary(all, caret);
-                self.edit.move_to(target, shift);
-            },
-            .right => {
-                const target = if (collapse) range.end else edit.next_boundary(all, caret);
-                self.edit.move_to(target, shift);
-            },
-            .home, .up, .page_up => self.edit.move_to(0, shift),
-            .end, .down, .page_down => self.edit.move_to(self.edit.len, shift),
-            .backspace => return self.changed_if(cx, self.edit.erase(.backward, false)),
-            .delete => return self.changed_if(cx, self.edit.erase(.forward, false)),
-            .enter => {
-                cx.clear_focus();
-                cx.redraw();
-                return .committed;
-            },
-            .escape => {
-                cx.redraw();
-                return .cancelled;
-            },
-            .tab => return .none,
-            else => {
-                if (press.len == 0) return .none;
-                return self.changed_if(cx, self.edit.insert(press.typed()));
-            },
+
+        fn changed_if(self: *Self, cx: anytype, changed: bool) Action {
+            self.moved(cx);
+            if (changed) return .changed;
+            return .none;
         }
-        self.moved(cx);
-        return .none;
-    }
 
-    fn changed_if(self: *TextField, cx: anytype, changed: bool) Action {
-        self.moved(cx);
-        if (changed) return .changed;
-        return .none;
-    }
+        /// After the caret or text moved: keep the caret in view and owe a draw.
+        fn moved(self: *Self, cx: anytype) void {
+            self.follow(cx.focused_rect());
+            cx.redraw();
+            assert(self.scroll_x >= 0);
+        }
 
-    /// After the caret or text moved: keep the caret in view and owe a draw.
-    fn moved(self: *TextField, cx: anytype) void {
-        self.follow(cx.focused_rect());
-        cx.redraw();
-        assert(self.scroll_x >= 0);
-    }
+        /// Scrolls so the caret is inside the field's inner box, and never past the text's end.
+        /// A field not drawn yet has no box and keeps its scroll.
+        fn follow(self: *Self, rect: Rect) void {
+            const room = field_inner(rect).width;
+            if (!(room > 0)) return;
+            const all = self.edit.text();
+            const caret_x = text.measure(self.style, all[0..self.edit.caret]);
+            if (caret_x - self.scroll_x > room) self.scroll_x = caret_x - room;
+            if (caret_x < self.scroll_x) self.scroll_x = caret_x;
+            const limit = @max(0, text.measure(self.style, all) - room);
+            self.scroll_x = std.math.clamp(self.scroll_x, 0, limit);
+            assert(self.scroll_x >= 0);
+        }
 
-    /// Scrolls so the caret is inside the field's inner box, and never past the text's end.
-    /// A field not drawn yet has no box and keeps its scroll.
-    fn follow(self: *TextField, rect: Rect) void {
-        const room = field_inner(rect).width;
-        if (!(room > 0)) return;
-        const all = self.edit.text();
-        const caret_x = text.measure(self.style, all[0..self.edit.caret]);
-        if (caret_x - self.scroll_x > room) self.scroll_x = caret_x - room;
-        if (caret_x < self.scroll_x) self.scroll_x = caret_x;
-        const limit = @max(0, text.measure(self.style, all) - room);
-        self.scroll_x = std.math.clamp(self.scroll_x, 0, limit);
-        assert(self.scroll_x >= 0);
-    }
-
-    /// The boundary under a press, from the field's rect at the last draw.
-    fn index_at(self: *const TextField, press: ui.Press) u32 {
-        const local = press.x - field_inner(press.rect).x + self.scroll_x;
-        const index = text.index_at(self.style, self.edit.text(), local);
-        assert(index <= self.edit.len);
-        return index;
-    }
-};
+        /// The boundary under a press, from the field's rect at the last draw.
+        fn index_at(self: *const Self, press: ui.Press) u32 {
+            const local = press.x - field_inner(press.rect).x + self.scroll_x;
+            const index = text.index_at(self.style, self.edit.text(), local);
+            assert(index <= self.edit.len);
+            return index;
+        }
+    };
+}
 
 /// The text box of a field: its rect inset by `field_padding_x` on both sides.
 pub fn field_inner(rect: Rect) Rect {

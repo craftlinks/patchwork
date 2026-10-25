@@ -9,9 +9,10 @@
 //! 2 * thumb_inset`. The name sits in the knob's label column (`side_box`).
 //!
 //! ## 2. Events
-//! The pill is the hit area. Hover follows the kit's table without a press channel; a release
-//! inside flips `on` and aims the `thumb` animator, which eases on `.frame` beside the hover.
-//! Only the thumb disc lightens.
+//! The skin's shape is the hit area (`widgets/skin.zig`; the default skin's is the pill, and
+//! `Toggle` is `ToggleOf(skins.Default)`). Hover follows the kit's table without a press
+//! channel; a release inside flips `on` and aims the `thumb` animator, which eases on `.frame`
+//! beside the hover. Only the thumb disc lightens.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +21,7 @@ const input = @import("../input.zig");
 const theme = @import("../theme.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const skin = @import("skin.zig");
 const knob_file = @import("knob.zig");
 
 const Rect = kit.Rect;
@@ -34,66 +36,76 @@ pub const pill_radius: f32 = 12;
 pub const thumb_side: f32 = 20;
 pub const thumb_inset: f32 = 2;
 
-/// Pill with a sliding thumb. A release on the pill flips `on` and re-aims the thumb.
-pub const Toggle = struct {
-    id: Id,
-    name: []const u8,
-    on: bool,
-    hover: animator.Animator,
-    thumb: animator.Animator,
+/// The default toggle: `ToggleOf(skins.Default)`, a pill with a sliding thumb.
+pub const Toggle = ToggleOf(skin.Default);
 
-    pub const Action = union(enum) {
-        none,
-        toggled: bool,
-    };
+/// A toggle drawn by `Skin` (`widgets/skin.zig`). A release on the hit shape flips `on` and
+/// re-aims the thumb.
+pub fn ToggleOf(comptime Skin: type) type {
+    if (comptime skin.check(Skin, .toggle)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
 
-    /// A toggle at rest, thumb on the side `on` selects.
-    pub fn init(id: Id, name: []const u8, on: bool) Toggle {
-        assert(id != .none);
-        assert(name.len <= 8);
-        const toggle: Toggle = .{
-            .id = id,
-            .name = name,
-            .on = on,
-            .hover = animator.Animator.init(kit.hover_rate_per_ms),
-            .thumb = kit.settled(kit.hover_rate_per_ms, on),
+        id: Id,
+        name: []const u8,
+        on: bool,
+        hover: animator.Animator,
+        thumb: animator.Animator,
+
+        pub const Action = union(enum) {
+            none,
+            toggled: bool,
         };
-        assert(!toggle.thumb.live());
-        return toggle;
-    }
 
-    pub fn handle(self: *Toggle, cx: anytype, event: input.Event) Action {
-        assert(self.id != .none);
-        assert(self.thumb.rate_per_ms > 0);
-        if (event == .frame) {
-            kit.step(cx, &self.hover, event.frame);
-            kit.step(cx, &self.thumb, event.frame);
-            return .none;
+        /// A toggle at rest, thumb on the side `on` selects.
+        pub fn init(id: Id, name: []const u8, on: bool) Self {
+            assert(id != .none);
+            assert(name.len <= 8);
+            const toggle: Self = .{
+                .id = id,
+                .name = name,
+                .on = on,
+                .hover = animator.Animator.init(kit.hover_rate_per_ms),
+                .thumb = kit.settled(kit.hover_rate_per_ms, on),
+            };
+            assert(!toggle.thumb.live());
+            return toggle;
         }
-        const hit = cx.hit(self.id, event);
-        kit.respond(cx, hit, &self.hover, null);
-        if (hit != .up) return .none;
-        if (!hit.up.inside) return .none;
-        self.on = !self.on;
-        kit.aim(cx, &self.thumb, if (self.on) 1 else 0);
-        return .{ .toggled = self.on };
-    }
 
-    pub fn draw(self: *const Toggle, cx: anytype, walk: Walk) void {
-        assert(self.thumb.value >= 0);
-        assert(self.thumb.value <= 1);
-        const row = cx.walk(walk);
-        const clip = cx.visible(row) orelse return;
-        const pill = pill_of(row);
-        cx.area(self.id, pill, pill_radius, ui.cx.plain);
-        const scheme = cx.theme();
-        kit.face(cx, pill, clip, .{ .fill = scheme.colors.track, .radius = pill_radius });
-        const thumb = toggle_thumb(pill, self.thumb.value);
-        const disc = kit.paint_of(scheme.colors.control, thumb_side * 0.5);
-        kit.face(cx, thumb, clip, disc.look(scheme, self.hover.value, 0));
-        kit.label(cx, scheme.name, self.name, knob_file.side_box(row), clip, kit.centered);
-    }
-};
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.id != .none);
+            assert(self.thumb.rate_per_ms > 0);
+            if (event == .frame) {
+                kit.step(cx, &self.hover, event.frame);
+                kit.step(cx, &self.thumb, event.frame);
+                return .none;
+            }
+            const hit = cx.hit(self.id, event);
+            kit.respond(cx, hit, &self.hover, null);
+            if (hit != .up) return .none;
+            if (!hit.up.inside) return .none;
+            self.on = !self.on;
+            kit.aim(cx, &self.thumb, if (self.on) 1 else 0);
+            return .{ .toggled = self.on };
+        }
+
+        /// Hands the box `walk` gets to the skin and records the shape it returns.
+        pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(self.thumb.value >= 0);
+            assert(self.thumb.value <= 1);
+            const row = cx.walk(walk);
+            const clip = cx.visible(row) orelse return;
+            const shape = Skin.toggle(cx, .{
+                .row = row,
+                .clip = clip,
+                .thumb = self.thumb.value,
+                .hover = self.hover.value,
+                .name = self.name,
+            }) orelse return;
+            cx.area(self.id, shape.rect, shape.radius, ui.cx.plain);
+        }
+    };
+}
 
 pub fn pill_of(row: Rect) Rect {
     const pill: Rect = .{

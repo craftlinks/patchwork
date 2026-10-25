@@ -4,7 +4,8 @@
 //! application's root file. It contains no app code, so the same app source builds for
 //! native and browser. `linux_window.run` checks the app contract at compile time, then
 //! owns all storage on its own stack frame: window state, draw lists, queue, and the app.
-//! The command line selects the adapter and bench mode (`bench.zig`, `bench.usage`).
+//! The command line selects the adapter, bench mode, and the windowless shader check
+//! (`--check`, which returns before any Wayland connection; `bench.zig`, `bench.usage`).
 
 const std = @import("std");
 const patchwork = @import("patchwork");

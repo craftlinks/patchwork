@@ -32,7 +32,9 @@
 // `main` awaits those scopes before the first frame. Shader modules and their pipelines carry
 // the same label, so WGSL compilation messages name the draw type. Later errors
 // arrive on the device's `uncapturederror` event and are logged with the last frame's ops.
-// Loading the page with `?trace=1` logs the op names of every submitted stream.
+// Loading the page with `?trace=1` logs the op names of every submitted stream, and one
+// "compiled shader" line per shader module with its error and warning counts (the browser has
+// no `--check` mode; `getCompilationInfo` reports WGSL problems at creation).
 //
 // ## 5. Frame Scheduling
 // There is no unconditional `requestAnimationFrame` loop; an idle UI should not burn power.
@@ -280,11 +282,20 @@ const OPS = {
         const label = new TextDecoder().decode(span_bytes(p.label));
         const module = device.createShaderModule({ label, code });
         module.getCompilationInfo().then((info) => {
+            const counts = { error: 0, warning: 0, info: 0 };
             for (const message of info.messages) {
+                counts[message.type] += 1;
+                const where = `${p.id} (${label} line ${message.lineNum}:${message.linePos})`;
                 if (message.type === "error") {
-                    const where = `${p.id} (${label} line ${message.lineNum}:${message.linePos})`;
                     console.error(`op ${index} shader_create ${where}: ${message.message}`);
+                } else if (trace) {
+                    console.log(`op ${index} shader_create ${where} ${message.type}: ${message.message}`);
                 }
+            }
+            // With `?trace=1`, one line per module: the browser's answer to `zig build check`.
+            if (trace) {
+                const summary = `${counts.error} errors, ${counts.warning} warnings`;
+                console.log(`compiled shader ${p.id} (${label}): ${summary}`);
             }
         });
         store("shader", p.id, module, "shader_create");
