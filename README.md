@@ -108,6 +108,7 @@ patchwork/
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
 │   ├── ui/canvas.zig           # Pan/zoom canvases: CanvasState, the zoom ladder, wheel and drag
 │   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
+│   ├── ui/popup.zig            # Popup placement: place (side, flip, clamp, cut), Anchor
 │   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
 │   ├── widgets/kit.zig         # The widget kit: append, face, arc, label, step, aim, weight,
 │   │                           #   clicked, Interaction, Paint, the hover and press constants
@@ -120,6 +121,9 @@ patchwork/
 │   ├── widgets/meter.zig
 │   ├── widgets/toggle.zig
 │   ├── widgets/text_field.zig
+│   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
+│   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
+│   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
@@ -217,7 +221,9 @@ patchwork/
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
     ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
     ├── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
-    └── contract_skin_missing.zig # Test verifying that a skin without `knob` fails, naming it
+    ├── contract_skin_missing.zig # Test verifying that a skin without `knob` fails, naming it
+    └── contract_overlays_none.zig # Test verifying that `ui.overlays` of a target without
+                                   # any `draw_overlay` fails, naming it
 ```
 
 ## Build Steps
@@ -277,8 +283,9 @@ zig build serve-gallery   # Serve it on localhost (prints the address)
 zig build test            # Run unit tests across the library and the nine examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
-                          # `Audio` source without `audio`, a theme color of 1.5, and a
-                          # knob skin without `knob`
+                          # `Audio` source without `audio`, a theme color of 1.5, a
+                          # knob skin without `knob`, and `ui.overlays` of a target
+                          # with no `draw_overlay`
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -615,6 +622,43 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
 - **Check the shaders.** `zig build check` compiles every draw type's WGSL before a window
   opens and names the broken type.
 
+## Popups
+
+Menus, dropdown lists, context menus, dialogs, and tooltips are drawn by the widget that owns
+them, last, at the root of the turtle stack, on their own layers (`Layer.popup` 6 and
+`Layer.tooltip` 7, above the overlay layer 4 and canvases 1 to 4). The rule is one line at the
+end of `App.draw`:
+
+```zig
+pub fn draw(app: *App, cx: *Context) void {
+    // ... the whole screen ...
+    ui.overlays(cx, app); // calls draw_overlay on every field that has one, in field order
+}
+```
+
+- **Placement.** `ui.popup.place(anchor, size, window, side)` puts a popup `.below`,
+  `.above`, `.right`, `.left` of its anchor or `.at` its top-left (a context menu at the
+  pointer), 2 px from it and 4 px inside the window; a side that overflows flips when the other
+  side has more room, then the box is clamped and, if larger than the window, cut. Widgets take
+  `bounds: ?Rect` (null for the window) so placement does not depend on a window size the
+  compositor picks.
+- **Input.** `cx.begin_popup(id, rect, layout, dim)` records a backdrop area over the whole
+  window on the popup layer before the popup's own areas. Resolution already prefers the highest
+  layer, then the last appended, so the popup's rows take the pointer over them and the backdrop
+  takes it everywhere else: an outside press dismisses and does not also click what was under it.
+  The wheel reaches nothing under a popup. `dim` (0 to 1) darkens the screen behind a dialog.
+- **Widgets.** `widgets.Menu` (up to 32 items, disabled items, Up/Down/Home/End/Enter/Escape,
+  Tab dismisses), `widgets.ContextMenu` (a menu opened by a right press on a target id),
+  `widgets.Dropdown` (a face and its menu, `Action.changed` only for a different item), and
+  `widgets.Tooltip` (the app says what is hovered as a `widgets.Tip`; it shows after
+  `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)` and
+  `DropdownOf(Skin)` are skinnable like the other widgets.
+- **Forgetting `ui.overlays`.** Opening a popup calls `cx.request_popup(id)`; in safe builds
+  the next draw panics naming the id if no `draw_overlay` drew it, and `ui.overlays` on a target
+  with no overlay at all is a compile error.
+- **Idle.** An open menu at rest wakes nothing, and a tooltip's dwell animates only until it
+  shows.
+
 ## Example Applications
 
 Worked coordinates, initial values, palettes, and budgets live in the examples' tests, not
@@ -662,10 +706,12 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
   envelope drawn with `draw.path.polyline`. Hovering the display runs a playhead dot along
   it, advanced on every displayed frame (the display's refresh rate) through
   `cx.keep_animating()`; leaving the display stops the frames.
-- **Layers.** Hovering a knob for `tooltip_delay_ms` (500 ms) shows a tooltip that covers the
-  neighbouring knob's name. It is drawn on the overlay layer and records no hit area, so it
-  never takes the hover from the knob; test "the tooltip box covers the neighbour's text on
-  the overlay layer" locks it.
+- **Layers.** Hovering a knob for `tooltip_delay_ms` (500 ms) shows a `widgets.Tooltip` that
+  covers the neighbouring knob's name. It is drawn on the tooltip layer by `ui.overlays` and
+  records no hit area, so it never takes the hover from the knob; test "the tooltip box covers
+  the neighbour's text on the tooltip layer" locks it, and "the tooltip draws the records of
+  the rack's own tooltip" that its box and text are byte for byte those of the rack's earlier
+  hand-made tooltip.
 - **Audio-driven meters.** The rack declares `Audio = realtime.TestTone`; Space (when no
   title is being renamed) starts and stops it ("tone on", "tone off"). Each block's L, R, and
   mid peaks go through `realtime.Ballistics` onto the osc, filter, and amp meters, and the
@@ -818,7 +864,14 @@ rows ("hardware knob 0 changed 0.83"). Scenarios: `still`, `interact` (a click, 
 toggle, typing, a wheel, and a row click, then settled), `hover` (the pointer rests on button
 1), `light` (the toggle, then the focused field with "abc" selected, settled), and `hardware`
 (hardware knob 0 dragged up 40 px, hardware button 1 clicked, hardware toggle 0 flipped,
-settled).
+settled). Right of the screen a popups column shows the overlay model (see Popups): a dropdown
+of six waveforms, a "File" button opening a menu (Save as… disabled, About… opening a modal
+dialog over a dimmed screen), a panel with a context menu (Copy, Paste, Reset), a second
+dropdown 40 px above the frame's bottom whose list opens above it, and tooltips on every knob
+("gain 0.25"). Popups stay inside the 1280 by 704 frame. Popup scenarios: `dropdown` (Down
+twice and Enter: "dropdown changed 2"), `menu-open`, `menu-flip`, `context` (right click,
+Reset), `dismiss` (an outside click closes the menu and clicks nothing), `tooltip`, and
+`about`.
 
 ## Pan and Zoom
 
@@ -886,7 +939,7 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 - **Scenarios.** An app declares `pub const scenarios: []const bench.Scenario`: a `setup`
   list run once and a `cycle` list repeated while `frames` frames are measured. Steps are
   `key`, `click` and `click_at` (an area of the last frame, by `bench.area(name, index)`),
-  `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
+  `right_click` (a right press and release at a point, for a context menu), `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
   move by a delta, release; a zero delta is refused), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
@@ -1126,7 +1179,8 @@ adds its own (the rack's `Led`).
   `textureLoad`, interpolating rows by hand, and calls the app's `Color.wgsl`
   `fn ring_color(value, px)`.
 - **Pools and layers.** `cx.append(T, texture, instance)` writes to `T`'s pool on the current
-  layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring). A full pool or
+  layer (`cx.draw.layer(.overlay)` returns the previous layer for restoring; `.popup` and
+  `.tooltip` are the top two, used by popups). A full pool or
   batch list refuses the instance and counts it in `cx.draw.overflow_count`; in builds with
   runtime safety both hosts log refused instances, areas, and glyphs once per change
   (`cx.overflow_report()`).

@@ -49,7 +49,17 @@
 //! routed by hand. Routing every field of the app (`route(cx, event, app)`) means a widget
 //! added to the app is never silently dead. Test "route reaches every widget field" locks it.
 //!
-//! ## 3b. Overflow Reports
+//! ## 3b. Overlays
+//! Popups and tooltips are drawn last, at the root, on their own layers (`ui/popup.zig`,
+//! `ui/cx.zig` section 3c), by the widget that owns them. `overlays(cx, target)` is the
+//! drawing counterpart of `route`: it calls `draw_overlay(cx)` on every widget the target
+//! names, by the same rules (a widget, a slice or array, or the fields of a struct one level
+//! deep, in field order), where a widget is now a type with a two-parameter `draw_overlay`.
+//! Apps call `overlays(cx, app)` once, as the last thing `App.draw` does; a target with no
+//! overlay at all is a compile error, so it cannot silently draw nothing. Test "overlays
+//! reaches every field with draw_overlay" locks it.
+//!
+//! ## 3c. Overflow Reports
 //! After each draw, in builds with runtime safety, both hosts log `cx.overflow_report()`: the
 //! instances, areas, and glyphs refused this frame, when that differs from the last report and
 //! is not all zero, so a capacity guessed too low shows once, not every frame.
@@ -69,6 +79,7 @@ pub const view = @import("ui/view.zig");
 pub const canvas = @import("ui/canvas.zig");
 pub const cx = @import("ui/cx.zig");
 pub const edit = @import("ui/edit.zig");
+pub const popup = @import("ui/popup.zig");
 
 pub const Context = cx.Context;
 pub const Rect = draw.Rect;
@@ -148,6 +159,69 @@ pub fn route(context: anytype, event: input.Event, target: anytype) u32 {
     return acted;
 }
 
+/// Calls `draw_overlay(cx)` on every widget `target` names, in the order `route` would visit
+/// them (module guide, section 3b). Only at the root of a draw: the last call of `App.draw`. A
+/// target that names no overlay at all is a compile error.
+pub fn overlays(context: anytype, target: anytype) void {
+    assert(context.phase == .draw);
+    assert(context.depth == 1);
+    const Target = @TypeOf(target);
+    const info = @typeInfo(Target);
+    if (info != .pointer) {
+        @compileError("ui.overlays: the target must be a pointer, not " ++ @typeName(Target));
+    }
+    const Child = info.pointer.child;
+    if (info.pointer.size == .slice) {
+        comptime if (!is_overlay(Child)) {
+            @compileError("ui.overlays: " ++ @typeName(Child) ++ " has no draw_overlay");
+        };
+        for (target) |*widget| widget.draw_overlay(context);
+        return;
+    }
+    if (comptime is_overlay(Child)) return target.draw_overlay(context);
+    if (comptime is_overlays(Child)) {
+        for (target) |*widget| widget.draw_overlay(context);
+        return;
+    }
+    comptime {
+        if (@typeInfo(Child) != .@"struct") {
+            @compileError("ui.overlays: " ++ @typeName(Child) ++ " has no draw_overlay");
+        }
+        var any = false;
+        for (@typeInfo(Child).@"struct".field_types) |F| {
+            any = any or is_overlay(F) or is_overlays(F);
+        }
+        if (!any) @compileError("ui.overlays: " ++ @typeName(Child) ++ " has no overlay field");
+    }
+    const fields = @typeInfo(Child).@"struct";
+    inline for (fields.field_names, fields.field_types) |name, F| {
+        if (comptime is_overlay(F)) @field(target.*, name).draw_overlay(context);
+        if (comptime is_overlays(F)) {
+            for (&@field(target.*, name)) |*widget| widget.draw_overlay(context);
+        }
+    }
+    assert(context.depth == 1);
+}
+
+/// True for a type with a two-parameter `draw_overlay` (`overlays`).
+fn is_overlay(comptime W: type) bool {
+    switch (@typeInfo(W)) {
+        .@"struct", .@"union", .@"enum" => {},
+        else => return false,
+    }
+    if (!@hasDecl(W, "draw_overlay")) return false;
+    const function = @typeInfo(@TypeOf(W.draw_overlay));
+    if (function != .@"fn") return false;
+    return function.@"fn".param_types.len == 2;
+}
+
+/// True for an array of overlay widgets.
+fn is_overlays(comptime W: type) bool {
+    const info = @typeInfo(W);
+    if (info != .array) return false;
+    return is_overlay(info.array.child);
+}
+
 /// True for a type with a three-parameter `handle` (`route`).
 fn is_widget(comptime W: type) bool {
     switch (@typeInfo(W)) {
@@ -225,6 +299,7 @@ test {
     _ = canvas;
     _ = cx;
     _ = edit;
+    _ = popup;
 }
 
 const testing = std.testing;
@@ -288,4 +363,47 @@ test "route reaches every widget field" {
     try testing.expectEqual(@as(u32, 1), route({}, event, screen.row[0..]));
     try testing.expectEqual(@as(u32, 1), route({}, event, &screen.one));
     try testing.expectEqual(@as(u32, 7), screen.count);
+}
+
+const Popover = struct {
+    drawn: u32 = 0,
+
+    pub fn draw_overlay(self: *Popover, context: anytype) void {
+        assert(context.depth == 1);
+        self.drawn += 1;
+    }
+};
+
+const Overlaid = struct {
+    menu: Popover,
+    tips: [2]Popover,
+    count: u32,
+    one: Counter,
+};
+
+/// The smallest context `overlays` accepts: a draw phase at the root.
+const RootOnly = struct {
+    phase: cx.Phase = .draw,
+    depth: u32 = 1,
+};
+
+// Locks overlays (section 3b): a struct's overlay field and array field are each drawn once,
+// in field order, data and a widget without `draw_overlay` are skipped, and a slice or a
+// single widget works as `route`'s do.
+test "overlays reaches every field with draw_overlay" {
+    var screen: Overlaid = .{
+        .menu = .{},
+        .tips = .{ .{}, .{} },
+        .count = 3,
+        .one = .{ .acts = true },
+    };
+    const root: RootOnly = .{};
+    overlays(root, &screen);
+    try testing.expectEqual(@as(u32, 1), screen.menu.drawn);
+    for (screen.tips) |tip| try testing.expectEqual(@as(u32, 1), tip.drawn);
+    overlays(root, screen.tips[0..]);
+    overlays(root, &screen.menu);
+    try testing.expectEqual(@as(u32, 2), screen.menu.drawn);
+    try testing.expectEqual(@as(u32, 2), screen.tips[1].drawn);
+    try testing.expectEqual(@as(u32, 0), screen.one.hits);
 }

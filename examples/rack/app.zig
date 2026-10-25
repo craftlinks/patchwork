@@ -74,7 +74,7 @@
 //! (`badge.zig`, an `Image` of the texture `init` creates) at its left end and, on a voice
 //! panel, an LED centered over the meter track whose brightness is that panel's meter level;
 //! the title is centered between them. Everything is on the base layer except the playhead
-//! and the cables (`cable_layer`, 2) and the tooltip (overlay, 4).
+//! and the cables (`cable_layer`, 2) and the tooltip (`Layer.tooltip`, 7).
 //!
 //! ## 3a. Header and Text Styles
 //! The header bar holds the tempo readout (`tempo_runs`: "121.00" in 32 px mono and " BPM"
@@ -84,13 +84,14 @@
 //!
 //! ## 3b. Tooltip
 //! Hovering a knob for `tooltip_delay_ms` shows its name and value in a bordered box beside
-//! the ring. The box overlaps the neighbouring knob's name, so it goes on the overlay layer,
-//! which is drawn after every base batch. The delay is a `dwell` animator keyed by the
-//! hovered knob's id (`cx.hovered()`); a change of hovered knob restarts it. `event` owes a
-//! redraw only when the tooltip appears or disappears, so the dwell frames between draw
-//! nothing. The tooltip is anchored to the knob's area (`cx.find`) and records no area of
-//! its own, so it never takes the hover from the knob under it. Test "the tooltip box covers
-//! the neighbour's text on the overlay layer" locks the rule.
+//! the ring: a `widgets.Tooltip` that `event` tells which knob is hovered (`cx.hovered()`)
+//! and that `ui.overlays` draws last. The box overlaps the neighbouring knob's name, so it is
+//! on the tooltip layer, drawn after every other batch. The rack keeps its own box: placed
+//! `.at` the ring moved by `tooltip_offset` (the cell's 128 px column), a fixed 176 x 32, in
+//! `tooltip_fill`. The dwell owes a redraw only when the tooltip appears or disappears, and
+//! a press hides it until another knob is hovered. It records no area, so it never takes the
+//! hover from the knob under it. Tests "the tooltip box covers the neighbour's text on the
+//! tooltip layer" and "the tooltip draws the records of the rack's own tooltip" lock it.
 //!
 //! ## 3c. Patch Cables
 //! Each drawn knob gets a jack hub: a `hub_radius` disc at its ring's center with its own
@@ -154,7 +155,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
-const animator = patchwork.animator;
 const text = patchwork.text;
 const quads = patchwork.draw;
 const input = patchwork.input;
@@ -250,7 +250,7 @@ const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = them
 const header_glyph_cap: u32 = 32;
 
 /// Hover time before a knob's tooltip appears.
-pub const tooltip_delay_ms: f32 = 500;
+pub const tooltip_delay_ms: f32 = widgets.tooltip_delay_ms;
 
 /// Tooltip box relative to the knob cell. A cell's name column (`widgets.name_box`) spans
 /// 72 to 144 px into the cell and the next cell starts 152 px in, so a box from 128 to 304
@@ -394,10 +394,8 @@ pub const App = struct {
     titles: [panel_count]Title,
     rename: widgets.TextField,
     renaming: ?u32,
-    /// Hover time toward the tooltip; see the module guide, section 3b.
-    dwell: animator.Animator,
-    /// The knob `dwell` is timing, or null when no knob is hovered.
-    dwell_knob: ?u32,
+    /// The hovered knob's name and value after a dwell; see the module guide, section 3b.
+    tooltip: widgets.Tooltip,
     /// The badge texture and its pixels, which must outlive the stream that uploads them.
     badge_texture: quads.TextureId,
     badge_pixels: [badge.bytes]u8,
@@ -451,8 +449,7 @@ pub const App = struct {
             .width = badge.side,
             .height = badge.side,
         }, &app.badge_pixels);
-        app.dwell = animator.Animator.init(1.0 / tooltip_delay_ms);
-        app.dwell_knob = null;
+        app.tooltip = rack_tooltip();
         for (&app.knobs, knob_table, 0..) |*knob, spec, index| {
             const accent = widgets.accents[index % widgets.accent_count];
             const id = ui.id("knob", @intCast(index));
@@ -477,7 +474,7 @@ pub const App = struct {
         app.envelope_hovered = false;
         app.envelope_phase = 0;
         assert(app.knobs[knob_count - 1].value == knob_table[knob_count - 1].value);
-        assert(!app.dwell.live());
+        assert(!app.tooltip.visible());
     }
 
     /// Routes the event to the rename field, the titles, every knob, the preset view, and the
@@ -514,9 +511,8 @@ pub const App = struct {
             const press = event_value.key_down;
             if (press.key == .other and std.mem.eql(u8, press.typed(), " ")) app.toggle_tone(cx);
         }
-        app.retarget_dwell(cx);
-        if (event_value == .frame) app.step_dwell(cx, event_value.frame);
-        assert(app.dwell_knob == null or app.dwell.target == 1);
+        var tip_bytes: [tooltip_text_cap]u8 = undefined;
+        app.tooltip.handle(cx, event_value, app.hovered_tip(cx, &tip_bytes));
     }
 
     /// The rack has no timer.
@@ -568,7 +564,7 @@ pub const App = struct {
         _ = cx.end();
         _ = cx.end();
         app.draw_patch_layer(cx);
-        app.draw_tooltip(cx);
+        ui.overlays(cx, app);
         // A window smaller than one panel has no positive face, so that frame is empty.
         assert(cx.draw.overflow_count == 0);
         assert(cx.area_overflow == 0);
@@ -696,10 +692,16 @@ pub const App = struct {
         assert(app.status_len <= status_cap);
     }
 
-    /// True while the tooltip of `dwell_knob` is showing.
+    /// True while the hovered knob's tooltip is showing.
     pub fn tooltip_visible(app: *const App) bool {
-        if (app.dwell_knob == null) return false;
-        return app.dwell.value == 1;
+        return app.tooltip.visible();
+    }
+
+    /// The hovered knob's tip: its id and "name d.dd" written into `bytes`, or null.
+    fn hovered_tip(app: *const App, cx: *Context, bytes: *[tooltip_text_cap]u8) ?widgets.Tip {
+        const index = hovered_knob(app, cx.hovered()) orelse return null;
+        const knob = &app.knobs[index];
+        return .{ .anchor = knob.id, .text = tooltip_text(bytes, knob) };
     }
 
     /// One panel: the face, the title band, then the knob row and the meter cell, or for the
@@ -957,53 +959,6 @@ pub const App = struct {
         const level = app.meters[panel_index].value;
         kit.append(cx, led.Led, null, led.at(center_x, center_y, led_color, level, clip_rect));
     }
-
-    /// The hovered knob's name and value in a bordered box on the overlay layer, so it
-    /// covers the neighbouring knob's text. See the module guide, section 3b.
-    fn draw_tooltip(app: *const App, cx: *Context) void {
-        if (!app.tooltip_visible()) return;
-        const knob = &app.knobs[app.dwell_knob.?];
-        const ring = cx.find(knob.id) orelse return;
-        const window = cx.clip().?;
-        const box = tooltip_rect(ring.rect);
-        const previous = cx.draw.layer(.overlay);
-        defer _ = cx.draw.layer(previous);
-        kit.face(cx, box, window, .{
-            .fill = tooltip_fill,
-            .border_color = cx.theme().colors.text,
-            .border_width = tooltip_border_px,
-            .radius = tooltip_radius,
-        });
-        var bytes: [tooltip_text_cap]u8 = undefined;
-        const label = tooltip_text(&bytes, knob);
-        text.place(cx.drawing(), cx.theme().name, label, box, window, widgets.centered);
-    }
-
-    /// Restarts the dwell when the hovered knob changed. Owes a draw when that hid the
-    /// tooltip.
-    fn retarget_dwell(app: *App, cx: *Context) void {
-        const next = hovered_knob(app, cx.hovered());
-        if (next == app.dwell_knob) return;
-        const was_visible = app.tooltip_visible();
-        app.dwell = animator.Animator.init(1.0 / tooltip_delay_ms);
-        app.dwell_knob = next;
-        if (next != null) {
-            const aimed = app.dwell.set_target(1);
-            assert(aimed);
-            cx.keep_animating();
-        }
-        if (was_visible) cx.redraw();
-        assert(!app.tooltip_visible());
-    }
-
-    /// Steps the dwell. Owes a draw only on the step that shows the tooltip.
-    fn step_dwell(app: *App, cx: *Context, dt_ms: f32) void {
-        assert(dt_ms >= 0);
-        const was_visible = app.tooltip_visible();
-        _ = app.dwell.step(dt_ms);
-        if (app.dwell.live()) cx.keep_animating();
-        if (!was_visible and app.tooltip_visible()) cx.redraw();
-    }
 };
 
 /// The face of the rack's panels and the preset panel.
@@ -1258,7 +1213,23 @@ fn hovered_knob(app: *const App, hovered: ui.Id) ?u32 {
     return null;
 }
 
-/// The tooltip box beside the knob cell around `ring` (`widgets.ring_of` inverted).
+/// The rack's tooltip (module guide, section 3b): `.at` the ring moved by the cell's offset,
+/// 176 x 32, in `tooltip_fill`.
+fn rack_tooltip() widgets.Tooltip {
+    var tooltip = widgets.Tooltip.init();
+    tooltip.side = .at;
+    tooltip.offset = .{
+        tooltip_offset_x - widgets.ring_inset,
+        tooltip_offset_y - (widgets.knob_height - widgets.ring_size) * 0.5,
+    };
+    tooltip.size = .{ tooltip_width, tooltip_height };
+    tooltip.fill = tooltip_fill;
+    assert(tooltip.offset[0] > 0);
+    return tooltip;
+}
+
+/// The tooltip box beside the knob cell around `ring` (`widgets.ring_of` inverted): where the
+/// rack's hand-made tooltip drew before `widgets.Tooltip`, kept for the equality test.
 fn tooltip_rect(ring: [4]f32) Rect {
     const cell_x = ring[0] - widgets.ring_inset;
     const cell_y = ring[1] - (widgets.knob_height - widgets.ring_size) * 0.5;
@@ -1375,11 +1346,12 @@ comptime {
     // One badge per panel and one LED per meter.
     assert(panel_count == image_cap);
     assert(meter_panel_count == led_cap);
-    // Base: box, glyph, image, LED, arc, path; cable layer: box and path; overlay: box and
+    // Base: box, glyph, image, LED, arc, path; cable layer: box and path; tooltip: box and
     // glyph.
     assert(6 + 2 + 2 <= batch_cap);
     assert(@backingInt(cable_layer) > @backingInt(quads.Layer.base));
-    assert(@backingInt(cable_layer) < @backingInt(quads.Layer.overlay));
+    assert(@backingInt(cable_layer) < @backingInt(quads.Layer.tooltip));
+    assert(tooltip_text_cap <= widgets.tooltip_text_cap);
     // Areas: a ring and a hub per knob, the preset view and its thumb, the visible rows, one
     // title per panel, the rename field, one per cable, and the envelope display.
     assert(2 * knob_count + 2 + preset_rows_max + panel_count + 1 + cable_cap + 1 == area_cap);
@@ -1885,10 +1857,10 @@ test "rack hovers write only the records they change" {
 }
 
 // Locks the layer rule for the tooltip: it appears only after `tooltip_delay_ms` of hover,
-// its box overlaps the neighbouring knob's name glyphs, it sits on the overlay layer with no
-// area of its own, and both overlay batches (box, then text) are drawn after every base
+// its box overlaps the neighbouring knob's name glyphs, it sits on the tooltip layer with no
+// area of its own, and both tooltip batches (box, then text) are drawn after every other
 // batch. A move to the neighbour hides it.
-test "the tooltip box covers the neighbour's text on the overlay layer" {
+test "the tooltip box covers the neighbour's text on the tooltip layer" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     try std.testing.expect(send(app, .{ .pointer_move = ring_grip(cx, app, 0) }));
@@ -1906,7 +1878,7 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
     const boxes = cx.draw.items(quads.Box);
     const last = boxes.len - 1;
-    try std.testing.expectEqual(quads.Layer.overlay, cx.draw.layer_at(quads.Box, @intCast(last)));
+    try std.testing.expectEqual(quads.Layer.tooltip, cx.draw.layer_at(quads.Box, @intCast(last)));
     const tip = rect_of(boxes[last].rect);
     const neighbour = ring_at(cx, app, 1).?;
     var covered: u32 = 0;
@@ -1917,7 +1889,7 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     }
     try std.testing.expect(covered >= 1);
     const batches = cx.draw.batch_list();
-    const overlay: u8 = @backingInt(quads.Layer.overlay);
+    const overlay: u8 = @backingInt(quads.Layer.tooltip);
     try std.testing.expectEqual(overlay, batches[batches.len - 2].layer);
     try std.testing.expectEqual(@as(u8, 0), batches[batches.len - 2].type_id);
     try std.testing.expectEqual(overlay, batches[batches.len - 1].layer);
@@ -1927,6 +1899,83 @@ test "the tooltip box covers the neighbour's text on the overlay layer" {
     }
     try std.testing.expect(send(app, .{ .pointer_move = ring_grip(cx, app, 1) }));
     try std.testing.expect(!app.tooltip_visible());
+}
+
+/// The rack's tooltip as it drew before `widgets.Tooltip` (step 32): the box of
+/// `tooltip_rect` on the overlay layer and the text centered in it. Test reference only.
+fn draw_tooltip_before(app: *const App, cx: *Context, index: u32) void {
+    const knob = &app.knobs[index];
+    const ring = cx.find(knob.id) orelse return;
+    const window = cx.clip().?;
+    const box = tooltip_rect(ring.rect);
+    const previous = cx.draw.layer(.overlay);
+    defer _ = cx.draw.layer(previous);
+    kit.face(cx, box, window, .{
+        .fill = tooltip_fill,
+        .border_color = cx.theme().colors.text,
+        .border_width = tooltip_border_px,
+        .radius = tooltip_radius,
+    });
+    var bytes: [tooltip_text_cap]u8 = undefined;
+    const label = tooltip_text(&bytes, knob);
+    text.place(cx.drawing(), cx.theme().name, label, box, window, widgets.centered);
+}
+
+/// The records of `T` on `layer` this frame, copied into `out`; returns how many.
+fn layer_records(comptime T: type, cx: *Context, layer: quads.Layer, out: []T) usize {
+    var count: usize = 0;
+    for (cx.draw.items(T), 0..) |item, index| {
+        if (cx.draw.layer_at(T, @intCast(index)) != layer) continue;
+        out[count] = item;
+        count += 1;
+    }
+    return count;
+}
+
+// Locks the move onto `widgets.Tooltip` (module guide, section 3b): for each of the 16 knobs
+// in a 1280 x 720 window, the tooltip's one Box and its glyphs ("rate 0.25" and so on) equal,
+// byte for byte, the records the rack's own tooltip appended before (now on the tooltip
+// layer, then on the overlay layer).
+test "the tooltip draws the records of the rack's own tooltip" {
+    const app = new_app();
+    var compared: u32 = 0;
+    var index: u32 = 0;
+    while (index < knob_count) : (index += 1) {
+        var cx = frame_at(app, 1280, 720);
+        _ = send(app, .{ .pointer_move = ring_grip(cx, app, index) });
+        _ = ui.animate(App, app, cx, 0);
+        _ = ui.animate(App, app, cx, tooltip_delay_ms);
+        try std.testing.expect(app.tooltip_visible());
+        cx = frame_at(app, 1280, 720);
+        var boxes: [2]quads.Box = undefined;
+        var glyphs: [tooltip_text_cap]quads.Glyph = undefined;
+        const box_count = layer_records(quads.Box, cx, .tooltip, &boxes);
+        const glyph_count = layer_records(quads.Glyph, cx, .tooltip, &glyphs);
+        try std.testing.expectEqual(@as(usize, 1), box_count);
+        // The old box, drawn into a frame without the new one.
+        app.tooltip.hidden = true;
+        cx.redraw();
+        cx.begin_frame(1280, 720, 120);
+        App.draw(app, cx);
+        draw_tooltip_before(app, cx, index);
+        _ = cx.end_frame();
+        app.tooltip.hidden = false;
+        var old_boxes: [2]quads.Box = undefined;
+        var old_glyphs: [tooltip_text_cap]quads.Glyph = undefined;
+        try std.testing.expectEqual(@as(usize, 1), layer_records(quads.Box, cx, .overlay, &old_boxes));
+        const old_glyph_count = layer_records(quads.Glyph, cx, .overlay, &old_glyphs);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&old_boxes[0]), std.mem.asBytes(&boxes[0]));
+        try std.testing.expectEqual(old_glyph_count, glyph_count);
+        try std.testing.expect(glyph_count >= 6);
+        try std.testing.expectEqualSlices(
+            u8,
+            std.mem.sliceAsBytes(old_glyphs[0..old_glyph_count]),
+            std.mem.sliceAsBytes(glyphs[0..glyph_count]),
+        );
+        compared += 1;
+        _ = send(app, .pointer_leave);
+    }
+    try std.testing.expectEqual(knob_count, compared);
 }
 
 // Locks the title band: each panel's badge samples the badge texture and clears the centered

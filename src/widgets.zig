@@ -1,5 +1,5 @@
-//! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, and a text field as
-//! plain structs, and the kit they are built from.
+//! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, a text field, menus, a
+//! dropdown, and a tooltip as plain structs, and the kit they are built from.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -45,6 +45,9 @@
 //! widgets/meter.zig       Meter
 //! widgets/toggle.zig      Toggle and its pill geometry
 //! widgets/text_field.zig  TextField
+//! widgets/menu.zig        Menu and ContextMenu: a list in a popup (`ui/popup.zig`)
+//! widgets/dropdown.zig    Dropdown: a face and its Menu
+//! widgets/tooltip.zig     Tooltip: one line after a hover dwell, on the tooltip layer
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
 //! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
@@ -73,6 +76,13 @@
 //! gets a look struct of values and returns the hit shape; a missing or mistyped function is
 //! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
 //!
+//! ## 6a. Popups
+//! `Menu`, `ContextMenu`, `Dropdown`, and `Tooltip` draw their popups in `draw_overlay(cx)`,
+//! which `ui.overlays(cx, app)` calls at the end of `App.draw`, at the root, on `Layer.popup`
+//! and `Layer.tooltip` (`ui/cx.zig`, section 3c). A menu's backdrop takes every press outside
+//! it, so an outside press only dismisses. `bounds` (null for the window) is the rect a popup
+//! stays inside.
+//!
 //! ## 7. TigerStyle Invariants
 //! - No allocation: label text points at app-owned bytes bounded by `text.byte_cap`; a
 //!   knob's value text and a field's bytes are inline.
@@ -95,6 +105,9 @@ const knob = @import("widgets/knob.zig");
 const meter = @import("widgets/meter.zig");
 const toggle = @import("widgets/toggle.zig");
 const text_field = @import("widgets/text_field.zig");
+const menu = @import("widgets/menu.zig");
+const dropdown = @import("widgets/dropdown.zig");
+const tooltip = @import("widgets/tooltip.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -122,6 +135,9 @@ pub const ToggleLook = skins.ToggleLook;
 pub const MeterLook = skins.MeterLook;
 pub const PanelLook = skins.PanelLook;
 pub const FieldLook = skins.FieldLook;
+pub const MenuFaceLook = skins.MenuFaceLook;
+pub const MenuRowLook = skins.MenuRowLook;
+pub const DropdownLook = skins.DropdownLook;
 
 pub const Label = label.Label;
 pub const Panel = panel.Panel;
@@ -190,6 +206,24 @@ pub const field_selection = text_field.field_selection;
 pub const field_text_options = text_field.field_text_options;
 pub const field_inner = text_field.field_inner;
 
+pub const Menu = menu.Menu;
+pub const MenuOf = menu.MenuOf;
+pub const MenuAction = menu.MenuAction;
+pub const ContextMenu = menu.ContextMenu;
+pub const ContextMenuOf = menu.ContextMenuOf;
+pub const menu_items_max = menu.menu_items_max;
+pub const menu_row_h = menu.menu_row_h;
+pub const menu_pad_x = menu.menu_pad_x;
+pub const menu_pad_y = menu.menu_pad_y;
+
+pub const Dropdown = dropdown.Dropdown;
+pub const DropdownOf = dropdown.DropdownOf;
+
+pub const Tooltip = tooltip.Tooltip;
+pub const Tip = tooltip.Tip;
+pub const tooltip_delay_ms = tooltip.tooltip_delay_ms;
+pub const tooltip_text_cap = tooltip.tooltip_text_cap;
+
 test {
     _ = kit;
     _ = skins;
@@ -201,6 +235,9 @@ test {
     _ = meter;
     _ = toggle;
     _ = text_field;
+    _ = menu;
+    _ = dropdown;
+    _ = tooltip;
 }
 
 /// Every public name of `widgets.zig` at step 29, before the split.

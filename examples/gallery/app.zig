@@ -9,7 +9,9 @@
 //! Every widget reports its last action on the status line, for example "knob 1 changed 0.75".
 //! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
 //! with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
-//! behaviour in the gallery's own skin (section 3b).
+//! behaviour in the gallery's own skin (section 3b). A popups column right of the screen shows
+//! the overlay model: a dropdown, a "File" menu, a context menu, tooltips on every knob, and an
+//! About dialog (section 3c).
 //!
 //! ## 2. Layout (logical pixels)
 //! A fixed `screen_w` by `screen_h` screen from the top-left, so it fits the 1280 by 720
@@ -21,7 +23,13 @@
 //!   band   fill x 152       toggles (176) | meter (176)   | text field (fill; field 240 x 32)
 //!   row    fill x 88        hardware: 4 knob cells of 140 | 2 buttons of 96 | 2 toggles of 116
 //!   list   fill x 208       a view of 40 rows of 28, the selected row highlighted
+//! popups   184 x 672 at (1080, 16), flow down, padding 8, spacing 8
+//!   caption 20 | "wave" dropdown 32 | "File" button 40 | right-click panel 120
+//!   "flip" dropdown 168 x 32 at (1088, 632): 40 px above the frame's bottom
 //! ```
+//! The frame, `(0, 0, 1280, 704)`, is the 1280 by 720 browser viewport's width and the screen's
+//! height. The popups column sits right of the screen's own 1088 px, so the screen's pixels are
+//! the same as without it.
 //! Each group is a `Panel` with padding 8 that clips its children. The knobs have rings of 56,
 //! 40, 56, and 72 (`Knob.sized`) in 72 px rows, the hardware knobs 56, 48, 64, and 72; the
 //! hardware row spaces its widgets by 8 and centers them vertically; the meter follows
@@ -48,6 +56,19 @@
 //! the dial's body, the bevel, and the housing, and report as "hardware knob 0 changed 0.83".
 //! Their accents are restyled with the default knobs'.
 //!
+//! ## 3c. Popups
+//! The popups draw last: `draw` ends with `ui.overlays(cx, app)`, which reaches the two
+//! dropdowns, the File menu, the context menu, the About dialog, and the tooltip, in field
+//! order. Each popup is placed inside `frame` (`bounds`), not the window, because the native
+//! window is larger than the frame and the compositor picks its size, which would move a popup
+//! that flips at the window's edge. The "flip" dropdown sits 40 px above the frame's bottom, so
+//! its list opens above it. The File menu holds New, Open…, Save, Save as… (disabled),
+//! About…, and Quit; About… opens a modal dialog centered in the frame over a dimmed backdrop,
+//! closed by its Close button or Escape. A right press on the panel opens the context menu
+//! (Copy, Paste, Reset) at the pointer. Hovering any knob, default or hardware, for
+//! `widgets.tooltip_delay_ms` shows "name value" beside its ring. An outside press only
+//! dismisses: the button under it does not click.
+//!
 //! ## 4. Scenarios
 //! `still`; `interact` (click button 0, drag slider 0 by +80 px, click toggle 1, drag knob 1
 //! by -30 px, click the field and type "abc", wheel the list by 3 rows, click row 5, then let
@@ -55,8 +76,14 @@
 //! `light` (click the "light" toggle, click the field, type "abc", select it by dragging
 //! across it, then wait for the animations to settle, so the light theme shows the focus ring,
 //! the selection band, and the caret); `hardware` (drag hardware knob 0 up 40 px, click
-//! hardware button 1, flip hardware toggle 0, then settle). The app tests replay `interact`,
-//! `light`, and `hardware` headless and check every value they leave.
+//! hardware button 1, flip hardware toggle 0, then settle). Popups (section 3c): `dropdown`
+//! (click the wave dropdown, Down twice, Enter: "dropdown changed 2", closed); `menu-open`
+//! (click File, wait 2); `menu-flip` (click the flip dropdown, wait 2: its list above it);
+//! `context` (right-click the panel, click Reset); `dismiss` (open the File menu, click button
+//! 0 through the backdrop: no click, the menu closed); `tooltip` (hover knob 0 for 40 frames);
+//! `about` (choose About… from the File menu: the dialog over the dimmed screen). The app tests
+//! replay `interact`, `light`, `hardware`, and the popup scenarios headless and check every
+//! value they leave.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays, a fixed status buffer, and no allocation; every loop is bounded.
@@ -102,6 +129,21 @@ const row_inset_px: f32 = 12;
 const title_inset_px: f32 = 12;
 const status_cap: u32 = 48;
 
+/// The frame popups stay inside (section 3c), and the popups column right of the screen.
+const frame_w: f32 = 1280;
+const frame_rect: Rect = .{ .x = 0, .y = 0, .width = frame_w, .height = screen_h };
+const column_x: f32 = screen_w - screen_padding + gap_px;
+const column_w: f32 = frame_w - screen_padding - column_x;
+const column_h: f32 = screen_h - 2 * screen_padding;
+const dropdown_h: f32 = 32;
+const scratch_px: f32 = 120;
+/// The flip dropdown's bottom is this far above the frame's.
+const flip_margin_px: f32 = 40;
+const about_size: [2]f32 = .{ 320, 136 };
+const about_close_size: [2]f32 = .{ 96, 36 };
+/// The About dialog's backdrop alpha.
+const about_dim: f32 = 0.4;
+
 const knob_rings = [_]f32{ 56, 40, 56, 72 };
 const knob_names = [_][]const u8{ "gain", "tone", "mix", "drive" };
 const knob_values = [_]f32{ 0.25, 0.5, 0.75, 0.6 };
@@ -118,6 +160,12 @@ const hard_button_labels = [_][]const u8{ "Tap", "Sync" };
 const hard_toggle_names = [_][]const u8{ "power", "bypass" };
 const hard_toggle_values = [_]bool{ false, true };
 
+const wave_items = [_][]const u8{ "sine", "triangle", "saw", "square", "noise", "sample & hold" };
+const file_items = [_][]const u8{ "New", "Open…", "Save", "Save as…", "About…", "Quit" };
+const file_disabled: u32 = 3;
+const file_about: u32 = 4;
+const context_items = [_][]const u8{ "Copy", "Paste", "Reset" };
+
 /// The hardware row's widgets: the library behaviour in the gallery's skin (`hardware.zig`).
 const HardKnob = widgets.KnobOf(hardware.Skin);
 const HardButton = widgets.ButtonOf(hardware.Skin);
@@ -129,6 +177,14 @@ const meter_slider: u32 = 0;
 const view_id = ui.id("view", 0);
 const field_id = ui.id("field", 0);
 const theme_id = ui.id("theme", 0);
+const wave_id = ui.id("wave", 0);
+const flip_id = ui.id("flip", 0);
+const file_id = ui.id("file", 0);
+const file_menu_id = ui.id("file_menu", 0);
+const scratch_id = ui.id("scratch", 0);
+const context_id = ui.id("context", 0);
+const about_id = ui.id("about", 0);
+const close_id = ui.id("close", 0);
 
 /// The "light" toggle's box in the title bar: right of "gallery", one toggle row high.
 const theme_toggle_x: f32 = 156;
@@ -153,7 +209,9 @@ const rows_drawn_max: u32 = 8;
 /// Pool and area capacities; the comptime block checks them against the counts.
 const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
-const glyph_cap: u32 = 512;
+const glyph_cap: u32 = 640;
+const path_cap: u32 = 4;
+const point_cap: u32 = 16;
 const dial_cap: u32 = 8;
 const bevel_cap: u32 = 8;
 const led_cap: u32 = 4;
@@ -182,6 +240,14 @@ pub const App = struct {
     hard_toggles: [hard_toggle_names.len]HardToggle,
     meter: widgets.Meter,
     field: widgets.TextField,
+    /// The popups column (section 3c). Overlays draw in this field order.
+    wave: widgets.Dropdown,
+    flip: widgets.Dropdown,
+    file: widgets.Button,
+    file_menu: widgets.Menu,
+    context: widgets.ContextMenu,
+    about: About,
+    tooltip: widgets.Tooltip,
     view: ui.ViewState,
     /// The rows drawn last, which `event` routes.
     drawn: ui.List.Range,
@@ -199,8 +265,10 @@ pub const App = struct {
             .{ .type = hardware.Dial, .cap = dial_cap },
             .{ .type = hardware.Bevel, .cap = bevel_cap },
             .{ .type = hardware.Led, .cap = led_cap },
+            .{ .type = quads.Path, .cap = path_cap },
         },
         .area_cap = area_cap,
+        .point_cap = point_cap,
     };
 
     pub const scenarios: []const bench.Scenario = &.{
@@ -209,6 +277,13 @@ pub const App = struct {
         .{ .name = "hover", .setup = &hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "light", .setup = &light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "hardware", .setup = &hardware_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "dropdown", .setup = &dropdown_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "menu-open", .setup = &menu_open_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "menu-flip", .setup = &menu_flip_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "context", .setup = &context_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "dismiss", .setup = &dismiss_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tooltip", .setup = &tooltip_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "about", .setup = &about_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -265,6 +340,27 @@ pub const App = struct {
         app.meter = .{ .name = "level", .value = slider_values[meter_slider], .track_h = meter_track_px };
         app.field = widgets.TextField.init(field_id, 32, field_style(&config.theme));
         app.view = ui.ViewState.init();
+        app.wave = widgets.Dropdown.init(wave_id, &wave_items, 0);
+        app.wave.menu.bounds = frame_rect;
+        app.flip = widgets.Dropdown.init(flip_id, &wave_items, 0);
+        app.flip.menu.bounds = frame_rect;
+        app.file = .{
+            .id = file_id,
+            .label = "File",
+            .style = button_style,
+            .padding = .xy(12, 0),
+            .paint = button_paint,
+            .hover = .init(widgets.hover_rate_per_ms),
+            .down = .init(widgets.down_rate_per_ms),
+        };
+        app.file_menu = widgets.Menu.init(file_menu_id, &file_items);
+        app.file_menu.set_enabled(file_disabled, false);
+        app.file_menu.bounds = frame_rect;
+        app.context = widgets.ContextMenu.init(context_id, &context_items);
+        app.context.menu.bounds = frame_rect;
+        app.about = About.init();
+        app.tooltip = widgets.Tooltip.init();
+        app.tooltip.bounds = frame_rect;
         app.drawn = .{ .first = 0, .end = 0 };
         app.selected = null;
         app.status = @splat(0);
@@ -313,7 +409,52 @@ pub const App = struct {
         while (row < app.drawn.end) : (row += 1) {
             if (kit.clicked(cx, ui.id("row", row), event_value)) app.select(cx, row);
         }
+        app.popup_events(cx, event_value);
         assert(app.status_len <= status_cap);
+    }
+
+    /// The popups column (section 3c): the dropdowns, the File button and its menu, the context
+    /// menu over the panel, the About dialog, and the knobs' tooltip.
+    fn popup_events(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.wave.handle(cx, event_value)) {
+            .changed => |index| app.note(cx, &.{ "dropdown changed ", digit(index) }),
+            .none => {},
+        }
+        switch (app.flip.handle(cx, event_value)) {
+            .changed => |index| app.note(cx, &.{ "flip changed ", digit(index) }),
+            .none => {},
+        }
+        if (app.file.handle(cx, event_value) == .clicked) {
+            app.file_menu.open_at(cx, .{ .id = file_id }, .below);
+            app.note(cx, &.{"file menu"});
+        }
+        switch (app.file_menu.handle(cx, event_value)) {
+            .chosen => |index| {
+                app.note(cx, &.{ "file ", file_items[index] });
+                if (index == file_about) app.about.show(cx);
+            },
+            .none, .dismissed => {},
+        }
+        switch (app.context.handle(cx, event_value, scratch_id)) {
+            .chosen => |index| app.note(cx, &.{ "context ", context_items[index] }),
+            .none, .dismissed => {},
+        }
+        if (app.about.handle(cx, event_value)) app.note(cx, &.{"about closed"});
+        var bytes: [16]u8 = undefined;
+        app.tooltip.handle(cx, event_value, app.hovered_tip(cx, &bytes));
+    }
+
+    /// The hovered knob's tip, default or hardware: its id and "name value" in `bytes`.
+    fn hovered_tip(app: *const App, cx: *Context, bytes: *[16]u8) ?widgets.Tip {
+        const hovered = cx.hovered();
+        if (hovered == .none) return null;
+        for (&app.knobs) |*knob| {
+            if (knob.id == hovered) return tip_of(bytes, knob.id, knob.name, knob.value_text[0..4]);
+        }
+        for (&app.hard_knobs) |*knob| {
+            if (knob.id == hovered) return tip_of(bytes, knob.id, knob.name, knob.value_text[0..4]);
+        }
+        return null;
     }
 
     /// Hands `event_value` to each button of `buttons`, default or skinned (they share the
@@ -370,6 +511,8 @@ pub const App = struct {
         app.draw_hardware(cx);
         app.draw_list(cx);
         _ = cx.end();
+        app.draw_popups(cx);
+        ui.overlays(cx, app);
         assert(cx.draw.overflow_count == 0);
         assert(cx.area_overflow == 0);
     }
@@ -475,6 +618,34 @@ pub const App = struct {
         _ = cx.end();
     }
 
+    /// The popups column right of the screen (section 2): its widgets; their popups draw in
+    /// `ui.overlays`.
+    fn draw_popups(app: *const App, cx: *Context) void {
+        const column: Rect = .{ .x = column_x, .y = screen_padding, .width = column_w, .height = column_h };
+        const clip = cx.visible(column) orelse return;
+        kit.face(cx, column, clip, panel_paint(cx).look(cx.theme(), 0, 0));
+        _ = cx.begin_at(column, group_layout);
+        caption(cx, "popups");
+        app.wave.draw(cx, ui.sized(.fill, .{ .fixed = dropdown_h }));
+        app.file.draw(cx, ui.sized(.fill, .{ .fixed = button_px }));
+        const scratch = cx.walk(ui.sized(.fill, .{ .fixed = scratch_px }));
+        if (cx.visible(scratch)) |inside| {
+            kit.face(cx, scratch, inside, .{ .fill = cx.theme().colors.track, .radius = 6 });
+            cx.area(scratch_id, scratch, 6, ui.cx.plain);
+            kit.label(cx, styled(cx, .sans, 14), "right-click me", scratch, inside, widgets.centered);
+        }
+        const flip: Rect = .{
+            .x = column_x + group_padding,
+            .y = frame_rect.height - flip_margin_px - dropdown_h,
+            .width = column_w - 2 * group_padding,
+            .height = dropdown_h,
+        };
+        _ = cx.begin_at(flip, .{ .flow = .down });
+        app.flip.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
+        _ = cx.end();
+    }
+
     /// The list: a view of the visible rows only, standing in for the others with `skip`.
     fn draw_list(app: *App, cx: *Context) void {
         const face: widgets.Panel = .{ .paint = panel_paint(cx) };
@@ -536,6 +707,79 @@ pub const App = struct {
         assert(app.status_len <= status_cap);
     }
 };
+
+/// The About dialog (section 3c): a modal popup centered in the frame over a dimmed backdrop,
+/// with a Close button. Escape closes it too; a press on the backdrop does nothing.
+const About = struct {
+    open: bool,
+    close: widgets.Button,
+
+    fn init() About {
+        return .{
+            .open = false,
+            .close = .{
+                .id = close_id,
+                .label = "Close",
+                .style = button_style,
+                .padding = .xy(12, 0),
+                .paint = button_paint,
+                .hover = .init(widgets.hover_rate_per_ms),
+                .down = .init(widgets.down_rate_per_ms),
+            },
+        };
+    }
+
+    /// Opens the dialog and requests its popup.
+    fn show(self: *About, cx: *Context) void {
+        assert(!self.open);
+        self.open = true;
+        cx.request_popup(about_id);
+    }
+
+    /// True on the event that closed it.
+    fn handle(self: *About, cx: *Context, event_value: input.Event) bool {
+        if (event_value == .frame) {
+            _ = self.close.handle(cx, event_value);
+            return false;
+        }
+        if (!self.open) return false;
+        const clicked = self.close.handle(cx, event_value) == .clicked;
+        const escape = event_value == .key_down and event_value.key_down.key == .escape;
+        if (!clicked and !escape) return false;
+        self.open = false;
+        cx.redraw();
+        return true;
+    }
+
+    pub fn draw_overlay(self: *const About, cx: *Context) void {
+        if (!self.open) return;
+        const rect = ui.popup.centered(about_size, frame_rect);
+        _ = cx.begin_popup(about_id, rect, .{ .flow = .down, .spacing = gap_px, .padding = .all(16), .clip = true }, about_dim);
+        const clip = cx.clip().?;
+        kit.face(cx, rect, clip, .{
+            .fill = cx.theme().colors.panel,
+            .border_color = cx.theme().colors.control,
+            .border_width = 1,
+            .radius = panel_radius,
+        });
+        const title = cx.walk(ui.sized(.fill, .{ .fixed = 24 }));
+        kit.label(cx, styled(cx, .sans_bold, 18), "patchwork gallery", title, clip, start);
+        const line = cx.walk(ui.sized(.fill, .{ .fixed = caption_px }));
+        kit.label(cx, styled(cx, .sans, 14), "Every widget, skin, and popup.", line, clip, start);
+        cx.skip(gap_px);
+        self.close.draw(cx, ui.sized(.{ .fixed = about_close_size[0] }, .{ .fixed = about_close_size[1] }));
+        cx.end_popup();
+    }
+};
+
+/// A tip for knob `id`: "name value" written into `bytes`.
+fn tip_of(bytes: *[16]u8, id: ui.Id, name: []const u8, value: []const u8) widgets.Tip {
+    assert(name.len + 1 + value.len <= bytes.len);
+    @memcpy(bytes[0..name.len], name);
+    bytes[name.len] = ' ';
+    @memcpy(bytes[name.len + 1 ..][0..value.len], value);
+    return .{ .anchor = id, .text = bytes[0 .. name.len + 1 + value.len] };
+}
 
 /// A caption line above a control.
 fn caption(cx: *Context, words: []const u8) void {
@@ -612,7 +856,71 @@ const hardware_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// The context menu's row `index`, a click target of the `context` scenario.
+fn context_row(index: u32) bench.Target {
+    return .{ .id = context_id.derive(index), .name = "context row", .index = index };
+}
+
+/// The File menu's row `index`.
+fn file_row(index: u32) bench.Target {
+    return .{ .id = file_menu_id.derive(index), .name = "file row", .index = index };
+}
+
+/// `dropdown`: open the wave dropdown, Down twice from "sine", Enter: "dropdown changed 2".
+const dropdown_steps = [_]bench.Step{
+    .{ .click = bench.area("wave", 0) },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .key = .{ .key = .enter, .text = "" } },
+    .{ .wait = 12 },
+};
+
+/// `menu-open`: the File menu open below its button.
+const menu_open_steps = [_]bench.Step{
+    .{ .click = bench.area("file", 0) },
+    .{ .wait = 2 },
+};
+
+/// `menu-flip`: the flip dropdown's list, which has no room below it in the frame, above it.
+const menu_flip_steps = [_]bench.Step{
+    .{ .click = bench.area("flip", 0) },
+    .{ .wait = 2 },
+};
+
+/// `context`: a right click 40 px into the panel opens the context menu there; click Reset.
+const context_steps = [_]bench.Step{
+    .{ .right_click = .{ .target = bench.area("scratch", 0), .x = 40, .y = 30 } },
+    .{ .click = context_row(2) },
+    .{ .wait = 12 },
+};
+
+/// `dismiss`: open the File menu, then click button 0 through its backdrop: the menu closes,
+/// the button does not click, and the status still reads "file menu".
+const dismiss_steps = [_]bench.Step{
+    .{ .click = bench.area("file", 0) },
+    .{ .wait = 2 },
+    .{ .click = bench.area("button", 0) },
+    .{ .wait = 12 },
+};
+
+/// `tooltip`: the pointer rests on knob 0's ring until its tooltip shows (40 frames, 667 ms).
+const tooltip_steps = [_]bench.Step{
+    .{ .hover = .{ .target = bench.area("knob", 0), .x = 28, .y = 28 } },
+    .{ .wait = 40 },
+};
+
+/// `about`: choose About… from the File menu: the dialog over the dimmed screen.
+const about_steps = [_]bench.Step{
+    .{ .click = bench.area("file", 0) },
+    .{ .click = file_row(file_about) },
+    .{ .wait = 12 },
+};
+
 comptime {
+    // The popups column: right of the screen's panels, inside the frame.
+    assert(column_x == screen_w - screen_padding + gap_px);
+    assert(column_x + column_w + screen_padding == frame_w);
+    assert(3 * gap_px + caption_px + dropdown_h + button_px + scratch_px + 2 * group_padding < frame_rect.height - flip_margin_px - dropdown_h - screen_padding);
     // The title: the toggle sits right of "gallery" and inside the bar.
     assert(theme_toggle_x + theme_toggle_w < screen_w - screen_padding);
     assert(widgets.toggle_height == title_px);
@@ -632,16 +940,21 @@ comptime {
     assert(@ceil((list_h - 2 * group_padding) / row_px) + 1 == rows_drawn_max);
     for (knob_rings) |ring| assert(ring <= widgets.knob_height);
     // Faces: title, 7 groups, 3 buttons, 3 per slider, 2 per toggle (the title's too), 2
-    // meter, 3 field, 2 highlighted rows, the thumb.
-    assert(1 + 8 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 <= box_cap);
+    // meter, 3 field, 2 highlighted rows, the thumb; the popups column, its two dropdowns,
+    // button, and panel; a popup's dim, face, and band or button; the tooltip.
+    assert(1 + 8 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 + 5 + 3 + 1 <= box_cap);
     assert(2 * knob_names.len + hard_knob_names.len <= arc_cap);
     // The hardware row: a dial per knob, a bevel per button and toggle, an LED per toggle.
     assert(hard_knob_names.len <= dial_cap);
     assert(hard_button_labels.len + hard_toggle_names.len <= bevel_cap);
     assert(hard_toggle_names.len <= led_cap);
-    // Areas: every widget, the title's toggle, the view and its thumb, the rows drawn, and the
-    // hardware row.
-    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max + 4 + 2 + 2 <= area_cap);
+    // Areas: every widget, the title's toggle, the view and its thumb, the rows drawn, the
+    // hardware row, the popups column (two dropdowns, the button, the panel), and one popup:
+    // its backdrop and at most six rows (the dialog: its backdrop and its button).
+    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max + 4 + 2 + 2 + 4 + 1 + file_items.len <= area_cap);
+    assert(wave_items.len >= file_items.len and file_items.len >= context_items.len);
+    // Paths: one chevron per dropdown, three points each.
+    assert(2 <= path_cap and 2 * 3 <= point_cap);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
 }
 
@@ -853,6 +1166,128 @@ test "the light scenario switches the theme and restyles the widgets" {
     try std.testing.expectEqual(theme.dark.colors.track[0], app.sliders[0].track.r);
 }
 
+/// Replays the popup scenario `name` headless (all its setup steps) and draws once more.
+fn replay(app: *App, name: []const u8) !void {
+    const scenario = bench.find(App.scenarios, name).?;
+    _ = try bench.replay_headless(App, app, &test_context, scenario, .{ 1280, 720 }, @intCast(scenario.setup.len + 1));
+    _ = frame(app);
+}
+
+/// The rect of the area `id` in the last frame.
+fn area_of(id: ui.Id) Rect {
+    return area_rect(id);
+}
+
+// Locks the `dropdown` scenario (section 4): the click opens the wave list with "sine"
+// highlighted, Down twice and Enter choose "saw" (2), the status reads "dropdown changed 2",
+// the list is closed, and focus is back on the dropdown.
+test "the dropdown scenario changes the wave to 2" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "dropdown");
+    try std.testing.expectEqual(@as(u32, 2), app.wave.selected);
+    try std.testing.expectEqualStrings("dropdown changed 2", app.status_text());
+    try std.testing.expect(!app.wave.menu.open);
+    try std.testing.expectEqual(wave_id, test_context.focus);
+    try std.testing.expect(test_context.find(test_context.popup_backdrop(app.wave.menu.id)) == null);
+}
+
+// Locks the popups' placement (section 3c): the File menu's first row is 2 + 4 px below the
+// File button on the popup layer over a backdrop covering the window; the flip dropdown's list
+// opens above it (its last row ends 2 + 4 px above the dropdown), inside the frame.
+test "the file menu opens below its button and the flip list above its dropdown" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "menu-open");
+    try std.testing.expect(app.file_menu.open);
+    const button = area_of(file_id);
+    const row0 = test_context.find(file_menu_id.derive(0)).?;
+    try std.testing.expectEqual(button.x, row0.rect[0]);
+    try std.testing.expectEqual(button.y + button.height + ui.popup.popup_gap + widgets.menu_pad_y, row0.rect[1]);
+    try std.testing.expectEqual(@as(u8, 6), row0.layer);
+    const backdrop = test_context.find(test_context.popup_backdrop(file_menu_id)).?;
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1280, 720 }, &backdrop.rect);
+    const flip_app = new_app();
+    _ = frame(flip_app);
+    try replay(flip_app, "menu-flip");
+    const face = area_of(flip_id);
+    try std.testing.expectEqual(@as(f32, 704 - 40 - 32), face.y);
+    const last = test_context.find(flip_app.flip.menu.id.derive(wave_items.len - 1)).?;
+    try std.testing.expectEqual(face.y - ui.popup.popup_gap - widgets.menu_pad_y, last.rect[1] + last.rect[3]);
+    const first = test_context.find(flip_app.flip.menu.id.derive(0)).?;
+    try std.testing.expect(first.rect[1] >= ui.popup.popup_margin);
+    try std.testing.expect(first.rect[0] + first.rect[2] <= frame_w - ui.popup.popup_margin);
+}
+
+// Locks the `context` and `dismiss` scenarios (section 3c): a right click on the panel opens
+// the context menu at the pointer and Reset chooses item 2; a click on button 0 through the
+// File menu's backdrop closes the menu and does not click the button.
+test "the context menu chooses Reset and an outside click only dismisses" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "context");
+    try std.testing.expectEqualStrings("context Reset", app.status_text());
+    try std.testing.expect(!app.context.menu.open);
+    const dismiss = new_app();
+    _ = frame(dismiss);
+    try replay(dismiss, "dismiss");
+    try std.testing.expect(!dismiss.file_menu.open);
+    try std.testing.expectEqualStrings("file menu", dismiss.status_text());
+    try std.testing.expectEqual(@as(f32, 0), dismiss.buttons[0].down.target);
+}
+
+// Locks the `tooltip` scenario (section 3c): hovering knob 0 shows nothing until the dwell
+// completes; after 500 ms of frames "gain 0.25" shows to the right of its ring on the
+// tooltip layer, inside the frame, and no area was added.
+test "the tooltip scenario shows the knob's name and value beside it" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tooltip");
+    const areas_before = test_context.area_list().len;
+    try std.testing.expect(!app.tooltip.visible());
+    var frames: u32 = 0;
+    while (frames < 31) : (frames += 1) _ = ui.animate(App, app, &test_context, 1000.0 / 60.0);
+    try std.testing.expect(app.tooltip.visible());
+    try std.testing.expectEqualStrings("gain 0.25", app.tooltip.text_of());
+    _ = frame(app);
+    try std.testing.expectEqual(areas_before, test_context.area_list().len);
+    const boxes = test_context.draw.items(quads.Box);
+    const last = boxes.len - 1;
+    try std.testing.expectEqual(quads.Layer.tooltip, test_context.draw.layer_at(quads.Box, @intCast(last)));
+    const ring = area_of(app.knobs[0].id);
+    try std.testing.expectEqual(ring.x + ring.width + ui.popup.popup_gap, boxes[last].rect[0]);
+    try std.testing.expectEqual(ring.y, boxes[last].rect[1]);
+}
+
+// Locks the `about` scenario (section 3c): About… opens the dialog centered in the frame over a
+// black face at alpha 0.4 covering the window; a press on the backdrop leaves it open, Close
+// closes it with "about closed".
+test "the about dialog is modal and closes on its button" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "about");
+    try std.testing.expect(app.about.open);
+    try std.testing.expectEqualStrings("file About…", app.status_text());
+    var dimmed = false;
+    for (test_context.draw.items(quads.Box)) |box| {
+        dimmed = dimmed or std.meta.eql(box.fill, [4]f32{ 0, 0, 0, about_dim });
+    }
+    try std.testing.expect(dimmed);
+    const close = area_of(close_id);
+    try std.testing.expectEqual(@as(f32, 480 + 16), close.x);
+    const outside: input.Point = .{ .x = 20, .y = 20 };
+    ui.dispatch(App, app, &test_context, .{ .pointer_down = input.left_at(outside) });
+    ui.dispatch(App, app, &test_context, .{ .pointer_up = input.left_at(outside) });
+    try std.testing.expect(app.about.open);
+    const press: input.Point = .{ .x = close.x + 10, .y = close.y + 10 };
+    ui.dispatch(App, app, &test_context, .{ .pointer_move = press });
+    ui.dispatch(App, app, &test_context, .{ .pointer_down = input.left_at(press) });
+    ui.dispatch(App, app, &test_context, .{ .pointer_up = input.left_at(press) });
+    try std.testing.expect(!app.about.open);
+    try std.testing.expectEqualStrings("about closed", app.status_text());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
 const Renderer = patchwork.renderer.Renderer(Context.DrawContext);
 
 /// The frame the renderer records for the test context at 1280 by 720.
@@ -913,9 +1348,9 @@ test "a theme switch records one uniform write and one full repaint" {
         else => {},
     };
     try std.testing.expectEqual(@as(u32, 1), uniform_writes);
-    // The uniform and the six pools' changed ranges (Box, Arc, Glyph, and the hardware row's
-    // Dial, Bevel, and Led): every text and face color moved.
-    try std.testing.expectEqual(@as(u32, 7), writes);
+    // The uniform and the seven pools' changed ranges (Box, Arc, Glyph, the hardware row's
+    // Dial, Bevel, and Led, and the dropdowns' chevron Paths): every text and face color moved.
+    try std.testing.expectEqual(@as(u32, 8), writes);
     try std.testing.expect(written > 256);
     var frames: u32 = 0;
     while (ui.animate(App, app, &test_context, 1000.0 / 60.0)) : (frames += 1) {
