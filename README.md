@@ -149,7 +149,7 @@ patchwork/
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
-│   ├── bench.zig               # Bench mode: scenarios, replay, samples, summaries, PPM images
+│   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM and PNG
 │   ├── realtime.zig            # Audio blocks, the SPSC queue, the wake, test tone, meters, scope
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
 │   └── native_tests.zig        # Test root of tests that call libxkbcommon or spawn threads
@@ -159,7 +159,8 @@ patchwork/
 │   ├── linux_window.zig        # Linux Wayland event loop, timerfd, audio wake, and Host(App)
 │   ├── audio_thread.zig        # Native audio engine: the app's source on a paced thread
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
-│   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain
+│   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain, headless target
+│   ├── headless.zig            # `--regress`: every scenario with no window, against the goldens
 │   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
 │   ├── xkb.zig                 # libxkbcommon: keymap, modifiers, text, compose, repeat
 │   ├── wp_cursor_shape.zig     # wp_cursor_shape_v1 bindings and the cursor shape map
@@ -202,13 +203,15 @@ patchwork/
 │       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
 │       └── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
 ├── tools/
-│   ├── compare.zig             # `zig build compare`: how two frame dumps differ
+│   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
+│   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   ├── shell.js                # Generic command interpreter, Wasm bridge, and input handler
 │   └── worklet.js              # AudioWorklet processor running the app's source from its wasm
 └── test/                       # Regression tests
+    ├── golden/<adapter>/<app>.txt # Regress hashes per adapter and driver (`zig build regress`)
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
@@ -279,10 +282,16 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
+zig build regress -Doptimize=ReleaseFast   # Every example's scenarios headless on both GPUs,
+                          # cache on and off, against test/golden (needs a GPU; see Regression)
+zig build regress -Doptimize=ReleaseFast -- --bless   # Rewrite the goldens from this run
+python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
 zig build compare -- a.ppm b.ppm   # Compare two frame dumps; exit 1 when they differ
+zig build compare -- a.png b.ppm --crop 0 0 1088 704 --diff d.png   # A rect of both, diff PNG
+zig build compare -- a.ppm --crop 0 0 640 360 --png out.png         # A crop of one, as PNG
 ```
 
 An optional override flag `-Dwgpu-lib-dir=` is available if you wish to link against a
@@ -914,7 +923,47 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   thread, so dumps are deterministic. The report adds the blocks, drops, the most drained at
   once, and the render and drain time per block.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
-  timed passes (`window.patchworkBench` holds the last). No scenarios or dumps.
+  timed passes (`window.patchworkBench` holds the last). `?bench=<scenario>` replays a
+  scenario (see Regression).
+
+## Regression
+
+`zig build regress` asks one question of every example: did any picture change? It needs no
+window, no master build, and no dumps; the windowed bench stays the tool for timing,
+presentation, and the idle invariant.
+
+```text
+<app> --regress [--adapter high|low|both] [--bless] [--only scenario] [--keep]
+zig build regress -Doptimize=ReleaseFast [-- options]
+```
+
+- **Headless.** `--regress` (`src/host/headless.zig`) opens no Wayland connection. Per adapter
+  it creates a device with no surface and a `bgra8unorm` target that stands in for the
+  swapchain (`gpu_wgpu.headless_target_create`): acquiring returns it, presenting is a no-op,
+  so the renderer's stream replays unchanged. Every scenario with `regress = true` (the
+  default) renders cache on and off, each from fresh state (app, UI context, renderer, and GPU
+  tables re-created), at 1280 x 720 and scale 1 (`pub const regress_size: [2]u32` overrides,
+  1 to 4096 a side), and the last frame's RGB rows are hashed (XxHash64, seed 0).
+- **Clock.** Frame `n` is at `n * 1000 / 60` ms: the step of that frame, then every app timer
+  tick due by then (each at its own multiple of the period), `ui.animate` by 1/60 s, the
+  frame's audio blocks (`realtime.blocks_for_frame`), and the draw. Nothing reads wall time,
+  so timer and audio scenarios (wave `play`, audio `play`) give the same hash every run.
+- **Goldens.** `test/golden/<adapter slug>/<app>.txt` names the adapter, its driver, and the
+  size, then one sorted `scenario  hash` line per scenario. A golden blessed on another driver
+  is refused before anything renders ("Re-bless from master"); a missing line is `new`.
+  `--bless` rewrites the file once cache on and off agree; a step that changes pixels on purpose
+  blesses in its own commit and the changed lines are the review.
+- **Report.** One table per app, written in one go, and a summary line with the run count and
+  the wall time; exit 1 unless every row is `same` and `ok` (or `blessed`). A passing run
+  writes nothing. A failing one writes `zig-out/regress/<app>/<scenario>-<adapter>-<cache>.new.png`
+  and a diff PNG (dim grey where equal, red by difference) against cache on, or against the
+  baseline `<scenario>-<adapter>-on.png` that a `--keep` run on a passing tree leaves.
+- **Browser.** `?bench=<scenario>` sets the canvas to the regress size at scale 1 and replays
+  the scenario on the same clock (input, the interval timer, and the worklet are off).
+  `tools/browser_check.py <app> <scenario>` (standard library only) renders the headless
+  frame, serves the app, drives system Chromium over CDP, and compares the screenshot: it
+  passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
+  console errors.
 
 ## GPU Command Stream
 

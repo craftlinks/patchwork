@@ -85,6 +85,18 @@
 // does unless a flag is set), so native numbers are the reference. Scenarios, phase timers,
 // and frame dumps are native only.
 //
+// ## 8a. Scenario Replay
+// Loading the page with `?bench=<scenario>` (any value but `1`) replays one of the app's
+// scenarios on the simulated clock of the native `--regress` run (`src/host/web_exports.zig`,
+// section 4c), so a screenshot compares with the headless frame pixel for pixel. The canvas
+// gets the regress size (`bench_width`, `bench_height`) as both its CSS size and its backing
+// size, at scale 1 whatever the device pixel ratio, and the window's resize and ratio changes
+// are not watched. Every animation frame is one replay frame; when the last one is presented
+// the console logs `bench done <scenario>` (or `bench failed <scenario>` when a step's target
+// has no area). While replaying, Wasm ignores input, reports its timer and audio off, and
+// renders audio itself, so the page arms no interval and starts no worklet. Without the
+// parameter none of this runs.
+//
 // ## 9. Audio
 // An app with an audio source exports `audio_on`'s companions (`src/host/web_exports.zig`,
 // section 4b). `sync_audio` runs wherever `sync_timer` runs, so the call that sets audio on is
@@ -99,7 +111,10 @@
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
-const benchRequested = new URLSearchParams(window.location.search).get("bench") === "1";
+const benchParameter = new URLSearchParams(window.location.search).get("bench");
+const benchRequested = benchParameter === "1";
+// The scenario `?bench=<scenario>` replays (guide, section 8a), or null.
+const benchScenario = benchParameter !== null && benchParameter !== "1" ? benchParameter : null;
 const BENCH_WINDOW = 120;
 const BENCH_POOL = 4;
 
@@ -649,8 +664,14 @@ function schedule() {
     }
     raf = requestAnimationFrame((now) => {
         raf = 0;
-        // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5).
+        // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5); a
+        // replay returns 2 after its last frame and 3 when it failed (section 8a).
         const live = wasm.tick(Math.floor(now));
+        if (live === 2) {
+            console.log(`bench done ${benchScenario}`);
+        } else if (live === 3) {
+            console.error(`bench failed ${benchScenario}`);
+        }
         log_overflow();
         sync_cursor();
         sync_timer();
@@ -769,6 +790,24 @@ function fit_canvas() {
     if (dirty === 1) {
         schedule();
     }
+}
+
+/**
+ * Starts the `?bench=<scenario>` replay (guide, section 8a): the canvas at the regress size in
+ * CSS and device pixels, then the first frame.
+ */
+function start_replay() {
+    const width = wasm.bench_width();
+    const height = wasm.bench_height();
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.width = width;
+    canvas.height = height;
+    if (wasm.bench_start(write_input(benchScenario)) !== 1) {
+        console.error(`bench: no scenario "${benchScenario}"`);
+        return;
+    }
+    schedule();
 }
 
 /**
@@ -1000,12 +1039,16 @@ async function main() {
     setupScopes = null;
     await Promise.all(scopes);
 
-    fit_canvas();
+    if (benchScenario !== null) {
+        start_replay();
+    } else {
+        fit_canvas();
+        window.addEventListener("resize", fit_canvas);
+        watch_ratio();
+    }
     sync_timer();
     sync_audio();
 
-    window.addEventListener("resize", fit_canvas);
-    watch_ratio();
     canvas.addEventListener("pointermove", on_pointer_move);
     canvas.addEventListener("pointerdown", on_pointer_down);
     canvas.addEventListener("pointerup", on_pointer_up);

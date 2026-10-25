@@ -79,6 +79,20 @@
 //! it wherever it reads `timer_on`, inside the input handler that changed it, so a start has
 //! the page's user activation.
 //!
+//! ## 4c. Scenario Replay (`?bench=<scenario>`)
+//! `bench_start(len)` names a scenario by the `len` bytes in the input buffer and, when the app
+//! declares it, sets the canvas to the regress size at scale 1 (`bench.regress_size`) and
+//! starts replaying it on the simulated clock of `--regress` (`bench.zig`, section 5b;
+//! `host/headless.zig`, section 2). While a replay runs, `tick` ignores the rAF time: frame
+//! `n` applies the scenario's next step, the app timer's ticks due by `t_n`, `ui.animate` with
+//! the clock's delta, and, while `cx.audio_on`, `realtime.blocks_for_frame` blocks rendered by
+//! this instance's own audio source; then it presents with the animation time of `t_n`. It
+//! returns 1 while frames remain, 2 after the last one (`shell.js` logs `bench done`), and 3
+//! when a step's target has no area. From `bench_start` on, `timer_on` and `audio_on` report 0
+//! (so `shell.js` arms no interval and starts no worklet), `audio_push` and every input export
+//! are ignored, and after the run `tick` presents nothing more, so the canvas keeps the last
+//! frame for the screenshot. Without `bench_start` none of this runs.
+//!
 //! ## 4a. Keyboard, Clipboard, and Cursor
 //! All key mapping lives in Zig, so `shell.js` stays a generic interpreter plus glue:
 //! - `key_down(len, mods, repeat)` and `key_up(len, mods)` read `KeyboardEvent.key` as UTF-8
@@ -124,6 +138,7 @@ const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
 const realtime = @import("../realtime.zig");
 const ui = @import("../ui.zig");
+const bench = @import("../bench.zig");
 
 /// Bytes `shell.js` may write into the input buffer: a key name or a paste.
 pub const input_cap: u32 = ui.cx.clipboard_cap;
@@ -214,6 +229,9 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.tick, .{ .name = "tick" });
     @export(&Web.overflow_take, .{ .name = "overflow_take" });
     @export(&Web.audio_on, .{ .name = "audio_on" });
+    @export(&Web.bench_start, .{ .name = "bench_start" });
+    @export(&Web.bench_width, .{ .name = "bench_width" });
+    @export(&Web.bench_height, .{ .name = "bench_height" });
     if (app_contract.has_audio(App)) {
         @export(&Web.audio_inbox_ptr, .{ .name = "audio_inbox_ptr" });
         @export(&Web.audio_post_blocks, .{ .name = "audio_post_blocks" });
@@ -256,6 +274,33 @@ fn WebApp(comptime App: type) type {
         var overflow_pending: bool = false;
         /// Key names and pastes from `shell.js` (section 4a).
         var input_buffer: [input_cap]u8 = undefined;
+
+        /// The `?bench=` replay (section 4c); `phase` is `.off` without one.
+        const scenarios: []const bench.Scenario =
+            if (@hasDecl(App, "scenarios")) App.scenarios else &.{};
+        const regress_size = bench.regress_size(App);
+        const ReplayRun = struct {
+            phase: enum { off, running, done, failed },
+            scenario: *const bench.Scenario,
+            replay: bench.Replay,
+            /// The next frame's number on the simulated clock.
+            n: u64,
+            frames_max: u64,
+            clock: bench.Clock,
+            audio_frames: u64,
+            owns_copy: bool,
+        };
+        var replay_run: ReplayRun = .{
+            .phase = .off,
+            .scenario = undefined,
+            .replay = undefined,
+            .n = 0,
+            .frames_max = 0,
+            .clock = undefined,
+            .audio_frames = 0,
+            .owns_copy = false,
+        };
+        var replay_paste: [ui.cx.clipboard_cap]u8 = undefined;
 
         /// Initializes host state, the draw context, the renderer, and the app, then submits
         /// the setup stream. Called once by JavaScript after the device exists. The app runs
@@ -445,6 +490,7 @@ fn WebApp(comptime App: type) type {
         /// it after every call and sets or clears its interval to match (section 4).
         fn timer_on() callconv(.c) u32 {
             if (App.config.timer_period_ms == 0) assert(!context.timer_on);
+            if (replay_run.phase != .off) return 0;
             return @intFromBool(context.timer_on);
         }
 
@@ -455,6 +501,7 @@ fn WebApp(comptime App: type) type {
             assert(state.frame.running);
             assert(App.config.timer_period_ms != 0);
             if (!context.timer_on) return dirty_flag();
+            if (replay_run.phase != .off) return 0;
             App.timer(&app, &context, now_ms);
             if (context.dirty) {
                 state.frame.request_redraw();
@@ -469,6 +516,7 @@ fn WebApp(comptime App: type) type {
         /// sample after idle has dt 0 (see `animator.Clock.advance`).
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
+            if (replay_run.phase != .off) return replay_tick();
             drain_audio();
             const dt_ms = state.clock.advance(now_ms);
             if (render.animating) {
@@ -500,6 +548,7 @@ fn WebApp(comptime App: type) type {
         /// 1 while the app wants its audio source running (`cx.audio_on`), else 0 (section 4b).
         fn audio_on() callconv(.c) u32 {
             if (!has_audio) assert(!context.audio_on);
+            if (replay_run.phase != .off) return 0;
             return @intFromBool(context.audio_on);
         }
 
@@ -521,6 +570,7 @@ fn WebApp(comptime App: type) type {
             assert(state.frame.running);
             assert(count <= realtime.post_blocks);
             if (!context.audio_on) return 0;
+            if (replay_run.phase != .off) return 0;
             for (audio_inbox[0..count]) |*block| _ = audio_queue.push(block);
             return @intFromBool(audio_queue.pending() != 0);
         }
@@ -536,6 +586,127 @@ fn WebApp(comptime App: type) type {
             assert(has_audio);
             App.Audio.render(&audio_source, &audio_rendered);
             return &audio_rendered.samples;
+        }
+
+        /// Starts replaying the scenario named by the first `len` bytes of the input buffer
+        /// (section 4c). Returns 1 when the app declares it, 0 otherwise (nothing changes).
+        /// Called once, after `start` and before the first frame.
+        fn bench_start(len: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(len <= input_cap);
+            if (replay_run.phase != .off) return 0;
+            const found = bench.find(scenarios, input_buffer[0..len]) orelse return 0;
+            state.frame.apply_configure(regress_size[0], regress_size[1]);
+            state.frame.apply_scale(120) catch unreachable;
+            assert(state.frame.width_px == regress_size[0]);
+            var setup_frames: u64 = 0;
+            for (found.setup) |step| setup_frames += if (step == .wait) step.wait else 1;
+            replay_run = .{
+                .phase = .running,
+                .scenario = found,
+                .replay = .init(),
+                .n = 0,
+                .frames_max = setup_frames + found.frames + 1,
+                .clock = .init(App.config.timer_period_ms),
+                .audio_frames = 0,
+                .owns_copy = false,
+            };
+            if (has_audio) App.Audio.init(&audio_source, realtime.sample_rate);
+            state.frame.request_redraw();
+            return 1;
+        }
+
+        /// The regress size `bench_start` sets, in CSS and device pixels.
+        fn bench_width() callconv(.c) u32 {
+            return regress_size[0];
+        }
+
+        fn bench_height() callconv(.c) u32 {
+            return regress_size[1];
+        }
+
+        /// One replay frame (section 4c): 1 while frames remain, 2 after the last, 3 on a
+        /// step whose target has no area, 0 once the run ended.
+        fn replay_tick() u32 {
+            const run = &replay_run;
+            if (run.phase != .running) return 0;
+            const n = run.n;
+            if (n > run.frames_max) {
+                run.phase = .failed;
+                return 3;
+            }
+            if (n > 0) {
+                if (run.replay.next(run.scenario)) |step| {
+                    if (!replay_step(step, n)) {
+                        run.phase = .failed;
+                        return 3;
+                    }
+                }
+            }
+            const t_ms = bench.Clock.frame_time_ms(n);
+            var ticks: u32 = 0;
+            while (run.clock.due(t_ms, context.timer_on)) |at| : (ticks += 1) {
+                if (ticks == bench.ticks_per_frame_max) break;
+                App.timer(&app, &context, at);
+            }
+            _ = ui.animate(App, &app, &context, bench.Clock.frame_dt(n));
+            if (has_audio and context.audio_on) {
+                replay_audio(realtime.blocks_for_frame(run.audio_frames));
+                run.audio_frames += 1;
+                drain_audio();
+            }
+            state.time = .{ .ms = t_ms };
+            state.frame.request_redraw();
+            present_frame();
+            _ = run.replay.presented(run.scenario);
+            run.n += 1;
+            if (run.replay.phase == .done) {
+                run.phase = .done;
+                return 2;
+            }
+            return 1;
+        }
+
+        /// Dispatches one scenario step at frame `n`; false when its target has no area.
+        fn replay_step(step: bench.Step, n: u64) bool {
+            var rect: ?[4]f32 = null;
+            if (bench.step_target(step)) |target| {
+                const found = context.find(target.id) orelse return false;
+                rect = found.rect;
+            }
+            var events: [bench.event_cap]input.Event = undefined;
+            const time_ms: u32 = @intCast(bench.Clock.frame_time_ms(n));
+            const count = bench.step_events(step, rect, time_ms, &events);
+            for (events[0..count]) |event| replay_dispatch(event);
+            return true;
+        }
+
+        /// The regress host's dispatch: a paste request pastes the app's own copy.
+        fn replay_dispatch(event: input.Event) void {
+            ui.dispatch(App, &app, &context, event);
+            if (context.take_copy()) replay_run.owns_copy = true;
+            if (!context.take_paste_request()) return;
+            if (!replay_run.owns_copy) return;
+            const own = context.copied();
+            @memcpy(replay_paste[0..own.len], own);
+            ui.dispatch(App, &app, &context, .{ .paste = replay_paste[0..own.len] });
+        }
+
+        /// Renders `count` blocks from this instance's source into the queue, as the native
+        /// engine does (`audio_thread.zig`), counting a refused one.
+        fn replay_audio(count: u32) void {
+            if (!has_audio) return;
+            assert(count <= realtime.post_blocks * 2);
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                if (audio_queue.slot()) |block| {
+                    App.Audio.render(&audio_source, block);
+                    audio_queue.publish();
+                } else {
+                    App.Audio.render(&audio_source, &audio_rendered);
+                    audio_queue.refuse();
+                }
+            }
         }
 
         /// Drains the queue through `App.audio`, or releases it unread while audio is off.
@@ -554,6 +725,8 @@ fn WebApp(comptime App: type) type {
         }
 
         fn note_event(event: input.Event) u32 {
+            // A replay owns every event (section 4c).
+            if (replay_run.phase != .off) return 0;
             ui.dispatch(App, &app, &context, event);
             // The page's own paste event delivers the text, so a request needs no action.
             _ = context.take_paste_request();

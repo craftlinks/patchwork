@@ -46,6 +46,8 @@
 //!   that declared a period (section 4).
 //! - Optional: `pub const scenarios: []const patchwork.bench.Scenario`, the scripted runs the
 //!   native host replays with `--bench <name>` (`bench.zig`). `check` validates them.
+//! - Optional: `pub const regress_size: [2]u32`, the logical size `--regress` renders at
+//!   (`host/headless.zig`; 1280 x 720 without it). `check` requires 1 to 4096 for each side.
 //! - Optional, together: `pub const Audio` and `pub fn audio` (section 4a).
 //!
 //! ## 2a. Draw Configuration
@@ -173,6 +175,9 @@ pub fn has_audio(comptime App: type) bool {
 /// comptime assert at the end of this file and the "slow timer" test keep in sync.
 pub const timer_period_ms_max: u32 = 1000;
 
+/// Largest side of `App.regress_size`, in logical pixels.
+pub const regress_side_max: u32 = 4096;
+
 /// Returns null when `App` satisfies the contract, otherwise a message naming the first
 /// problem. Pure, so tests can check failure cases without a compile error. Signature types
 /// are compared exactly.
@@ -221,6 +226,14 @@ pub fn conformance(comptime App: type) ?[]const u8 {
         }
         if (bench.validate(App.scenarios)) |message| {
             return message;
+        }
+    }
+    if (@hasDecl(App, "regress_size")) {
+        if (@TypeOf(App.regress_size) != [2]u32) return "App.regress_size must have type [2]u32";
+        for (App.regress_size) |side| {
+            if (side < 1 or side > regress_side_max) {
+                return "App.regress_size: each side must be 1 to 4096";
+            }
         }
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
@@ -470,6 +483,16 @@ const WrongScenarios = struct {
     pub const scenarios = 3;
 };
 
+const WideRegress = struct {
+    pub const config: Config = .{ .title = "wide", .timer_period_ms = 0, .draw = &test_draw };
+    pub const regress_size: [2]u32 = .{ 5000, 720 };
+};
+
+const SmallRegress = struct {
+    pub const config: Config = .{ .title = "small", .timer_period_ms = 0, .draw = &test_draw };
+    pub const regress_size: [2]u32 = .{ 640, 480 };
+};
+
 const OldEvent = struct {
     pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
     pub fn init(app: *OldEvent, textures: *quads.Textures) void {
@@ -549,6 +572,17 @@ test "scenarios of the wrong type or with a zero wait are rejected" {
     const wrong = comptime conformance(WrongScenarios).?;
     try std.testing.expect(std.mem.find(u8, wrong, "App.scenarios") != null);
     try std.testing.expect(!@hasDecl(GoodApp, "scenarios"));
+}
+
+// Locks `regress_size` validation: 5000 x 720 is refused by name; 640 x 480 passes the check
+// (the next problem reported is the missing `init`).
+test "a regress size outside 1 to 4096 is rejected" {
+    try std.testing.expectEqualStrings(
+        "App.regress_size: each side must be 1 to 4096",
+        comptime conformance(WideRegress).?,
+    );
+    const next = comptime conformance(SmallRegress).?;
+    try std.testing.expectEqualStrings("App is missing `pub fn init`", next);
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and
