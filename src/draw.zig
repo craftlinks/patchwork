@@ -23,9 +23,11 @@
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
 //! This file re-exports the public names so apps and widgets write `draw.Box`,
-//! `draw.Context`, and so on. It also owns the plain geometry types `Rect` and `Inset`,
-//! which layout (`ui/turtle.zig`), text placement, and hit areas share, so text depends on
-//! drawing only and never on the UI layer.
+//! `draw.Context`, and so on. It also owns the plain geometry types `Rect`, `Clip`, and
+//! `Inset`, which layout (`ui/turtle.zig`), text placement, and hit areas share, so text
+//! depends on drawing only and never on the UI layer. `Rect.array` and `Clip.array` are the
+//! `[4]f32` an instance's `rect` and `clip` fields hold; `Inset.all`, `xy`, and `sides` build
+//! insets.
 //!
 //! ## 3. Y-Down Orthographic Projection
 //! Coordinate spaces:
@@ -116,6 +118,14 @@ pub const Clip = struct {
     y0: f32,
     x1: f32,
     y1: f32,
+
+    /// `.{ x0, y0, x1, y1 }`, the order of an instance's `clip` field.
+    pub fn array(self: Clip) [4]f32 {
+        const values: [4]f32 = .{ self.x0, self.y0, self.x1, self.y1 };
+        assert(values[0] == self.x0);
+        assert(values[3] == self.y1);
+        return values;
+    }
 };
 
 /// Axis-aligned box in UI logical pixels. `(x, y)` is the top-left corner. Layout
@@ -125,6 +135,14 @@ pub const Rect = struct {
     y: f32,
     width: f32,
     height: f32,
+
+    /// `.{ x, y, width, height }`, the order of an instance's `rect` field.
+    pub fn array(self: Rect) [4]f32 {
+        const values: [4]f32 = .{ self.x, self.y, self.width, self.height };
+        assert(values[0] == self.x);
+        assert(values[3] == self.height);
+        return values;
+    }
 };
 
 /// Independent insets in UI logical pixels: container padding and child margins.
@@ -133,6 +151,23 @@ pub const Inset = struct {
     top: f32,
     right: f32,
     bottom: f32,
+
+    /// `value` on all four sides.
+    pub fn all(value: f32) Inset {
+        return sides(value, value, value, value);
+    }
+
+    /// `x` on the left and right, `y` on the top and bottom.
+    pub fn xy(x: f32, y: f32) Inset {
+        return sides(x, y, x, y);
+    }
+
+    /// Each side on its own, in CSS order after the left: left, top, right, bottom.
+    pub fn sides(left: f32, top: f32, right: f32, bottom: f32) Inset {
+        assert(left >= 0 and right >= 0);
+        assert(top >= 0 and bottom >= 0);
+        return .{ .left = left, .top = top, .right = right, .bottom = bottom };
+    }
 };
 
 pub const DrawType = registry.DrawType;
@@ -154,6 +189,10 @@ pub const Blend = @import("gpu/commands.zig").Blend;
 pub const TextureRegion = textures_module.Region;
 pub const AppendError = types.AppendError;
 pub const Box = types.Box;
+/// `Box.of`'s look and `Arc.of`'s (`draw/types.zig`, section 5).
+pub const BoxLook = types.BoxLook;
+pub const ArcLook = types.ArcLook;
+pub const transparent = types.transparent;
 pub const Arc = types.Arc;
 pub const Glyph = types.Glyph;
 pub const Image = types.Image;
@@ -473,4 +512,21 @@ test "dirty_range covers changed records and a grown tail" {
     try std.testing.expectEqual(Range{ .first = 1, .end = 4 }, dirty_range(Record, &old, &two).?);
     const grown = records(8, null);
     try std.testing.expectEqual(Range{ .first = 6, .end = 8 }, dirty_range(Record, &old, &grown).?);
+}
+
+// Locks the array views in instance order and the inset constructors: `all`, `xy` (left and
+// right take x), and `sides` in argument order.
+test "rect and clip arrays and inset constructors" {
+    const rect: Rect = .{ .x = 1, .y = 2, .width = 30, .height = 40 };
+    try std.testing.expectEqual([4]f32{ 1, 2, 30, 40 }, rect.array());
+    const clip: Clip = .{ .x0 = 1, .y0 = 2, .x1 = 31, .y1 = 42 };
+    try std.testing.expectEqual([4]f32{ 1, 2, 31, 42 }, clip.array());
+    const twelve: Inset = .{ .left = 12, .top = 12, .right = 12, .bottom = 12 };
+    try std.testing.expectEqual(twelve, Inset.all(12));
+    const wide: Inset = .{ .left = 8, .top = 4, .right = 8, .bottom = 4 };
+    try std.testing.expectEqual(wide, Inset.xy(8, 4));
+    try std.testing.expectEqual(
+        Inset{ .left = 1, .top = 2, .right = 3, .bottom = 4 },
+        Inset.sides(1, 2, 3, 4),
+    );
 }

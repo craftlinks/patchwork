@@ -857,16 +857,9 @@ test "a refused path keeps nothing and is counted" {
     var level: u8 = 0;
     while (level < 4) : (level += 1) {
         _ = cx.layer(@fromBackingInt(level));
-        try cx.append(types.Box, null, .{
-            .rect = .{ 0, 0, 1, 1 },
-            .clip = .{ 0, 0, 1, 1 },
-            .fill = .{ 1, 1, 1, 1 },
-            .border_color = .{ 0, 0, 0, 0 },
-            .radius = 0,
-            .border_width = 0,
-            .hover = 0,
-            .down = 0,
-        });
+        const unit: draw.Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+        const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 };
+        try cx.append(types.Box, null, .of(unit, clip, .{ .fill = .{ 1, 1, 1, 1 } }));
     }
     const revision = cx.point_revision;
     try testing.expectEqual(@as(?Placed, null), polyline(cx, straight[0..2], cable_stroke, window));

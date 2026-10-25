@@ -35,6 +35,7 @@ const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
+const kit = widgets.kit;
 
 const Rect = quads.Rect;
 
@@ -114,11 +115,16 @@ pub fn draw(cx: anytype, id: ui.Id, look: Look) void {
     if (look.enabled) cx.area(id, look.ring, look.ring.width * 0.5, widgets.knob_flags);
     var track = theme.chrome.track;
     track[3] *= alpha;
-    append_arc(cx, look.ring, track, 0, 1, clip);
+    kit.arc(cx, look.ring, clip, .{ .color = track, .thickness = thickness });
     if (look.fraction > 0) {
         var accent = look.accent;
         accent[3] *= alpha;
-        append_arc(cx, look.ring, accent, look.lit * widgets.hover_lighten, look.fraction, clip);
+        kit.arc(cx, look.ring, clip, .{
+            .color = accent,
+            .thickness = thickness,
+            .sweep = look.fraction,
+            .hover = kit.weight(look.lit, widgets.hover_lighten),
+        });
     }
     const size = look.ring.width;
     var color = theme.chrome.text;
@@ -150,30 +156,6 @@ pub fn value_size(size: f32) f32 {
 }
 
 const fitted: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = true };
-
-fn append_arc(
-    cx: anytype,
-    ring: Rect,
-    color: [4]f32,
-    hover: f32,
-    sweep: f32,
-    clip: quads.Clip,
-) void {
-    assert(sweep >= 0);
-    assert(sweep <= 1);
-    cx.append(quads.Arc, null, .{
-        .rect = .{ ring.x, ring.y, ring.width, ring.height },
-        .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
-        .color = color,
-        .thickness = thickness,
-        .sweep = sweep,
-        .hover = hover,
-        .pad = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
 
 comptime {
     assert(value_size(44) == 11);

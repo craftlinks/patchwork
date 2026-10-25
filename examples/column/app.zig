@@ -42,8 +42,8 @@ const widgets = patchwork.widgets;
 
 const Rect = quads.Rect;
 
-const frame_padding: quads.Inset = .{ .left = 16, .top = 16, .right = 16, .bottom = 16 };
-const panel_padding: quads.Inset = .{ .left = 8, .top = 8, .right = 8, .bottom = 8 };
+const frame_padding: quads.Inset = .all(16);
+const panel_padding: quads.Inset = .all(8);
 const panel_width_px: f32 = 320;
 const row_gap_px: f32 = 8;
 
@@ -134,14 +134,9 @@ pub const App = struct {
 
     /// The panel on the right, its view, and one row per control.
     pub fn draw(app: *App, cx: *Context) void {
-        var frame = ui.flow_of(.down);
-        frame.padding = frame_padding;
-        frame.alignment.x = 1;
-        _ = cx.begin(ui.sized(.fill, .fill), frame);
+        _ = cx.begin(ui.sized(.fill, .fill), .{ .flow = .down, .padding = frame_padding, .alignment = .{ .x = 1, .y = 0 } });
         const panel: widgets.Panel = .{ .paint = widgets.paint_of(theme.chrome.panel, 0) };
-        var layout = ui.flow_of(.down);
-        layout.padding = panel_padding;
-        _ = panel.begin(cx, ui.sized(.{ .fixed = panel_width_px }, .fill), layout);
+        _ = panel.begin(cx, ui.sized(.{ .fixed = panel_width_px }, .fill), .{ .flow = .down, .padding = panel_padding });
         _ = cx.begin_view(view_id, ui.sized(.fill, .fill), ui.flow_of(.down), &app.view);
         for (&app.knobs) |*knob| knob.draw(cx, row(widgets.knob_height));
         app.meter.draw(cx, row(widgets.meter_height));

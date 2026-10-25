@@ -91,25 +91,23 @@ pub const CanvasState = canvas.CanvasState;
 pub const List = view.List;
 pub const zero_inset = turtle.zero_inset;
 
-/// A walk with no margins.
+/// A walk with no margins: `.{ .width = width, .height = height }`.
 pub fn sized(width: Size, height: Size) Walk {
-    const walk: Walk = .{ .width = width, .height = height, .margin = zero_inset };
+    const walk: Walk = .{ .width = width, .height = height };
     assert(walk.margin.left == 0);
     assert(walk.margin.top == 0);
     return walk;
 }
 
-/// A layout with no spacing, padding, alignment, or clip, flowing by `flow`.
+/// A layout with no spacing, padding, alignment, or clip, flowing by `flow`:
+/// `.{ .flow = flow }`.
 pub fn flow_of(flow: Flow) Layout {
     comptime assert(@typeInfo(Flow).@"enum".field_names.len == 3);
     assert(@backingInt(flow) < 3);
-    return .{
-        .flow = flow,
-        .spacing = 0,
-        .padding = zero_inset,
-        .alignment = .{ .x = 0, .y = 0 },
-        .clip = false,
-    };
+    const layout: Layout = .{ .flow = flow };
+    assert(layout.spacing == 0);
+    assert(!layout.clip);
+    return layout;
 }
 
 /// Calls `handle(cx, event)` on every widget `target` names and returns how many returned
@@ -230,6 +228,28 @@ test {
 }
 
 const testing = std.testing;
+
+// Locks the layout defaults: `.{ .flow = flow }` is `flow_of(flow)` for every flow (no spacing,
+// padding, alignment, or clip), a walk's margin defaults to zero, and `sized` is the literal.
+test "layout and walk defaults equal flow_of and sized" {
+    for ([_]Flow{ .right, .down, .overlay }) |flow| {
+        const literal: Layout = .{ .flow = flow };
+        try testing.expectEqual(flow_of(flow), literal);
+        const explicit: Layout = .{
+            .flow = flow,
+            .spacing = 0,
+            .padding = zero_inset,
+            .alignment = .{ .x = 0, .y = 0 },
+            .clip = false,
+        };
+        try testing.expectEqual(explicit, literal);
+    }
+    const walk: Walk = .{ .width = .fill, .height = .{ .fixed = 24 } };
+    try testing.expectEqual(zero_inset, walk.margin);
+    try testing.expectEqual(sized(.fill, .{ .fixed = 24 }), walk);
+    const padded: Layout = .{ .flow = .down, .spacing = 8, .padding = .all(12) };
+    try testing.expectEqual(@as(f32, 12), padded.padding.bottom);
+}
 
 const Counter = struct {
     hits: u32 = 0,

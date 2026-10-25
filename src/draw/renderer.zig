@@ -1591,29 +1591,16 @@ const Fixture = struct {
     }
 };
 
+const test_clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+
 fn face(x: f32) types.Box {
-    return .{
-        .rect = .{ x, 0, 10, 10 },
-        .clip = .{ 0, 0, 100, 100 },
-        .fill = .{ 1, 1, 1, 1 },
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    };
+    const rect: draw.Rect = .{ .x = x, .y = 0, .width = 10, .height = 10 };
+    return .of(rect, test_clip, .{ .fill = .{ 1, 1, 1, 1 } });
 }
 
 fn ring(x: f32, hover: f32) types.Arc {
-    return .{
-        .rect = .{ x, 0, 56, 56 },
-        .clip = .{ 0, 0, 100, 100 },
-        .color = .{ 1, 1, 1, 1 },
-        .thickness = 4,
-        .sweep = 1,
-        .hover = hover,
-        .pad = 0,
-    };
+    const rect: draw.Rect = .{ .x = x, .y = 0, .width = 56, .height = 56 };
+    return .of(rect, test_clip, .{ .color = .{ 1, 1, 1, 1 }, .thickness = 4, .hover = hover });
 }
 
 fn glyph(x: f32) types.Glyph {

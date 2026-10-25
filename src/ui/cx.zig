@@ -706,16 +706,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             if (!(state.viewport.height > 0)) return;
             const thumb = state.thumb_rect();
             const outer = parent.clip orelse return;
-            self.append(draw.Box, null, .{
-                .rect = .{ thumb.x, thumb.y, thumb.width, thumb.height },
-                .clip = .{ outer.x0, outer.y0, outer.x1, outer.y1 },
+            const look: draw.BoxLook = .{
                 .fill = theme.chrome.control,
-                .border_color = .{ 0, 0, 0, 0 },
                 .radius = view.thumb_radius,
-                .border_width = 0,
-                .hover = 0,
-                .down = 0,
-            }) catch |err| switch (err) {
+            };
+            self.append(draw.Box, null, .of(thumb, outer, look)) catch |err| switch (err) {
                 error.PoolFull, error.BatchFull => {},
                 error.EdgeNotPositive, error.ClipUnordered => unreachable,
             };
@@ -1437,16 +1432,8 @@ fn flow_of(flow: turtle.Flow) turtle.Layout {
 
 fn box(context: *TestContext, rect: Rect) void {
     const current = context.clip().?;
-    context.append(draw.Box, null, .{
-        .rect = .{ rect.x, rect.y, rect.width, rect.height },
-        .clip = .{ current.x0, current.y0, current.x1, current.y1 },
-        .fill = .{ 1, 1, 1, 1 },
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    }) catch unreachable;
+    context.append(draw.Box, null, .of(rect, current, .{ .fill = .{ 1, 1, 1, 1 } })) catch
+        unreachable;
 }
 
 fn rect_at(x: f32, y: f32, width: f32, height: f32) Rect {

@@ -687,6 +687,7 @@ comptime {
 }
 
 const testing = std.testing;
+const geometry = @import("../draw.zig");
 
 const test_draw = [_]registry.DrawType{
     .{ .type = types.Box, .cap = 8 },
@@ -697,16 +698,9 @@ const test_draw = [_]registry.DrawType{
 const TestContext = Context(&test_draw, 6, 0);
 
 fn test_box(x: f32) types.Box {
-    return .{
-        .rect = .{ x, 0, 10, 10 },
-        .clip = .{ 0, 0, 100, 100 },
-        .fill = .{ 1, 1, 1, 1 },
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = 0,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    };
+    const rect: geometry.Rect = .{ .x = x, .y = 0, .width = 10, .height = 10 };
+    const clip: geometry.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 100, .y1 = 100 };
+    return .of(rect, clip, .{ .fill = .{ 1, 1, 1, 1 } });
 }
 
 fn test_glyph(x: f32) types.Glyph {

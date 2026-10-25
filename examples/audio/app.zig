@@ -40,6 +40,7 @@ const realtime = patchwork.realtime;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
+const kit = patchwork.widgets.kit;
 const fx = quads.fx;
 
 const Rect = quads.Rect;
@@ -270,8 +271,8 @@ pub const App = struct {
     fn draw_xy(app: *const App, cx: *Context) void {
         const draw_cx = cx.drawing();
         const inner = inset(xy_rect, 8);
-        const target = arr(inner);
-        const clip = clip_array(inner);
+        const target = inner.array();
+        const clip = clip_of(inner).array();
         draw_cx.offscreen(xy_layer, app.xy, target);
         const previous = draw_cx.layer(xy_layer);
         fx.composite(draw_cx, app.xy, target, target, clip, persistence, 1, fade_bias);
@@ -325,32 +326,11 @@ fn inset(rect: Rect, by: f32) Rect {
 }
 
 fn append_box(cx: *Context, rect: Rect, color: [4]f32, clip: Rect, radius: f32) void {
-    cx.append(quads.Box, null, .{
-        .rect = arr(rect),
-        .clip = clip_array(clip),
-        .fill = color,
-        .border_color = .{ 0, 0, 0, 0 },
-        .radius = radius,
-        .border_width = 0,
-        .hover = 0,
-        .down = 0,
-    }) catch |err| switch (err) {
-        error.PoolFull, error.BatchFull => {},
-        error.EdgeNotPositive, error.ClipUnordered => unreachable,
-    };
-}
-
-fn arr(rect: Rect) [4]f32 {
-    return .{ rect.x, rect.y, rect.width, rect.height };
+    kit.append(cx, quads.Box, null, .of(rect, clip_of(clip), .{ .fill = color, .radius = radius }));
 }
 
 fn clip_of(rect: Rect) quads.Clip {
     return .{ .x0 = rect.x, .y0 = rect.y, .x1 = rect.x + rect.width, .y1 = rect.y + rect.height };
-}
-
-fn clip_array(rect: Rect) [4]f32 {
-    const clip = clip_of(rect);
-    return .{ clip.x0, clip.y0, clip.x1, clip.y1 };
 }
 
 const fixture = struct {
