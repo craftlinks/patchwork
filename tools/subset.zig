@@ -34,6 +34,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
     const input = try map_file(path_in);
     const summary = subset.subset(&scratch, input, ranges[0..count], &output) catch |err| {
+        if (err == error.NoGlyf) {
+            std.debug.print(
+                "subset: {s}: no glyf table; CFF outlines are not supported, " ++
+                    "use a TrueType (glyf) face\n",
+                .{path_in},
+            );
+            return 1;
+        }
         std.debug.print("subset: {s}: {s}\n", .{ path_in, @errorName(err) });
         return 1;
     };

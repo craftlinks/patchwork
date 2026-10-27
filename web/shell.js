@@ -643,16 +643,24 @@ function load_table() {
 
 /**
  * Logs the draw's overflow report once per change, in builds with runtime safety (the wasm
- * returns 0 otherwise): instances, areas, and glyphs refused for lack of room.
+ * returns 0 otherwise): instances, areas, and glyphs refused for lack of room, and icons whose
+ * face does not map their codepoint (the last as `face << 21 | codepoint`).
  */
 function log_overflow() {
     const at = wasm.overflow_take();
     if (at === 0) {
         return;
     }
-    const counts = new Uint32Array(wasm.memory.buffer, at, 3);
-    console.warn(`overflow: ${counts[0]} instances, ${counts[1]} areas, ${counts[2]} glyphs ` +
-        "refused this frame (raise App.config caps)");
+    const counts = new Uint32Array(wasm.memory.buffer, at, 5);
+    if (counts[0] + counts[1] + counts[2] > 0) {
+        console.warn(`overflow: ${counts[0]} instances, ${counts[1]} areas, ${counts[2]} ` +
+            "glyphs refused this frame (raise App.config caps)");
+    }
+    if (counts[3] > 0) {
+        const codepoint = (counts[4] & 0x1FFFFF).toString(16).toUpperCase().padStart(4, "0");
+        console.warn(`icons: ${counts[3]} drawn this frame are not in their face ` +
+            `(last U+${codepoint} in face ${counts[4] >>> 21})`);
+    }
 }
 
 /**

@@ -12,8 +12,9 @@
 //! behaviour in the gallery's own skin (section 3b). A `widgets.Tabs` bar under the title holds
 //! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32), "popups" (step 33:
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
-//! "containers" (step 34: splitters, a list box, and number boxes). Tooltips show on every
-//! knob of the basics page.
+//! "containers" (step 34: splitters, a list box, and number boxes), and "type" (step 36: an
+//! icon face beside the library's three; section 2b). Tooltips show on every knob of the
+//! basics page and every button of the type page's toolbar.
 //!
 //! ## 2. Layout (logical pixels)
 //! A fixed `screen_w` by `screen_h` screen from the top-left, so it fits the 1280 by 720
@@ -35,6 +36,11 @@
 //! containers
 //!   split  fill x fill      horizontal: the presets (a list box in a panel) | vertical: the
 //!                           parameter grid (2 rows of 3 number boxes) over the preset panel
+//! type
+//!   band   fill x 92        transport (336: 5 buttons of 56 x 40) | toolbar (176: 3 of 40 x 40)
+//!                           | sizes (fill: 5 cells of 64 x 48)
+//!   set    fill x 84        the 14 icons at 24 px in 40 px cells
+//!   faces  fill x fill      a line in each library face at 16 px, 28 px apart
 //! ```
 //! The frame, `(0, 0, 1280, 704)`, is the 1280 by 720 browser viewport's width and the screen's
 //! height.
@@ -53,6 +59,18 @@
 //! dB, attack, release, q, mix) over a panel naming the selected preset and the last activated
 //! one. Each reports on the status line: "split 0.15", "preset 0024 selected", "frequency
 //! 4436.0 Hz", "gain = -6.5 dB" (a typed value).
+//!
+//! ## 2b. Type
+//! The gallery adds one face, `icons`: Lucide (`icons.zig`, `fonts/lucide.ttf`), which
+//! `build.zig` passes in `AppOptions.fonts` subset to the 14 icons `icons.zig` names, so
+//! `text.Face` here has a fourth tag. The type page's buttons are `widgets.ButtonOf(IconSkin)`:
+//! the default face, then the label's one codepoint drawn with `text.icon` at 18 px, its ink
+//! centred in the button whatever the icon's advance and baseline. The transport (skip back,
+//! play, stop, record, loop) reports "transport play"; play toggles to pause and back, and stop
+//! shows play again. The toolbar (open, save, settings) reports "toolbar save", and each of its
+//! buttons shows a tooltip. The size ladder draws the settings icon at 12, 16, 24, 32, and 48
+//! px, each centred in a cell, and the icon set every icon at 24 px; no hinting, so the
+//! smallest is soft. Last, a line in each Noto face.
 //!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
@@ -104,11 +122,13 @@
 //! wave dropdown through the backdrop: it does not open, the menu closed); `tooltip` (hover
 //! knob 0 for 40 frames); `about` (choose About… from the File menu: the dialog over the dimmed
 //! screen); each popup scenario but `tooltip` first clicks the popups tab. Containers (section
-//! 2a): `tabs` (click each tab: the containers page); `split` (drag the presets' divider 120 px
-//! left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled into view);
-//! `number` (drag the frequency up 40 px, double-click the gain, type "-6.5", Enter). The app
-//! tests replay all but `still` and `hover` headless (`number` a 60 Hz frame apart, so its two
-//! clicks are a double click as in regress) and check every value they leave.
+//! 2a): `tabs` (click each tab in turn, ending on containers); `split` (drag the presets'
+//! divider 120 px left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled
+//! into view); `number` (drag the frequency up 40 px, double-click the gain, type "-6.5",
+//! Enter). Type (section 2b): `type` (the type page, still); `transport` (click play: its icon
+//! is pause). The app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
+//! apart, so its two clicks are a double click as in regress) and check every value they
+//! leave.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays, a fixed status buffer, and no allocation; every loop is bounded.
@@ -126,6 +146,7 @@ const widgets = patchwork.widgets;
 const kit = widgets.kit;
 const bench = patchwork.bench;
 const hardware = @import("hardware.zig");
+const icons = @import("icons.zig");
 
 const Rect = quads.Rect;
 
@@ -199,6 +220,22 @@ const HardKnob = widgets.KnobOf(hardware.Skin);
 const HardButton = widgets.ButtonOf(hardware.Skin);
 const HardToggle = widgets.ToggleOf(hardware.Skin);
 
+/// The type page's buttons (section 2b): the library behaviour, the default face, and an icon.
+const IconButton = widgets.ButtonOf(IconSkin);
+
+/// The icon buttons' skin (section 2b): the default face, then the label's one codepoint in the
+/// label style's face and size, its ink centred in the button (`text.icon`).
+const IconSkin = struct {
+    pub fn button(cx: anytype, look: widgets.ButtonLook) ?widgets.Shape {
+        assert(look.label.len == 3);
+        assert(look.style.size > 0);
+        kit.face(cx, look.rect, look.clip, look.paint.look(cx.theme(), look.hover, look.down));
+        const codepoint = std.unicode.utf8Decode(look.label) catch unreachable;
+        kit.icon(cx, look.style.face, codepoint, look.style.size, look.rect, look.clip, look.style.color);
+        return .{ .rect = look.rect, .radius = look.paint.radius };
+    }
+};
+
 /// The slider the meter follows.
 const meter_slider: u32 = 0;
 
@@ -219,10 +256,57 @@ const side_id = ui.id("side", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
+const page_type: u32 = 3;
+
+/// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
+/// icon set, and the face lines.
+const icon_px: f32 = 18;
+const transport_w: f32 = 336;
+const transport_button_w: f32 = 56;
+const tool_button_w: f32 = 40;
+const ladder_sizes = [_]f32{ 12, 16, 24, 32, 48 };
+const ladder_cell_w: f32 = 64;
+const ladder_cell_h: f32 = 48;
+/// The band: a caption, a gap, and a row of ladder cells inside the panel's padding.
+const type_band_px: f32 = 2 * group_padding + caption_px + gap_px + ladder_cell_h;
+const set_icon_px: f32 = 24;
+const set_cell_px: f32 = 40;
+const set_px: f32 = 2 * group_padding + caption_px + gap_px + set_cell_px;
+const face_line_px: f32 = 28;
+const transport_icons = [_]u21{ icons.skip_back, icons.play, icons.stop, icons.record, icons.loop };
+const transport_names = [_][]const u8{ "skip back", "play", "stop", "record", "loop" };
+const transport_play: u32 = 1;
+const transport_stop: u32 = 2;
+const transport_record: u32 = 3;
+const tool_icons = [_]u21{ icons.folder_open, icons.save, icons.settings };
+const tool_names = [_][]const u8{ "open", "save", "settings" };
+const tool_tips = [_][]const u8{ "Open…", "Save", "Settings" };
+/// The record button's icon: a red that reads on the buttons' blue in both themes.
+const record_color: [4]f32 = .{ 0.95, 0.42, 0.42, 1 };
+const face_lines = [_]struct { face: text.Face, words: []const u8 }{
+    .{ .face = .sans, .words = "Noto Sans: The quick brown fox jumps over the lazy dog. 0123456789" },
+    .{ .face = .sans_bold, .words = "Noto Sans Bold: The quick brown fox jumps over the lazy dog." },
+    .{ .face = .mono, .words = "Noto Sans Mono: fn main() !void { return; } // 0O 1lI" },
+};
+
+/// `codepoints` as UTF-8, the icon buttons' labels: every icon is in the Private Use Area, three
+/// bytes each.
+fn utf8_of(comptime codepoints: []const u21) [codepoints.len][3]u8 {
+    var out: [codepoints.len][3]u8 = undefined;
+    for (codepoints, &out) |codepoint, *bytes| {
+        const length = std.unicode.utf8Encode(codepoint, bytes) catch unreachable;
+        assert(length == 3);
+    }
+    return out;
+}
+
+const transport_labels = utf8_of(&transport_icons);
+const tool_labels = utf8_of(&tool_icons);
+const pause_label = utf8_of(&.{icons.pause});
 
 /// The containers page (section 2a): 1,000 presets in a list box beside a splitter of six
 /// number boxes over a panel naming the selected preset.
@@ -336,6 +420,10 @@ pub const App = struct {
     params: [param_names.len]widgets.NumberBox,
     /// The preset last activated (a double click or Enter).
     activated: ?u32,
+    /// The type page (section 2b): the transport, playing or not, and the toolbar.
+    transport: [transport_icons.len]IconButton,
+    playing: bool,
+    tools: [tool_icons.len]IconButton,
     view: ui.ViewState,
     /// The rows drawn last, which `event` routes.
     drawn: ui.List.Range,
@@ -376,6 +464,8 @@ pub const App = struct {
         .{ .name = "split", .setup = &split_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "list", .setup = &list_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "number", .setup = &number_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "type", .setup = &type_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "transport", .setup = &transport_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -391,6 +481,14 @@ pub const App = struct {
             number.* = widgets.NumberBox.init(ui.id("param", @intCast(index)), param.value, param.min, param.max, param.step, param.format);
         }
         app.activated = null;
+        for (&app.transport, &transport_labels, 0..) |*button, *label, index| {
+            const color = if (index == transport_record) record_color else button_style.color;
+            button.* = icon_button(ui.id("transport", @intCast(index)), label, transport_button_w, color);
+        }
+        app.playing = false;
+        for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
+            button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
+        }
         for (&app.buttons, button_labels, 0..) |*button, label, index| {
             button.* = .{
                 .id = ui.id("button", @intCast(index)),
@@ -511,7 +609,33 @@ pub const App = struct {
         }
         app.popup_events(cx, event_value);
         app.container_events(cx, event_value);
+        app.type_events(cx, event_value);
         assert(app.status_len <= status_cap);
+    }
+
+    /// The type page's transport and toolbar (section 2b): play toggles to pause and back, and
+    /// stop shows play again.
+    fn type_events(app: *App, cx: *Context, event_value: input.Event) void {
+        for (&app.transport, 0..) |*button, index| {
+            if (button.handle(cx, event_value) != .clicked) continue;
+            if (index == transport_play) {
+                app.set_playing(!app.playing);
+                app.note(cx, &.{ "transport ", if (app.playing) "play" else "pause" });
+                continue;
+            }
+            if (index == transport_stop) app.set_playing(false);
+            app.note(cx, &.{ "transport ", transport_names[index] });
+        }
+        for (&app.tools, tool_names) |*button, name| {
+            if (button.handle(cx, event_value) == .clicked) app.note(cx, &.{ "toolbar ", name });
+        }
+    }
+
+    /// Shows the play button as pause while playing.
+    fn set_playing(app: *App, playing: bool) void {
+        app.playing = playing;
+        app.transport[transport_play].label = if (playing) &pause_label[0] else &transport_labels[transport_play];
+        assert(app.transport[transport_play].label.len == 3);
     }
 
     /// The tabs and the containers page (section 2a): the splitters, the list box, and the
@@ -586,10 +710,14 @@ pub const App = struct {
         app.tooltip.handle(cx, event_value, app.hovered_tip(cx, &bytes));
     }
 
-    /// The hovered knob's tip, default or hardware: its id and "name value" in `bytes`.
+    /// The hovered knob's tip, default or hardware: its id and "name value" in `bytes`; or the
+    /// hovered toolbar button's.
     fn hovered_tip(app: *const App, cx: *Context, bytes: *[16]u8) ?widgets.Tip {
         const hovered = cx.hovered();
         if (hovered == .none) return null;
+        for (&app.tools, tool_tips) |*button, tip| {
+            if (button.id == hovered) return .{ .anchor = button.id, .text = tip };
+        }
         for (&app.knobs) |*knob| {
             if (knob.id == hovered) return tip_of(bytes, knob.id, knob.name, knob.value_text[0..4]);
         }
@@ -645,6 +773,7 @@ pub const App = struct {
             page_basics => app.draw_basics(cx),
             page_popups => app.draw_popups(cx),
             page_containers => app.draw_containers(cx),
+            page_type => app.draw_type(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -823,6 +952,54 @@ pub const App = struct {
         app.split.end(cx);
     }
 
+    /// The type page (section 2b): the transport, the toolbar, and the size ladder in a band,
+    /// the icon set, and a line in each library face.
+    fn draw_type(app: *const App, cx: *Context) void {
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = type_band_px }), .{ .flow = .right, .spacing = gap_px });
+        _ = face.begin(cx, ui.sized(.{ .fixed = transport_w }, .fill), group_layout);
+        caption(cx, "transport");
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = button_px }), .{ .flow = .right, .spacing = gap_px });
+        for (&app.transport) |*button| button.draw(cx, ui.sized(.{ .fixed = transport_button_w }, .fill));
+        _ = cx.end();
+        _ = cx.end();
+        _ = face.begin(cx, ui.sized(.{ .fixed = narrow_px }, .fill), group_layout);
+        caption(cx, "toolbar");
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = button_px }), .{ .flow = .right, .spacing = gap_px });
+        for (&app.tools) |*button| button.draw(cx, ui.sized(.{ .fixed = tool_button_w }, .fill));
+        _ = cx.end();
+        _ = cx.end();
+        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        caption(cx, "sizes: 12, 16, 24, 32, 48 px");
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = ladder_cell_h }), .{ .flow = .right, .spacing = gap_px });
+        for (ladder_sizes) |size| {
+            const cell = cx.walk(ui.sized(.{ .fixed = ladder_cell_w }, .fill));
+            const clip = cx.visible(cell) orelse continue;
+            kit.face(cx, cell, clip, .{ .fill = cx.theme().colors.track, .radius = 4 });
+            kit.icon(cx, .icons, icons.settings, size, cell, clip, cx.theme().colors.text);
+        }
+        _ = cx.end();
+        _ = cx.end();
+        _ = cx.end();
+        _ = face.begin(cx, ui.sized(.fill, .{ .fixed = set_px }), group_layout);
+        caption(cx, "lucide 1.55.0: 14 icons at 24 px");
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = set_cell_px }), .{ .flow = .right, .spacing = gap_px });
+        for (icons.all) |codepoint| {
+            const cell = cx.walk(ui.sized(.{ .fixed = set_cell_px }, .fill));
+            const clip = cx.visible(cell) orelse continue;
+            kit.icon(cx, .icons, codepoint, set_icon_px, cell, clip, cx.theme().colors.text);
+        }
+        _ = cx.end();
+        _ = cx.end();
+        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        for (face_lines) |line| {
+            const row = cx.walk(ui.sized(.fill, .{ .fixed = face_line_px }));
+            const clip = cx.visible(row) orelse continue;
+            kit.label(cx, styled(cx, line.face, 16), line.words, row, clip, start);
+        }
+        _ = cx.end();
+    }
+
     /// Two rows of three number boxes, each under its caption.
     fn draw_params(app: *const App, cx: *Context) void {
         const face: widgets.Panel = .{ .paint = panel_paint(cx) };
@@ -989,6 +1166,22 @@ const About = struct {
         cx.end_popup();
     }
 };
+
+/// An icon button of the type page (section 2b): `label` is one icon's UTF-8, drawn at
+/// `icon_px` in `color` on the buttons' blue.
+fn icon_button(id: ui.Id, label: *const [3]u8, width: f32, color: [4]f32) IconButton {
+    assert(width >= button_px);
+    assert(color[3] == 1);
+    return .{
+        .id = id,
+        .label = label,
+        .style = .{ .face = .icons, .size = icon_px, .color = color },
+        .padding = .xy(0, 0),
+        .paint = button_paint,
+        .hover = .init(widgets.hover_rate_per_ms),
+        .down = .init(widgets.down_rate_per_ms),
+    };
+}
 
 /// A tip for knob `id`: "name value" written into `bytes`.
 fn tip_of(bytes: *[16]u8, id: ui.Id, name: []const u8, value: []const u8) widgets.Tip {
@@ -1205,6 +1398,19 @@ const number_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `type`: the type page, still (section 2b).
+const type_steps = [_]bench.Step{
+    .{ .click = tab(page_type) },
+    .{ .wait = 12 },
+};
+
+/// `transport`: click play on the type page: its icon turns to pause.
+const transport_steps = [_]bench.Step{
+    .{ .click = tab(page_type) },
+    .{ .click = bench.area("transport", transport_play) },
+    .{ .wait = 12 },
+};
+
 /// `about`: choose About… from the File menu: the dialog over the dimmed screen.
 const about_steps = [_]bench.Step{
     .{ .click = tab(page_popups) },
@@ -1245,13 +1451,16 @@ comptime {
     assert(params_h + side_min_b + widgets.splitter_px <= page_h);
     assert(params.len == param_names.len and params.len == 6);
     // Faces, on the busiest page (basics): the title and its toggle (2), the tab bar's line,
-    // three tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
+    // four tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
     // 3 field, 2 highlighted rows, the thumb; a popup's dim, face, and band; the tooltip.
-    assert(1 + 2 + 5 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 1 + 3 + 1 <= box_cap);
-    // The containers page: the title (3), the tabs (5), the list's panel, two bands, and thumb,
+    assert(1 + 2 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 1 + 3 + 1 <= box_cap);
+    // The containers page: the title (3), the tabs (6), the list's panel, two bands, and thumb,
     // two dividers, the grid's panel, six faces (one an editing field: face, band, caret), and
     // the preset panel.
-    assert(3 + 5 + 4 + 2 + 1 + 6 + 2 + 1 <= box_cap);
+    assert(3 + 6 + 4 + 2 + 1 + 6 + 2 + 1 <= box_cap);
+    // The type page: the title (3), the tabs (6), five panels, eight buttons, five ladder
+    // cells, and the tooltip.
+    assert(3 + 6 + 5 + 8 + 5 + 1 <= box_cap);
     assert(2 * knob_names.len + hard_knob_names.len <= arc_cap);
     // The hardware row: a dial per knob, a bevel per button and toggle, an LED per toggle.
     assert(hard_knob_names.len <= dial_cap);
@@ -1270,6 +1479,18 @@ comptime {
     assert(2 <= path_cap and 2 * 3 <= point_cap);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
     assert(preset_count <= 9999);
+    // The type page: the transport's five buttons and the toolbar's three fit their panels, the
+    // ladder's five cells and the icon set's fourteen fit the page, and the band, the set, and
+    // three face lines fit its height.
+    assert(transport_icons.len * transport_button_w + 4 * gap_px <= transport_w - 2 * group_padding);
+    assert(tool_icons.len * tool_button_w + 2 * gap_px <= narrow_px - 2 * group_padding);
+    assert(ladder_sizes.len * ladder_cell_w + 4 * gap_px <= inner_w - transport_w - narrow_px - 2 * gap_px - 2 * group_padding);
+    for (ladder_sizes) |size| assert(size <= ladder_cell_h);
+    assert(icons.all.len * set_cell_px + (icons.all.len - 1) * gap_px <= inner_w - 2 * group_padding);
+    assert(type_band_px + set_px + 2 * gap_px + 2 * group_padding + face_lines.len * face_line_px <= page_h);
+    assert(transport_names.len == transport_icons.len and tool_tips.len == tool_icons.len);
+    // Areas: the chrome and the eight icon buttons.
+    assert(chrome + transport_icons.len + tool_icons.len <= area_cap);
 }
 
 // ------------------------------------------------------------------------------------ tests
@@ -1685,6 +1906,114 @@ test "the number scenario drags the frequency and types the gain" {
     try std.testing.expectEqual(@as(f64, -6.5), app.params[1].value);
     try std.testing.expect(!app.params[1].editing);
     try std.testing.expectEqualStrings("gain = -6.5 dB", app.status_text());
+}
+
+// Locks the generated faces (section 2b): the gallery's `text.Face` has the library's three
+// tags at 0 to 2 and `icons` at 3, and its icons face is the Lucide subset: 14 icons and
+// `.notdef`, each icon mapped, its ranges exactly `icons.ranges`, at 1000 units per em.
+test "the gallery adds an icons face after the library's three" {
+    const names = @typeInfo(text.Face).@"enum".field_names;
+    try std.testing.expectEqual(@as(usize, 4), names.len);
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(text.Face.sans));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(text.Face.sans_bold));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(text.Face.mono));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(text.Face.icons));
+    try std.testing.expectEqualStrings("icons", text.font_data.names[3]);
+    const font = text.font_of(.icons);
+    try std.testing.expectEqual(@as(u32, icons.all.len + 1), font.glyph_count);
+    try std.testing.expectEqual(@as(u32, 1000), font.units_per_em);
+    for (icons.all) |codepoint| try std.testing.expect(text.ttf.glyph_id(font, codepoint) != 0);
+    try std.testing.expectEqualSlices([2]u21, &icons.ranges, text.font_data.face_ranges[3]);
+    // The library's faces keep the default ranges.
+    try std.testing.expect(text.font_data.subset);
+    try std.testing.expectEqual(@as(u16, 0), text.ttf.glyph_id(font, 'A'));
+}
+
+/// The centre of each glyph quad drawn last, in logical pixels.
+fn glyph_centres(out: [][2]f32) [][2]f32 {
+    const glyphs = test_context.draw.items(quads.Glyph);
+    assert(glyphs.len <= out.len);
+    for (glyphs, out[0..glyphs.len]) |glyph, *centre| {
+        centre.* = .{ glyph.rect[0] + glyph.rect[2] / 2, glyph.rect[1] + glyph.rect[3] / 2 };
+    }
+    return out[0..glyphs.len];
+}
+
+/// True when one of `centres` is within half a pixel of `rect`'s centre.
+fn centred_in(centres: []const [2]f32, rect: Rect) bool {
+    for (centres) |centre| {
+        const dx = @abs(centre[0] - (rect.x + rect.width / 2));
+        const dy = @abs(centre[1] - (rect.y + rect.height / 2));
+        if (dx <= 0.5 and dy <= 0.5) return true;
+    }
+    return false;
+}
+
+// Locks the `type` scenario (section 2b): the type page under the bar, the transport's buttons
+// at (24, 140) 64 px apart (56 wide, 40 tall: the panel's padding, the caption, a gap), the
+// toolbar's at x 368 (16 + 336 + 8 + 8); every icon button's glyph centred on its button to
+// half a pixel; no icon missing from the face, and no overflow.
+test "the type scenario centres each icon in its button" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "type");
+    try std.testing.expectEqual(page_type, app.tabs.selected);
+    try std.testing.expectEqualStrings("page type", app.status_text());
+    try expect_rect(area_rect(app.transport[0].id), 24, 140, 56, 40);
+    try expect_rect(area_rect(app.transport[1].id), 88, 140, 56, 40);
+    try expect_rect(area_rect(app.tools[0].id), 368, 140, 40, 40);
+    var storage: [glyph_cap][2]f32 = undefined;
+    const centres = glyph_centres(&storage);
+    for (&app.transport) |*button| try std.testing.expect(centred_in(centres, area_rect(button.id)));
+    for (&app.tools) |*button| try std.testing.expect(centred_in(centres, area_rect(button.id)));
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.text.icon_missing);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+    try std.testing.expect(test_context.find(app.buttons[0].id) == null);
+}
+
+// Locks the `transport` scenario (section 2b): play shows pause while playing and reports
+// "transport play"; a second click pauses; stop while playing shows play again.
+test "the transport scenario turns play into pause" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "transport");
+    try std.testing.expect(app.playing);
+    try std.testing.expectEqualStrings("transport play", app.status_text());
+    try std.testing.expectEqualSlices(u8, &pause_label[0], app.transport[transport_play].label);
+    const again = [_]bench.Step{.{ .click = bench.area("transport", transport_play) }};
+    const pause: bench.Scenario = .{ .name = "pause", .setup = &again, .cycle = &.{.{ .wait = 1 }}, .frames = 1 };
+    _ = try bench.replay_headless(App, app, &test_context, &pause, .{ 1280, 720 }, 2);
+    try std.testing.expect(!app.playing);
+    try std.testing.expectEqualStrings("transport pause", app.status_text());
+    const play_then_stop = [_]bench.Step{
+        .{ .click = bench.area("transport", transport_play) },
+        .{ .click = bench.area("transport", transport_stop) },
+    };
+    const stop: bench.Scenario = .{ .name = "stop", .setup = &play_then_stop, .cycle = &.{.{ .wait = 1 }}, .frames = 1 };
+    _ = try bench.replay_headless(App, app, &test_context, &stop, .{ 1280, 720 }, 3);
+    try std.testing.expect(!app.playing);
+    try std.testing.expectEqualStrings("transport stop", app.status_text());
+    try std.testing.expectEqualSlices(u8, &transport_labels[transport_play], app.transport[transport_play].label);
+}
+
+// Locks the toolbar (section 2b): a click on save reports "toolbar save", and hovering the
+// settings button past the dwell shows its "Settings" tooltip.
+test "the toolbar reports clicks and shows tooltips" {
+    const app = new_app();
+    _ = frame(app);
+    const steps = [_]bench.Step{
+        .{ .click = tab(page_type) },
+        .{ .click = bench.area("tool", 1) },
+        .{ .hover = .{ .target = bench.area("tool", 2), .x = 20, .y = 20 } },
+    };
+    const scenario: bench.Scenario = .{ .name = "tools", .setup = &steps, .cycle = &.{.{ .wait = 1 }}, .frames = 1 };
+    _ = try bench.replay_headless(App, app, &test_context, &scenario, .{ 1280, 720 }, steps.len + 1);
+    try std.testing.expectEqualStrings("toolbar save", app.status_text());
+    var frames: u32 = 0;
+    while (frames < 31) : (frames += 1) _ = ui.animate(App, app, &test_context, 1000.0 / 60.0);
+    try std.testing.expect(app.tooltip.visible());
+    try std.testing.expectEqualStrings("Settings", app.tooltip.text_of());
 }
 
 // Locks the preset names: row 0 is "preset 0001" and row 999 "preset 1000".

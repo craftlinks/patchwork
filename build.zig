@@ -84,19 +84,38 @@
 //!   (`tools/compare.zig`).
 //!
 //! ## 6. Fonts
-//! `add_font_module(patchwork_builder, ranges)` builds `tools/subset.zig` for the host, runs it
-//! once per face in `src/text/fonts/` with `ranges` (`src/text/subset.zig`), and writes the
-//! three outputs beside a generated `fonts.zig` that embeds them: the `patchwork_fonts` module
-//! every library module imports. It has no target, so one module serves the native and wasm
-//! libraries, and the default ranges' module is made once per builder. Null ranges copy the
-//! full faces instead. The tool's runs are cached, so a build with unchanged faces and ranges
-//! runs it zero times.
+//! `add_font_module(patchwork_builder, ranges, fonts)` builds `tools/subset.zig` for the host,
+//! runs it once per face in `src/text/fonts/` with `ranges` (`src/text/subset.zig`) and once
+//! per app face (`AppOptions.fonts`) with that face's ranges, and writes the outputs beside a
+//! generated `fonts.zig` that embeds them: the `patchwork_fonts` module every library module
+//! imports. `fonts.zig` declares `Face`, the library's three tags at 0, 1, and 2 and then the
+//! app's in order, so `.{ .face = .icons }` compiles only in an app that added `icons`. The
+//! module has no target, so one serves the native and wasm libraries, and the default ranges'
+//! module without app faces is made once per builder. Null ranges copy a face whole instead.
+//! The tool's runs are cached, so a build with unchanged faces and ranges runs it zero times.
+//! `addApp` checks the app's face list first (`subset.check_faces`) and panics naming the
+//! face and the problem.
 
 const std = @import("std");
 const subset = @import("src/text/subset.zig");
+const gallery_icons = @import("examples/gallery/icons.zig");
 
 /// The codepoints an app's faces cover unless it passes `font_ranges` (`src/text/subset.zig`).
 pub const default_font_ranges: []const [2]u21 = &subset.default_ranges;
+
+/// Faces an app may add beside the library's three (section 6).
+pub const app_face_max: u32 = subset.app_face_max;
+
+/// One face an app adds beside the library's three (section 6).
+pub const FontOption = struct {
+    /// A Zig identifier: becomes the `text.Face` tag. Not sans, sans_bold, or mono.
+    name: []const u8,
+    /// A TrueType face with `glyf` outlines, usually `b.path(...)` in the consumer's tree.
+    source: std.Build.LazyPath,
+    /// Codepoints to keep, increasing and apart. Null keeps the app's `font_ranges` (null
+    /// there: the full face).
+    ranges: ?[]const [2]u21 = null,
+};
 
 /// Options for `addApp`. `target` applies to the native executable and the tests, and
 /// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
@@ -112,6 +131,9 @@ pub const AppOptions = struct {
     /// Codepoint ranges the embedded faces keep, on both targets (section 6). Null embeds
     /// the full faces.
     font_ranges: ?[]const [2]u21 = default_font_ranges,
+    /// Faces the app adds, at most `app_face_max`: `text.Face` tags after the library's three
+    /// (section 6).
+    fonts: []const FontOption = &.{},
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -147,7 +169,8 @@ pub fn addApp(
     options: AppOptions,
 ) AppSteps {
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    const fonts = add_font_module(patchwork_builder, options.font_ranges);
+    check_fonts(options);
+    const fonts = add_font_module(patchwork_builder, options.font_ranges, options.fonts);
     const optimize = options.optimize;
     const native_library = add_library_module(patchwork_builder, options.target, optimize, fonts);
     const wasm_library = add_library_module(patchwork_builder, wasm_target, optimize, fonts);
@@ -213,24 +236,81 @@ const faces = [_]struct { name: []const u8, source: []const u8 }{
     .{ .name = "mono", .source = "src/text/fonts/NotoSansMono-Regular.ttf" },
 };
 
-/// The default ranges' module, made once per Patchwork builder and shared by every app and
-/// both targets.
+comptime {
+    std.debug.assert(faces.len == subset.library_faces.len);
+    for (faces, subset.library_faces) |face, name| {
+        std.debug.assert(std.mem.eql(u8, face.name, name));
+    }
+}
+
+/// The default ranges' module without app faces, made once per Patchwork builder and shared by
+/// every such app and both targets.
 var default_fonts: ?struct { builder: *std.Build, module: *std.Build.Module } = null;
 
-/// The generated `patchwork_fonts` module (section 6): the three faces subset to `ranges` by
-/// `tools/subset.zig` (or copied whole when `ranges` is null), and `fonts.zig`, which embeds
-/// them. It has no target of its own, so the native and wasm libraries share it.
-pub fn add_font_module(patchwork_builder: *std.Build, ranges: ?[]const [2]u21) *std.Build.Module {
+/// Panics, naming the app and the face, when `options.fonts` breaks `subset.check_faces`
+/// (section 6). Configure time, so a bad list never reaches the compiler.
+fn check_fonts(options: AppOptions) void {
+    var specs: [app_face_max + 1]subset.FaceSpec = undefined;
+    const count = @min(options.fonts.len, specs.len);
+    for (options.fonts[0..count], specs[0..count]) |font, *spec| {
+        spec.* = .{ .name = font.name, .ranges = font.ranges };
+    }
+    const found = subset.check_faces(specs[0..count]) orelse return;
+    const name = if (found.index < options.fonts.len) options.fonts[found.index].name else "";
+    std.debug.panic("addApp {s}: fonts[{d}] '{s}': {s}", .{
+        options.name,
+        found.index,
+        name,
+        subset.problem_text(found.problem),
+    });
+}
+
+/// The generated `patchwork_fonts` module (section 6): the three faces subset to `ranges` and
+/// each of `fonts` to its own ranges (else `ranges`) by `tools/subset.zig`, or copied whole
+/// when those are null, and `fonts.zig`, which embeds them. It has no target of its own, so
+/// the native and wasm libraries share it.
+pub fn add_font_module(
+    patchwork_builder: *std.Build,
+    ranges: ?[]const [2]u21,
+    fonts: []const FontOption,
+) *std.Build.Module {
     const b = patchwork_builder;
-    const is_default = if (ranges) |list| list.ptr == default_font_ranges.ptr else false;
+    const is_default = fonts.len == 0 and
+        if (ranges) |list| list.ptr == default_font_ranges.ptr else false;
     if (is_default) {
         if (default_fonts) |made| {
             if (made.builder == b) return made.module;
         }
     }
     const files = b.addWriteFiles();
-    if (ranges) |list| {
-        const tool = b.addExecutable(.{
+    var tool: ?*std.Build.Step.Compile = null;
+    for (faces) |face| {
+        add_face(b, files, &tool, .{ .name = face.name, .source = b.path(face.source) }, ranges);
+    }
+    for (fonts) |font| add_face(b, files, &tool, font, font.ranges orelse ranges);
+    _ = files.add("fonts.zig", fonts_source(b, ranges, fonts));
+    const root = files.getDirectory().path(b, "fonts.zig");
+    const module = b.createModule(.{ .root_source_file = root });
+    if (is_default) default_fonts = .{ .builder = b, .module = module };
+    return module;
+}
+
+/// Writes `<name>.ttf` into `files`: `font` subset to `ranges` by the tool (built on first
+/// use into `tool`), or copied whole when `ranges` is null.
+fn add_face(
+    b: *std.Build,
+    files: *std.Build.Step.WriteFile,
+    tool: *?*std.Build.Step.Compile,
+    font: FontOption,
+    ranges: ?[]const [2]u21,
+) void {
+    const name = b.fmt("{s}.ttf", .{font.name});
+    const list = ranges orelse {
+        _ = files.addCopyFile(font.source, name);
+        return;
+    };
+    const subsetter = tool.* orelse made: {
+        const exe = b.addExecutable(.{
             .name = "subset",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tools/subset.zig"),
@@ -238,27 +318,17 @@ pub fn add_font_module(patchwork_builder: *std.Build, ranges: ?[]const [2]u21) *
                 .optimize = .ReleaseSafe,
             }),
         });
-        tool.root_module.addImport("subset", b.createModule(.{
+        exe.root_module.addImport("subset", b.createModule(.{
             .root_source_file = b.path("src/text/subset.zig"),
         }));
-        const spec = ranges_arg(b, list);
-        for (faces) |face| {
-            const run = b.addRunArtifact(tool);
-            run.addFileArg(b.path(face.source));
-            const output = run.addOutputFileArg(b.fmt("{s}.ttf", .{face.name}));
-            run.addArg(spec);
-            _ = files.addCopyFile(output, b.fmt("{s}.ttf", .{face.name}));
-        }
-    } else {
-        for (faces) |face| {
-            _ = files.addCopyFile(b.path(face.source), b.fmt("{s}.ttf", .{face.name}));
-        }
-    }
-    _ = files.add("fonts.zig", fonts_source(b, ranges));
-    const root = files.getDirectory().path(b, "fonts.zig");
-    const module = b.createModule(.{ .root_source_file = root });
-    if (is_default) default_fonts = .{ .builder = b, .module = module };
-    return module;
+        tool.* = exe;
+        break :made exe;
+    };
+    const run = b.addRunArtifact(subsetter);
+    run.addFileArg(font.source);
+    const output = run.addOutputFileArg(name);
+    run.addArg(ranges_arg(b, list));
+    _ = files.addCopyFile(output, name);
 }
 
 /// `ranges` as the tool's argument: `20-7E,A0-FF,...` in hex.
@@ -272,25 +342,54 @@ fn ranges_arg(b: *std.Build, ranges: []const [2]u21) []const u8 {
     return spec;
 }
 
-/// The generated `fonts.zig` of `patchwork_fonts`.
-fn fonts_source(b: *std.Build, ranges: ?[]const [2]u21) []const u8 {
-    const everything: []const [2]u21 = &.{.{ 0, 0x10FFFF }};
-    var list: []const u8 = "";
-    for (ranges orelse everything) |range| {
-        list = b.fmt("{s}    .{{ 0x{X}, 0x{X} }},\n", .{ list, range[0], range[1] });
+/// The generated `fonts.zig` of `patchwork_fonts` (section 6).
+fn fonts_source(b: *std.Build, ranges: ?[]const [2]u21, fonts: []const FontOption) []const u8 {
+    var tags: []const u8 = "";
+    var names: []const u8 = "";
+    var data: []const u8 = "";
+    var kept: []const u8 = "";
+    for (faces, 0..) |face, index| {
+        tags = b.fmt("{s}    {s} = {d},\n", .{ tags, face.name, index });
+        names = b.fmt("{s}    \"{s}\",\n", .{ names, face.name });
+        data = b.fmt("{s}    @embedFile(\"{s}.ttf\"),\n", .{ data, face.name });
+        kept = b.fmt("{s}    ranges,\n", .{kept});
+    }
+    for (fonts, faces.len..) |font, index| {
+        tags = b.fmt("{s}    {s} = {d},\n", .{ tags, font.name, index });
+        names = b.fmt("{s}    \"{s}\",\n", .{ names, font.name });
+        data = b.fmt("{s}    @embedFile(\"{s}.ttf\"),\n", .{ data, font.name });
+        kept = b.fmt("{s}    {s},\n", .{ kept, ranges_source(b, font.ranges orelse ranges) });
     }
     return b.fmt(
         \\//! Generated by Patchwork's `build.zig` (`add_font_module`): the faces `text.zig` embeds.
-        \\pub const sans = @embedFile("sans.ttf");
-        \\pub const sans_bold = @embedFile("sans_bold.ttf");
-        \\pub const mono = @embedFile("mono.ttf");
-        \\/// False when the faces are the full files.
+        \\/// The faces: the library's three, then the app's (`AppOptions.fonts`) in order.
+        \\pub const Face = enum(u8) {{
+        \\{s}}};
+        \\/// Each face's name, by `Face`.
+        \\pub const names = [_][]const u8{{
+        \\{s}}};
+        \\/// Each face's bytes, by `Face`.
+        \\pub const data = [_][]const u8{{
+        \\{s}}};
+        \\/// False when the library's faces are the full files.
         \\pub const subset = {};
-        \\/// The codepoints kept.
-        \\pub const ranges: []const [2]u21 = &.{{
+        \\/// The codepoints the library's faces keep.
+        \\pub const ranges: []const [2]u21 = {s};
+        \\/// The codepoints each face keeps, by `Face`.
+        \\pub const face_ranges = [_][]const [2]u21{{
         \\{s}}};
         \\
-    , .{ ranges != null, list });
+    , .{ tags, names, data, ranges != null, ranges_source(b, ranges), kept });
+}
+
+/// `ranges` as a Zig slice literal; null is every codepoint.
+fn ranges_source(b: *std.Build, ranges: ?[]const [2]u21) []const u8 {
+    const everything: []const [2]u21 = &.{.{ 0, 0x10FFFF }};
+    var list: []const u8 = "";
+    for (ranges orelse everything) |range| {
+        list = b.fmt("{s} .{{ 0x{X}, 0x{X} }},", .{ list, range[0], range[1] });
+    }
+    return b.fmt("&.{{{s} }}", .{list});
 }
 
 /// The consumer's app file, compiled against the library module of the same target.
@@ -468,7 +567,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    library.addImport("patchwork_fonts", add_font_module(b, default_font_ranges));
+    library.addImport("patchwork_fonts", add_font_module(b, default_font_ranges, &.{}));
 
     const rack = addApp(b, b, .{
         .name = "rack",
@@ -548,6 +647,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .wgpu_lib_dir = wgpu_lib_dir,
+        .fonts = &.{.{
+            .name = "icons",
+            .source = b.path("examples/gallery/fonts/lucide.ttf"),
+            .ranges = &gallery_icons.ranges,
+        }},
     });
     b.getInstallStep().dependOn(gallery.install);
     add_example_steps(b, "-gallery", "the widget gallery", gallery);

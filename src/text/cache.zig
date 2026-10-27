@@ -13,7 +13,7 @@
 //! The size key is `size_q = round(size_logical * scale_120 / 30)`, the em size in quarter
 //! device pixels. The key packs an occupied bit, the face, `size_q`, and the 12-bit glyph id:
 //! ```text
-//! key = 1 << 31 | face << 28 | size_q << 12 | glyph
+//! key = 1 << 31 | face << 28 | size_q << 12 | glyph        (face < text.face_cap = 8)
 //! ```
 //! `slot_count` slots are probed linearly from a multiplicative hash, and at most
 //! `entry_cap` (half of them) are filled, so a probe sequence stays short and always ends on
@@ -128,6 +128,10 @@ pub const Cache = struct {
     pending: u32,
     /// Glyphs skipped this frame that no reset can fit (thrash guard).
     overflow_count: u32,
+    /// `text.icon` calls this frame whose codepoint the face does not map (`text/layout.zig`,
+    /// section 3a), and the last of them as `face << 21 | codepoint`.
+    icon_missing: u32,
+    icon_last: u32,
     /// Resets so far.
     epoch: u32,
     reset_owed: bool,
@@ -146,6 +150,8 @@ pub const Cache = struct {
         self.new_count = 0;
         self.pending = 0;
         self.overflow_count = 0;
+        self.icon_missing = 0;
+        self.icon_last = 0;
         self.epoch = 0;
         self.reset_owed = false;
         self.fresh = true;
@@ -181,6 +187,8 @@ pub const Cache = struct {
         self.new_count = 0;
         self.pending = 0;
         self.overflow_count = 0;
+        self.icon_missing = 0;
+        self.icon_last = 0;
         self.drawn_scale_120 = self.scale_120;
         assert(!self.reset_owed);
         assert(self.pending == 0);
@@ -202,6 +210,15 @@ pub const Cache = struct {
 
     /// The entry for `glyph` of `face` at `size_q`, rasterizing it on a miss. Null when the
     /// glyph is skipped this frame (budget, full atlas, or overflow).
+    /// Counts a `text.icon` call for a codepoint `face` does not map; the overflow report
+    /// carries it (`ui/cx.zig`, section 10).
+    pub fn miss_icon(self: *Cache, face: u8, codepoint: u21) void {
+        assert(face < text.face_cap);
+        self.icon_missing += 1;
+        self.icon_last = @as(u32, face) << 21 | codepoint;
+        assert(self.icon_missing >= 1);
+    }
+
     pub fn glyph(
         self: *Cache,
         face: u8,
@@ -209,7 +226,7 @@ pub const Cache = struct {
         glyph_id: u16,
         size_q: u32,
     ) ?Entry {
-        assert(face < 4);
+        assert(face < text.face_cap);
         assert(size_q >= 1);
         assert(size_q <= size_q_max);
         assert(glyph_id < ttf.glyph_cap);
@@ -450,6 +467,8 @@ comptime {
     assert(atlas_side <= std.math.maxInt(u16));
     assert(raster.side_cap <= std.math.maxInt(u8));
     assert(size_q_max < 1 << 16);
+    // The face takes bits 28 to 30, between `size_q` and the occupied bit.
+    assert((text.face_cap - 1) << 28 < 1 << 31);
     assert(@sizeOf(Entry) == 16);
     assert(budget <= entry_cap);
 }

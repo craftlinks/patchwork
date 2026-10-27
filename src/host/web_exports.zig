@@ -270,7 +270,7 @@ fn WebApp(comptime App: type) type {
         var audio_source: Source = undefined;
         var audio_rendered: realtime.Block = undefined;
         /// The last overflow report, and whether `overflow_take` has yet to hand it out.
-        var overflow_counts: [3]u32 = @splat(0);
+        var overflow_counts: [5]u32 = @splat(0);
         var overflow_pending: bool = false;
         /// Key names and pastes from `shell.js` (section 4a).
         var input_buffer: [input_cap]u8 = undefined;
@@ -537,8 +537,9 @@ fn WebApp(comptime App: type) type {
             return 1;
         }
 
-        /// The address of the last overflow report's three counts (instances, areas, glyphs)
-        /// once, or 0: `shell.js` logs it after `tick` (`ui/cx.zig`, section 10).
+        /// The address of the last overflow report's five words (instances, areas, glyphs,
+        /// missing icons, the last missing icon as `face << 21 | codepoint`) once, or 0:
+        /// `shell.js` logs it after `tick` (`ui/cx.zig`, section 10).
         fn overflow_take() callconv(.c) u32 {
             if (!overflow_pending) return 0;
             overflow_pending = false;
@@ -764,7 +765,13 @@ fn WebApp(comptime App: type) type {
             assert(context.draw.text.drawn_scale_120 == scale_120);
             if (std.debug.runtime_safety) {
                 if (context.overflow_report()) |refused| {
-                    overflow_counts = .{ refused.instances, refused.areas, refused.glyphs };
+                    overflow_counts = .{
+                        refused.instances,
+                        refused.areas,
+                        refused.glyphs,
+                        refused.icons,
+                        refused.icon,
+                    };
                     overflow_pending = true;
                 }
             }

@@ -175,6 +175,7 @@ const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
+const font_data = @import("../text.zig").font_data;
 const ui = @import("../ui.zig");
 const wl_callback = @import("wl_callback.zig");
 const wl_seat = @import("wl_seat.zig");
@@ -1386,13 +1387,24 @@ fn Host(comptime App: type) type {
             }
         }
 
-        /// One line per changed overflow (`ui/cx.zig`, section 10).
+        /// One line per changed overflow (`ui/cx.zig`, section 10), and one for missing
+        /// icons.
         fn log_overflow(refused: ui.cx.Overflow) void {
-            std.debug.print(
-                "overflow: {d} instances, {d} areas, {d} glyphs refused this frame " ++
-                    "(raise App.config caps)\n",
-                .{ refused.instances, refused.areas, refused.glyphs },
-            );
+            if (refused.instances + refused.areas + refused.glyphs > 0) {
+                std.debug.print(
+                    "overflow: {d} instances, {d} areas, {d} glyphs refused this frame " ++
+                        "(raise App.config caps)\n",
+                    .{ refused.instances, refused.areas, refused.glyphs },
+                );
+            }
+            if (refused.icons > 0) {
+                const face = refused.icon >> 21;
+                const name = if (face < font_data.names.len) font_data.names[face] else "?";
+                std.debug.print(
+                    "icons: {d} drawn this frame are not in their face (last U+{X:0>4} in {s})\n",
+                    .{ refused.icons, refused.icon & 0x1FFFFF, name },
+                );
+            }
         }
 
         /// Blocks until the compositor writes, the app timer fires, or the latched

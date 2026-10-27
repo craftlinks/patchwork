@@ -33,7 +33,8 @@
 //!
 //! The bounding box is computed from the decoded points, so a composite's box is exactly the
 //! union of its offset components (test "composite e bounds are the union of base and
-//! accent").
+//! accent"), and does not trust the box a glyph's header stores (some icon fonts write 0 for
+//! every `xMin` and `yMin`).
 //!
 //! ## 4. TigerStyle Invariants
 //! - `Outline` is a fixed scratch owned by the cache; nothing allocates.

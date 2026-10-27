@@ -37,6 +37,21 @@
 //! lands on a device pixel edge and each fragment center samples one texel center: the UVs
 //! need no half-texel inset and the gutter is never read.
 //!
+//! ## 3a. Icons
+//! `icon` draws one glyph centred by its ink, not its advance and line. The ink is the cache
+//! entry's raster box (the decoded points' box, floored and ceiled to device pixels; the
+//! glyph header's box is not trusted, since some icon fonts store 0 for every minimum). With
+//! the rect's centre `(c_x, c_y)` and the box in device pixels (`left`, `top`, `width`,
+//! `height`, each times `k`):
+//! ```text
+//! pen_x       = round(c_x * s - width / 2 - left) / s
+//! baseline_px = round(c_y * s + top - height / 2)
+//! ```
+//! so the quad's centre lands within half a device pixel of the rect's centre whatever the
+//! face's advances and baseline (icon fonts are often inconsistent in both), and its edges on
+//! the grid as above. A codepoint the face does not map draws nothing, not `.notdef`, and is
+//! counted for the overflow report (`cache.miss_icon`).
+//!
 //! ## 4. TigerStyle Invariants
 //! - Loops are bounded by `text.byte_cap` bytes and `text.run_cap` runs.
 //! - `measure` is pure; only `place_runs` touches the cache, through `cx.text`.
@@ -282,6 +297,46 @@ fn emit(
     return advance;
 }
 
+/// Draws `codepoint` of `face` at `size` with its ink centred on `rect`, clipped to `clip`. See
+/// the module guide, section 3a.
+pub fn icon(
+    cx: anytype,
+    face: text.Face,
+    codepoint: u21,
+    size: f32,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    color: [4]f32,
+) void {
+    assert(size > 0);
+    assert(size <= text.size_max);
+    assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
+    const font = text.font_of(face);
+    const id = ttf.glyph_id(font, codepoint);
+    if (id == 0) {
+        cx.text.miss_icon(@backingInt(face), codepoint);
+        return;
+    }
+    const scale = cx.text.device_scale();
+    const size_q = cx.text.size_key_of(size);
+    const entry = cx.text.glyph(@backingInt(face), font, id, size_q) orelse return;
+    if (entry.width == 0) return;
+    const stretch = @as(f32, @floatFromInt(size_q)) / @as(f32, @floatFromInt(entry.raster_q));
+    const left = @as(f32, @floatFromInt(entry.left)) * stretch;
+    const top = @as(f32, @floatFromInt(entry.top)) * stretch;
+    const width = @as(f32, @floatFromInt(entry.width)) * stretch;
+    const height = @as(f32, @floatFromInt(entry.height)) * stretch;
+    const centre_x = (rect.x + rect.width * 0.5) * scale;
+    const centre_y = (rect.y + rect.height * 0.5) * scale;
+    const pen_x = @round(centre_x - width * 0.5 - left) / scale;
+    const baseline_px = @round(centre_y + top - height * 0.5);
+    append_glyph(cx, instance_of(entry, size_q, pen_x, baseline_px, scale, .{
+        .clip = clip,
+        .color = color,
+    }));
+}
+
 /// What a glyph instance carries besides its cache entry and pen.
 pub const Paint = struct {
     clip: draw.Clip,
@@ -462,8 +517,9 @@ test "alignment offsets the pen by zero, half the gap, and the gap" {
     try testing.expectEqual(@round(rect.x + gap * 0.5) - @round(rect.x), x[1] - x[0]);
     try testing.expectEqual(@round(rect.x + gap) - @round(rect.x), x[2] - x[0]);
     const font = text.font_of(.sans);
-    const ascent = @as(f32, @floatFromInt(font.ascent)) * 16 / 1000;
-    const descent = @as(f32, @floatFromInt(font.descent)) * 16 / 1000;
+    const em: f32 = @floatFromInt(font.units_per_em);
+    const ascent = @as(f32, @floatFromInt(font.ascent)) * 16 / em;
+    const descent = @as(f32, @floatFromInt(font.descent)) * 16 / em;
     const baseline = @round(rect.y + (rect.height - ascent - descent) * 0.5 + ascent);
     // "H" sits on the baseline: its bitmap's bottom row is the baseline row.
     const glyph = test_context(120).text.glyph(0, font, ttf.glyph_id(font, 'H'), 64).?;
@@ -532,4 +588,46 @@ test "runs of different sizes share one baseline" {
     const big_bottom = glyphs[0].rect[1] + glyphs[0].rect[3];
     try testing.expectEqual(big_bottom, glyphs[1].rect[1] + glyphs[1].rect[3]);
     try testing.expect(glyphs[0].rect[3] > glyphs[1].rect[3]);
+}
+
+// Locks icon centring (section 3a) at scale 1.5: "." has its ink low and left of its advance
+// box, yet its quad's centre lands on the rect's centre to within half a device pixel, with
+// every edge on the device grid; `place` would have put it on the baseline instead.
+test "icon centres the ink box on the rect to the device pixel" {
+    const cx = test_context(180);
+    const rect: draw.Rect = .{ .x = 10.3, .y = 7.1, .width = 64, .height = 48 };
+    icon(cx, .sans, '.', 40, rect, window, .{ 1, 1, 1, 1 });
+    const glyphs = cx.items(types.Glyph);
+    try testing.expectEqual(@as(usize, 1), glyphs.len);
+    const quad = glyphs[0].rect;
+    for (quad) |edge| {
+        try testing.expectApproxEqAbs(@round(edge * 1.5), edge * 1.5, 0.001);
+    }
+    const centre_x = (quad[0] + quad[2] * 0.5) * 1.5;
+    const centre_y = (quad[1] + quad[3] * 0.5) * 1.5;
+    try testing.expect(@abs(centre_x - (rect.x + rect.width * 0.5) * 1.5) <= 0.5);
+    try testing.expect(@abs(centre_y - (rect.y + rect.height * 0.5) * 1.5) <= 0.5);
+    try testing.expectEqual(@as(u32, 0), cx.text.icon_missing);
+    // `place` puts the period on the baseline, far below the centre.
+    const placed = test_context(180);
+    place(placed, .{ .face = .sans, .size = 40, .color = .{ 1, 1, 1, 1 } }, ".", rect, window, .{
+        .align_x = .center,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+    const dot = placed.items(types.Glyph)[0].rect;
+    try testing.expect(dot[1] + dot[3] * 0.5 > rect.y + rect.height * 0.5 + 4);
+}
+
+// Locks the missing icon (section 3a): a codepoint the face does not map (U+0416 is outside
+// the subset) appends nothing, not `.notdef`, and is counted with its face and codepoint.
+test "icon of an unmapped codepoint appends nothing and is counted" {
+    const cx = test_context(120);
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 32, .height = 32 };
+    icon(cx, .sans_bold, 0x0416, 18, rect, window, .{ 1, 1, 1, 1 });
+    try testing.expectEqual(@as(usize, 0), cx.items(types.Glyph).len);
+    try testing.expectEqual(@as(u32, 1), cx.text.icon_missing);
+    try testing.expectEqual(@as(u32, 1 << 21 | 0x0416), cx.text.icon_last);
+    cx.reset();
+    try testing.expectEqual(@as(u32, 0), cx.text.icon_missing);
 }
