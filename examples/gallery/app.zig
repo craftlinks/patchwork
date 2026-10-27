@@ -1,4 +1,4 @@
-//! Gallery example: every library widget on three tabbed pages, built only from the kit.
+//! Gallery example: every library widget on five tabbed pages, built only from the kit.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -12,8 +12,9 @@
 //! behaviour in the gallery's own skin (section 3b). A `widgets.Tabs` bar under the title holds
 //! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32), "popups" (step 33:
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
-//! "containers" (step 34: splitters, a list box, and number boxes), and "type" (step 36: an
-//! icon face beside the library's three; section 2b). Tooltips show on every knob of the
+//! "containers" (step 34: splitters, a list box, and number boxes), "type" (step 36: an icon
+//! face beside the library's three; section 2b), and "files" (step 37: a drop zone, the
+//! dropped files, and a WAV's waveform; section 2c). Tooltips show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
 //! ## 2. Layout (logical pixels)
@@ -41,6 +42,9 @@
 //!                           | sizes (fill: 5 cells of 64 x 48)
 //!   set    fill x 84        the 14 icons at 24 px in 40 px cells
 //!   faces  fill x fill      a line in each library face at 16 px, 28 px apart
+//! files
+//!   column 400 x fill       the drop zone (fill x 200) over the files' list box (fill x fill)
+//!   wave   fill x fill      the WAV's info line (20), then its waveform (fill x fill)
 //! ```
 //! The frame, `(0, 0, 1280, 704)`, is the 1280 by 720 browser viewport's width and the screen's
 //! height.
@@ -71,6 +75,16 @@
 //! buttons shows a tooltip. The size ladder draws the settings icon at 12, 16, 24, 32, and 48
 //! px, each centred in a cell, and the icon set every icon at 24 px; no hinting, so the
 //! smallest is soft. Last, a line in each Noto face.
+//!
+//! ## 2c. Files
+//! The files page is `files.zig`: one area flagged `drop` (step 37) over a panel that highlights
+//! its border in the accent while a file drag is over it (`cx.drop_hovering`); the dropped
+//! files in a `ListBox` with their sizes and statuses ("reading 42%", "done", "folder", "cut at
+//! 21.8 s"); and the first WAV among them, decoded chunk by chunk (`wav.zig`) into one
+//! `samples_max` buffer and drawn as a `draw.Waveform` from a `wave.Pyramid`. A WAV longer than
+//! the buffer cancels itself (`cx.cancel_files`); the other files are counted, not stored. The
+//! status line reports "drop 3 files", "file tone.wav done", "file long.wav cut", and "drop on
+//! nothing".
 //!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
@@ -126,7 +140,10 @@
 //! divider 120 px left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled
 //! into view); `number` (drag the frequency up 40 px, double-click the gain, type "-6.5",
 //! Enter). Type (section 2b): `type` (the type page, still); `transport` (click play: its icon
-//! is pause). The app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
+//! is pause). Files (section 2c): `files` (the files page, empty); `drop-hover` (files dragged
+//! over the zone: its border lit); `drop` (three files dropped on the zone: `tone.wav`, 96,044
+//! bytes of a 120 Hz tone in two chunks, `readme.txt`, and a folder: the tone's waveform). The
+//! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
 //!
@@ -147,6 +164,7 @@ const kit = widgets.kit;
 const bench = patchwork.bench;
 const hardware = @import("hardware.zig");
 const icons = @import("icons.zig");
+const files_page = @import("files.zig");
 
 const Rect = quads.Rect;
 
@@ -256,11 +274,12 @@ const side_id = ui.id("side", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
 const page_type: u32 = 3;
+const page_files: u32 = 4;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -369,9 +388,9 @@ const rows_drawn_max: u32 = 7;
 /// Pool and area capacities; the comptime block checks them against the counts.
 const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
-const glyph_cap: u32 = 640;
+const glyph_cap: u32 = 1024;
 const path_cap: u32 = 4;
-const point_cap: u32 = 16;
+const point_cap: u32 = 2048;
 const dial_cap: u32 = 8;
 const bevel_cap: u32 = 8;
 const led_cap: u32 = 4;
@@ -424,6 +443,8 @@ pub const App = struct {
     transport: [transport_icons.len]IconButton,
     playing: bool,
     tools: [tool_icons.len]IconButton,
+    /// The files page (section 2c): the drop zone, the dropped files, and a WAV's samples.
+    drops: files_page.Page,
     view: ui.ViewState,
     /// The rows drawn last, which `event` routes.
     drawn: ui.List.Range,
@@ -442,6 +463,7 @@ pub const App = struct {
             .{ .type = hardware.Bevel, .cap = bevel_cap },
             .{ .type = hardware.Led, .cap = led_cap },
             .{ .type = quads.Path, .cap = path_cap },
+            .{ .type = quads.Waveform, .cap = 1 },
         },
         .area_cap = area_cap,
         .point_cap = point_cap,
@@ -466,6 +488,9 @@ pub const App = struct {
         .{ .name = "number", .setup = &number_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "type", .setup = &type_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "transport", .setup = &transport_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "files", .setup = &files_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "drop-hover", .setup = &drop_hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "drop", .setup = &drop_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -486,6 +511,7 @@ pub const App = struct {
             button.* = icon_button(ui.id("transport", @intCast(index)), label, transport_button_w, color);
         }
         app.playing = false;
+        app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
         }
@@ -610,6 +636,7 @@ pub const App = struct {
         app.popup_events(cx, event_value);
         app.container_events(cx, event_value);
         app.type_events(cx, event_value);
+        if (app.drops.handle(cx, event_value)) |report| app.note(cx, report.slice());
         assert(app.status_len <= status_cap);
     }
 
@@ -774,6 +801,7 @@ pub const App = struct {
             page_popups => app.draw_popups(cx),
             page_containers => app.draw_containers(cx),
             page_type => app.draw_type(cx),
+            page_files => app.drops.draw(cx, gap_px, group_padding, panel_paint(cx)),
             else => unreachable,
         }
         _ = cx.end();
@@ -1083,10 +1111,13 @@ pub const App = struct {
         assert(app.selected.? == row);
     }
 
-    /// Writes `parts` to the status line and owes a draw.
+    /// Writes `parts` to the status line and owes a draw. A native safe build also logs it to
+    /// stderr, so a manual run (a file drop from a file manager) leaves a record.
     fn note(app: *App, cx: *Context, parts: []const []const u8) void {
         app.set_status(parts);
         cx.redraw();
+        const native = @import("builtin").os.tag == .linux and !@import("builtin").is_test;
+        if (native and std.debug.runtime_safety) std.debug.print("status: {s}\n", .{app.status_text()});
     }
 
     /// Joins `parts` into the status buffer, cut at `status_cap`.
@@ -1411,6 +1442,38 @@ const transport_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `files`: the files page, empty (section 2c).
+const files_steps = [_]bench.Step{
+    .{ .click = tab(page_files) },
+    .{ .wait = 12 },
+};
+
+/// `drop-hover`: files dragged over the zone: its border in the accent.
+const drop_hover_steps = [_]bench.Step{
+    .{ .click = tab(page_files) },
+    .{ .drop_hover = drop_zone },
+    .{ .wait = 12 },
+};
+
+/// `drop`: three files dropped on the zone: the tone (96,044 bytes, two chunks), a text file,
+/// and a folder; the tone's waveform shows.
+const drop_steps = [_]bench.Step{
+    .{ .click = tab(page_files) },
+    .{ .drop = .{ .target = drop_zone, .files = &dropped_files } },
+    .{ .wait = 12 },
+};
+
+const drop_zone: bench.Target = .{ .id = files_page.zone_id, .name = "drop_zone", .index = 0 };
+
+const dropped_files = [_]bench.File{
+    .{ .name = "tone.wav", .parts = &.{
+        .{ .bytes = &files_page.tone_header },
+        .{ .bytes = &files_page.tone_cycle, .repeat = files_page.tone_periods },
+    } },
+    .{ .name = "readme.txt", .parts = &.{.{ .bytes = files_page.readme }} },
+    .{ .name = "samples", .parts = &.{}, .readable = false },
+};
+
 /// `about`: choose About… from the File menu: the dialog over the dimmed screen.
 const about_steps = [_]bench.Step{
     .{ .click = tab(page_popups) },
@@ -1491,6 +1554,15 @@ comptime {
     assert(transport_names.len == transport_icons.len and tool_tips.len == tool_icons.len);
     // Areas: the chrome and the eight icon buttons.
     assert(chrome + transport_icons.len + tool_icons.len <= area_cap);
+    // The files page: the zone over the list, beside the waveform panel; the list shows at
+    // most 14 rows. Boxes: the title (3), the tabs (7), the zone, the list's panel, a band,
+    // and its thumb, the wave panel and its track. Areas: the zone, the list's view and
+    // thumb, and its rows.
+    assert(files_page.zone_h + gap_px + 2 * group_padding + files_page.row_px <= page_h - gap_px);
+    assert(3 + 7 + 1 + 1 + 2 + 2 <= box_cap);
+    assert(chrome + 3 + 14 <= area_cap);
+    // Points: the waveform's columns with RMS, then the dropdowns' chevrons.
+    assert(2 * (inner_w - files_page.zone_w - gap_px - 2 * group_padding) + 2 * 3 <= point_cap);
 }
 
 // ------------------------------------------------------------------------------------ tests
@@ -2108,4 +2180,90 @@ test {
 
 comptime {
     patchwork.app.check(App);
+}
+
+// Locks the `files` and `drop-hover` scenarios (section 2c): the zone is 400 x 200 at the
+// page's top-left with one drop area, and a drag over it highlights its border in the accent.
+test "the drop zone highlights under a file drag" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "files");
+    try std.testing.expectEqual(page_files, app.tabs.selected);
+    try expect_rect(area_rect(files_page.zone_id), 16, 104, 400, 200);
+    try std.testing.expect(test_context.find(files_page.zone_id).?.flags.drop);
+    try std.testing.expect(!test_context.drop_hovering(files_page.zone_id));
+    try replay(app, "drop-hover");
+    try std.testing.expect(test_context.drop_hovering(files_page.zone_id));
+    var found = false;
+    for (test_context.draw.items(quads.Box)) |box| {
+        if (box.rect[0] == 16 and box.rect[1] == 104 and box.rect[2] == 400) {
+            try std.testing.expectEqual(@as(f32, 2), box.border_width);
+            try std.testing.expectEqual(test_context.theme().accents[0], box.border_color);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// Locks the `drop` scenario (section 2c): three files listed with their sizes and statuses
+// ("tone.wav 93.8 KB done", "readme.txt 112 B done", "samples folder"), the tone decoded to
+// 48,000 samples of 48 kHz mono, its waveform drawn one column per pixel, and the status line.
+test "the drop scenario lists three files and draws the tone" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "drop");
+    const page = &app.drops;
+    try std.testing.expectEqual(@as(u8, 3), page.count);
+    try std.testing.expectEqualStrings("tone.wav", page.names[0][0..page.name_lens[0]]);
+    try std.testing.expectEqual(@as(u64, 96044), page.sizes[0]);
+    try std.testing.expectEqual(@as(u64, 96044), page.received[0]);
+    try std.testing.expectEqual(files_page.Status.done, page.status[0]);
+    try std.testing.expectEqual(files_page.Status.done, page.status[1]);
+    try std.testing.expectEqual(@as(u64, 112), page.received[1]);
+    try std.testing.expectEqual(files_page.Status.folder, page.status[2]);
+    try std.testing.expectEqual(@as(u32, 48000), page.decoder.count);
+    try std.testing.expectEqual(@as(u32, 48000), page.decoder.rate);
+    try std.testing.expect(page.shown);
+    try std.testing.expectEqualStrings("tone.wav · 48000 Hz · mono · 16-bit · 1.00 s", page.info[0..page.info_len]);
+    try std.testing.expectEqualStrings("file readme.txt done", app.status_text());
+    const waves = test_context.draw.items(quads.Waveform);
+    try std.testing.expectEqual(@as(usize, 1), waves.len);
+    try std.testing.expectEqual(@as(f32, 824 * 2), waves[0].point_count);
+    var size: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("93.8 KB", files_page.size_text(&size, 96044));
+    try std.testing.expectEqualStrings("112 B", files_page.size_text(&size, 112));
+    try std.testing.expectEqualStrings("4.0 MB", files_page.size_text(&size, 4 << 20));
+    try std.testing.expect(!test_context.drop_hovering(files_page.zone_id));
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks the big-file path (section 2c): a 30 s WAV dropped with a text file fills the
+// 1,048,576 samples, cancels only itself ("cut at 21.8 s"), and the text file after it still
+// arrives; the waveform shows what was kept.
+test "a long wav is cut at the sample cap and cancels only itself" {
+    const app = new_app();
+    _ = frame(app);
+    const seconds: u32 = 30;
+    const long_header = comptime @import("wav.zig").header(48000, 1, 48000 * 2 * 30);
+    const long = [_]bench.File{
+        .{ .name = "long.WAV", .parts = &.{
+            .{ .bytes = &long_header },
+            .{ .bytes = &files_page.tone_cycle, .repeat = 120 * seconds },
+        } },
+        .{ .name = "notes.txt", .parts = &.{.{ .bytes = "abc" }} },
+    };
+    const steps = [_]bench.Step{
+        .{ .click = tab(page_files) },
+        .{ .drop = .{ .target = drop_zone, .files = &long } },
+    };
+    const scenario: bench.Scenario = .{ .name = "long", .setup = &steps, .cycle = &.{.{ .wait = 1 }}, .frames = 1 };
+    _ = try bench.replay_headless(App, app, &test_context, &scenario, .{ 1280, 720 }, 3);
+    _ = frame(app);
+    const page = &app.drops;
+    try std.testing.expectEqual(files_page.Status.cut, page.status[0]);
+    try std.testing.expectEqual(files_page.samples_max, page.decoder.count);
+    try std.testing.expectEqualStrings("cut at 21.8 s", page.cut_text[0..page.cut_len]);
+    try std.testing.expect(page.received[0] < page.sizes[0]);
+    try std.testing.expectEqual(files_page.Status.done, page.status[1]);
+    try std.testing.expect(page.shown);
 }

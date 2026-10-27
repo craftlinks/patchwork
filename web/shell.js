@@ -75,6 +75,20 @@
 // input call and every tick, `sync_cursor` reads `cursor()` and sets `canvas.style.cursor`
 // only when it changed, using the CSS names Wasm exports (`cursor_names_ptr/len`).
 //
+// ## 7a. File Drops
+// A drag that carries files (`dataTransfer.types` includes "Files") over the canvas calls
+// `drop_over` with the canvas point on every `dragenter` and `dragover`, which are always
+// prevented so the drop is ours; `dropEffect` is "copy" when Wasm reports a drop target under
+// the point (bit 1) and "none" otherwise. `dragleave` calls `drop_leave`. On `drop` each item
+// of kind "file" is listed with `drop_add` (its name in the input buffer, its size as two
+// 32-bit halves, and readable unless `webkitGetAsEntry` says it is a directory), the `File`s are
+// kept by index, and `drop` dispatches them; when Wasm reports accepted files (bit 2)
+// `pump_files` reads them one slice at a time: `read_next` names a ticket, a file, an offset,
+// and a length; the slice's `arrayBuffer()` is written at `chunk_ptr()` (a fresh view after
+// the await, since memory may grow) and `read_done` dispatches it. A rejected read or a short
+// buffer is reported as failed. `window` prevents `dragover` and `drop` too, so a file dropped
+// beside the canvas does not open in the tab.
+//
 // ## 8. Bench Timestamps
 // Loading the page with `?bench=1` requests `timestamp-query` when the adapter offers it and
 // times every render pass on the GPU, the browser half of the native `--bench` mode
@@ -143,6 +157,10 @@ let audioApplied = false;
 // Frames per Web Audio render quantum, and interleaved samples per block.
 const BLOCK_SAMPLES = 128 * 2;
 const textEncoder = new TextEncoder();
+/** The `File`s of the last drop, by the index Wasm lists them under (guide, section 7a). */
+let droppedFiles = [];
+/** True while `pump_files` is reading. */
+let pumping = false;
 const textDecoder = new TextDecoder();
 
 // Interpreter state for the stream being replayed.
@@ -991,6 +1009,106 @@ function on_paste(event) {
 }
 
 /**
+ * True for a drag that carries files.
+ * @param {DragEvent} event
+ */
+function carries_files(event) {
+    return event.dataTransfer !== null && Array.from(event.dataTransfer.types).includes("Files");
+}
+
+/**
+ * Reports a file drag over the canvas and sets the drop effect from Wasm's answer.
+ * @param {DragEvent} event
+ */
+function on_drag_over(event) {
+    if (!carries_files(event)) {
+        return;
+    }
+    event.preventDefault();
+    const result = wasm.drop_over(event.offsetX, event.offsetY);
+    event.dataTransfer.dropEffect = (result & 2) === 2 ? "copy" : "none";
+    after_input(result);
+}
+
+/**
+ * Reports that the file drag left the canvas.
+ * @param {DragEvent} event
+ */
+function on_drag_leave(event) {
+    if (!carries_files(event)) {
+        return;
+    }
+    after_input(wasm.drop_leave());
+}
+
+/**
+ * Lists the dropped files in Wasm, dispatches the drop, and reads what the app accepted.
+ * @param {DragEvent} event
+ */
+function on_drop(event) {
+    if (!carries_files(event)) {
+        return;
+    }
+    event.preventDefault();
+    droppedFiles = [];
+    wasm.drop_reset();
+    for (const item of Array.from(event.dataTransfer.items)) {
+        if (item.kind !== "file") {
+            continue;
+        }
+        const file = item.getAsFile();
+        if (file === null) {
+            continue;
+        }
+        const entry = item.webkitGetAsEntry !== undefined ? item.webkitGetAsEntry() : null;
+        const readable = entry !== null && entry.isDirectory ? 0 : 1;
+        const size = readable === 1 ? file.size : 0;
+        const length = write_input(file.name);
+        if (wasm.drop_add(length, size >>> 0, Math.floor(size / 4294967296), readable) === 1) {
+            droppedFiles.push(file);
+        }
+    }
+    const result = wasm.drop(event.offsetX, event.offsetY);
+    after_input(result);
+    if ((result & 4) === 4) {
+        pump_files();
+    }
+}
+
+/**
+ * Reads the accepted files one slice at a time into Wasm (guide, section 7a).
+ */
+async function pump_files() {
+    if (pumping) {
+        return;
+    }
+    pumping = true;
+    for (;;) {
+        const ticket = wasm.read_next();
+        after_input(1);
+        if (ticket === 0) {
+            break;
+        }
+        const file = droppedFiles[wasm.read_file()];
+        const offset = wasm.read_offset_hi() * 4294967296 + wasm.read_offset_lo();
+        const length = wasm.read_len();
+        let bytes = null;
+        try {
+            bytes = new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+        } catch (error) {
+            console.warn("file read failed:", file.name, error);
+        }
+        if (bytes === null || bytes.length !== length) {
+            after_input(wasm.read_done(ticket, 0, 1));
+            continue;
+        }
+        new Uint8Array(wasm.memory.buffer, wasm.chunk_ptr(), length).set(bytes);
+        after_input(wasm.read_done(ticket, length, 0));
+    }
+    pumping = false;
+}
+
+/**
  * Bootstrap order matters: the device and op table exist before `start`, whose setup stream
  * creates every resource; its error scopes resolve before `fit_canvas` asks for the first
  * frame, so layout sees the real size and a setup failure stops the page.
@@ -1071,6 +1189,18 @@ async function main() {
     document.addEventListener("copy", on_copy);
     document.addEventListener("cut", on_copy);
     document.addEventListener("paste", on_paste);
+    canvas.addEventListener("dragenter", on_drag_over);
+    canvas.addEventListener("dragover", on_drag_over);
+    canvas.addEventListener("dragleave", on_drag_leave);
+    canvas.addEventListener("drop", on_drop);
+    // A file dropped beside the canvas must not open in the tab (guide, section 7a).
+    window.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        if (event.target !== canvas && event.dataTransfer !== null) {
+            event.dataTransfer.dropEffect = "none";
+        }
+    });
+    window.addEventListener("drop", (event) => event.preventDefault());
     sync_cursor();
 }
 

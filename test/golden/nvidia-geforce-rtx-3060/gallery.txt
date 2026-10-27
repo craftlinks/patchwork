@@ -2,22 +2,25 @@
 # adapter: NVIDIA GeForce RTX 3060
 # driver: 615.78.08
 # size: 1280x720 @120
-scenario   hash
-about      82e946569718922f
-context    5870cc0a2e1757c9
-dismiss    1104a0fe7f5e7640
-dropdown   4dcb3b0370e27755
-hardware   095768bbbd33fe23
-hover      f51d6bacd417eda3
-interact   b452a264dd8c2bd2
-light      5395cd540e4c3cfb
-list       6031e3f41ce45db2
-menu-flip  12ab7f033144700c
-menu-open  4b111bc1b8184252
-number     6db66b1f1ad019e0
-split      a993405058dd0eba
-still      2058e61c89777bfc
-tabs       c73e92461a871d2d
-tooltip    67cf5d6aea9e4d3c
-transport  0cdeafe0c2361c70
-type       540bdddb1140d029
+scenario    hash
+about       226ef0b0517d3fb5
+context     961ac8573a5e4f13
+dismiss     0e42c19e630daafa
+drop        c4eac13c3b4d0561
+drop-hover  f3edc7e61e51f5b2
+dropdown    e6b38515ae4a93ae
+files       78f3f93b16c5934d
+hardware    5f0c3e20ee15e38f
+hover       c4919594779de591
+interact    314896ace8766a36
+light       3d36e9f35fb8ef8f
+list        57d5861409e9a201
+menu-flip   beae4e9e92e3a847
+menu-open   0827c443ecaa58ff
+number      9a952ea3be31db8e
+split       ff5352adbbb89d94
+still       ddc975935699e946
+tabs        74ab555e747588ff
+tooltip     b784290e2d8a6571
+transport   c9abb2822f476d3e
+type        6e320d38440d0e4c

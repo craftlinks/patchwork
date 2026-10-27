@@ -24,7 +24,9 @@
 //! - A push into a full queue is counted in `dropped` and discarded; queued history is never
 //!   modified and nothing is allocated (test "overflow drops the newest event").
 //! - `paste` never enters the queue: its slice points at a host buffer that is only valid
-//!   while the host dispatches it, so the hosts call `ui.dispatch` directly (asserted).
+//!   while the host dispatches it, so the hosts call `ui.dispatch` directly (asserted). The
+//!   same holds for `drop` and `file` (section 6).
+//! - A `drop_over` pushed directly after a `drop_over` replaces it, like a move.
 //!
 //! ### Native vs. Web
 //! Native Wayland callbacks only push to the queue; the window loop pops events in order
@@ -71,7 +73,22 @@
 //! defaults `repeat_rate_default` and `repeat_delay_ms_default` apply. Test "repeat arms on a
 //! repeating press and disarms on its release".
 //!
-//! ## 6. TigerStyle Invariants
+//! ## 6. File Drops
+//! A drag that carries files reports `drop_over` while it is over the window and
+//! `drop_leave` when it leaves or is cancelled; the pointer, hover, and capture are not
+//! involved (the drag holds the pointer). `drop` lists up to `drop_files_max` files by base
+//! name, size, and whether they can be read; the app accepts some of them during that event,
+//! and the host then delivers their bytes as `file` events (`Chunk`, `src/drop.zig`):
+//! - Accepted files arrive in index order, never interleaved; each file's chunks have
+//!   increasing offsets, back to back, and end with exactly one terminal chunk (`done`,
+//!   `failed`, or `cancelled`).
+//! - A file delivers exactly `size` bytes in chunks of `drop.chunk_cap`, except the last. The
+//!   chunk that reaches `size` is `done` and carries bytes; an empty file is one empty `done`.
+//!   `failed` and `cancelled` carry no bytes and sit at the offset reached.
+//! So chunk boundaries are the same on every host. `drop` and `file` point into host storage
+//! that is valid only while they are dispatched; neither enters the queue.
+//!
+//! ## 7. TigerStyle Invariants
 //! - Capacity is fixed by `queue_cap`; there is no allocation.
 //! - `push`, `pop`, and `index_at` are O(1); the key maps are O(1) switches or O(name) compares.
 //! - Dropped events are counted, never silent.
@@ -95,6 +112,12 @@ pub const repeat_delay_ms_default: u32 = 600;
 
 /// Bytes of text one `KeyPress` carries: one codepoint of up to 4 bytes, or several short ones.
 pub const key_text_cap: u32 = 4;
+
+/// Files one drop lists; the rest are counted in `Drop.skipped`. The accept and cancel masks
+/// are a `u16`, one bit per file.
+pub const drop_files_max: u32 = 16;
+/// Bytes of one dropped file's name, cut on a codepoint boundary.
+pub const drop_name_max: u32 = 255;
 
 /// A point in UI logical pixels. Origin is the top-left. Y grows downward.
 pub const Point = struct {
@@ -247,10 +270,56 @@ pub const KeyPress = struct {
     }
 };
 
+/// One file of a drop (section 6).
+pub const DropFile = struct {
+    /// The base name, valid UTF-8; path bytes that are not are shown as '?'.
+    name: []const u8,
+    /// The bytes the transfer delivers: the size when the files were dropped.
+    size: u64,
+    /// False for a directory, a special file, or a path that could not be examined.
+    readable: bool,
+};
+
+/// The files of one drop at `(x, y)` (section 6).
+pub const Drop = struct {
+    x: f32,
+    y: f32,
+    /// Files listed in `files`.
+    count: u8,
+    /// Files not listed: over `drop_files_max`, over the host's name room, or not local files.
+    skipped: u16,
+    files: [drop_files_max]DropFile,
+
+    pub fn listed(self: *const Drop) []const DropFile {
+        assert(self.count <= drop_files_max);
+        return self.files[0..self.count];
+    }
+};
+
+/// Whether a chunk is the last of its file, and how the file ended.
+pub const ChunkEnd = enum(u8) {
+    more,
+    done,
+    failed,
+    cancelled,
+};
+
+/// A piece of an accepted file (section 6).
+pub const Chunk = struct {
+    /// The file's index in the `Drop` that was accepted.
+    file: u8,
+    /// The offset of `bytes[0]` in the file.
+    offset: u64,
+    /// At most `drop.chunk_cap` bytes, valid only while the chunk is dispatched.
+    bytes: []const u8,
+    end: ChunkEnd,
+};
+
 /// One input fact, in the order the platform observed it. `frame` carries the clock delta in
 /// milliseconds; the native loop injects it from `sync_clock`. `paste` is the pasted UTF-8,
 /// valid only during its dispatch (section 1). `window_focus` reports keyboard focus of the
-/// window: false releases held keys.
+/// window: false releases held keys. `drop_over`, `drop_leave`, `drop`, and `file` are a file
+/// drag and the bytes of the files it delivered (section 6).
 pub const Event = union(enum) {
     pointer_move: Point,
     pointer_down: Button,
@@ -262,6 +331,22 @@ pub const Event = union(enum) {
     key_up: KeyPress,
     paste: []const u8,
     window_focus: bool,
+    /// A drag carrying files is over the window at the point.
+    drop_over: Point,
+    /// That drag left the window, or ended, without dropping here.
+    drop_leave,
+    /// It dropped here; valid only during the dispatch.
+    drop: *const Drop,
+    /// Bytes of an accepted file; valid only during the dispatch.
+    file: *const Chunk,
+
+    /// True for the events whose payload points into host storage: they never enter the queue.
+    pub fn borrowed(self: Event) bool {
+        return switch (self) {
+            .paste, .drop, .file => true,
+            else => false,
+        };
+    }
 };
 
 /// Latest pointer sample. The UI context stores this so a redraw can re-hit the same point.
@@ -371,7 +456,7 @@ pub const EventQueue = struct {
     pub fn push(self: *EventQueue, event: Event) void {
         assert(self.count <= queue_cap);
         assert(self.head < queue_cap);
-        assert(event != .paste);
+        assert(!event.borrowed());
         if (coalesce(self, event)) {
             assert(self.count >= 1);
             return;
@@ -405,7 +490,7 @@ pub const EventQueue = struct {
         self.count -= 1;
         assert(self.head < queue_cap);
         assert(self.count < queue_cap);
-        assert(event != .paste);
+        assert(!event.borrowed());
         return event;
     }
 
@@ -443,6 +528,10 @@ fn coalesce(self: *EventQueue, event: Event) bool {
         return false;
     }
     const last = self.index_at(self.count - 1);
+    if (event == .drop_over and self.items[last] == .drop_over) {
+        self.items[last] = event;
+        return true;
+    }
     if (event == .pointer_move) {
         if (self.items[last] == .pointer_move) {
             self.items[last] = event;
@@ -740,6 +829,8 @@ comptime {
     assert(@sizeOf(KeyPress) == 8);
     assert(@sizeOf(Mods) == 1);
     assert(@sizeOf(Event) <= 24);
+    assert(drop_files_max <= 16);
+    assert(drop_name_max <= 255);
 }
 
 const testing = std.testing;
@@ -815,6 +906,27 @@ test "move down move up keeps four events" {
     try testing.expect(queue.pop().? == .key_down);
     try testing.expect(queue.pop().? == .key_down);
     try testing.expect(queue.pop() == null);
+}
+
+// Locks the drop rules: consecutive `drop_over`s keep the newest point in one slot, a
+// `drop_leave` splits them, and the borrowed events are the three host-storage ones.
+test "drop overs coalesce and a leave splits them" {
+    var queue = EventQueue.init();
+    queue.push(.{ .drop_over = .{ .x = 1, .y = 2 } });
+    queue.push(.{ .drop_over = .{ .x = 3, .y = 4 } });
+    queue.push(.drop_leave);
+    queue.push(.{ .drop_over = .{ .x = 5, .y = 6 } });
+    try testing.expectEqual(@as(u32, 3), queue.count);
+    try testing.expectEqual(@as(f32, 3), queue.pop().?.drop_over.x);
+    try testing.expect(queue.pop().? == .drop_leave);
+    try testing.expectEqual(@as(f32, 6), queue.pop().?.drop_over.y);
+    const drop: Drop = .{ .x = 0, .y = 0, .count = 0, .skipped = 0, .files = undefined };
+    const chunk: Chunk = .{ .file = 0, .offset = 0, .bytes = "", .end = .done };
+    try testing.expect((Event{ .drop = &drop }).borrowed());
+    try testing.expect((Event{ .file = &chunk }).borrowed());
+    try testing.expect((Event{ .paste = "a" }).borrowed());
+    try testing.expect(!(Event{ .drop_over = .{ .x = 0, .y = 0 } }).borrowed());
+    try testing.expectEqual(@as(usize, 0), drop.listed().len);
 }
 
 // Locks overflow: the press after `queue_cap` queued presses is counted and discarded;

@@ -24,6 +24,7 @@ pub const commands = @import("gpu/commands.zig");
 pub const renderer = @import("draw/renderer.zig");
 pub const bench = @import("bench.zig");
 pub const realtime = @import("realtime.zig");
+pub const drop = @import("drop.zig");
 
 /// The platform hosts. `linux_window.run` and `web_exports.export_app` are the only entry
 /// points an app build uses.
@@ -46,6 +47,9 @@ pub const host = struct {
     pub const wp_cursor_shape = @import("host/wp_cursor_shape.zig");
     pub const wl_data_device = @import("host/wl_data_device.zig");
     pub const clipboard = @import("host/clipboard.zig");
+    /// File drops (`wl_data_offer` drag-and-drop); its tests are `host/dnd_test.zig`, run
+    /// from `native_tests.zig`.
+    pub const dnd = @import("host/dnd.zig");
 };
 
 test {
@@ -63,6 +67,7 @@ test {
     _ = renderer;
     _ = bench;
     _ = realtime;
+    _ = drop;
     _ = host.wp_presentation;
     _ = host.wp_fractional_scale;
     _ = host.wl_seat;

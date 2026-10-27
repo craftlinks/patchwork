@@ -72,11 +72,12 @@
 //!   `zig build regress` runs every example's, in parallel, each printing its report once.
 //! - `tests` runs the app's own tests. They need no GPU and no display.
 //! - `zig build test` in this repo adds the library tests and the native-only tests
-//!   (`src/native_tests.zig`, linked with libxkbcommon). `zig build test-contract`
-//!   compiles an app with no `draw`, an app whose draw type is not a multiple of 16 bytes,
-//!   an app whose draw type reads time without declaring `animated`, an app that declares
-//!   `Audio` without `audio`, a theme color out of range, and a knob whose skin lacks `knob`,
-//!   and passes only if the compiler rejects each with its expected message.
+//!   (`src/native_tests.zig`, linked with libxkbcommon and libwayland-client).
+//!   `zig build test-contract` compiles an app with no `draw`, an app whose draw type is not a
+//!   multiple of 16 bytes, an app whose draw type reads time without declaring `animated`, an
+//!   app that declares `Audio` without `audio`, a theme color out of range, and a knob whose
+//!   skin lacks `knob`, and passes only if the compiler rejects each with its expected
+//!   message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
@@ -731,7 +732,8 @@ fn add_test_steps(
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
-    // Native-only tests call libxkbcommon, so they get their own root and link it.
+    // Native-only tests call libxkbcommon, and the drop tests reference libwayland-client's
+    // proxy calls, so they get their own root and link both.
     const native = b.createModule(.{
         .root_source_file = b.path("src/native_tests.zig"),
         .target = library.resolved_target,
@@ -739,6 +741,13 @@ fn add_test_steps(
         .link_libc = true,
     });
     link_xkbcommon(native);
+    native.linkSystemLibrary("wayland-client", .{
+        .needed = true,
+        .weak = false,
+        .use_pkg_config = .yes,
+        .preferred_link_mode = .dynamic,
+        .search_strategy = .paths_first,
+    });
     const native_tests = b.addTest(.{ .root_module = native });
     test_step.dependOn(&b.addRunArtifact(native_tests).step);
     for (examples) |example| {

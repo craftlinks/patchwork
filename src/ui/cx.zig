@@ -90,6 +90,7 @@
 //! leave       the capture gets up { inside = false }; else the hover gets hover_out
 //! wheel       the wheel target gets wheel; otherwise as move
 //! keys, paste, window focus, frame: none (section 7)
+//! drops       none: file drags answer through `drop_hit` (section 7a)
 //! ```
 //! A path area (`path_area`, for a stroke drawn with `draw.path`) is hit within a distance of
 //! its polyline instead of a rounded rect (`ui/areas.zig`, section 3); the scan is the same.
@@ -123,6 +124,26 @@
 //! - `window_focus(false)` clears the held keys and the modifiers.
 //! A browser key is `consumed` when a widget had focus or Tab moved it, unless it is a
 //! clipboard shortcut, so the page's own copy, cut, and paste events still fire.
+//!
+//! ## 7a. File Drops
+//! A file drag does not move the pointer (the drag holds it), so it has its own target: the
+//! topmost area flagged `drop` under the drag's point, on a layer at least the hot area's
+//! (`ui/areas.zig`, section 4), so a popup blocks drops beneath it. `drop_over` and `drop`
+//! resolve it at their point and `drop_leave` clears it; hover, capture, and focus are
+//! untouched, and `hit` answers `none` for the four drop events. `drop_hit(id, event)` answers
+//! them instead, a separate call so the widgets that switch over `Hit` need no new arms:
+//! ```text
+//! drop_over   the target changed: the new one drop_in, the old one drop_out
+//! drop_leave  the old target drop_out
+//! drop        the target dropped { x, y, rect, files }; the drag is over after the event
+//! file        the receiver (accept_files) file: the chunk
+//! ```
+//! `drop_hovering(id)` reports the target in any phase, so a drop zone highlights itself in
+//! `draw` with no state of its own. During the `drop` event the app may call
+//! `accept_files(id, mask)` once: `id` receives the files' chunks, and the host starts the
+//! transfer after the dispatch (`take_files_accept`). `cancel_files(mask)` during any event ends
+//! those files of the running transfer (`take_files_cancel`); the host dispatches their
+//! `cancelled` chunks after the current dispatch (`input.zig`, section 6).
 //!
 //! ## 8. Cursor and Clipboard
 //! The hot area's `Flags.cursor` is resolved with the hot area; `cursor()` reports it, the
@@ -238,6 +259,26 @@ pub const Hit = union(enum) {
     secondary: Press,
 };
 
+/// A drop on an area: the drag's point, the area's rect at the last draw, and the files.
+pub const Dropped = struct {
+    x: f32,
+    y: f32,
+    rect: Rect,
+    files: *const input.Drop,
+};
+
+/// What a file-drag event means for one id. See the module guide, section 7a.
+pub const DropHit = union(enum) {
+    none,
+    /// The drag moved onto the area.
+    drop_in,
+    /// The drag moved off it, left the window, or ended.
+    drop_out,
+    dropped: Dropped,
+    /// A chunk of a file the id accepted.
+    file: *const input.Chunk,
+};
+
 /// No hover, press, or wheel interest beyond the default.
 pub const plain: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default };
 /// Takes wheel input.
@@ -246,6 +287,15 @@ pub const wheel_flag: Flags = .{
     .focusable = false,
     .tab = false,
     .cursor = .default,
+};
+
+/// Takes dropped files.
+pub const drop_flag: Flags = .{
+    .wheel = false,
+    .focusable = false,
+    .tab = false,
+    .cursor = .default,
+    .drop = true,
 };
 
 /// The layout of the root turtle: the window, flowing down, clipped to the window.
@@ -343,6 +393,17 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         copy_len: u32,
         copy_pending: bool,
         paste_pending: bool,
+        /// The file drag's target and the target when the current event began, and its rect
+        /// at the last draw (section 7a).
+        drop_target: Id,
+        drop_prev: Id,
+        drop_rect: Rect,
+        /// Files listed by the `drop` being dispatched.
+        drop_count: u8,
+        /// The id that accepted the running transfer, and the host's requests (section 7a).
+        files_receiver: Id,
+        files_accept: ?u16,
+        files_cancel: u16,
         /// A draw is owed. Set by `redraw`, cleared by `begin_frame`.
         dirty: bool,
         /// An animator is still moving; see `keep_animating`.
@@ -411,6 +472,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.copy_len = 0;
             self.copy_pending = false;
             self.paste_pending = false;
+            self.drop_target = .none;
+            self.drop_prev = .none;
+            self.drop_rect = self.window;
+            self.drop_count = 0;
+            self.files_receiver = .none;
+            self.files_accept = null;
+            self.files_cancel = 0;
             self.dirty = true;
             self.animating = false;
             self.timer_period_ms = 0;
@@ -1112,11 +1180,19 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.event_tag = event;
             self.hover_prev = self.hover;
             self.focus_prev = self.focus;
+            self.drop_prev = self.drop_target;
             self.pressed = false;
             self.ending_capture = false;
             self.escaping = false;
             switch (event) {
-                .frame, .paste => {},
+                .frame, .paste, .file => {},
+                .drop_over => |point| self.drop_at(point.x, point.y),
+                .drop_leave => self.drop_target = .none,
+                .drop => |files| {
+                    assert(files.count <= input.drop_files_max);
+                    self.drop_count = files.count;
+                    self.drop_at(files.x, files.y);
+                },
                 .pointer_leave => {
                     self.pointer.leave();
                     self.hot = .none;
@@ -1160,6 +1236,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     self.capture = .none;
                 },
                 .pointer_leave => self.capture = .none,
+                // The drag is over, whatever the app did with it (section 7a).
+                .drop => self.drop_target = .none,
                 else => {},
             }
             if (self.escaping) self.focus = .none;
@@ -1174,6 +1252,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(@as(std.meta.Tag(input.Event), event) == self.event_tag);
             switch (event) {
                 .frame, .key_down, .key_up, .paste, .window_focus => return .none,
+                .drop_over, .drop_leave, .drop, .file => return .none,
                 .pointer_move => |point| {
                     if (self.capture != .none) return self.drag_of(id, point.x, point.y);
                     return self.hover_change(id);
@@ -1220,6 +1299,107 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     if (self.capture != .none) return .none;
                     return self.hover_change(id);
                 },
+            }
+        }
+
+        /// What the file-drag event `event` means for `id`. O(1); see the module guide,
+        /// section 7a.
+        pub fn drop_hit(self: *const Self, id: Id, event: input.Event) DropHit {
+            assert(self.phase == .event);
+            assert(id != .none);
+            assert(@as(std.meta.Tag(input.Event), event) == self.event_tag);
+            switch (event) {
+                .drop_over, .drop_leave => {
+                    if (self.drop_target == self.drop_prev) return .none;
+                    if (id == self.drop_target) return .drop_in;
+                    if (id == self.drop_prev) return .drop_out;
+                    return .none;
+                },
+                .drop => |files| {
+                    if (id == self.drop_target) {
+                        return .{ .dropped = .{
+                            .x = files.x,
+                            .y = files.y,
+                            .rect = self.drop_rect,
+                            .files = files,
+                        } };
+                    }
+                    if (id == self.drop_prev) return .drop_out;
+                    return .none;
+                },
+                .file => |chunk| {
+                    if (id == self.files_receiver) return .{ .file = chunk };
+                    return .none;
+                },
+                else => return .none,
+            }
+        }
+
+        /// True while a file drag is over `id`'s area (section 7a). Any phase.
+        pub fn drop_hovering(self: *const Self, id: Id) bool {
+            assert(id != .none);
+            assert(self.drop_count <= input.drop_files_max);
+            return id == self.drop_target;
+        }
+
+        /// Host side: true while a file drag is over a drop target, so a drop here would be
+        /// taken (the native host accepts the offer, the browser shows a copy cursor).
+        pub fn drop_wanted(self: *const Self) bool {
+            assert(self.phase == .idle);
+            return self.drop_target != .none;
+        }
+
+        /// Takes the files in `mask` of the `drop` being dispatched; `id` receives their
+        /// chunks (section 7a). Once per drop, during the `drop` event only.
+        pub fn accept_files(self: *Self, id: Id, mask: u16) void {
+            assert(self.phase == .event);
+            assert(self.event_tag == .drop);
+            assert(self.files_accept == null);
+            assert(id != .none);
+            assert(mask != 0);
+            assert(self.drop_count == 16 or mask >> @intCast(self.drop_count) == 0);
+            self.files_receiver = id;
+            self.files_accept = mask;
+            self.files_cancel = 0;
+        }
+
+        /// Ends the files in `mask` of the running transfer: each that has not ended gets one
+        /// `cancelled` chunk after the current dispatch (section 7a). Event phase.
+        pub fn cancel_files(self: *Self, mask: u16) void {
+            assert(self.phase == .event);
+            assert(mask != 0);
+            self.files_cancel |= mask;
+            assert(self.files_cancel != 0);
+        }
+
+        /// Host side: the mask of an `accept_files` during the last dispatch, once.
+        pub fn take_files_accept(self: *Self) ?u16 {
+            assert(self.phase == .idle);
+            const accepted = self.files_accept;
+            self.files_accept = null;
+            assert(self.files_accept == null);
+            return accepted;
+        }
+
+        /// Host side: the files `cancel_files` asked to end since the last call, once.
+        pub fn take_files_cancel(self: *Self) u16 {
+            assert(self.phase == .idle);
+            const cancelled = self.files_cancel;
+            self.files_cancel = 0;
+            assert(self.files_cancel == 0);
+            return cancelled;
+        }
+
+        /// Resolves the drop target at the drag's point (section 7a). The pointer stays.
+        fn drop_at(self: *Self, x: f32, y: f32) void {
+            assert(x == x);
+            assert(y == y);
+            const live = self.areas[0..self.area_count];
+            const found = areas.resolve(live, self.draw.point_items(), x, y);
+            self.drop_target = .none;
+            if (found.drop) |index| {
+                self.drop_target = self.areas[index].id;
+                self.drop_rect = rect_of(self.areas[index].rect);
             }
         }
 
@@ -2376,4 +2556,90 @@ test "a popup request is met by the next draw" {
     context.skip_popup(menu);
     _ = context.end_frame();
     try testing.expectEqual(Id.none, context.popup_requested);
+}
+
+/// Dispatches the file-drag `event` and writes what it means for each of `ids` into `out`.
+fn send_drop(context: *TestContext, event: input.Event, ids: []const Id, out: []DropHit) void {
+    assert(ids.len == out.len);
+    context.event_begin(event);
+    for (ids, out) |key, *result| result.* = context.drop_hit(key, event);
+    context.event_end();
+}
+
+// Locks the drop target (section 7a): two zones side by side get drop_in and drop_out as the
+// drag crosses them, a plain area answers nothing, `hit` answers none and the pointer, hover,
+// and capture stay, a leave ends the target, and a drop carries the zone's rect and clears it.
+test "a file drag crosses two zones and drops on the second" {
+    const context = new_context();
+    const left = areas.id("zone", 0);
+    const right = areas.id("zone", 1);
+    const label = areas.id("label", 0);
+    context.begin_frame(400, 300, 120);
+    context.area(left, rect_at(0, 0, 100, 100), 0, drop_flag);
+    context.area(right, rect_at(200, 0, 100, 100), 0, drop_flag);
+    context.area(label, rect_at(220, 20, 40, 20), 0, plain);
+    _ = context.end_frame();
+    const ids = [_]Id{ left, right, label };
+    var out: [3]DropHit = undefined;
+    send_drop(context, .{ .drop_over = .{ .x = 50, .y = 50 } }, &ids, &out);
+    try testing.expectEqual(DropHit.drop_in, out[0]);
+    try testing.expectEqual(DropHit.none, out[1]);
+    try testing.expect(context.drop_hovering(left));
+    try testing.expect(context.drop_wanted());
+    send_drop(context, .{ .drop_over = .{ .x = 60, .y = 50 } }, &ids, &out);
+    try testing.expectEqual(DropHit.none, out[0]);
+    send_drop(context, .{ .drop_over = .{ .x = 230, .y = 30 } }, &ids, &out);
+    try testing.expectEqual(DropHit.drop_out, out[0]);
+    try testing.expectEqual(DropHit.drop_in, out[1]);
+    try testing.expectEqual(DropHit.none, out[2]);
+    context.event_begin(.{ .drop_over = .{ .x = 230, .y = 30 } });
+    try testing.expectEqual(Hit.none, context.hit(label, .{ .drop_over = .{ .x = 230, .y = 30 } }));
+    context.event_end();
+    try testing.expect(!context.pointer.inside);
+    try testing.expectEqual(Id.none, context.hover);
+    send_drop(context, .drop_leave, &ids, &out);
+    try testing.expectEqual(DropHit.drop_out, out[1]);
+    try testing.expect(!context.drop_wanted());
+    var files: input.Drop = .{ .x = 250, .y = 50, .count = 2, .skipped = 0, .files = undefined };
+    send_drop(context, .{ .drop = &files }, &ids, &out);
+    try testing.expectEqual(@as(f32, 200), out[1].dropped.rect.x);
+    try testing.expectEqual(@as(f32, 250), out[1].dropped.x);
+    try testing.expectEqual(&files, out[1].dropped.files);
+    try testing.expectEqual(DropHit.none, out[0]);
+    try testing.expect(!context.drop_hovering(right));
+    files.x = 350;
+    send_drop(context, .{ .drop = &files }, &ids, &out);
+    try testing.expectEqual(DropHit.none, out[1]);
+}
+
+// Locks the accept and cancel handshake (section 7a): the accepting id receives the chunks and
+// no other id does, the host takes the mask once, and cancels gather until the host takes them.
+test "accept_files names the receiver and the host takes accept and cancel once" {
+    const context = new_context();
+    const zone = areas.id("zone", 0);
+    const other = areas.id("zone", 1);
+    context.begin_frame(400, 300, 120);
+    context.area(zone, rect_at(0, 0, 100, 100), 0, drop_flag);
+    _ = context.end_frame();
+    const files: input.Drop = .{ .x = 10, .y = 10, .count = 3, .skipped = 0, .files = undefined };
+    const event: input.Event = .{ .drop = &files };
+    context.event_begin(event);
+    switch (context.drop_hit(zone, event)) {
+        .dropped => context.accept_files(zone, 0b101),
+        else => return error.TestUnexpectedResult,
+    }
+    context.event_end();
+    try testing.expectEqual(@as(?u16, 0b101), context.take_files_accept());
+    try testing.expectEqual(@as(?u16, null), context.take_files_accept());
+    const chunk: input.Chunk = .{ .file = 0, .offset = 0, .bytes = "abc", .end = .more };
+    var out: [2]DropHit = undefined;
+    send_drop(context, .{ .file = &chunk }, &.{ zone, other }, &out);
+    try testing.expectEqual(&chunk, out[0].file);
+    try testing.expectEqual(DropHit.none, out[1]);
+    context.event_begin(.{ .file = &chunk });
+    context.cancel_files(0b001);
+    context.cancel_files(0b100);
+    context.event_end();
+    try testing.expectEqual(@as(u16, 0b101), context.take_files_cancel());
+    try testing.expectEqual(@as(u16, 0), context.take_files_cancel());
 }
