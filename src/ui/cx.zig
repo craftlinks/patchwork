@@ -748,6 +748,20 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             layout: turtle.Layout,
             state: *ViewState,
         ) Rect {
+            return self.begin_view_with(id, child, layout, state, wheel_flag);
+        }
+
+        /// `begin_view` whose own area carries `flags` (which take the wheel): a list box makes
+        /// its view focusable, so Tab reaches it and its keys follow focus.
+        pub fn begin_view_with(
+            self: *Self,
+            id: Id,
+            child: turtle.Walk,
+            layout: turtle.Layout,
+            state: *ViewState,
+            flags: Flags,
+        ) Rect {
+            assert(flags.wheel);
             assert(self.depth < turtle.depth_max);
             assert(child.width != .fit);
             assert(child.height != .fit);
@@ -758,7 +772,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             state.viewport = viewport;
             state.scroll_y = std.math.clamp(state.scroll_y, 0, state.max_scroll());
             if (viewport.width > 0 and viewport.height > 0) {
-                self.area(id, viewport, 0, wheel_flag);
+                self.area(id, viewport, 0, flags);
             }
             const content: Rect = .{
                 .x = viewport.x,

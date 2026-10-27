@@ -45,9 +45,10 @@
 //! widgets whose result it does not need, `route(cx, event, target)` calls every widget the
 //! target names: a widget, a slice or array of widgets, or the fields of a struct (one level,
 //! in field order) that are widgets or arrays of widgets. A widget is a type with a
-//! three-parameter `handle(self, cx, event)`; `ViewState.handle` takes an id too, so a view is
-//! routed by hand. Routing every field of the app (`route(cx, event, app)`) means a widget
-//! added to the app is never silently dead. Test "route reaches every widget field" locks it.
+//! three-parameter `handle(self, cx, event)`; `ViewState.handle` takes an id too, so a bare view
+//! is routed by hand, while `widgets.ListBox` wraps one and routes it itself. Routing every
+//! field of the app (`route(cx, event, app)`) means a widget added to the app is never
+//! silently dead. Test "route reaches every widget field" locks it.
 //!
 //! ## 3b. Overlays
 //! Popups and tooltips are drawn last, at the root, on their own layers (`ui/popup.zig`,

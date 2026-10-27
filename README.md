@@ -67,7 +67,9 @@ exact problem (`App.config.theme.colors.panel: a component is outside [0, 1]`). 
 point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
-`Toggle`, `Slider`, `Knob`, `Meter`, and `TextField`; the code editor
+`Toggle`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`, `Dropdown`,
+`Tooltip`), and the containers and value boxes (`Tabs`, `Splitter`, `ListBox`, `NumberBox`);
+the code editor
 (`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
 when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
 Events resolve once per event against the areas of the last frame, so `handle` is O(1) per
@@ -124,6 +126,10 @@ patchwork/
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
 │   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
+│   ├── widgets/tabs.zig        # Tabs: a bar of tabs over a page the app draws
+│   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
+│   ├── widgets/list_box.zig    # ListBox: a virtual list with selection, keys, scroll-into-view
+│   ├── widgets/number_box.zig  # NumberBox: drag, wheel, or type a value with a unit
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
@@ -203,7 +209,7 @@ patchwork/
 │   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
 │   ├── canvas/                 # Pan and zoom
 │   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
-│   └── gallery/                # Every library widget on one screen (phase 6 regression app)
+│   └── gallery/                # Every library widget on tabbed pages (phases 6 and 7)
 │       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
 │       └── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
 ├── tools/
@@ -531,7 +537,8 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   the viewport, starts them `scroll_y` above it, measures their height at `cx.end_view()`,
   and draws the scrollbar thumb from that same frame's height. `ui.List.visible` turns the
   offset into the rows under the viewport; the app skips the others with `cx.skip`, so a
-  1,000-row list costs only its visible rows.
+  1,000-row list costs only its visible rows. `widgets.ListBox` does all of this for uniform
+  rows (see Containers and Value Boxes below).
 
 All of it is fixed storage with no allocation; per-frame work is proportional to the
 instances, areas, and nesting depth drawn, never to capacities. A display scale change does
@@ -586,7 +593,8 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 A widget's behaviour (its fields, `handle`, and actions) is written once; how it looks and
 where it takes presses belong to a skin, a struct of draw functions passed at compile time.
 `widgets.Knob` is `widgets.KnobOf(widgets.skins.Default)`; `ButtonOf`, `SliderOf`, `ToggleOf`,
-`MeterOf`, `PanelOf`, and `TextFieldOf` (its face and border only) work the same way. There
+`MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`, `DropdownOf`, `TabsOf`,
+`SplitterOf`, `ListBoxOf`, and `NumberBoxOf` work the same way. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
 
 A knob skin declares one function. It gets a `widgets.KnobLook` of plain values (the row, the
@@ -610,8 +618,9 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
 ```
 
 - **The contract.** `button`, `slider` (with `slider_travel(area) [2]f32`, the x span a press
-  maps onto `[0, 1]`), `knob`, and `toggle` return `?widgets.Shape`; `meter`, `panel`, and
-  `field` return nothing. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
+  maps onto `[0, 1]`), `knob`, `toggle`, `dropdown`, `tab`, `divider`, and `number_face` return
+  `?widgets.Shape`; `meter`, `panel`, `field`, `menu_face`, `menu_row`, `tab_bar`, and
+  `list_row` return nothing. A number box skin also needs `field`, for its editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
   fails the build with a message naming the skin and the function, for example
   "hardware.Skin: missing `pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`".
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
@@ -659,6 +668,69 @@ pub fn draw(app: *App, cx: *Context) void {
 - **Idle.** An open menu at rest wakes nothing, and a tooltip's dwell animates only until it
   shows.
 
+## Containers and Value Boxes
+
+`Tabs`, `Splitter`, and `ListBox` keep the turtle's begin/end shape: the library owns the
+chrome, the geometry, and the input, and the app draws the content between the calls. No widget
+takes a callback, and all four answer `handle(cx, event)`, so `ui.route` reaches them. Each is
+skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
+
+- **Tabs.** A bar of up to 16 tabs over a page the app draws with a `switch`; the tabs own no
+  page. Tabs are left-aligned at their labels' widths and shrink evenly to 48 px when the bar is
+  narrow, cutting labels with an ellipsis. A press selects (`Action.changed` for a different
+  tab); with the bar focused, Left and Right, Ctrl+Tab and Ctrl+Shift+Tab move, wrapping.
+
+  ```zig
+  _ = app.tabs.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down });
+  switch (app.tabs.selected) {
+      0 => app.draw_mixer(cx),
+      else => app.draw_settings(cx),
+  }
+  _ = cx.end();
+  ```
+- **Splitter.** Two panes (`.horizontal` side by side, `.vertical` stacked) and a 6 px divider
+  with minimum pane lengths; pane a is `clamp(round(ratio * span), min_a, span - min_b)`, split
+  in proportion when the minimums do not fit. Dragging the divider returns `moved` (the ratio),
+  a double click `reset`. Panes are clipped containers, so splitters nest. The order of
+  `begin`, `next`, and `end` is asserted.
+
+  ```zig
+  _ = app.split.begin(cx, ui.sized(.fill, .fill)); // pane a
+  app.draw_browser(cx);
+  _ = app.split.next(cx); // the divider, then pane b
+  app.draw_inspector(cx);
+  app.split.end(cx);
+  ```
+- **ListBox.** A virtual list of up to 2^20 uniform rows in a scrolling view: only the rows under
+  the viewport are walked, each with a derived id, so the app never builds row ids. A click
+  returns `selected`, a double click `activated`; with the list focused (Tab reaches it), Up,
+  Down, Page Up, Page Down, Home, and End move the selection and scroll it into view, and Enter
+  activates. The skin draws the band under each row; the app draws the row's content.
+
+  ```zig
+  _ = app.presets.begin(cx, ui.sized(.fill, .fill));
+  while (app.presets.next(cx)) |row| {
+      kit.label(cx, style, name_of(row.index), row.rect, row.clip, start);
+  }
+  app.presets.end(cx);
+  ```
+- **NumberBox.** An `f64` in `[min, max]` with a step (0 for continuous) and a format (decimals
+  and a unit such as " Hz"). A vertical drag covers the range in 200 px (Shift a tenth, Ctrl or
+  Meta ten times), the wheel moves one step, a right press resets, and a double click opens a
+  `TextField` with the value selected: Enter parses it (an optional sign, digits, a fraction;
+  anything else keeps the old value), clamps it, and returns `committed`, Escape cancels.
+  `widgets.format_number` and `widgets.parse_number` are pure, use no `std.fmt`, and work in
+  the wasm build.
+
+  ```zig
+  app.gain = widgets.NumberBox.init(ui.id("gain", 0), 0, -60, 12, 0.1, .{ .decimals = 1, .unit = " dB" });
+  app.gain.draw(cx, ui.sized(.fill, .{ .fixed = 32 })); // in draw
+  switch (app.gain.handle(cx, event)) { // in event
+      .changed, .committed => |db| app.engine.set_gain(db),
+      .none => {},
+  }
+  ```
+
 ## Example Applications
 
 Worked coordinates, initial values, palettes, and budgets live in the examples' tests, not
@@ -675,13 +747,17 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
 - **Actions.** Knobs return `changed`, which the rack writes to its status line
   ("filter.cut changed 0.42"); a right click resets a knob to its initial value
   ("filter.cut reset 0.50"); clicking a preset row selects and highlights it ("preset 412
-  selected").
+  selected"), and once the list has focus the arrow, page, Home, and End keys move the
+  selection.
 - **Renaming.** A double click on a panel title opens a `TextField` in its place with the
   name selected; Enter or a click elsewhere commits ("osc renamed vco"), Escape cancels, and
   copy and paste work with other apps. Knob rings show the grab cursor and the field the
   I-beam.
-- **Virtual list.** The preset list draws only the rows under its viewport; the view's
-  height is capped so the pools hold the worst case at any window size.
+- **Virtual list.** The preset list is a `widgets.ListBox` in the rack's own skin (its
+  selected band is the first accent); it draws only the rows under its viewport, and the view's
+  height is capped so the pools hold the worst case at any window size. Test "the preset list
+  draws the records of the rack's own list" checks that the move onto `ListBox` changed no
+  record.
 - **Text.** The header shows a 32 px monospace "121.00" and a bold "BPM" sharing one baseline
   (`text.place_runs`) and the label "Jürgen Köhler · Café" (composite and non-ASCII glyphs),
   right-aligned and cut with an ellipsis when the bar is narrow. Panel titles are bold 14 px,
@@ -847,31 +923,41 @@ at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), an
 
 ### 9. Widget Gallery (`examples/gallery/app.zig`)
 
-Every library widget on one fixed 1088 by 704 screen from the top-left, built only from
-`widgets.kit` and the one-statement layouts: three buttons, two sliders, four knobs with
-rings of 56, 40, 56, and 72, three toggles, a meter that follows slider 0, a 240 px text
-field, and a list of 40 clickable rows (`kit.clicked`) in a view, the selected one
-highlighted. The title bar's status line shows the last action ("knob 1 changed 0.75"), so
-the app handles each widget itself rather than through `ui.route`. It is the regression app
-of phases 6 and 7: each step adds a section. A "light" toggle in the title bar switches the
-whole app between `theme.dark` and `theme.light` (`cx.set_theme`); the widgets' stored colors
-(slider paints, knob accents, the field's text) are restyled from the scheme, while the
-buttons keep their own blue. Under the default widgets a hardware row draws four knobs, two
-buttons, and two toggles with the same library behaviour in the gallery's own skin
-(`examples/gallery/hardware.zig`): a `Dial` draw type with a drop shadow and a pointer, a
-`Bevel` face lit on top and shaded below, and the rack's `Led`; the status line reports both
-rows ("hardware knob 0 changed 0.83"). Scenarios: `still`, `interact` (a click, two drags, a
-toggle, typing, a wheel, and a row click, then settled), `hover` (the pointer rests on button
-1), `light` (the toggle, then the focused field with "abc" selected, settled), and `hardware`
-(hardware knob 0 dragged up 40 px, hardware button 1 clicked, hardware toggle 0 flipped,
-settled). Right of the screen a popups column shows the overlay model (see Popups): a dropdown
-of six waveforms, a "File" button opening a menu (Save as… disabled, About… opening a modal
-dialog over a dimmed screen), a panel with a context menu (Copy, Paste, Reset), a second
-dropdown 40 px above the frame's bottom whose list opens above it, and tooltips on every knob
-("gain 0.25"). Popups stay inside the 1280 by 704 frame. Popup scenarios: `dropdown` (Down
-twice and Enter: "dropdown changed 2"), `menu-open`, `menu-flip`, `context` (right click,
-Reset), `dismiss` (an outside click closes the menu and clicks nothing), `tooltip`, and
-`about`.
+Every library widget on a fixed 1280 by 704 screen from the top-left, built only from
+`widgets.kit` and the one-statement layouts. It is the regression app of phases 6 and 7: a
+`widgets.Tabs` bar under the title holds one page per section, and the title bar's status line
+shows the last action ("knob 1 changed 0.75"), so the app handles each widget itself rather
+than through `ui.route`. A "light" toggle in the title bar switches the whole app between
+`theme.dark` and `theme.light` (`cx.set_theme`); the widgets' stored colors (slider paints,
+knob accents, the field's text) are restyled from the scheme, while the buttons keep their own
+blue.
+
+- **basics** (steps 30 to 32): three buttons, two sliders, four knobs with rings of 56, 40, 56,
+  and 72, three toggles, a meter that follows slider 0, a 240 px text field, and a list of 40
+  clickable rows (`kit.clicked`) in a view. Under them a hardware row draws four knobs, two
+  buttons, and two toggles with the same library behaviour in the gallery's own skin
+  (`examples/gallery/hardware.zig`): a `Dial` draw type with a drop shadow and a pointer, a
+  `Bevel` face lit on top and shaded below, and the rack's `Led` ("hardware knob 0 changed
+  0.83"). Every knob shows a tooltip ("gain 0.25").
+- **popups** (step 33, see Popups): a dropdown of six waveforms, a "File" button opening a menu
+  (Save as… disabled, About… opening a modal dialog over a dimmed screen), a panel with a
+  context menu (Copy, Paste, Reset), and a second dropdown 40 px above the frame's bottom whose
+  list opens above it. Popups stay inside the 1280 by 704 frame.
+- **containers** (step 34, see Containers and Value Boxes): a horizontal `Splitter` whose left
+  pane is a `ListBox` of 1,000 presets ("preset 0001" ...) and whose right pane is a vertical
+  splitter of six `NumberBox`es (frequency 20 to 20000 Hz, gain -60 to 12 dB, attack, release,
+  q, mix) over a panel naming the selected and the last activated preset.
+
+Scenarios: `still`, `interact` (a click, two drags, a toggle, typing, a wheel, and a row click,
+then settled), `hover` (the pointer rests on button 1), `light` (the toggle, then the focused
+field with "abc" selected, settled), and `hardware` (hardware knob 0 dragged up 40 px, hardware
+button 1 clicked, hardware toggle 0 flipped, settled) on the basics page; `dropdown` (Down twice
+and Enter: "dropdown changed 2"), `menu-open`, `menu-flip`, `context` (right click, Reset),
+`dismiss` (an outside click closes the menu and opens nothing), `tooltip`, and `about` for the
+popups; `tabs` (each tab clicked: the containers page), `split` (the divider dragged 120 px
+left), `list` (row 3 clicked, then Down 20 times: preset 0024 scrolled into view), and `number`
+(the frequency dragged up 40 px, the gain double-clicked, "-6.5" typed, Enter) for the
+containers.
 
 ## Pan and Zoom
 
@@ -943,7 +1029,9 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   move by a delta, release; a zero delta is refused), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
-  a name lists the scenarios.
+  a name lists the scenarios. `bench.replay_headless_paced` spaces the steps by a given
+  number of milliseconds instead of a second (16 is the regress clock's frame), so two clicks
+  on one spot make a double click as they do in `--regress` and the browser replay.
 - **Per frame.** `App.draw` (with layout), `finalize`, record (compare and stream), submit
   and present on the CPU; the render pass on the GPU from timestamp queries, read back by
   blocking after present (so profiled frames do not overlap CPU and GPU work); instances
