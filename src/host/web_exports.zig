@@ -118,6 +118,19 @@
 //!   numbering), the modifiers, and `event.timeStamp` in whole milliseconds, which the
 //!   library's click counting compares.
 //!
+//! ## 4d. File Drops
+//! `shell.js` reports a file drag over the canvas with `drop_over(x, y)`, whose bit 1 says
+//! whether a drop target is under it (`cx.drop_wanted`, so the page shows a copy or a no-drop
+//! cursor), and `drop_leave()`. A drop lists its files (`drop_reset`, then `drop_add(name_len,
+//! size_lo, size_hi, readable)` per file, its name in the input buffer) and dispatches them
+//! with `drop(x, y)`, whose bit 2 says the app accepted some. `shell.js` then asks
+//! `read_next()` for a ticket (0: done) and `read_file`, `read_offset_lo/hi`, and `read_len`,
+//! reads that slice of its `File`, writes it at `chunk_ptr()`, and calls `read_done(ticket,
+//! got, failed)`, which dispatches the chunk. `drop.Transfer` does the cutting (`drop.zig`), so
+//! the chunks are the native host's; a read that resolves after its file was cancelled has a
+//! stale ticket and is ignored. After every dispatch `note_event` starts a transfer the app
+//! accepted and dispatches the `cancelled` chunks of its cancels.
+//!
 //! ## 5. TigerStyle Invariants
 //! - `state`, the draw context, the renderer, and the app are static globals declared
 //!   `undefined`, so they occupy BSS rather than data: the module does not carry their bytes,
@@ -139,6 +152,7 @@ const renderer = @import("../draw/renderer.zig");
 const realtime = @import("../realtime.zig");
 const ui = @import("../ui.zig");
 const bench = @import("../bench.zig");
+const drop = @import("../drop.zig");
 
 /// Bytes `shell.js` may write into the input buffer: a key name or a paste.
 pub const input_cap: u32 = ui.cx.clipboard_cap;
@@ -222,6 +236,18 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.copy_ptr, .{ .name = "copy_ptr" });
     @export(&Web.copy_take, .{ .name = "copy_take" });
     @export(&Web.window_focus, .{ .name = "window_focus" });
+    @export(&Web.drop_over, .{ .name = "drop_over" });
+    @export(&Web.drop_leave, .{ .name = "drop_leave" });
+    @export(&Web.drop_reset, .{ .name = "drop_reset" });
+    @export(&Web.drop_add, .{ .name = "drop_add" });
+    @export(&Web.drop_files, .{ .name = "drop" });
+    @export(&Web.read_next, .{ .name = "read_next" });
+    @export(&Web.read_file, .{ .name = "read_file" });
+    @export(&Web.read_offset_lo, .{ .name = "read_offset_lo" });
+    @export(&Web.read_offset_hi, .{ .name = "read_offset_hi" });
+    @export(&Web.read_len, .{ .name = "read_len" });
+    @export(&Web.chunk_ptr, .{ .name = "chunk_ptr" });
+    @export(&Web.read_done, .{ .name = "read_done" });
     @export(&Web.cursor, .{ .name = "cursor" });
     @export(&Web.timer_period_ms, .{ .name = "timer_period_ms" });
     @export(&Web.timer_on, .{ .name = "timer_on" });
@@ -274,6 +300,17 @@ fn WebApp(comptime App: type) type {
         var overflow_pending: bool = false;
         /// Key names and pastes from `shell.js` (section 4a).
         var input_buffer: [input_cap]u8 = undefined;
+        /// The last drop's files, the transfer, the read `shell.js` is doing, and the chunk
+        /// buffer it fills (section 4d).
+        const Drops = struct {
+            list: drop.List,
+            transfer: drop.Transfer,
+            read: drop.Read,
+            bytes: [drop.chunk_cap]u8,
+            chunk: input.Chunk,
+            cancelled: [input.drop_files_max]input.Chunk,
+        };
+        var drops: Drops = undefined;
 
         /// The `?bench=` replay (section 4c); `phase` is `.off` without one.
         const scenarios: []const bench.Scenario =
@@ -317,6 +354,8 @@ fn WebApp(comptime App: type) type {
             context.init();
             app_contract.start(App, &context);
             if (has_audio) audio_queue.init();
+            drops.transfer.init();
+            drops.list.reset(0, 0);
             render.init();
             App.init(&app, &context.draw.textures);
             render.setup(&state.commands, &context.draw);
@@ -464,6 +503,125 @@ fn WebApp(comptime App: type) type {
             assert(state.frame.running);
             assert(focused <= 1);
             return note_event(.{ .window_focus = focused != 0 });
+        }
+
+        /// A file drag over the canvas at `(x, y)`. Returns bit 0 = dirty, bit 1 = a drop
+        /// target is under it (section 4d).
+        fn drop_over(x: f32, y: f32) callconv(.c) u32 {
+            assert(state.frame.running);
+            const dirty = note_event(.{ .drop_over = .{ .x = x, .y = y } });
+            return dirty | @as(u32, @intFromBool(context.drop_wanted())) << 1;
+        }
+
+        /// The file drag left the canvas. Returns the dirty flag.
+        fn drop_leave() callconv(.c) u32 {
+            assert(state.frame.running);
+            return note_event(.drop_leave);
+        }
+
+        /// Starts listing a drop's files.
+        fn drop_reset() callconv(.c) void {
+            assert(state.frame.running);
+            drops.list.reset(0, 0);
+        }
+
+        /// Lists one dropped file, its name the `name_len` bytes in the input buffer. Returns 0
+        /// when it was skipped.
+        fn drop_add(name_len: u32, size_lo: u32, size_hi: u32, readable: u32) callconv(.c) u32 {
+            assert(name_len <= input_cap);
+            assert(readable <= 1);
+            const size = @as(u64, size_hi) << 32 | size_lo;
+            return @intFromBool(drops.list.add("", input_buffer[0..name_len], size, readable == 1));
+        }
+
+        /// Dispatches the listed files dropped at `(x, y)`, after cancelling a transfer still
+        /// running. Returns bit 0 = dirty, bit 2 = files were accepted: `shell.js` reads them.
+        fn drop_files(x: f32, y: f32) callconv(.c) u32 {
+            assert(state.frame.running);
+            if (drops.transfer.running()) {
+                const all = std.math.maxInt(u16);
+                dispatch_chunks(drops.transfer.cancel(all, &drops.cancelled));
+            }
+            drops.list.drop.x = x;
+            drops.list.drop.y = y;
+            const dirty = note_event(.{ .drop = drops.list.files() });
+            return dirty | @as(u32, @intFromBool(drops.transfer.running())) << 2;
+        }
+
+        /// The ticket of the next read `shell.js` does, or 0 when the transfer ended. Empty and
+        /// unreadable files end here without a read.
+        fn read_next() callconv(.c) u32 {
+            assert(state.frame.running);
+            var guard: u32 = 0;
+            while (guard <= input.drop_files_max) : (guard += 1) {
+                const next = drops.transfer.next() orelse return 0;
+                switch (next) {
+                    .end => |end| {
+                        drops.chunk = end;
+                        _ = note_event(.{ .file = &drops.chunk });
+                    },
+                    .read => |read| {
+                        drops.read = read;
+                        assert(read.ticket != 0);
+                        return read.ticket;
+                    },
+                }
+            }
+            return 0;
+        }
+
+        fn read_file() callconv(.c) u32 {
+            return drops.read.file;
+        }
+
+        fn read_offset_lo() callconv(.c) u32 {
+            return @truncate(drops.read.offset);
+        }
+
+        fn read_offset_hi() callconv(.c) u32 {
+            return @intCast(drops.read.offset >> 32);
+        }
+
+        fn read_len() callconv(.c) u32 {
+            assert(drops.read.len <= drop.chunk_cap);
+            return drops.read.len;
+        }
+
+        /// Where `shell.js` writes a read's bytes.
+        fn chunk_ptr() callconv(.c) [*]u8 {
+            return &drops.bytes;
+        }
+
+        /// A read finished: `got` bytes in the chunk buffer, or failed. Dispatches its chunk
+        /// unless the ticket went stale. Returns the dirty flag.
+        fn read_done(ticket: u32, got: u32, failed: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(got <= drop.chunk_cap);
+            const bytes = drops.bytes[0..got];
+            const chunk = drops.transfer.complete(ticket, bytes, failed != 0) orelse return 0;
+            drops.chunk = chunk;
+            return note_event(.{ .file = &drops.chunk });
+        }
+
+        /// Dispatches cancelled chunks directly.
+        fn dispatch_chunks(count: u32) void {
+            assert(count <= input.drop_files_max);
+            for (drops.cancelled[0..count]) |*chunk| {
+                ui.dispatch(App, &app, &context, .{ .file = chunk });
+                if (context.dirty) state.frame.request_redraw();
+            }
+        }
+
+        /// After a dispatch: a transfer the app accepted, and the cancelled chunks of its
+        /// cancels, bounded (section 4d).
+        fn serve_files() void {
+            if (context.take_files_accept()) |mask| drops.transfer.begin(drops.list.files(), mask);
+            var guard: u32 = 0;
+            while (guard < input.drop_files_max) : (guard += 1) {
+                const mask = context.take_files_cancel();
+                if (mask == 0) break;
+                dispatch_chunks(drops.transfer.cancel(mask, &drops.cancelled));
+            }
         }
 
         /// The `ui.Cursor` value to show over the canvas.
@@ -679,6 +837,7 @@ fn WebApp(comptime App: type) type {
             const time_ms: u32 = @intCast(bench.Clock.frame_time_ms(n));
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| replay_dispatch(event);
+            if (step == .drop) bench.replay_drop(App, &app, &context, step.drop, rect.?);
             return true;
         }
 
@@ -731,6 +890,7 @@ fn WebApp(comptime App: type) type {
             ui.dispatch(App, &app, &context, event);
             // The page's own paste event delivers the text, so a request needs no action.
             _ = context.take_paste_request();
+            serve_files();
             if (context.dirty) {
                 state.frame.request_redraw();
             }

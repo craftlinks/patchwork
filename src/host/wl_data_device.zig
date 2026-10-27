@@ -1,5 +1,6 @@
 //! Wayland `wl_data_device_manager`, `wl_data_device`, `wl_data_source`, and `wl_data_offer`
-//! client bindings: the clipboard's protocol surface. The state machine is `clipboard.zig`.
+//! client bindings: the clipboard's and drag-and-drop's protocol surface. The state machines are
+//! `clipboard.zig` and `dnd.zig`.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -7,14 +8,17 @@
 //! The host binds `min(advertised, manager_version_max)` (3). Every interface here is core,
 //! exported by `libwayland-client.so.0`, so no table is written by hand; only the listener
 //! tables are, with one slot per event of version 3 in opcode order (asserted below). Version
-//! 3 adds only drag-and-drop actions, which this host never starts, so its events are no-ops.
+//! 3 adds drag-and-drop actions: the host takes file drops (`dnd.zig`) only from a manager
+//! bound at version 3, and never starts a drag, so the source's drag-and-drop events are
+//! no-ops.
 //!
 //! ## 2. Requests Used
 //! ```text
 //! wl_data_device_manager  create_data_source (0, new_id), get_data_device (1, new_id, seat)
 //! wl_data_device          set_selection (1, source?, serial), release (2, v2)
 //! wl_data_source          offer (0, mime), destroy (1)
-//! wl_data_offer           receive (1, mime, fd), destroy (2)
+//! wl_data_offer           accept (0, serial, mime?), receive (1, mime, fd), destroy (2),
+//!                         finish (3, v3), set_actions (4, v3, actions, preferred)
 //! ```
 //! `receive` passes a file descriptor; libwayland duplicates it while marshalling, so the
 //! caller closes its copy right after the request.
@@ -60,6 +64,15 @@ extern fn wl_proxy_add_listener(
 extern fn wl_proxy_destroy(proxy: *WlProxy) void;
 
 const marshal_flag_destroy: u32 = 1;
+
+/// `wl_data_device_manager.dnd_action` values.
+pub const action_none: u32 = 0;
+pub const action_copy: u32 = 1;
+pub const action_move: u32 = 2;
+pub const action_ask: u32 = 4;
+
+/// The version at which an offer has `finish` and `set_actions`.
+pub const dnd_version: u32 = 3;
 
 /// `wl_data_device` events at version 3.
 pub const DeviceListener = extern struct {
@@ -174,6 +187,34 @@ pub fn receive(offer: *Offer, mime: [*:0]const u8, fd: i32) void {
     assert(fd >= 0);
     const proxy: *WlProxy = @ptrCast(offer);
     _ = wl_proxy_marshal_flags(proxy, 1, null, wl_proxy_get_version(proxy), 0, mime, fd);
+}
+
+/// `wl_data_offer.accept` (0): a drop here would take `mime`, or nothing for null. `serial`
+/// is the drag's `enter` serial.
+pub fn accept(offer: *Offer, serial: u32, mime: ?[*:0]const u8) void {
+    const proxy: *WlProxy = @ptrCast(offer);
+    _ = wl_proxy_marshal_flags(proxy, 0, null, wl_proxy_get_version(proxy), 0, serial, mime);
+    assert(@intFromPtr(offer) != 0);
+}
+
+/// `wl_data_offer.finish` (3, v3): the drop's data was received.
+pub fn finish(offer: *Offer) void {
+    const proxy: *WlProxy = @ptrCast(offer);
+    assert(wl_proxy_get_version(proxy) >= dnd_version);
+    _ = wl_proxy_marshal_flags(proxy, 3, null, wl_proxy_get_version(proxy), 0);
+}
+
+/// `wl_data_offer.set_actions` (4, v3): the actions this client takes, and the one it prefers.
+pub fn set_actions(offer: *Offer, actions: u32, preferred: u32) void {
+    const proxy: *WlProxy = @ptrCast(offer);
+    assert(wl_proxy_get_version(proxy) >= dnd_version);
+    assert(actions & preferred == preferred);
+    _ = wl_proxy_marshal_flags(proxy, 4, null, wl_proxy_get_version(proxy), 0, actions, preferred);
+}
+
+/// The version the offer's object was created at.
+pub fn offer_version(offer: *Offer) u32 {
+    return wl_proxy_get_version(@ptrCast(offer));
 }
 
 /// `wl_data_offer.destroy` (2).

@@ -34,7 +34,7 @@ pub const App = struct {
 |---|---|---|
 | `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`, `theme` (see Theme). |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
-| `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, and `frame` events to the app's widgets. |
+| `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, file drop, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 | `scenarios` (optional) | `[]const bench.Scenario` | Scripted runs for `--bench` (see Bench Mode). |
@@ -88,6 +88,10 @@ widget; the app routes every event to every widget it owns.
 | `key_down`, `key_up` | `KeyPress{key, mods, repeat, len, text: [4]u8}`: the typed text rides on `key_down` |
 | `paste` | `[]const u8`, valid only while it is dispatched |
 | `window_focus` | `bool`: false releases held keys and modifiers |
+| `drop_over` | `Point{x, y}`: a drag carrying files is over the window |
+| `drop_leave` | none: that drag left, or ended without dropping here |
+| `drop` | `*const Drop{x, y, count, skipped, files}`, valid only while it is dispatched |
+| `file` | `*const Chunk{file, offset, bytes, end}`: bytes of an accepted file, valid only while it is dispatched |
 | `frame` | the animator step in milliseconds |
 
 `Key` names arrows, Home, End, Page Up and Down, Backspace, Delete, Enter, Tab, Escape, `a`
@@ -161,8 +165,9 @@ patchwork/
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
 │   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM and PNG
 │   ├── realtime.zig            # Audio blocks, the SPSC queue, the wake, test tone, meters, scope
+│   ├── drop.zig                # File drops: the file list, the URI list parser, the transfer
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
-│   └── native_tests.zig        # Test root of tests that call libxkbcommon or spawn threads
+│   └── native_tests.zig        # Test root of tests that call system libraries, files, or threads
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native entry point: parses options, runs linux_window.run(App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
@@ -174,8 +179,10 @@ patchwork/
 │   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
 │   ├── xkb.zig                 # libxkbcommon: keymap, modifiers, text, compose, repeat
 │   ├── wp_cursor_shape.zig     # wp_cursor_shape_v1 bindings and the cursor shape map
-│   ├── wl_data_device.zig      # Clipboard protocol bindings (wl_data_device_manager 3)
+│   ├── wl_data_device.zig      # Clipboard and drag-and-drop bindings (wl_data_device_manager 3)
 │   ├── clipboard.zig           # Clipboard state machine: selection, send and receive pipes
+│   ├── dnd.zig                 # Native file drops: the drag offer, its URI list, file reads
+│   ├── dnd_test.zig            # Its tests: real files, a folder, a FIFO (native test root only)
 │   ├── wl_callback.zig         # Wayland frame completion callback
 │   ├── wp_presentation.zig     # Wayland presentation-time feedback listener
 │   ├── wp_fractional_scale.zig # wp_fractional_scale_v1 and wp_viewporter bindings
@@ -213,6 +220,8 @@ patchwork/
 │       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
 │       ├── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
 │       ├── icons.zig           # Named Lucide codepoints and the icon face's ranges
+│       ├── files.zig           # The files page: a drop zone, the dropped files, a waveform
+│       ├── wav.zig             # A streaming 16-bit PCM WAV decoder fed chunk by chunk
 │       └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
@@ -955,6 +964,11 @@ blue.
   a toolbar (open, save, settings, each with a tooltip) are `widgets.ButtonOf` a small skin that
   draws the default face and the icon with `kit.icon`; a ladder draws one icon at 12, 16, 24,
   32, and 48 px, the icon set every icon at 24 px, and a line in each Noto face.
+- **files** (step 37, see File Drops): a drop zone that lights its border while files are
+  dragged over it, the dropped files in a `ListBox` with sizes and statuses ("reading 42%",
+  "done", "folder"), and the first WAV among them decoded chunk by chunk
+  (`examples/gallery/wav.zig`) and drawn as a waveform. A WAV longer than 21.8 s cancels itself
+  at the sample cap ("cut at 21.8 s"); other files are counted, not stored.
 
 Scenarios: `still`, `interact` (a click, two drags, a toggle, typing, a wheel, and a row click,
 then settled), `hover` (the pointer rests on button 1), `light` (the toggle, then the focused
@@ -966,7 +980,55 @@ popups; `tabs` (each tab clicked: the containers page), `split` (the divider dra
 left), `list` (row 3 clicked, then Down 20 times: preset 0024 scrolled into view), and `number`
 (the frequency dragged up 40 px, the gain double-clicked, "-6.5" typed, Enter) for the
 containers; `type` (the type page) and `transport` (play clicked: pause shows) for the type
-page.
+page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
+tone, a text file, and a folder dropped: the tone's waveform) for the files page.
+
+## File Drops
+
+A drag of files from a file manager (natively) or from the desktop (in the browser) reaches
+the app as events, and the files' bytes follow in chunks; the app never sees a path.
+
+```zig
+const zone = ui.id("zone", 0);
+
+// draw: one area flagged `drop`; highlight while a drag is over it.
+cx.area(zone, rect, radius, ui.cx.drop_flag);
+const lit = cx.drop_hovering(zone);
+
+// event: accept what you want, store the chunks yourself.
+switch (cx.drop_hit(zone, event)) {
+    .drop_in, .drop_out => cx.redraw(),
+    .dropped => |dropped| cx.accept_files(zone, mask_of(dropped.files)),
+    .file => |chunk| store(chunk.file, chunk.offset, chunk.bytes, chunk.end),
+    .none => {},
+}
+```
+
+- **The target** is the topmost area flagged `drop` under the drag, resolved like the wheel
+  target, so a popup blocks drops beneath it. The pointer, hover, and focus are untouched;
+  `cx.hit` answers `none` for the four drop events and `cx.drop_hit` answers them.
+- **The drop** lists up to 16 files by base name (cut to 255 bytes), size, and whether they can
+  be read (a folder or a special file cannot); more are counted in `skipped`. During the `drop`
+  event the app calls `cx.accept_files(id, mask)` once; `id` then receives the chunks.
+- **Chunks.** Accepted files arrive in order, never interleaved, in chunks of exactly 64 KiB
+  but the last; the chunk that reaches the file's size is `done`, and every accepted file ends
+  with exactly one of `done`, `failed`, or `cancelled`. An empty file is one empty `done`. The
+  bytes are valid only while the chunk is dispatched: copy what you keep into your own static
+  storage. One state machine (`patchwork.drop.Transfer`) cuts the chunks for every host, so a
+  decoder sees the same splits natively, in the browser, and in regress.
+- **Big files** stream at any size. Refuse one up front by not accepting it, or stop it with
+  `cx.cancel_files(mask)`: its `cancelled` chunk follows, and the other files go on.
+- **Natively** (`src/host/dnd.zig`) a drag offering `text/uri-list` is taken at
+  `wl_data_device_manager` version 3: copy only, and `accept` is sent exactly while a drop
+  target is under the drag, so the compositor shows a copy cursor over drop zones only. The
+  list arrives through a pipe in the poll set; each `file:` path is examined with `statx`, and
+  a non-regular file is never opened. Files are read with `pread` on the UI thread, at most four
+  chunks per wake, and the loop does not sleep while a transfer runs.
+- **In the browser** `dragover` and `drop` on the canvas call into Wasm, the drop effect is
+  "copy" over a target and "none" elsewhere, and `File.slice` reads each chunk; the page itself
+  ignores drops beside the canvas.
+- **Bench steps** `drop_hover` and `drop` (files given as repeated byte parts) replay a drop
+  from memory in every host (`bench.replay_drop`).
 
 ## Pan and Zoom
 
@@ -1559,6 +1621,7 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   `UTF8_STRING`, and `text/plain`; transfers run through non-blocking pipes in the poll set,
   a paste reads at most 64 KiB, and `SIGPIPE` is ignored. A stalled peer costs no wakes and
   is closed when the next copy or paste replaces it.
+- File drops: the same data device's drag-and-drop events (see File Drops).
 - GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
   stream. The device's uncaptured-error callback is installed, so a validation error fails the
   frame with the op index, the op name (with the draw type's label for a shader), and the
@@ -1593,6 +1656,8 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   `window_focus`, the context menu is suppressed, all buttons are forwarded, and after each
   call `shell.js` sets `canvas.style.cursor` from `cursor()` and the CSS names Wasm exports.
   IME composition is not supported.
+- File drops: `dragenter`, `dragover`, `dragleave`, and `drop` on the canvas, read with
+  `File.slice` (see File Drops).
 - `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.
   JavaScript decodes the stream and its spans in place, with no intermediate copies, and
   asserts that `pass_begin` carries the canvas backing size.

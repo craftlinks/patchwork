@@ -31,6 +31,17 @@
 //! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
 //! pointer stays at the end point.
 //!
+//! ## 2b. File Drops
+//! `drop_hover` drags files over the target's centre and stays (the drag is not ended), so a
+//! drop zone's highlight shows in the dump. `drop` drags them there and drops: `replay_drop`
+//! dispatches the `drop` event with the step's files, and when the app accepts some, the
+//! whole transfer runs inside the step through the same `drop.Transfer` the hosts drive, with
+//! the bytes generated from the files' `parts` (a part is bytes repeated, so a WAV is its
+//! header and one period). Cancels the app asks for are served after each dispatch. Every
+//! replay (headless, `--regress`, `--bench`, the browser's `?bench=`) calls it, so they all
+//! deliver the same chunks. `validate` bounds a step to `input.drop_files_max` files of at most
+//! `drop_file_max` bytes.
+//!
 //! ## 2a. Headless Replay
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
 //! no GPU: the app draws a frame, the next step's events are dispatched, and so on. App tests
@@ -85,6 +96,7 @@ const ui = @import("ui.zig");
 const renderer = @import("draw/renderer.zig");
 const textures = @import("draw/textures.zig");
 const realtime = @import("realtime.zig");
+const drop = @import("drop.zig");
 
 /// Most steps in one `setup` or `cycle` list.
 pub const steps_max: u32 = 256;
@@ -101,6 +113,9 @@ pub const arg_cap: u32 = 16;
 /// Most events one step dispatches: move, press, release, leave (a click), or move, press,
 /// move, release (a drag).
 pub const event_cap: u32 = 4;
+
+/// Largest file a `drop` step carries: 64 chunks.
+pub const drop_file_max: u64 = 64 * drop.chunk_cap;
 
 /// Widest image `ppm_row` converts, in pixels.
 pub const width_max: u32 = 8192;
@@ -150,6 +165,33 @@ pub const Drag = struct {
     dy: f32,
 };
 
+/// Bytes repeated `repeat` times: a piece of a dropped file (section 2b).
+pub const Part = struct {
+    bytes: []const u8,
+    repeat: u32 = 1,
+};
+
+/// A file a `drop` step carries: its name and its bytes as parts.
+pub const File = struct {
+    name: []const u8,
+    parts: []const Part,
+    /// False lists it as a folder would be: unreadable, size 0.
+    readable: bool = true,
+
+    /// The file's size: every part's bytes times its repeat.
+    pub fn size(self: File) u64 {
+        var total: u64 = 0;
+        for (self.parts) |part| total += @as(u64, part.bytes.len) * part.repeat;
+        return total;
+    }
+};
+
+/// Files dropped at the target's centre (section 2b).
+pub const DropFiles = struct {
+    target: Target,
+    files: []const File,
+};
+
 /// One scripted action. Each step presents one frame (module guide, section 2).
 pub const Step = union(enum) {
     key: Press,
@@ -165,6 +207,10 @@ pub const Step = union(enum) {
     drag: Drag,
     /// Frames presented without input.
     wait: u32,
+    /// A file drag moves over the target's centre and stays (section 2b).
+    drop_hover: Target,
+    /// Files dragged to the target's centre and dropped; accepted ones are delivered.
+    drop: DropFiles,
 };
 
 pub const Scenario = struct {
@@ -199,6 +245,10 @@ pub fn validate(comptime scenarios: []const Scenario) ?[]const u8 {
         if (drag_still(scenario.setup) or drag_still(scenario.cycle)) {
             return "App.scenarios." ++ name ++ ": a drag moves by 0";
         }
+        if (drop_invalid(scenario.setup) or drop_invalid(scenario.cycle)) {
+            return "App.scenarios." ++ name ++ ": a drop has no files, more than 16, " ++
+                "an empty or long name, or a file over 4 MiB";
+        }
         for (scenarios[0..index]) |earlier| {
             if (std.mem.eql(u8, earlier.name, name)) {
                 return "App.scenarios: duplicate name " ++ name;
@@ -214,6 +264,22 @@ fn steps_invalid(steps: []const Step) bool {
             .key => |press| if (press.text.len > input.key_text_cap) return true,
             .wait => |frames| if (frames == 0) return true,
             .click, .click_at, .right_click, .wheel, .hover, .drag => {},
+            .drop_hover, .drop => {},
+        }
+    }
+    return false;
+}
+
+/// True when a `drop` of `steps` breaks the bounds of section 2b.
+fn drop_invalid(steps: []const Step) bool {
+    for (steps) |step| {
+        if (step != .drop) continue;
+        const files = step.drop.files;
+        if (files.len == 0 or files.len > input.drop_files_max) return true;
+        for (files) |file| {
+            if (file.name.len == 0 or file.name.len > input.drop_name_max) return true;
+            if (file.size() > drop_file_max) return true;
+            if (!file.readable and file.size() != 0) return true;
         }
     }
     return false;
@@ -360,6 +426,11 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[0] = .{ .pointer_move = .{ .x = r[0] + at.x, .y = r[1] + at.y } };
             return 1;
         },
+        .drop_hover, .drop => {
+            const r = rect.?;
+            out[0] = .{ .drop_over = .{ .x = r[0] + r[2] / 2, .y = r[1] + r[3] / 2 } };
+            return 1;
+        },
         .drag => |drag| {
             assert(drag.dx != 0 or drag.dy != 0);
             const r = rect.?;
@@ -392,8 +463,91 @@ pub fn step_target(step: Step) ?Target {
         .wheel => |turn| turn.target,
         .hover => |at| at.target,
         .drag => |drag| drag.target,
+        .drop_hover => |target| target,
+        .drop => |files| files.target,
         .key, .wait => null,
     };
+}
+
+/// The storage `replay_drop` uses; one replay runs at a time.
+const DropStore = struct {
+    list: drop.List,
+    transfer: drop.Transfer,
+    buffer: [drop.chunk_cap]u8,
+    cancelled: [input.drop_files_max]input.Chunk,
+};
+var drop_store: DropStore = undefined;
+
+/// After a `drop` step's `drop_over` (`step_events`): drops its files on the target whose
+/// rect is `rect` and delivers the accepted ones (section 2b).
+pub fn replay_drop(
+    comptime App: type,
+    app: *App,
+    cx: anytype,
+    files: DropFiles,
+    rect: [4]f32,
+) void {
+    assert(files.files.len >= 1);
+    assert(files.files.len <= input.drop_files_max);
+    const store = &drop_store;
+    store.list.reset(rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+    for (files.files) |file| _ = store.list.add("", file.name, file.size(), file.readable);
+    ui.dispatch(App, app, cx, .{ .drop = store.list.files() });
+    const mask = cx.take_files_accept() orelse return;
+    store.transfer.init();
+    store.transfer.begin(store.list.files(), mask);
+    serve_cancel(App, app, cx);
+    var guard: u32 = 0;
+    while (store.transfer.next()) |next| : (guard += 1) {
+        assert(guard <= input.drop_files_max * (drop_file_max / drop.chunk_cap + 1));
+        const chunk = switch (next) {
+            .end => |end| end,
+            .read => |read| blk: {
+                const bytes = store.buffer[0..read.len];
+                fill_parts(files.files[read.file].parts, read.offset, bytes);
+                break :blk store.transfer.complete(read.ticket, bytes, false).?;
+            },
+        };
+        ui.dispatch(App, app, cx, .{ .file = &chunk });
+        serve_cancel(App, app, cx);
+    }
+    assert(!store.transfer.running());
+}
+
+/// Dispatches the cancelled chunks of the `cancel_files` the last dispatch asked for, and of
+/// any those dispatches ask for in turn.
+fn serve_cancel(comptime App: type, app: *App, cx: anytype) void {
+    const store = &drop_store;
+    var guard: u32 = 0;
+    while (guard < input.drop_files_max) : (guard += 1) {
+        const mask = cx.take_files_cancel();
+        if (mask == 0) return;
+        const count = store.transfer.cancel(mask, &store.cancelled);
+        for (store.cancelled[0..count]) |*chunk| ui.dispatch(App, app, cx, .{ .file = chunk });
+    }
+    assert(cx.take_files_cancel() == 0);
+}
+
+/// Writes the bytes of `parts` from `offset` into `out` (section 2b).
+pub fn fill_parts(parts: []const Part, offset: u64, out: []u8) void {
+    var start: u64 = 0;
+    var written: usize = 0;
+    for (parts) |part| {
+        if (written == out.len) break;
+        const length = @as(u64, part.bytes.len) * part.repeat;
+        const end = start + length;
+        while (written < out.len and offset + written < end) {
+            const at = offset + written;
+            if (at < start) break;
+            const within: usize = @intCast((at - start) % part.bytes.len);
+            const left_in_part: usize = @intCast(end - at);
+            const take = @min(part.bytes.len - within, out.len - written, left_in_part);
+            @memcpy(out[written..][0..take], part.bytes[within..][0..take]);
+            written += take;
+        }
+        start = end;
+    }
+    assert(written == out.len);
 }
 
 pub const ReplayError = error{NoArea};
@@ -443,6 +597,7 @@ pub fn replay_headless_paced(
         for (events[0..step_events(step, rect, time_ms, &events)]) |event| {
             ui.dispatch(App, app, cx, event);
         }
+        if (step == .drop) replay_drop(App, app, cx, step.drop, rect.?);
         _ = replay.presented(scenario);
     }
     assert(count <= steps_limit);
@@ -1440,4 +1595,150 @@ comptime {
     assert(ticks_per_frame_max >= 17);
     assert(sample_cap <= 1 << 16);
     assert(steps_max <= 1 << 16);
+}
+
+/// A one-zone app for the drop replay tests: it accepts every listed file, records each
+/// chunk as (file, offset, length, end), and cancels file `cancel_file` after its first chunk.
+const DropApp = struct {
+    const app_module = @import("app.zig");
+    const zone = areas.id("zone", 0);
+    const Cx = app_module.Context(DropApp);
+
+    pub const config: app_module.Config = .{
+        .title = "drop",
+        .timer_period_ms = 0,
+        .draw = &.{.{ .type = @import("draw.zig").Box, .cap = 4 }},
+    };
+
+    chunks: [32][4]u64,
+    count: u32,
+    cancel_file: ?u8,
+
+    pub fn init(app: *DropApp, pool: *textures.Textures) void {
+        _ = pool;
+        app.count = 0;
+        app.cancel_file = null;
+    }
+    pub fn event(app: *DropApp, cx: *Cx, event_value: input.Event) void {
+        switch (cx.drop_hit(zone, event_value)) {
+            .dropped => |dropped| {
+                const listed: u16 = @intCast((@as(u32, 1) << @intCast(dropped.files.count)) - 1);
+                cx.accept_files(zone, listed);
+            },
+            .file => |chunk| {
+                const end: u64 = @backingInt(chunk.end);
+                app.chunks[app.count] = .{ chunk.file, chunk.offset, chunk.bytes.len, end };
+                app.count += 1;
+                if (app.cancel_file == chunk.file and chunk.end == .more) {
+                    cx.cancel_files(@as(u16, 1) << @intCast(chunk.file));
+                }
+            },
+            else => {},
+        }
+    }
+    pub fn timer(app: *DropApp, cx: *Cx, now_ms: u64) void {
+        _ = app;
+        _ = cx;
+        _ = now_ms;
+    }
+    pub fn draw(app: *DropApp, cx: *Cx) void {
+        _ = app;
+        cx.area(zone, .{ .x = 0, .y = 0, .width = 100, .height = 100 }, 0, ui.cx.drop_flag);
+    }
+};
+
+// Locks `replay_drop` (section 2b): three files dropped on the zone (70,000 bytes from a
+// repeated part, an empty one, and a folder) arrive as 65,536 more, 4,464 done, an empty
+// done, and one failed; the parts' bytes land where they belong.
+test "a drop step delivers the accepted files in exact chunks" {
+    const files = [_]File{
+        .{ .name = "loop.raw", .parts = &.{
+            .{ .bytes = "RIFF" },
+            .{ .bytes = "ab", .repeat = 34998 },
+        } },
+        .{ .name = "empty.txt", .parts = &.{} },
+        .{ .name = "samples", .parts = &.{}, .readable = false },
+    };
+    const scenario: Scenario = .{
+        .name = "drop",
+        .setup = &.{.{ .drop = .{ .target = comptime area("zone", 0), .files = &files } }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+    try testing.expectEqual(@as(?[]const u8, null), comptime validate(&.{scenario}));
+    var app: DropApp = undefined;
+    DropApp.init(&app, undefined);
+    const static = struct {
+        var context: DropApp.Cx = undefined;
+    };
+    static.context.init();
+    _ = try replay_headless(DropApp, &app, &static.context, &scenario, .{ 200, 200 }, 8);
+    const more: u64 = @backingInt(input.ChunkEnd.more);
+    const done: u64 = @backingInt(input.ChunkEnd.done);
+    const failed: u64 = @backingInt(input.ChunkEnd.failed);
+    const expected = [_][4]u64{
+        .{ 0, 0, 65536, more },
+        .{ 0, 65536, 4464, done },
+        .{ 1, 0, 0, done },
+        .{ 2, 0, 0, failed },
+    };
+    try testing.expectEqualSlices([4]u64, &expected, app.chunks[0..app.count]);
+    var bytes: [6]u8 = undefined;
+    fill_parts(files[0].parts, 2, &bytes);
+    try testing.expectEqualStrings("FFabab", &bytes);
+    fill_parts(files[0].parts, 69999, bytes[0..1]);
+    try testing.expectEqualStrings("b", bytes[0..1]);
+}
+
+// Locks a cancel during a drop step: the app cancels file 0 after its first chunk, which ends
+// it cancelled at 65,536, and file 1 still arrives.
+test "a cancel in a drop step ends only its file" {
+    const files = [_]File{
+        .{ .name = "big.raw", .parts = &.{.{ .bytes = "x", .repeat = 200000 }} },
+        .{ .name = "small.raw", .parts = &.{.{ .bytes = "y", .repeat = 3 }} },
+    };
+    const scenario: Scenario = .{
+        .name = "drop",
+        .setup = &.{.{ .drop = .{ .target = comptime area("zone", 0), .files = &files } }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+    var app: DropApp = undefined;
+    DropApp.init(&app, undefined);
+    app.cancel_file = 0;
+    const static = struct {
+        var context: DropApp.Cx = undefined;
+    };
+    static.context.init();
+    _ = try replay_headless(DropApp, &app, &static.context, &scenario, .{ 200, 200 }, 8);
+    const cancelled: u64 = @backingInt(input.ChunkEnd.cancelled);
+    const expected = [_][4]u64{
+        .{ 0, 0, 65536, @backingInt(input.ChunkEnd.more) },
+        .{ 0, 65536, 0, cancelled },
+        .{ 1, 0, 3, @backingInt(input.ChunkEnd.done) },
+    };
+    try testing.expectEqualSlices([4]u64, &expected, app.chunks[0..app.count]);
+}
+
+/// A one-step scenario that drops `files` on `target`, for the validation test.
+fn drop_scenario(comptime name: []const u8, target: Target, files: []const File) Scenario {
+    return .{
+        .name = name,
+        .setup = &.{.{ .drop = .{ .target = target, .files = files } }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+}
+
+// Locks the drop bounds of `validate`: no files, a file over 4 MiB, and a folder with bytes.
+test "drop steps are validated" {
+    const target = comptime area("zone", 0);
+    const none: Scenario = comptime drop_scenario("none", target, &.{});
+    try testing.expect(comptime validate(&.{none}) != null);
+    const huge = [_]File{.{ .name = "huge", .parts = &.{.{ .bytes = "z", .repeat = 5 << 20 }} }};
+    const big: Scenario = comptime drop_scenario("big", target, &huge);
+    try testing.expect(std.mem.find(u8, comptime validate(&.{big}).?, "4 MiB") != null);
+    const folder = [_]File{.{ .name = "dir", .parts = &.{.{ .bytes = "z" }}, .readable = false }};
+    const odd: Scenario = comptime drop_scenario("odd", target, &folder);
+    try testing.expect(comptime validate(&.{odd}) != null);
 }

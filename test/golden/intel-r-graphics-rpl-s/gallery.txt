@@ -2,22 +2,25 @@
 # adapter: Intel(R) Graphics (RPL-S)
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
-scenario   hash
-about      8d56e4faf9067dc9
-context    bea85a7c30b8850e
-dismiss    aa79e3969aa36a37
-dropdown   fc2911822390e97a
-hardware   0ebcfb87efc6ff9a
-hover      bb54ee38c1954d11
-interact   858df639e4af488f
-light      b3384fd67a989d8f
-list       dd6348e28ee4d713
-menu-flip  6f71e442626d4283
-menu-open  5f713d48bd919275
-number     167c31b986f06c77
-split      c94ac310063a77ff
-still      feaf5b60caa24ef2
-tabs       3f67f0fe669c2d7d
-tooltip    5d28f322bb1c2e26
-transport  7cd3d737ebdf48db
-type       8d4662d55b5f53a2
+scenario    hash
+about       255f7411d1d9574c
+context     75d800942ae0c2e0
+dismiss     68b04f0d816d719f
+drop        502b739d40b2cb49
+drop-hover  3e391e3c779e8130
+dropdown    71224583d8564bc6
+files       ce50d43ebd3fa166
+hardware    8b902d893fd819de
+hover       591dc0a15b22ba04
+interact    72894cc2561abe2f
+light       c62fdc0ffa71bd2b
+list        af5e921bc255bb76
+menu-flip   aa6d55fd52a60caa
+menu-open   5df4e9d8583b6527
+number      6f5b77a660b11996
+split       19b1ac93be9d9027
+still       44e140df699ec55c
+tabs        7d72db3a231fc75b
+tooltip     6771e42b6d86926d
+transport   d35872a613364074
+type        4ca4aefd460679b6

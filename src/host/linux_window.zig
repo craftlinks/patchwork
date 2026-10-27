@@ -10,14 +10,16 @@
 //! 1. `wl_display_prepare_read` claims the socket read. A non-zero return means events are
 //!    already queued: dispatch them, drain the timer so a busy socket cannot starve app
 //!    timers, and skip the sleep.
-//! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on a fixed set of six
+//! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on a fixed set of seven
 //!    descriptors (`Slot`): the Wayland socket, the optional app timer, the key repeat timer,
-//!    the clipboard's send and receive pipes, and the audio wake (section 5c). A negative
-//!    descriptor is ignored by `poll`, so an app without a timer passes `no_timer_fd` and
-//!    never wakes on ticks, the repeat timer is disarmed unless a repeating key is held, an
-//!    idle clipboard has no pipes, and an app without an audio source has no wake.
+//!    the clipboard's send and receive pipes, the audio wake (section 5c), and a file drop's
+//!    URI list pipe (section 5d). A negative descriptor is ignored by `poll`, so an app without
+//!    a timer passes `no_timer_fd` and never wakes on ticks, the repeat timer is disarmed
+//!    unless a repeating key is held, an idle clipboard has no pipes, an app without an audio
+//!    source has no wake, and no drop has no list.
 //! 3. The timeout is null (sleep until the compositor writes) unless a commit is latched in
-//!    `State.present_at_ns`, in which case it is the time remaining until that deadline.
+//!    `State.present_at_ns`, in which case it is the time remaining until that deadline, or a
+//!    file transfer runs (section 5d), in which case it is zero.
 //! 4. Cancel-read rule: every successful `prepare_read` must end in `wl_display_read_events`
 //!    or `wl_display_cancel_read`. A timer-only wake or timeout cancels; only a readable
 //!    socket reads. Skipping the cancel leaves libwayland's read lock held.
@@ -158,6 +160,18 @@
 //!   draw the host renders `realtime.blocks_for_frame(n)` blocks on this thread into the same
 //!   queue, so dumps are deterministic (`realtime.zig`, section 7).
 //!
+//! ## 5d. File Drops
+//! The data device's drag events reach `clipboard.dnd` (`dnd.zig`), which queues `drop_over`
+//! and `drop_leave` and receives the drop's URI list through `Slot.drop_list`. After each
+//! dispatch the host tells the compositor whether a drop target is under the drag
+//! (`dnd.sync_accept(cx.drop_wanted())`), starts a transfer the app accepted
+//! (`cx.take_files_accept`), and dispatches the `cancelled` chunks of a `cx.cancel_files`
+//! directly, in a bounded loop. `sync_input` then dispatches a finished list as one `drop`
+//! (cancelling a transfer still running first) and reads at most `drop.chunks_per_wake`
+//! chunks, each dispatched as a `file` event before the next read. A regular file is always
+//! ready, so while the transfer runs `ppoll` does not sleep (a zero timeout) and the loop
+//! keeps reading between frames; once it ends the loop sleeps as before. No drag, no wake.
+//!
 //! ## 6. TigerStyle Invariants
 //! - `State` lives on the stack of `run`; the app, the draw context, and the renderer are
 //!   static in `Host(App)`, because their sizes follow the app (an editor holds hundreds of
@@ -186,6 +200,7 @@ const xkb = @import("xkb.zig");
 const wp_cursor_shape = @import("wp_cursor_shape.zig");
 const wl_data_device = @import("wl_data_device.zig");
 const clipboard_module = @import("clipboard.zig");
+const drop = @import("../drop.zig");
 const bench = @import("../bench.zig");
 const realtime = @import("../realtime.zig");
 const audio_thread = @import("audio_thread.zig");
@@ -651,6 +666,7 @@ fn init_input(state: *State) !void {
     ignore_sigpipe();
     state.keyboard.init();
     clipboard_storage.init();
+    clipboard_storage.dnd.queue = &state.queue;
     state.repeat_fd = try create_timer();
     assert(state.repeat_fd >= 0);
     assert(state.repeat.code == null);
@@ -668,6 +684,7 @@ const Slot = enum(u8) {
     send,
     receive,
     audio,
+    drop_list,
 };
 const slot_count: u32 = @typeInfo(Slot).@"enum".field_names.len;
 
@@ -872,6 +889,7 @@ fn Host(comptime App: type) type {
             const time_ms: u32 = @truncate(monotonic_ns() / std.time.ns_per_ms);
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| self.dispatch(event);
+            if (step == .drop) bench.replay_drop(App, self.app, &context, step.drop, rect.?);
             state.frame.request_redraw();
             assert(state.frame.redraw);
         }
@@ -1262,8 +1280,50 @@ fn Host(comptime App: type) type {
             }
             assert(guard <= input.queue_cap);
             if (state.clipboard.take_received()) |pasted| self.dispatch(.{ .paste = pasted });
+            self.sync_drops();
             apply_cursor(state, context.cursor());
             assert(state.frame.running);
+        }
+
+        /// A finished drop list becomes one `drop` (a transfer still running is cancelled
+        /// first), then at most `drop.chunks_per_wake` chunks are read and dispatched
+        /// (section 5d).
+        fn sync_drops(self: *Self) void {
+            const dnd = &self.state.clipboard.dnd;
+            if (dnd.take_drop()) |files| {
+                if (dnd.busy()) self.dispatch_chunks(dnd.cancel(std.math.maxInt(u16)));
+                self.dispatch(.{ .drop = files });
+            }
+            var reads: u32 = 0;
+            while (reads < drop.chunks_per_wake and dnd.busy()) : (reads += 1) {
+                const chunk = dnd.next_chunk() orelse break;
+                self.dispatch(.{ .file = chunk });
+            }
+            assert(reads <= drop.chunks_per_wake);
+        }
+
+        /// Dispatches cancelled chunks directly; cancels they ask for wait for the next
+        /// `serve_files`.
+        fn dispatch_chunks(self: *Self, chunks: []const input.Chunk) void {
+            assert(chunks.len <= input.drop_files_max);
+            for (chunks) |*chunk| {
+                ui.dispatch(App, self.app, &context, .{ .file = chunk });
+                if (context.dirty) self.state.frame.request_redraw();
+            }
+        }
+
+        /// After a dispatch: the drag's accept, a transfer the app accepted, and the cancelled
+        /// chunks of its cancels, bounded (section 5d).
+        fn serve_files(self: *Self) void {
+            const dnd = &self.state.clipboard.dnd;
+            dnd.sync_accept(context.drop_wanted());
+            if (context.take_files_accept()) |mask| dnd.start(mask);
+            var guard: u32 = 0;
+            while (guard < input.drop_files_max) : (guard += 1) {
+                const mask = context.take_files_cancel();
+                if (mask == 0) break;
+                self.dispatch_chunks(dnd.cancel(mask));
+            }
         }
 
         /// One dispatch, then the clipboard requests it made (section 5a).
@@ -1273,6 +1333,7 @@ fn Host(comptime App: type) type {
             if (context.dirty) {
                 state.frame.request_redraw();
             }
+            self.serve_files();
             if (context.take_copy()) state.clipboard.copy(state.input_serial);
             if (!context.take_paste_request()) return;
             if (state.clipboard.owns_selection()) {
@@ -1441,13 +1502,14 @@ fn Host(comptime App: type) type {
             fds[@backingInt(Slot.send)] = poll_entry(clipboard.send_fd, std.posix.POLL.OUT);
             fds[@backingInt(Slot.receive)] = poll_entry(clipboard.receive_fd, std.posix.POLL.IN);
             fds[@backingInt(Slot.audio)] = poll_entry(wake.fd, std.posix.POLL.IN);
+            fds[@backingInt(Slot.drop_list)] = poll_entry(clipboard.dnd.list_fd, std.posix.POLL.IN);
             const ready = poll_wayland(state, fds[0..]) catch {
                 wl_display_cancel_read(display);
                 return error.PollFailed;
             };
             if (ready == 0) {
                 wl_display_cancel_read(display);
-                assert(state.present_at_ns != 0);
+                assert(state.present_at_ns != 0 or clipboard.dnd.busy());
                 return;
             }
             const wayland_ready = (fds[@backingInt(Slot.wayland)].revents & std.posix.POLL.IN) != 0;
@@ -1470,6 +1532,7 @@ fn Host(comptime App: type) type {
             if (fds[@backingInt(Slot.send)].revents != 0) clipboard.pump_send(context.copied());
             if (fds[@backingInt(Slot.receive)].revents != 0) clipboard.pump_receive();
             if (fds[@backingInt(Slot.audio)].revents != 0) drain_wake(wake.fd);
+            if (fds[@backingInt(Slot.drop_list)].revents != 0) clipboard.dnd.pump_list();
             // A close event read above stops the loop. That wake is not a failure.
             if (!state.frame.running) {
                 assert(!state.frame.running);
@@ -1797,8 +1860,10 @@ fn poll_wayland(state: *State, fds: []std.posix.pollfd) !usize {
     return error.PollFailed;
 }
 
-/// Remaining time until the latched commit. Null blocks until the compositor writes.
+/// Remaining time until the latched commit. Null blocks until the compositor writes. Zero
+/// while a file transfer runs, so the loop keeps reading (section 5d).
 fn poll_timeout(state: *const State) ?std.posix.timespec {
+    if (state.clipboard.dnd.busy()) return .{ .sec = 0, .nsec = 0 };
     if (state.present_at_ns == 0) {
         assert(state.present_at_ns == 0);
         return null;

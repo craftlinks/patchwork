@@ -21,9 +21,10 @@
 //! recorded on, `flags`, and the point range `first_point`, `point_count` of a path area.
 //! `flags` are `wheel` (the area takes wheel input), `focusable` (a left press focuses it and
 //! Tab visits it; the area list in draw order is the Tab order), `tab` (while focused, Tab
-//! and Shift+Tab go to its widget instead of moving focus), and `cursor` (the pointer shape
-//! over it, resolved with the hot area). A point hits a box area (`point_count == 0`)
-//! when the clip contains it and `draw.contains_box` accepts it.
+//! and Shift+Tab go to its widget instead of moving focus), `cursor` (the pointer shape
+//! over it, resolved with the hot area), and `drop` (the area takes dropped files). A point
+//! hits a box area (`point_count == 0`) when the clip contains it and `draw.contains_box`
+//! accepts it.
 //!
 //! A path area (`ui.Context.path_area`) is the set of points within `radius` of a stroked
 //! polyline whose points are in the draw context's point pool, relative to the path origin
@@ -46,9 +47,10 @@
 //! highest layer, then the last appended, so a path area drawn on a higher layer (a cable)
 //! takes the press and the wheel from the box areas under its stroke. The wheel target is the
 //! topmost wheel-flagged area under the point whose layer is at least the hot area's, so an
-//! overlay blocks wheel input to views beneath it. Both come from the same pass: a candidate
-//! replaces the best only on a strictly higher layer, so the first one met on the winning
-//! layer stays.
+//! overlay blocks wheel input to views beneath it. The drop target is found the same way among
+//! drop-flagged areas, so a popup blocks drops on what is beneath it too. All three come from
+//! the same pass: a candidate replaces the best only on a strictly higher layer, so the first
+//! one met on the winning layer stays.
 //!
 //! ## 5. Duplicate Check (`Stamps`)
 //! In safe builds a table of `2 * area_cap` slots (rounded up to a power of two) records each
@@ -103,7 +105,9 @@ pub const Flags = packed struct(u8) {
     /// instead of moving focus. Escape still clears focus, so the keyboard can leave it.
     tab: bool,
     cursor: Cursor,
-    unused: u2 = 0,
+    /// The area takes dropped files: the topmost one under a file drag is its target.
+    drop: bool = false,
+    unused: u1 = 0,
 };
 
 /// One hit area. See the module guide, section 3.
@@ -128,6 +132,7 @@ pub const Area = extern struct {
 pub const Resolved = struct {
     hot: ?u32,
     wheel: ?u32,
+    drop: ?u32,
 };
 
 const fnv_offset: u64 = 0xcbf29ce484222325;
@@ -204,12 +209,13 @@ pub fn contains(area: *const Area, points: []const draw.Point, x: f32, y: f32) b
     return draw.path.distance_to_polyline(shape, dx, dy) <= area.radius / area.zoom;
 }
 
-/// The hot area and the wheel target under `(x, y)`; `points` are the point pool path areas
-/// index. See the module guide, section 4.
+/// The hot area, the wheel target, and the drop target under `(x, y)`; `points` are the point
+/// pool path areas index. See the module guide, section 4.
 pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) Resolved {
     assert(areas.len <= area_cap_max);
     var hot: ?u32 = null;
     var wheel: ?u32 = null;
+    var drop: ?u32 = null;
     var index: u32 = @intCast(areas.len);
     while (index > 0) {
         index -= 1;
@@ -219,12 +225,18 @@ pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) 
         if (area.flags.wheel) {
             if (wheel == null or area.layer > areas[wheel.?].layer) wheel = index;
         }
+        if (area.flags.drop) {
+            if (drop == null or area.layer > areas[drop.?].layer) drop = index;
+        }
     }
     if (wheel) |target| {
         if (areas[target].layer < areas[hot.?].layer) wheel = null;
     }
-    if (wheel != null) assert(hot != null);
-    return .{ .hot = hot, .wheel = wheel };
+    if (drop) |target| {
+        if (areas[target].layer < areas[hot.?].layer) drop = null;
+    }
+    if (wheel != null or drop != null) assert(hot != null);
+    return .{ .hot = hot, .wheel = wheel, .drop = drop };
 }
 
 /// The duplicate-id check for frames of at most `area_cap` areas; see the module guide,
@@ -347,6 +359,27 @@ test "the wheel goes to the topmost wheel area not below the hot layer" {
     const covered = resolve(&areas, &.{}, 50, 50);
     try testing.expectEqual(@as(?u32, 1), covered.hot);
     try testing.expectEqual(@as(?u32, null), covered.wheel);
+}
+
+// Locks the drop rule: the topmost drop-flagged area wins over a later plain area on its layer
+// (a label inside a zone), the later of two zones wins, and a popup above blocks it.
+test "a popup blocks the drop target beneath it" {
+    var areas = [_]Area{
+        test_area(id("zone", 0), 0, 0, false),
+        test_area(id("zone", 1), 0, 0, false),
+        test_area(id("label", 0), 0, 0, false),
+    };
+    areas[0].flags.drop = true;
+    areas[1].flags.drop = true;
+    const base = resolve(&areas, &.{}, 50, 50);
+    try testing.expectEqual(@as(?u32, 2), base.hot);
+    try testing.expectEqual(@as(?u32, 1), base.drop);
+    try testing.expectEqual(@as(?u32, null), base.wheel);
+    areas[2].layer = 5;
+    const covered = resolve(&areas, &.{}, 50, 50);
+    try testing.expectEqual(@as(?u32, 2), covered.hot);
+    try testing.expectEqual(@as(?u32, null), covered.drop);
+    try testing.expectEqual(@as(?u32, null), resolve(&areas, &.{}, 500, 50).drop);
 }
 
 // Locks the duplicate check: a repeat in one frame is refused, the next frame starts empty.

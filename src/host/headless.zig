@@ -588,6 +588,7 @@ fn Runner(comptime App: type) type {
             const time_ms: u32 = @intCast(Clock.frame_time_ms(n));
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| dispatch(event);
+            if (step == .drop) bench.replay_drop(App, &app, &context, step.drop, rect.?);
         }
 
         /// One dispatch with the windowed host's clipboard rule when the app owns the

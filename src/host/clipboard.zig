@@ -21,13 +21,19 @@
 //!
 //! ## 3. Paste
 //! Offers arrive as `data_offer` followed by their `offer` (mime) events, then `selection`
-//! names the selection offer, or a drag-and-drop `enter` names one this host destroys.
+//! names the selection offer, or a drag-and-drop `enter` names one that `dnd.zig` takes (a
+//! file drag) or this host destroys.
 //! `start_receive` picks the best text mime of the selection offer (`preferred_mime`), opens a
 //! `pipe2(NONBLOCK)`, sends the write end, and closes it locally. `pump_receive` reads into the
 //! static `receive_cap` buffer until end of file or until the buffer is full; then the receive
 //! is complete, cut to whole codepoints (`input.utf8_whole`), and the host dispatches it as one
 //! `paste` event. While this client owns the selection the host pastes from `cx.copied()`
 //! directly.
+//!
+//! ## 3a. Drag and Drop
+//! The data device's drag events (`enter`, `motion`, `leave`, `drop`) go to `dnd`, the file
+//! drop state machine (`dnd.zig`), with the mime set of the offer `enter` names: an offer that
+//! carries `text/uri-list` (bit `uri_list_bit`) at version 3 is a file drag it keeps.
 //!
 //! ## 4. Signals
 //! Writing into a pipe whose reader closed raises `SIGPIPE`, which would end the process, so
@@ -43,6 +49,7 @@ const linux = std.os.linux;
 const input = @import("../input.zig");
 const data = @import("wl_data_device.zig");
 const xdg = @import("xdg_shell.zig");
+const dnd_module = @import("dnd.zig");
 
 /// Bytes one paste may read; the rest of a larger selection is dropped.
 pub const receive_cap: u32 = 65536;
@@ -53,11 +60,16 @@ pub const no_fd: i32 = -1;
 /// The text mimes we offer and accept, best first.
 pub const mimes = [_][*:0]const u8{ "text/plain;charset=utf-8", "UTF8_STRING", "text/plain" };
 
-/// The bit of `mime` in an offer's mime set, or 0 for a mime that is not text.
+/// The bit of `text/uri-list`, a file drag's mime, in an offer's mime set.
+pub const uri_list_bit: u8 = 1 << mimes.len;
+
+/// The bit of `mime` in an offer's mime set, or 0 for a mime that is neither text nor a URI
+/// list.
 pub fn mime_bit(mime: []const u8) u8 {
     for (mimes, 0..) |known, index| {
         if (std.mem.eql(u8, std.mem.span(known), mime)) return @as(u8, 1) << @intCast(index);
     }
+    if (std.mem.eql(u8, std.mem.span(dnd_module.uri_list_mime), mime)) return uri_list_bit;
     return 0;
 }
 
@@ -87,8 +99,11 @@ pub const Clipboard = struct {
     /// A finished receive waiting for the host to dispatch it.
     received: bool,
     buffer: [receive_cap]u8,
+    /// File drops (section 3a).
+    dnd: dnd_module.Dnd,
 
     pub fn init(self: *Clipboard) void {
+        self.dnd.init();
         self.manager = null;
         self.device = null;
         self.source = null;
@@ -278,7 +293,7 @@ fn device_data_offer(
     assert(self.pending_mimes == 0);
 }
 
-/// Drag and drop is out of scope: its offer is destroyed.
+/// A drag entered: `dnd` keeps a file drag (section 3a); any other offer is destroyed.
 fn device_enter(
     pointer: ?*anyopaque,
     device: ?*data.Device,
@@ -289,22 +304,24 @@ fn device_enter(
     offer: ?*data.Offer,
 ) callconv(.c) void {
     _ = device;
-    _ = serial;
     _ = surface;
-    _ = x;
-    _ = y;
     const self = clipboard_of(pointer);
     const live = offer orelse return;
+    var bits: u8 = 0;
     if (self.pending == live) {
-        self.drop_pending();
-        return;
+        bits = self.pending_mimes;
+        self.pending = null;
+        self.pending_mimes = 0;
     }
+    const at_x = input.fixed_to_logical(x);
+    const at_y = input.fixed_to_logical(y);
+    if (self.dnd.enter(live, serial, at_x, at_y, bits & uri_list_bit != 0)) return;
     data.destroy_offer(live);
 }
 
 fn device_leave(pointer: ?*anyopaque, device: ?*data.Device) callconv(.c) void {
-    _ = pointer;
     _ = device;
+    clipboard_of(pointer).dnd.leave();
 }
 
 fn device_motion(
@@ -314,16 +331,14 @@ fn device_motion(
     x: i32,
     y: i32,
 ) callconv(.c) void {
-    _ = pointer;
     _ = device;
     _ = time;
-    _ = x;
-    _ = y;
+    clipboard_of(pointer).dnd.motion(input.fixed_to_logical(x), input.fixed_to_logical(y));
 }
 
 fn device_drop(pointer: ?*anyopaque, device: ?*data.Device) callconv(.c) void {
-    _ = pointer;
     _ = device;
+    clipboard_of(pointer).dnd.dropped();
 }
 
 /// The selection changed: the named offer (or none) replaces the previous one.
@@ -429,6 +444,8 @@ test "the best text mime of an offer is chosen" {
     try testing.expectEqual(@as(u8, 2), mime_bit("UTF8_STRING"));
     try testing.expectEqual(@as(u8, 4), mime_bit("text/plain"));
     try testing.expectEqual(@as(u8, 0), mime_bit("image/png"));
+    try testing.expectEqual(uri_list_bit, mime_bit("text/uri-list"));
+    try testing.expectEqual(@as(?[*:0]const u8, null), preferred_mime(uri_list_bit));
     try testing.expectEqualStrings("UTF8_STRING", std.mem.span(preferred_mime(6).?));
     try testing.expectEqualStrings("text/plain;charset=utf-8", std.mem.span(preferred_mime(7).?));
     try testing.expectEqual(@as(?[*:0]const u8, null), preferred_mime(0));
