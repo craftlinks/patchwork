@@ -12,14 +12,17 @@
 //!
 //! ## 2. The Glyph Set
 //! ```text
-//! cmap format 12 groups -> every codepoint in `ranges` -> its glyph   (pairs, codepoint order)
+//! cmap groups (format 12) or segments (format 4)
+//!   -> every codepoint in `ranges` -> its glyph                       (pairs, codepoint order)
 //! keep = { .notdef } + those glyphs
 //! worklist: pop a glyph; a composite pushes each component not yet kept
 //! new_id[old] = how many kept glyphs precede it       (old order, so .notdef stays 0)
 //! ```
 //! The set is closed over components before anything is written, so no composite ever names
 //! a dropped glyph. The worklist holds each glyph at most once, so it is bounded by the glyph
-//! count.
+//! count. The input's Unicode `cmap` is format 12 (`(3, 10)` or platform 0), else format 4
+//! (`(3, 1)` or platform 0); the output is always format 12. A face without a `glyf` table
+//! (CFF or CFF2 outlines) is `error.NoGlyf`, which the tool reports with the file's name.
 //!
 //! ## 3. The Tables Written
 //! Only what the reader reads, in tag order, 4-byte aligned, each with its checksum:
@@ -39,7 +42,14 @@
 //! them; outlines and advances are unchanged, which the tests check glyph by glyph.
 //! `checkSumAdjustment = 0xB1B0AFBA - sum of the file's words`, computed with it zeroed.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. App Faces
+//! An app adds up to `app_face_max` faces beside the library's three (`AppOptions.fonts`,
+//! `build.zig`), each subset by this file like the library's. `check_faces` is the
+//! configure-time check of that list: the count, each name a Zig identifier that is not a
+//! library face's and not repeated, and each range list non-empty, each range ordered, the
+//! ranges increasing and apart. `build.zig` panics with `problem_text` and the face named.
+//!
+//! ## 5. TigerStyle Invariants
 //! - No allocation: `Scratch` holds the fixed tables, and the output goes into the caller's
 //!   buffer; a short buffer is `error.NoSpace`.
 //! - Every loop is bounded by the glyph count, a component count, or a codepoint group.
@@ -72,9 +82,89 @@ pub const default_ranges = [_]Range{
     .{ 0xFFFD, 0xFFFD },
 };
 
+/// Faces an app may add beside the library's three (section 4): eight in all, the faces the
+/// glyph cache key holds.
+pub const app_face_max: u32 = 5;
+/// The library's faces, in `text.Face` order: the first three tags of every app's `Face`.
+pub const library_faces = [_][]const u8{ "sans", "sans_bold", "mono" };
+/// Bytes of an app face's name.
+pub const face_name_max: u32 = 32;
+
+/// One app face as `check_faces` sees it: its `text.Face` tag and its ranges (null: the app's
+/// `font_ranges`).
+pub const FaceSpec = struct {
+    name: []const u8,
+    ranges: ?[]const Range,
+};
+
+/// What is wrong with an app's face list (section 4).
+pub const FaceProblem = enum {
+    too_many,
+    name_invalid,
+    name_reserved,
+    name_duplicate,
+    ranges_empty,
+    ranges_reversed,
+    ranges_unordered,
+};
+
+/// The first problem `check_faces` found, and the index of the face it is in.
+pub const FaceError = struct {
+    index: u32,
+    problem: FaceProblem,
+};
+
+/// Checks an app's face list (section 4); null when it is valid.
+pub fn check_faces(specs: []const FaceSpec) ?FaceError {
+    if (specs.len > app_face_max) return .{ .index = app_face_max, .problem = .too_many };
+    for (specs, 0..) |spec, index_usize| {
+        const index: u32 = @intCast(index_usize);
+        const name = spec.name;
+        const valid = name.len <= face_name_max and std.zig.isValidId(name) and
+            !std.zig.isUnderscore(name);
+        if (!valid) return .{ .index = index, .problem = .name_invalid };
+        for (library_faces) |library| {
+            if (std.mem.eql(u8, name, library)) {
+                return .{ .index = index, .problem = .name_reserved };
+            }
+        }
+        for (specs[0..index]) |before| {
+            if (std.mem.eql(u8, name, before.name)) {
+                return .{ .index = index, .problem = .name_duplicate };
+            }
+        }
+        const ranges = spec.ranges orelse continue;
+        if (ranges.len == 0) return .{ .index = index, .problem = .ranges_empty };
+        for (ranges, 0..) |range, at| {
+            if (range[0] > range[1]) return .{ .index = index, .problem = .ranges_reversed };
+            if (at > 0 and range[0] <= ranges[at - 1][1]) {
+                return .{ .index = index, .problem = .ranges_unordered };
+            }
+        }
+    }
+    return null;
+}
+
+/// The message `build.zig` panics with for `problem`.
+pub fn problem_text(problem: FaceProblem) []const u8 {
+    return switch (problem) {
+        .too_many => "more than app_face_max (5) faces",
+        .name_invalid => "the name must be a Zig identifier of at most 32 bytes, not `_`",
+        .name_reserved => "the name is a library face's (sans, sans_bold, mono)",
+        .name_duplicate => "the name is an earlier face's",
+        .ranges_empty => "ranges is empty (pass null to use font_ranges)",
+        .ranges_reversed => "a range ends before it starts",
+        .ranges_unordered => "ranges must increase and must not overlap",
+    };
+}
+
 pub const Error = error{
-    /// A required table or a Unicode format 12 `cmap` is missing, or the face is malformed.
+    /// A required table or a Unicode format 12 or 4 `cmap` is missing, or the face is
+    /// malformed.
     Unsupported,
+    /// The face has no `glyf` table: its outlines are CFF or CFF2, which the reader cannot
+    /// draw.
+    NoGlyf,
     /// The output buffer is too small.
     NoSpace,
     /// The ranges map more than `codepoint_cap` codepoints.
@@ -120,8 +210,9 @@ const Face = struct {
     glyph_count: u32,
     metric_count: u32,
     loca_long: bool,
-    /// Offset of the format 12 subtable.
-    cmap12: u32,
+    /// Offset of the Unicode subtable `collect` reads, and its format (12 or 4).
+    cmap: u32,
+    cmap_format: u16,
 };
 
 /// Writes the subset of `input` covering `ranges` into `out` (see the module guide).
@@ -160,6 +251,7 @@ pub fn subset(
 
 fn open(input: []const u8) Error!Face {
     if (input.len < 12) return error.Unsupported;
+    _ = find(input, "glyf") catch return error.NoGlyf;
     const tables: Tables = .{
         .head = try find(input, "head"),
         .hhea = try find(input, "hhea"),
@@ -176,13 +268,15 @@ fn open(input: []const u8) Error!Face {
     const metric_count: u32 = read_u16(input, tables.hhea.offset + 34);
     if (glyph_count == 0 or glyph_count > glyph_cap) return error.Unsupported;
     if (metric_count == 0 or metric_count > glyph_count) return error.Unsupported;
+    const map = try find_cmap(input, tables.cmap);
     return .{
         .bytes = input,
         .tables = tables,
         .glyph_count = glyph_count,
         .metric_count = metric_count,
         .loca_long = read_u16(input, tables.head.offset + 50) == 1,
-        .cmap12 = try find_cmap12(input, tables.cmap.offset),
+        .cmap = map.offset,
+        .cmap_format = map.format,
     };
 }
 
@@ -203,49 +297,43 @@ fn find(input: []const u8, comptime tag: *const [4]u8) Error!Slice {
     return error.Unsupported;
 }
 
-fn find_cmap12(input: []const u8, cmap: u32) Error!u32 {
-    const count: u32 = read_u16(input, cmap + 2);
+const Map = struct {
+    offset: u32,
+    format: u16,
+};
+
+/// The Unicode format 12 subtable, else the Unicode format 4 one (section 2).
+fn find_cmap(input: []const u8, cmap: Slice) Error!Map {
+    if (cmap.length < 4) return error.Unsupported;
+    const count: u32 = read_u16(input, cmap.offset + 2);
+    if (4 + 8 * count > cmap.length) return error.Unsupported;
+    var found: ?Map = null;
     var index: u32 = 0;
     while (index < count) : (index += 1) {
-        const record = cmap + 4 + 8 * index;
+        const record = cmap.offset + 4 + 8 * index;
         const platform = read_u16(input, record);
         const encoding = read_u16(input, record + 2);
-        const sub = cmap + read_u32(input, record + 4);
-        const unicode = platform == 0 or (platform == 3 and encoding == 10);
-        if (unicode and read_u16(input, sub) == 12) return sub;
+        const at = read_u32(input, record + 4);
+        if (at + 16 > cmap.length) return error.Unsupported;
+        const sub = cmap.offset + at;
+        const format = read_u16(input, sub);
+        const unicode = platform == 0 or (platform == 3 and (encoding == 1 or encoding == 10));
+        if (!unicode) continue;
+        if (format == 12) return .{ .offset = sub, .format = 12 };
+        if (format == 4 and found == null) found = .{ .offset = sub, .format = 4 };
     }
-    return error.Unsupported;
+    return found orelse error.Unsupported;
 }
 
 /// Records every `(codepoint, glyph)` in `ranges` in codepoint order and keeps the glyphs.
 fn collect(scratch: *Scratch, face: *const Face, ranges: []const Range) Error!u32 {
     @memset(&scratch.keep, false);
     scratch.keep[0] = true;
-    const bytes = face.bytes;
-    const groups = read_u32(bytes, face.cmap12 + 12);
-    var count: u32 = 0;
-    var group: u32 = 0;
-    while (group < groups) : (group += 1) {
-        const at = face.cmap12 + 16 + 12 * group;
-        const start = read_u32(bytes, at);
-        const end = read_u32(bytes, at + 4);
-        const first = read_u32(bytes, at + 8);
-        if (end < start or end > 0x10FFFF) return error.Unsupported;
-        for (ranges) |range| {
-            const low = @max(start, range[0]);
-            const high = @min(end, range[1]);
-            if (low > high) continue;
-            var codepoint = low;
-            while (codepoint <= high) : (codepoint += 1) {
-                const glyph = first + (codepoint - start);
-                if (glyph == 0 or glyph >= face.glyph_count) continue;
-                if (count == codepoint_cap) return error.TooManyCodepoints;
-                scratch.pairs[count] = .{ codepoint, glyph };
-                scratch.keep[glyph] = true;
-                count += 1;
-            }
-        }
-    }
+    const count = switch (face.cmap_format) {
+        12 => try collect12(scratch, face, ranges),
+        4 => try collect4(scratch, face, ranges),
+        else => unreachable,
+    };
     // Groups are sorted, but overlapping ranges may list a codepoint twice or out of order.
     std.mem.sort([2]u32, scratch.pairs[0..count], {}, less_codepoint);
     var unique: u32 = 0;
@@ -259,6 +347,90 @@ fn collect(scratch: *Scratch, face: *const Face, ranges: []const Range) Error!u3
 
 fn less_codepoint(_: void, a: [2]u32, b: [2]u32) bool {
     return a[0] < b[0];
+}
+
+/// `collect` over the sequential map groups `(start, end, first_glyph)` of format 12.
+fn collect12(scratch: *Scratch, face: *const Face, ranges: []const Range) Error!u32 {
+    const bytes = face.bytes;
+    const groups = read_u32(bytes, face.cmap + 12);
+    if (face.cmap + 16 + @as(u64, groups) * 12 > bytes.len) return error.Unsupported;
+    var count: u32 = 0;
+    var group: u32 = 0;
+    while (group < groups) : (group += 1) {
+        const at = face.cmap + 16 + 12 * group;
+        const start = read_u32(bytes, at);
+        const end = read_u32(bytes, at + 4);
+        const first = read_u32(bytes, at + 8);
+        if (end < start or end > 0x10FFFF) return error.Unsupported;
+        for (ranges) |range| {
+            const low = @max(start, range[0]);
+            const high = @min(end, range[1]);
+            if (low > high) continue;
+            var codepoint = low;
+            while (codepoint <= high) : (codepoint += 1) {
+                const glyph = first + (codepoint - start);
+                try keep_pair(scratch, face, &count, codepoint, glyph);
+            }
+        }
+    }
+    assert(count <= codepoint_cap);
+    return count;
+}
+
+/// `collect` over the segments `(end, start, delta, range_offset)` of format 4: a glyph is
+/// `codepoint + delta`, or, with a range offset, the glyph id array's entry plus `delta`
+/// (mod 65536), as `text/ttf.zig` reads it.
+fn collect4(scratch: *Scratch, face: *const Face, ranges: []const Range) Error!u32 {
+    const bytes = face.bytes;
+    const segments: u32 = read_u16(bytes, face.cmap + 6) / 2;
+    const ends = face.cmap + 14;
+    const starts = ends + 2 * segments + 2;
+    const deltas = starts + 2 * segments;
+    const offsets = deltas + 2 * segments;
+    if (offsets + 2 * segments > bytes.len) return error.Unsupported;
+    var count: u32 = 0;
+    var segment: u32 = 0;
+    while (segment < segments) : (segment += 1) {
+        const start: u32 = read_u16(bytes, starts + 2 * segment);
+        const end: u32 = read_u16(bytes, ends + 2 * segment);
+        const delta = read_u16(bytes, deltas + 2 * segment);
+        const range_offset: u32 = read_u16(bytes, offsets + 2 * segment);
+        if (end < start) return error.Unsupported;
+        for (ranges) |range| {
+            const low = @max(start, range[0]);
+            const high = @min(end, range[1]);
+            if (low > high) continue;
+            var codepoint = low;
+            while (codepoint <= high) : (codepoint += 1) {
+                var id: u16 = @intCast(codepoint);
+                if (range_offset != 0) {
+                    const at = offsets + 2 * segment + range_offset + 2 * (codepoint - start);
+                    if (at + 2 > bytes.len) return error.Unsupported;
+                    id = read_u16(bytes, at);
+                    if (id == 0) continue;
+                }
+                try keep_pair(scratch, face, &count, codepoint, id +% delta);
+            }
+        }
+    }
+    assert(count <= codepoint_cap);
+    return count;
+}
+
+/// Records `(codepoint, glyph)` and keeps the glyph; glyph 0 and ids past the face are
+/// unmapped.
+fn keep_pair(
+    scratch: *Scratch,
+    face: *const Face,
+    count: *u32,
+    codepoint: u32,
+    glyph: u32,
+) Error!void {
+    if (glyph == 0 or glyph >= face.glyph_count) return;
+    if (count.* == codepoint_cap) return error.TooManyCodepoints;
+    scratch.pairs[count.*] = .{ codepoint, glyph };
+    scratch.keep[glyph] = true;
+    count.* += 1;
 }
 
 /// Closes the kept set over composite components (section 2), assigns new ids, and returns
@@ -616,6 +788,7 @@ const fixture = struct {
     var again: [256 * 1024]u8 = undefined;
     var a: ttf.Outline = undefined;
     var b: ttf.Outline = undefined;
+    var pairs: [codepoint_cap][2]u32 = undefined;
 };
 
 // Locks the subset against the full faces (sections 2 and 3): for every codepoint of the
@@ -682,4 +855,94 @@ test "composites are renumbered, the output is deterministic, and space is check
     var short: [1024]u8 = undefined;
     const refused = subset(&fixture.scratch, bytes, &default_ranges, &short);
     try testing.expectError(error.NoSpace, refused);
+}
+
+// Locks the app face check (section 4): a valid list passes; each problem is found at the face
+// that has it, the first problem first; null ranges skip the range checks.
+test "check_faces refuses each bad face list" {
+    const icons: []const Range = &.{ .{ 0xE000, 0xE010 }, .{ 0xE100, 0xE100 } };
+    try testing.expectEqual(@as(?FaceError, null), check_faces(&.{
+        .{ .name = "icons", .ranges = icons },
+        .{ .name = "display_2", .ranges = null },
+    }));
+    try testing.expectEqual(@as(?FaceError, null), check_faces(&.{}));
+    const six: [6]FaceSpec = @splat(.{ .name = "a", .ranges = null });
+    const cases = [_]struct { specs: []const FaceSpec, index: u32, problem: FaceProblem }{
+        .{ .specs = &six, .index = 5, .problem = .too_many },
+        .{ .specs = &.{.{ .name = "2d", .ranges = null }}, .index = 0, .problem = .name_invalid },
+        .{ .specs = &.{.{ .name = "_", .ranges = null }}, .index = 0, .problem = .name_invalid },
+        .{ .specs = &.{.{ .name = "enum", .ranges = null }}, .index = 0, .problem = .name_invalid },
+        .{ .specs = &.{.{ .name = "", .ranges = null }}, .index = 0, .problem = .name_invalid },
+        .{
+            .specs = &.{.{ .name = "sans_bold", .ranges = null }},
+            .index = 0,
+            .problem = .name_reserved,
+        },
+        .{
+            .specs = &.{ .{ .name = "a", .ranges = null }, .{ .name = "a", .ranges = null } },
+            .index = 1,
+            .problem = .name_duplicate,
+        },
+        .{ .specs = &.{.{ .name = "a", .ranges = &.{} }}, .index = 0, .problem = .ranges_empty },
+        .{
+            .specs = &.{.{ .name = "a", .ranges = &.{.{ 9, 8 }} }},
+            .index = 0,
+            .problem = .ranges_reversed,
+        },
+        .{
+            .specs = &.{.{ .name = "a", .ranges = &.{ .{ 1, 8 }, .{ 8, 9 } } }},
+            .index = 0,
+            .problem = .ranges_unordered,
+        },
+    };
+    for (cases) |case| {
+        const found = check_faces(case.specs).?;
+        try testing.expectEqual(case.index, found.index);
+        try testing.expectEqual(case.problem, found.problem);
+        try testing.expect(problem_text(found.problem).len > 0);
+    }
+}
+
+// Locks the outline check (section 2): a face without a `glyf` table is refused as `NoGlyf`
+// before anything else is read, not as a malformed face.
+test "a face without glyf is refused by name" {
+    var bytes: [4096]u8 = undefined;
+    @memcpy(bytes[0..], full_faces[0][0..4096]);
+    // Rename the `glyf` directory entry, as a CFF face has no such entry.
+    const count = read_u16(&bytes, 4);
+    var index: u32 = 0;
+    var renamed = false;
+    while (index < count) : (index += 1) {
+        const record = 12 + 16 * index;
+        if (std.mem.eql(u8, bytes[record..][0..4], "glyf")) {
+            @memcpy(bytes[record..][0..4], "CFF ");
+            renamed = true;
+        }
+    }
+    try testing.expect(renamed);
+    const refused = subset(&fixture.scratch, &bytes, &default_ranges, &fixture.out);
+    try testing.expectError(error.NoGlyf, refused);
+}
+
+// Locks the format 4 input (section 2): the full Noto Sans read through its format 4 subtable
+// collects the same (codepoint, glyph) pairs of the default ranges as through its format 12 one.
+test "a format 4 cmap collects as format 12 does" {
+    var face = try open(full_faces[0]);
+    try testing.expectEqual(@as(u16, 12), face.cmap_format);
+    const count12 = try collect(&fixture.scratch, &face, &default_ranges);
+    try testing.expect(count12 > 300);
+    @memcpy(fixture.pairs[0..count12], fixture.scratch.pairs[0..count12]);
+    const bytes = face.bytes;
+    const cmap = face.tables.cmap.offset;
+    const tables: u32 = read_u16(bytes, cmap + 2);
+    var index: u32 = 0;
+    while (index < tables) : (index += 1) {
+        const sub = cmap + read_u32(bytes, cmap + 4 + 8 * index + 4);
+        if (read_u16(bytes, sub) == 4) face.cmap = sub;
+    }
+    face.cmap_format = 4;
+    const count4 = try collect(&fixture.scratch, &face, &default_ranges);
+    try testing.expectEqual(count12, count4);
+    const pairs4 = fixture.scratch.pairs[0..count4];
+    try testing.expectEqualSlices([2]u32, fixture.pairs[0..count12], pairs4);
 }

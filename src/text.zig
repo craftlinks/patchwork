@@ -1,15 +1,17 @@
-//! Text: three embedded faces, measurement, and glyph placement through the glyph cache.
+//! Text: embedded faces, measurement, and glyph placement through the glyph cache.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Pipeline
 //! ```text
-//! compile time  parse the three embedded faces (text/ttf.zig): tables, cmap, ASCII ids
+//! compile time  parse the embedded faces (text/ttf.zig): tables, cmap, ASCII ids
 //! frame         text.place(cx, style, utf8, rect, clip, options)
 //!                 decode UTF-8 (U+FFFD per invalid byte) -> glyph id -> advance
 //!                 cx.text.glyph(face, glyph, size_q)            (text/cache.zig)
 //!                   hit: entry      miss: rasterize within the frame budget (text/raster.zig)
 //!                 append one draw.Glyph per inked glyph with the entry's atlas UVs
+//!               text.icon(cx, face, codepoint, size, rect, clip, color)
+//!                 one glyph, its ink centred on rect               (text/layout.zig, 3a)
 //! ```
 //! The module map: `text/ttf.zig` reads the fonts, `text/raster.zig` scan-converts,
 //! `text/cache.zig` owns the atlas, `text/layout.zig` measures and places, and
@@ -29,6 +31,16 @@
 //! and `subset`. Both targets get the same bytes, so native and browser draw the same. A
 //! codepoint outside the ranges maps to glyph 0 and draws `.notdef`, as an unmapped one
 //! always has; `font_ranges = null` embeds the full faces.
+//!
+//! ## 2b. App Faces
+//! An app adds up to five faces of its own (`AppOptions.fonts`, `build.zig`): any TrueType
+//! face with `glyf` outlines, any `units_per_em` in `[16, 16384]`, and a format 12 or 4
+//! `cmap`, subset like the library's. `patchwork_fonts` generates `Face` per app: `sans`,
+//! `sans_bold`, and `mono` at 0, 1, and 2, then the app's names in order, so the library's
+//! cache keys and tests keep their values and a face tag type-checks only in an app that
+//! declared it. `fonts` is parsed from `font_data.data`, one entry per tag. Eight faces in all
+//! is what the glyph cache key holds (`face_cap`). The library's own code names only its three
+//! faces and never switches over `Face` exhaustively.
 //!
 //! ## 3. Units
 //! `Style.size` is the em size in logical pixels; `measure` and the pen advance in logical
@@ -62,21 +74,22 @@ pub const run_cap: u32 = 8;
 /// Largest `Style.size` in logical pixels.
 pub const size_max: f32 = 512;
 
-/// The embedded faces. The value is the face's index into `fonts` and its cache key field.
-pub const Face = enum(u8) {
-    sans = 0,
-    sans_bold = 1,
-    mono = 2,
-};
-
-/// The faces' bytes: the build's subsets of `text/fonts/` (section 2a).
+/// The faces' bytes: the build's subsets of `text/fonts/` and of the app's faces (section 2b).
 pub const font_data = @import("patchwork_fonts");
 
+/// The embedded faces, generated per app (section 2b): `sans`, `sans_bold`, and `mono` at 0,
+/// 1, and 2, then the app's own. The value is the face's index into `fonts` and its cache key
+/// field.
+pub const Face = font_data.Face;
+
+/// Faces the glyph cache key holds (`text/cache.zig`, section 2).
+pub const face_cap: u32 = 8;
+
 /// The parsed faces, indexed by `Face`. Parsed at compile time.
-pub const fonts: [3]ttf.Font = .{
-    ttf.parse(font_data.sans),
-    ttf.parse(font_data.sans_bold),
-    ttf.parse(font_data.mono),
+pub const fonts: [font_data.data.len]ttf.Font = parsed: {
+    var list: [font_data.data.len]ttf.Font = undefined;
+    for (font_data.data, &list) |bytes, *font| font.* = ttf.parse(bytes);
+    break :parsed list;
 };
 
 /// How a run of text looks. `size` is the em size in logical pixels; `color` is straight
@@ -121,6 +134,11 @@ pub const place = layout.place;
 /// Lays out `runs` as one line sharing a baseline. See `text/layout.zig`.
 pub const place_runs = layout.place_runs;
 
+/// Draws one glyph with its ink box centred on a rect: an icon from an icon face. A codepoint
+/// the face does not map draws nothing and is counted in the overflow report. See
+/// `text/layout.zig`, section 3a.
+pub const icon = layout.icon;
+
 /// The face record of `face`.
 pub fn font_of(face: Face) *const ttf.Font {
     return &fonts[@backingInt(face)];
@@ -139,11 +157,16 @@ pub fn size_key(size: f32, scale_120: u32) u32 {
 
 comptime {
     assert(fonts.len == @typeInfo(Face).@"enum".field_names.len);
+    assert(fonts.len <= face_cap);
+    assert(@backingInt(Face.sans) == 0);
+    assert(@backingInt(Face.sans_bold) == 1);
+    assert(@backingInt(Face.mono) == 2);
     assert(byte_cap == 4096);
     assert(size_max * 1920 / 30 <= cache.size_q_max);
     for (fonts) |font| {
-        assert(font.units_per_em == 1000);
-        assert(font.cmap_format == 12);
+        assert(font.units_per_em >= 16);
+        assert(font.units_per_em <= 16384);
+        assert(font.cmap_format == 12 or font.cmap_format == 4);
     }
 }
 
@@ -178,4 +201,18 @@ test "the embedded faces are the default subsets and cover the UI text" {
         try std.testing.expect(ttf.glyph_id(font, layout.replacement_char) != 0);
         try std.testing.expectEqual(@as(u16, 0), ttf.glyph_id(font, 0x0416));
     }
+}
+
+// Locks the generated faces without app faces (section 2b): the library's own build, like
+// every app that adds none, gets exactly `sans`, `sans_bold`, and `mono` at 0, 1, and 2, each
+// keeping the library's ranges.
+test "without app faces Face is the library's three" {
+    const names = @typeInfo(Face).@"enum".field_names;
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqual(@as(usize, 3), font_data.names.len);
+    for (names, font_data.names, [_][]const u8{ "sans", "sans_bold", "mono" }) |tag, name, want| {
+        try std.testing.expectEqualStrings(want, tag);
+        try std.testing.expectEqualStrings(want, name);
+    }
+    for (font_data.face_ranges) |kept| try std.testing.expectEqual(font_data.ranges.ptr, kept.ptr);
 }

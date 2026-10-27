@@ -211,12 +211,16 @@ pub const Up = struct {
     inside: bool,
 };
 
-/// What the last draw refused for lack of room (module guide, section 10): instances
-/// (`draw.overflow_count`), areas (`area_overflow`), and glyphs the atlas could not fit.
+/// What the last draw refused (module guide, section 10): instances (`draw.overflow_count`),
+/// areas (`area_overflow`), and glyphs the atlas could not fit, for lack of room; and icons
+/// whose face does not map their codepoint (`text.icon`), with the last as
+/// `face << 21 | codepoint`.
 pub const Overflow = struct {
     instances: u32,
     areas: u32,
     glyphs: u32,
+    icons: u32 = 0,
+    icon: u32 = 0,
 
     pub const zero: Overflow = .{ .instances = 0, .areas = 0, .glyphs = 0 };
 };
@@ -499,6 +503,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .instances = self.draw.overflow_count,
                 .areas = self.area_overflow,
                 .glyphs = self.draw.text.overflow_count,
+                .icons = self.draw.text.icon_missing,
+                .icon = self.draw.text.icon_last,
             };
         }
 
@@ -2249,6 +2255,19 @@ test "an overflow is reported once per change" {
     context.area_overflow = 1;
     const three: Overflow = .{ .instances = 2, .areas = 1, .glyphs = 0 };
     try testing.expectEqual(@as(?Overflow, three), context.overflow_report());
+    // A missing icon is reported once, with its face and codepoint, like a refusal.
+    context.draw.overflow_count = 0;
+    context.area_overflow = 0;
+    context.draw.text.miss_icon(3, 0xE13C);
+    const icon: Overflow = .{
+        .instances = 0,
+        .areas = 0,
+        .glyphs = 0,
+        .icons = 1,
+        .icon = 3 << 21 | 0xE13C,
+    };
+    try testing.expectEqual(@as(?Overflow, icon), context.overflow_report());
+    try testing.expectEqual(@as(?Overflow, null), context.overflow_report());
 }
 
 /// One frame with a base button at (20, 20, 100, 40) and, when `open`, popup `menu` at

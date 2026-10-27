@@ -144,9 +144,9 @@ patchwork/
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId, write revisions
 │   ├── draw/tiles.zig          # Pixel cache tiles: hashes, dirty bits, scissor rects, record keys
 │   ├── draw/renderer.zig       # Records setup and frame command streams; frame kinds, kept target
-│   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs
+│   ├── text.zig                # Text namespace: faces, Style, measure, place, place_runs, icon
 │   ├── text/ttf.zig            # Comptime TrueType reader: cmap 12/4, hmtx, glyf, composites
-│   ├── text/subset.zig         # Build-time subsetter: glyph closure, renumbered ids, no hinting
+│   ├── text/subset.zig         # Build-time subsetter and app face check: glyph closure, no hinting
 │   ├── text/raster.zig         # Quadratic flattening and exact signed-area coverage
 │   ├── text/cache.zig          # Glyph cache: hash table, shelf-packed atlas, CPU mirror, budget
 │   ├── text/layout.zig         # UTF-8, alignment, ellipsis, device-pixel snapping
@@ -211,7 +211,9 @@ patchwork/
 │   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
 │   └── gallery/                # Every library widget on tabbed pages (phases 6 and 7)
 │       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
-│       └── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
+│       ├── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
+│       ├── icons.zig           # Named Lucide codepoints and the icon face's ranges
+│       └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
@@ -392,7 +394,8 @@ pub fn build(b: *std.Build) void {
 
 `AppOptions.font_ranges` sets the codepoints the embedded faces keep, on both targets (see
 Text). It defaults to `patchwork.default_font_ranges`; pass wider ranges for other scripts,
-or `null` for the full faces.
+or `null` for the full faces. `AppOptions.fonts` adds up to five faces of the app's own (see
+Fonts).
 
 `addApp` links `libwayland-client` and `libxkbcommon` into the native executable, so a
 consumer's build machine needs both (with their pkg-config files) as described under Build
@@ -947,6 +950,11 @@ blue.
   pane is a `ListBox` of 1,000 presets ("preset 0001" ...) and whose right pane is a vertical
   splitter of six `NumberBox`es (frequency 20 to 20000 Hz, gain -60 to 12 dB, attack, release,
   q, mix) over a panel naming the selected and the last activated preset.
+- **type** (step 36, see Fonts): the gallery adds an `icons` face (Lucide, subset to 14 icons).
+  A transport of icon buttons (skip back, play, which turns into pause, stop, record, loop) and
+  a toolbar (open, save, settings, each with a tooltip) are `widgets.ButtonOf` a small skin that
+  draws the default face and the icon with `kit.icon`; a ladder draws one icon at 12, 16, 24,
+  32, and 48 px, the icon set every icon at 24 px, and a line in each Noto face.
 
 Scenarios: `still`, `interact` (a click, two drags, a toggle, typing, a wheel, and a row click,
 then settled), `hover` (the pointer rests on button 1), `light` (the toggle, then the focused
@@ -957,7 +965,8 @@ and Enter: "dropdown changed 2"), `menu-open`, `menu-flip`, `context` (right cli
 popups; `tabs` (each tab clicked: the containers page), `split` (the divider dragged 120 px
 left), `list` (row 3 clicked, then Down 20 times: preset 0024 scrolled into view), and `number`
 (the frequency dragged up 40 px, the gain double-clicked, "-6.5" typed, Enter) for the
-containers.
+containers; `type` (the type page) and `transport` (play clicked: pause shows) for the type
+page.
 
 ## Pan and Zoom
 
@@ -1415,7 +1424,8 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
 ## Text
 
 `patchwork.text` draws three embedded faces: `.sans` (Noto Sans Regular), `.sans_bold` (Noto
-Sans Bold), and `.mono` (Noto Sans Mono Regular), all SIL OFL 1.1 (`src/text/fonts/OFL.txt`).
+Sans Bold), and `.mono` (Noto Sans Mono Regular), all SIL OFL 1.1 (`src/text/fonts/OFL.txt`),
+and any the app adds (see Fonts).
 Both targets `@embedFile` them, so the browser fetches no font files and a project using
 `addApp` gets them with the library. The TrueType tables are parsed at compile time.
 
@@ -1457,6 +1467,49 @@ text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline fo
 
 Module guides in `src/text.zig` and `src/text/*.zig` hold the algebra; the tests hold the
 worked numbers (the rasterizer is checked against a polygon-clipping reference).
+
+## Fonts
+
+An app adds faces of its own beside the library's three with `AppOptions.fonts`, at most
+`patchwork.app_face_max` (5), so eight in all. Each goes through the same build-time path as
+the Noto faces: subset by `tools/subset.zig`, embedded by the generated `patchwork_fonts`
+module, parsed at compile time. `text.Face` is generated per app: the library's `.sans`,
+`.sans_bold`, and `.mono` at 0, 1, and 2, then the app's names in order, so `.{ .face =
+.icons }` compiles only in an app that added `icons`.
+
+```zig
+const icons = @import("src/icons.zig"); // the app's codepoints and their ranges
+const steps = patchwork.addApp(b, dep.builder, .{
+    .name = "synth",
+    .root_source_file = b.path("src/app.zig"),
+    .target = target,
+    .optimize = optimize,
+    .fonts = &.{.{ .name = "icons", .source = b.path("fonts/lucide.ttf"), .ranges = &icons.ranges }},
+});
+```
+
+- **The face.** TrueType with `glyf` outlines, any units per em (16 to 16384), a Unicode
+  `cmap` of format 12 or 4. A CFF (`.otf`) face fails the build naming the file. Commit its
+  licence next to it.
+- **The name** is a Zig identifier other than `sans`, `sans_bold`, and `mono`, used once; it
+  becomes the `text.Face` tag. `addApp` checks the list at configure time and panics naming the
+  face and the rule.
+- **Ranges.** `ranges` lists the codepoints to keep, increasing and apart; null keeps the app's
+  `font_ranges` (null there too: the whole face). Keep them tight: the gallery's 917 KB Lucide
+  face subset to its 14 icons is 4.5 KB, so its `gallery.wasm` grew by 10 KB with the page's
+  code. Name the codepoints in one file the app and its `build.zig` both import, as
+  `examples/gallery/icons.zig` does, so they cannot drift apart.
+- **Drawing.** Text in an app face is a `text.Style` like any other. For icons,
+  `kit.icon(cx, face, codepoint, size, rect, clip, color)` (`text.icon` on the draw context)
+  centres the glyph's ink on `rect`, snapped to the device grid: icon fonts' advances and
+  baselines vary, and centring the ink lines them up in buttons. A codepoint the face does not
+  map draws nothing and is logged once per change, like an overflow (`icons: 1 drawn this
+  frame are not in their face (last U+E13C in icons)`).
+- **Icons from a font or as a draw type?** A font for many small standard icons: one glyph
+  each, rasterized at the device size through the glyph cache, coloured by the style. An SDF
+  draw type, like the live app's `examples/live/icon.zig`, for a few icons that animate, morph,
+  or must stay crisp at any zoom; it costs a shader. No hinting either way, so a font icon at
+  12 px is soft.
 
 ## Platform Hosts
 

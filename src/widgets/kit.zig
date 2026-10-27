@@ -13,6 +13,7 @@
 //! face(cx, rect, clip, BoxLook)    a draw.Box, skipped when rect has a non-positive edge
 //! arc(cx, ring, clip, ArcLook)     a draw.Arc
 //! label(cx, style, bytes, rect, clip, options)   text.place with the kit's asserts
+//! icon(cx, face, codepoint, size, rect, clip, color)  text.icon: one glyph centred by its ink
 //! step(cx, *Animator, dt_ms)       a moved value redraws, a live one keeps animating
 //! aim(cx, *Animator, target)       a new target redraws
 //! weight(amount, scale)            an animator value scaled to a shader mix weight
@@ -214,6 +215,22 @@ pub fn label(
     assert(bytes.len <= text.byte_cap);
     assert(clip.x1 > clip.x0);
     text.place(cx.drawing(), style, bytes, rect, clip, options);
+}
+
+/// `codepoint` of `face` at `size`, its ink centred on `rect` under `clip` (`text.icon`): an
+/// icon from an app's icon face. A codepoint the face does not map appends nothing.
+pub fn icon(
+    cx: anytype,
+    font: text.Face,
+    codepoint: u21,
+    size: f32,
+    rect: Rect,
+    clip: Clip,
+    color: [4]f32,
+) void {
+    assert(size > 0);
+    assert(clip.x1 > clip.x0);
+    text.icon(cx.drawing(), font, codepoint, size, rect, clip, color);
 }
 
 /// Steps `value` by `dt_ms`: a moved value owes a redraw and a live one another frame.
