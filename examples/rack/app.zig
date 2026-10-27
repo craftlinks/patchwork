@@ -58,13 +58,14 @@
 //! "a double click renames a panel and Escape cancels" locks the flow.
 //!
 //! ## 2a. Presets and the Status Line
-//! The preset list is a `ui.List` of `preset_count` rows of `preset_row_px` in a view
-//! (`cx.begin_view`). `draw` asks `List.visible` for the rows under the viewport, skips the
-//! rest with `cx.skip`, and stores the range it drew; `event` resolves hits only for that
-//! range, so a frame and an event both cost the visible rows, not 1,000. Each drawn row
-//! records an area; a release inside a row selects it, and the selected and hovered rows
-//! draw a highlight. The view's height is capped so at most `preset_rows_max` rows are ever
-//! visible, which bounds the pools at any window size. The status line is formatted into a
+//! The preset list is a `widgets.ListBox` of `preset_count` rows of `preset_row_px`, drawn by
+//! `PresetSkin` (the library's bands with the rack's own selected fill). It walks only the rows
+//! under its viewport and resolves hits only for them, so a frame and an event both cost the
+//! visible rows, not 1,000; the rack draws each row's name. A release inside a row selects it,
+//! as do the arrow, page, Home, and End keys while the list has focus, and the selected and
+//! hovered rows draw a highlight. The view's height is capped so at most `preset_rows_max`
+//! rows are ever visible, which bounds the pools at any window size. Test "the preset list
+//! draws the records of the rack's own list" checks the move onto `ListBox` changed no record. The status line is formatted into a
 //! fixed `[status_cap]u8` from the rack's own name tables; the comptime block proves the
 //! longest message fits.
 //!
@@ -282,6 +283,8 @@ const preset_view_max_px: f32 = @as(f32, @floatFromInt(preset_rows_max - 2)) * p
 const preset_inset_px: f32 = 8;
 const preset_radius: f32 = 4;
 const preset_list: ui.List = .{ .row_height = preset_row_px, .count = preset_count };
+/// The preset list: a list box whose bands are the rack's (`PresetSkin`).
+const PresetList = widgets.ListBoxOf(PresetSkin);
 /// The selected row's highlight: the first knob accent, dark enough under the light text.
 const selected_fill: [4]f32 = .{
     widgets.accents[0].r,
@@ -399,10 +402,8 @@ pub const App = struct {
     /// The badge texture and its pixels, which must outlive the stream that uploads them.
     badge_texture: quads.TextureId,
     badge_pixels: [badge.bytes]u8,
-    /// The preset list's offset, the rows the last draw drew, and the selected row.
-    presets: ui.ViewState,
-    preset_range: ui.List.Range,
-    preset_selected: ?u32,
+    /// The preset list: its offset, the rows the last draw walked, and the selected row.
+    presets: PresetList,
     /// The last action, in `status[0..status_len]`.
     status: [status_cap]u8,
     status_len: u32,
@@ -460,9 +461,7 @@ pub const App = struct {
         for (&app.titles, panel_names) |*title, name| title.* = Title.of(name);
         app.rename = widgets.TextField.init(rename_id, title_cap, title_style);
         app.renaming = null;
-        app.presets = ui.ViewState.init();
-        app.preset_range = .{ .first = 0, .end = 0 };
-        app.preset_selected = null;
+        app.presets = PresetList.init(preset_view_id, preset_count, preset_row_px);
         app.status = @splat(0);
         app.status_len = 0;
         app.set_status(&.{"ready"});
@@ -502,10 +501,9 @@ pub const App = struct {
         app.route_hubs(cx, event_value);
         app.route_cables(cx, event_value);
         app.route_envelope(cx, event_value);
-        _ = app.presets.handle(cx, preset_view_id, event_value);
-        var row = app.preset_range.first;
-        while (row < app.preset_range.end) : (row += 1) {
-            if (kit.clicked(cx, ui.id("preset", row), event_value)) app.select_preset(cx, row);
+        switch (app.presets.handle(cx, event_value)) {
+            .selected, .activated => |row| app.report_preset(cx, row),
+            .none => {},
         }
         if (app.renaming == null and event_value == .key_down) {
             const press = event_value.key_down;
@@ -588,16 +586,10 @@ pub const App = struct {
         );
         const face: widgets.Panel = .{ .paint = panel_paint };
         _ = face.begin(cx, ui.sized(.fill, .{ .fixed = list_h }), .{ .flow = .down, .padding = panel_padding });
-        const fill = ui.sized(.fill, .fill);
-        const port = cx.begin_view(preset_view_id, fill, ui.flow_of(.down), &app.presets);
-        const range = preset_list.visible(app.presets.scroll_y, port.height);
+        const range = app.presets.begin(cx, ui.sized(.fill, .fill));
         assert(range.end - range.first <= preset_rows_max);
-        app.preset_range = range;
-        cx.skip(@as(f32, @floatFromInt(range.first)) * preset_row_px);
-        var row = range.first;
-        while (row < range.end) : (row += 1) app.draw_preset(cx, row);
-        cx.skip(@as(f32, @floatFromInt(preset_count - range.end)) * preset_row_px);
-        cx.end_view();
+        while (app.presets.next(cx)) |row| draw_preset(cx, row);
+        app.presets.end(cx);
         _ = cx.end();
         const line = cx.walk(ui.sized(.fill, .{ .fixed = status_px }));
         if (cx.visible(line)) |clip| {
@@ -610,36 +602,13 @@ pub const App = struct {
         _ = cx.end();
     }
 
-    /// One preset row: its area, a highlight when selected or hovered, and its name.
-    fn draw_preset(app: *const App, cx: *Context, row: u32) void {
+    /// Reports the selected `row` on the status line; the list already selected it.
+    fn report_preset(app: *App, cx: *Context, row: u32) void {
         assert(row < preset_count);
-        const rect = cx.walk(ui.sized(.fill, .{ .fixed = preset_row_px }));
-        const clip = cx.visible(rect) orelse return;
-        const id = ui.id("preset", row);
-        cx.area(id, rect, 0, ui.cx.plain);
-        const selected = app.preset_selected == row;
-        if (selected or cx.hovered() == id) {
-            const fill = if (selected) selected_fill else cx.theme().colors.track;
-            kit.face(cx, rect, clip, .{ .fill = fill, .radius = preset_radius });
-        }
-        var bytes: [preset_name_cap]u8 = undefined;
-        const name = preset_name(&bytes, row);
-        const inner = ui.cx.inset(rect, .sides(preset_inset_px, 0, 0, 0));
-        text.place(cx.drawing(), status_style, name, inner, clip, .{
-            .align_x = .start,
-            .align_y = .center,
-            .ellipsis = false,
-        });
-    }
-
-    /// Selects `row` and reports it on the status line.
-    fn select_preset(app: *App, cx: *Context, row: u32) void {
-        assert(row < preset_count);
-        app.preset_selected = row;
+        assert(app.presets.selected.? == row);
         var bytes: [preset_name_cap]u8 = undefined;
         app.set_status(&.{ preset_name(&bytes, row), " selected" });
         cx.redraw();
-        assert(app.preset_selected.? == row);
     }
 
     /// Reports knob `index`'s new value on the status line: "filter.cut changed 0.42" or
@@ -1257,6 +1226,30 @@ fn tooltip_text(out: *[tooltip_text_cap]u8, knob: *const widgets.Knob) []const u
     return out[0..used];
 }
 
+/// One preset row's name, after the list drew its band.
+fn draw_preset(cx: *Context, row: widgets.ListRow) void {
+    assert(row.index < preset_count);
+    var bytes: [preset_name_cap]u8 = undefined;
+    const name = preset_name(&bytes, row.index);
+    const inner = ui.cx.inset(row.rect, .sides(preset_inset_px, 0, 0, 0));
+    text.place(cx.drawing(), status_style, name, inner, row.clip, .{
+        .align_x = .start,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+}
+
+/// The preset list's look: a band under the selected row in `selected_fill` and under the
+/// hovered one in the scheme's track, as the rack drew them before `widgets.ListBox`.
+const PresetSkin = struct {
+    pub fn list_row(cx: anytype, look: widgets.ListRowLook) void {
+        assert(look.rect.width > 0);
+        if (!look.selected and !look.hovered) return;
+        const fill = if (look.selected) selected_fill else cx.theme().colors.track;
+        kit.face(cx, look.rect, look.clip, .{ .fill = fill, .radius = preset_radius });
+    }
+};
+
 /// Writes "preset N" into `out` and returns the used prefix.
 fn preset_name(out: *[preset_name_cap]u8, row: u32) []const u8 {
     assert(row < preset_count);
@@ -1507,9 +1500,9 @@ test "rack layout at 1280 by 720" {
     // and an 8 px gap, to the inner right edge 1008, as tall as the body.
     try expect_rect(rect_of(cx.find(envelope_id).?.rect), 24 + 608 + 8, 585, 1008 - 640, 111);
     // Presets: x = 16 + 1000 + 8, list 628 - 24 status - 8 = 596 tall, viewport 580 tall.
-    try expect_rect(app.presets.viewport, 1032, 84, 224, 580);
-    try std.testing.expectEqual(@as(f32, 24000), app.presets.content_h);
-    try std.testing.expectEqual(ui.List.Range{ .first = 0, .end = 25 }, app.preset_range);
+    try expect_rect(app.presets.view.viewport, 1032, 84, 224, 580);
+    try std.testing.expectEqual(@as(f32, 24000), app.presets.view.content_h);
+    try std.testing.expectEqual(ui.List.Range{ .first = 0, .end = 25 }, app.presets.range);
     // Boxes: the header, 4 panels, 3 meter tracks (empty: the tone is stopped), the preset
     // panel, its thumb, 16 hubs, and the display face. Arcs: 16 knobs * 2 minus the zero-valued knob's arc. Glyphs:
     // titles 3 + 6 + 3 + 3, knob names 68, values 16 * 4, the tempo 6 + 3, the author 17
@@ -2013,7 +2006,7 @@ fn cable_point(cx: *const Context, index: u32) input.Point {
 
 /// The rect of preset `row` at the last draw.
 fn preset_rect(cx: *const Context, row: u32) Rect {
-    return rect_of(cx.find(ui.id("preset", row)).?.rect);
+    return rect_of(cx.find(fixture.app.presets.row_id(row)).?.rect);
 }
 
 // Locks preset selection: a release inside a row selects it, reports it on the status line,
@@ -2025,7 +2018,7 @@ test "clicking a preset row selects and highlights it" {
     try std.testing.expect(send(app, .{ .pointer_move = point }));
     try std.testing.expect(!send(app, .{ .pointer_down = input.left_at(point) }));
     try std.testing.expect(send(app, .{ .pointer_up = input.left_at(point) }));
-    try std.testing.expectEqual(@as(?u32, 3), app.preset_selected);
+    try std.testing.expectEqual(@as(?u32, 3), app.presets.selected);
     try std.testing.expectEqualStrings("preset 3 selected", app.status_text());
     _ = frame_at(app, 1280, 720);
     // Rows are the viewport width minus the gutter: 224 - 16 = 208. Row 3 is 3 * 24 down.
@@ -2051,19 +2044,143 @@ test "the preset list scrolls and draws only its visible rows" {
         app,
         .{ .wheel = .{ .x = top.x, .y = top.y, .dx = 0, .dy = 412 * 24 } },
     ));
-    try std.testing.expectEqual(@as(f32, 412 * 24), app.presets.scroll_y);
+    try std.testing.expectEqual(@as(f32, 412 * 24), app.presets.view.scroll_y);
     _ = frame_at(app, 1280, 720);
-    try std.testing.expectEqual(ui.List.Range{ .first = 412, .end = 437 }, app.preset_range);
-    try std.testing.expect(cx.find(ui.id("preset", 411)) == null);
-    try std.testing.expect(cx.find(ui.id("preset", 437)) == null);
+    try std.testing.expectEqual(ui.List.Range{ .first = 412, .end = 437 }, app.presets.range);
+    try std.testing.expect(cx.find(app.presets.row_id(411)) == null);
+    try std.testing.expect(cx.find(app.presets.row_id(437)) == null);
     try std.testing.expectEqual(areas_at_rest, cx.area_list().len);
     const first = preset_rect(cx, 412);
-    try std.testing.expectEqual(app.presets.viewport.y, first.y);
+    try std.testing.expectEqual(app.presets.view.viewport.y, first.y);
     const point = center_of(first);
     _ = send(app, .{ .pointer_down = input.left_at(point) });
     _ = send(app, .{ .pointer_up = input.left_at(point) });
     try std.testing.expectEqualStrings("preset 412 selected", app.status_text());
     try std.testing.expectEqual(@as(u32, 0), cx.area_overflow);
+}
+
+/// The preset column as the rack drew it before `widgets.ListBox` (module guide, 2a), kept
+/// for the equality test: a view of hand-made rows whose areas are `ui.id("preset", row)`.
+fn draw_presets_before(app: *App, cx: *Context) void {
+    _ = cx.begin(ui.sized(.{ .fixed = preset_column_px }, .fill), .{ .flow = .down, .spacing = panel_gap_px });
+    const room = cx.remaining();
+    const list_h = std.math.clamp(
+        room.height - status_px - panel_gap_px,
+        0,
+        preset_view_max_px + panel_padding.top + panel_padding.bottom,
+    );
+    const face: widgets.Panel = .{ .paint = panel_paint };
+    _ = face.begin(cx, ui.sized(.fill, .{ .fixed = list_h }), .{ .flow = .down, .padding = panel_padding });
+    const port = cx.begin_view(preset_view_id, ui.sized(.fill, .fill), ui.flow_of(.down), &app.presets.view);
+    const range = preset_list.visible(app.presets.view.scroll_y, port.height);
+    cx.skip(@as(f32, @floatFromInt(range.first)) * preset_row_px);
+    var row = range.first;
+    while (row < range.end) : (row += 1) {
+        const rect = cx.walk(ui.sized(.fill, .{ .fixed = preset_row_px }));
+        const clip = cx.visible(rect) orelse continue;
+        const id = ui.id("preset", row);
+        cx.area(id, rect, 0, ui.cx.plain);
+        const selected = app.presets.selected == row;
+        if (selected or cx.hovered() == id) {
+            const fill = if (selected) selected_fill else cx.theme().colors.track;
+            kit.face(cx, rect, clip, .{ .fill = fill, .radius = preset_radius });
+        }
+        var bytes: [preset_name_cap]u8 = undefined;
+        const name = preset_name(&bytes, row);
+        const inner = ui.cx.inset(rect, .sides(preset_inset_px, 0, 0, 0));
+        text.place(cx.drawing(), status_style, name, inner, clip, .{
+            .align_x = .start,
+            .align_y = .center,
+            .ellipsis = false,
+        });
+    }
+    cx.skip(@as(f32, @floatFromInt(preset_count - range.end)) * preset_row_px);
+    cx.end_view();
+    _ = cx.end();
+    const line = cx.walk(ui.sized(.fill, .{ .fixed = status_px }));
+    if (cx.visible(line)) |clip| {
+        text.place(cx.drawing(), status_style, app.status_text(), line, clip, .{
+            .align_x = .start,
+            .align_y = .center,
+            .ellipsis = true,
+        });
+    }
+    _ = cx.end();
+}
+
+/// Draws only the preset column at the window's top-left, the new way or the old one.
+fn presets_frame(app: *App, before: bool) *Context {
+    const cx = &fixture.context;
+    cx.begin_frame(1280, 720, 120);
+    _ = cx.begin_at(.{ .x = 0, .y = 0, .width = 1280, .height = 720 }, .{ .flow = .right });
+    if (before) draw_presets_before(app, cx) else app.draw_presets(cx);
+    _ = cx.end();
+    _ = cx.end_frame();
+    assert(cx.draw.overflow_count == 0);
+    return cx;
+}
+
+/// Copies the Box and Glyph records of the last draw into `boxes` and `glyphs`.
+fn list_records(cx: *Context, boxes: *[8]quads.Box, glyphs: *[400]quads.Glyph) [2]usize {
+    const box_items = cx.draw.items(quads.Box);
+    const glyph_items = cx.draw.items(quads.Glyph);
+    @memcpy(boxes[0..box_items.len], box_items);
+    @memcpy(glyphs[0..glyph_items.len], glyph_items);
+    return .{ box_items.len, glyph_items.len };
+}
+
+// Locks the move onto `widgets.ListBox` (module guide, 2a): the preset column scrolled by 30 px
+// (a partial row at the top), with preset 3 selected by a click and preset 5 hovered, appends
+// byte for byte the boxes and glyphs the rack's own list appended: the panel, the selected and
+// hovered bands, the thumb, every row name, and the status line.
+test "the preset list draws the records of the rack's own list" {
+    const app = new_app();
+    var cx = presets_frame(app, false);
+    const top = center_of(preset_rect(cx, 0));
+    _ = send(app, .{ .wheel = .{ .x = top.x, .y = top.y, .dx = 0, .dy = 30 } });
+    cx = presets_frame(app, false);
+    const three = center_of(preset_rect(cx, 3));
+    _ = send(app, .{ .pointer_down = input.left_at(three) });
+    _ = send(app, .{ .pointer_up = input.left_at(three) });
+    try std.testing.expectEqual(@as(?u32, 3), app.presets.selected);
+    cx = presets_frame(app, false);
+    const five = center_of(preset_rect(cx, 5));
+    _ = send(app, .{ .pointer_move = five });
+    cx = presets_frame(app, false);
+    var boxes: [8]quads.Box = undefined;
+    var glyphs: [400]quads.Glyph = undefined;
+    const counts = list_records(cx, &boxes, &glyphs);
+    // The old list resolves hover against its own row ids: draw it, move again, draw again.
+    _ = presets_frame(app, true);
+    _ = send(app, .{ .pointer_move = five });
+    try std.testing.expectEqual(ui.id("preset", 5), cx.hovered());
+    cx = presets_frame(app, true);
+    var old_boxes: [8]quads.Box = undefined;
+    var old_glyphs: [400]quads.Glyph = undefined;
+    const old_counts = list_records(cx, &old_boxes, &old_glyphs);
+    // The panel, two bands, and the thumb.
+    try std.testing.expectEqual(@as(usize, 4), counts[0]);
+    try std.testing.expectEqual(old_counts, counts);
+    try std.testing.expect(counts[1] >= 200);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(old_boxes[0..old_counts[0]]), std.mem.sliceAsBytes(boxes[0..counts[0]]));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(old_glyphs[0..old_counts[1]]), std.mem.sliceAsBytes(glyphs[0..counts[1]]));
+}
+
+// Locks the keys the list gained on `widgets.ListBox`: with the list focused by a click on
+// preset 2, Down selects preset 3 and reports it, and End selects preset 999 and scrolls it
+// into view.
+test "the preset list follows the arrow keys once focused" {
+    const app = new_app();
+    const cx = frame_at(app, 1280, 720);
+    const two = center_of(preset_rect(cx, 2));
+    _ = send(app, .{ .pointer_down = input.left_at(two) });
+    _ = send(app, .{ .pointer_up = input.left_at(two) });
+    try std.testing.expect(cx.focused(preset_view_id));
+    _ = send(app, .{ .key_down = input.key_press(.down, .none, false, "") });
+    try std.testing.expectEqualStrings("preset 3 selected", app.status_text());
+    _ = send(app, .{ .key_down = input.key_press(.end, .none, false, "") });
+    try std.testing.expectEqualStrings("preset 999 selected", app.status_text());
+    try std.testing.expectEqual(app.presets.view.max_scroll(), app.presets.view.scroll_y);
 }
 
 // Locks the status line for a knob: a wheel that turns filter.cut from 0.50 to 0.42 reports

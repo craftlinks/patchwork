@@ -5,7 +5,8 @@
 //! ## 1. Behaviour and Look
 //! A library widget is generic over a skin: `KnobOf(Skin)`, `ButtonOf(Skin)`, `SliderOf(Skin)`,
 //! `ToggleOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, `TextFieldOf(Skin)`, `MenuOf(Skin)` (and
-//! `ContextMenuOf`), and `DropdownOf(Skin)`. The behaviour
+//! `ContextMenuOf`), `DropdownOf(Skin)`, `TabsOf(Skin)`, `SplitterOf(Skin)`, `ListBoxOf(Skin)`,
+//! and `NumberBoxOf(Skin)`. The behaviour
 //! (fields, `init`, `handle`, `Action`) is written once in the widget's file. Its `draw` asks
 //! the turtle for the box, culls it, builds a look struct of plain values, and hands it to the
 //! skin, which appends the instances and returns the hit shape the behaviour records:
@@ -36,7 +37,14 @@
 //! MenuOf(S)       menu_face(cx, MenuFaceLook)          void     the popup's face
 //!                 menu_row(cx, MenuRowLook)            void     one row: band and label
 //! DropdownOf(S)   dropdown(cx, DropdownLook)           ?Shape   the face; its list is MenuOf(S)
+//! TabsOf(S)       tab_bar(cx, TabBarLook)              void     the strip under the tabs
+//!                 tab(cx, TabLook)                     ?Shape   one tab
+//! SplitterOf(S)   divider(cx, DividerLook)             ?Shape
+//! ListBoxOf(S)    list_row(cx, ListRowLook)            void     the band under one row
+//! NumberBoxOf(S)  number_face(cx, NumberLook)          ?Shape
+//!                 field(cx, FieldLook)                 void     its editor is TextFieldOf(S)
 //! ```
+//! `check` reads the table of each widget's functions (`functions_of`), in this order.
 //! - A look carries values, never the widget, so a skin cannot change state. Animator values
 //!   arrive raw in `[0, 1]`; the skin applies the scheme's weights (`cx.theme()`).
 //! - Only the skin knows where what it drew is, so it returns the hit shape: a dial with a
@@ -60,7 +68,8 @@
 //! `widgets.value_at` is this map over it.
 //!
 //! ## 4. `Default`
-//! The bodies of the step 31 `draw` functions, moved here unchanged. Draw order within a
+//! The bodies of the step 31 `draw` functions, moved here unchanged, and the looks of the
+//! widgets added since. Draw order within a
 //! layer follows first appearance, so each appends in exactly the order it always did. The
 //! geometry helpers (`ring_sized`, `name_box`, `pill_of`, ...) stay in the widget files.
 //!
@@ -81,6 +90,10 @@ const meter_file = @import("meter.zig");
 const field_file = @import("text_field.zig");
 const menu_file = @import("menu.zig");
 const dropdown_file = @import("dropdown.zig");
+const tabs_file = @import("tabs.zig");
+const splitter_file = @import("splitter.zig");
+const list_box_file = @import("list_box.zig");
+const number_box_file = @import("number_box.zig");
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -186,8 +199,115 @@ pub const DropdownLook = struct {
     open: bool,
 };
 
-/// The widgets a skin may cover, one skin function each (the slider and the menu two).
-pub const Kind = enum { button, slider, knob, toggle, meter, panel, field, menu, dropdown };
+/// A tab bar's strip under its tabs; `focused` while the bar has keyboard focus.
+pub const TabBarLook = struct {
+    rect: Rect,
+    clip: Clip,
+    focused: bool,
+};
+
+/// One tab: its rect, its label (cut with an ellipsis when the tab shrank), and whether it is
+/// the selected or the hovered tab.
+pub const TabLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    selected: bool,
+    hovered: bool,
+};
+
+/// A splitter's divider: its rect across the splitter, the axis the panes are laid along, and
+/// the raw hover value (1 while dragged).
+pub const DividerLook = struct {
+    rect: Rect,
+    clip: Clip,
+    axis: splitter_file.Axis,
+    hover: f32,
+};
+
+/// The band under one list box row: whether the row is selected and whether it is hovered.
+/// The app draws the row's content after it.
+pub const ListRowLook = struct {
+    rect: Rect,
+    clip: Clip,
+    selected: bool,
+    hovered: bool,
+};
+
+/// A number box's face: the formatted value, its unit, and the raw hover value.
+pub const NumberLook = struct {
+    rect: Rect,
+    clip: Clip,
+    value_text: []const u8,
+    unit: []const u8,
+    hover: f32,
+};
+
+/// The widgets a skin may cover.
+pub const Kind = enum {
+    button,
+    slider,
+    knob,
+    toggle,
+    meter,
+    panel,
+    field,
+    menu,
+    dropdown,
+    tabs,
+    splitter,
+    list_box,
+    number_box,
+};
+
+/// One skin function: its name, its look's type and name, and whether it returns the hit
+/// shape (`?Shape`) or nothing.
+const Function = struct {
+    name: []const u8,
+    look: []const u8,
+    Look: type,
+    shape: bool,
+};
+
+/// The skin functions `widget` draws with, in the order `check` reports them (section 2).
+fn functions_of(comptime widget: Kind) []const Function {
+    return switch (widget) {
+        .button => &.{
+            .{ .name = "button", .look = "ButtonLook", .Look = ButtonLook, .shape = true },
+        },
+        .slider => &.{
+            .{ .name = "slider", .look = "SliderLook", .Look = SliderLook, .shape = true },
+        },
+        .knob => &.{.{ .name = "knob", .look = "KnobLook", .Look = KnobLook, .shape = true }},
+        .toggle => &.{
+            .{ .name = "toggle", .look = "ToggleLook", .Look = ToggleLook, .shape = true },
+        },
+        .meter => &.{.{ .name = "meter", .look = "MeterLook", .Look = MeterLook, .shape = false }},
+        .panel => &.{.{ .name = "panel", .look = "PanelLook", .Look = PanelLook, .shape = false }},
+        .field => &.{.{ .name = "field", .look = "FieldLook", .Look = FieldLook, .shape = false }},
+        .menu => &.{
+            .{ .name = "menu_face", .look = "MenuFaceLook", .Look = MenuFaceLook, .shape = false },
+            .{ .name = "menu_row", .look = "MenuRowLook", .Look = MenuRowLook, .shape = false },
+        },
+        .dropdown => &.{
+            .{ .name = "dropdown", .look = "DropdownLook", .Look = DropdownLook, .shape = true },
+        },
+        .tabs => &.{
+            .{ .name = "tab_bar", .look = "TabBarLook", .Look = TabBarLook, .shape = false },
+            .{ .name = "tab", .look = "TabLook", .Look = TabLook, .shape = true },
+        },
+        .splitter => &.{
+            .{ .name = "divider", .look = "DividerLook", .Look = DividerLook, .shape = true },
+        },
+        .list_box => &.{
+            .{ .name = "list_row", .look = "ListRowLook", .Look = ListRowLook, .shape = false },
+        },
+        .number_box => &.{
+            .{ .name = "number_face", .look = "NumberLook", .Look = NumberLook, .shape = true },
+            .{ .name = "field", .look = "FieldLook", .Look = FieldLook, .shape = false },
+        },
+    };
+}
 
 /// The first reason `S` cannot skin `widget`, naming `S` and the function, or null.
 pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
@@ -195,37 +315,14 @@ pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
         .@"struct", .@"union", .@"enum", .@"opaque" => {},
         else => return @typeName(S) ++ ": a skin must be a struct type",
     }
-    if (widget == .menu) {
-        const face = "pub fn menu_face(cx, widgets.MenuFaceLook) void";
-        if (problem(S, "menu_face", &.{ null, MenuFaceLook }, void, face, "void")) |message| {
-            return message;
-        }
-        const row = "pub fn menu_row(cx, widgets.MenuRowLook) void";
-        return problem(S, "menu_row", &.{ null, MenuRowLook }, void, row, "void");
+    for (functions_of(widget)) |function| {
+        const result = if (function.shape) "?widgets.Shape" else "void";
+        const Result = if (function.shape) ?Shape else void;
+        const shown = "pub fn " ++ function.name ++ "(cx, widgets." ++ function.look ++ ") " ++
+            result;
+        const params: []const ?type = &.{ null, function.Look };
+        if (problem(S, function.name, params, Result, shown, result)) |message| return message;
     }
-    const name = @tagName(widget);
-    const result = switch (widget) {
-        .button, .slider, .knob, .toggle, .dropdown => "?widgets.Shape",
-        .meter, .panel, .field, .menu => "void",
-    };
-    const Result = switch (widget) {
-        .button, .slider, .knob, .toggle, .dropdown => ?Shape,
-        .meter, .panel, .field, .menu => void,
-    };
-    const look = switch (widget) {
-        .button => "ButtonLook",
-        .slider => "SliderLook",
-        .knob => "KnobLook",
-        .toggle => "ToggleLook",
-        .meter => "MeterLook",
-        .panel => "PanelLook",
-        .field => "FieldLook",
-        .dropdown => "DropdownLook",
-        .menu => unreachable,
-    };
-    const Look = @field(@This(), look);
-    const shown = "pub fn " ++ name ++ "(cx, widgets." ++ look ++ ") " ++ result;
-    if (problem(S, name, &.{ null, Look }, Result, shown, result)) |message| return message;
     if (widget != .slider) return null;
     const travel = "pub fn slider_travel(area: widgets.Rect) [2]f32";
     return problem(S, "slider_travel", &.{Rect}, [2]f32, travel, "[2]f32");
@@ -458,6 +555,125 @@ pub const Default = struct {
         }
         return .{ .rect = look.rect, .radius = menu_file.menu_radius };
     }
+
+    /// A one-pixel line along the bar's bottom: `colors.focus` while the bar has focus,
+    /// `colors.control` otherwise. The tabs draw over it.
+    pub fn tab_bar(cx: anytype, look: TabBarLook) void {
+        assert(look.rect.width > 0);
+        assert(look.rect.height >= tabs_file.tab_line_px);
+        const colors = &cx.theme().colors;
+        const line: Rect = .{
+            .x = look.rect.x,
+            .y = look.rect.y + look.rect.height - tabs_file.tab_line_px,
+            .width = look.rect.width,
+            .height = tabs_file.tab_line_px,
+        };
+        const fill = if (look.focused) colors.focus else colors.control;
+        kit.face(cx, line, look.clip, .{ .fill = fill });
+    }
+
+    /// The tab's face, `colors.panel` when selected and `colors.track` otherwise (lightened
+    /// while hovered), the selected tab's accent underline, and the label centered inside
+    /// `tab_pad_x`, cut with an ellipsis. The face is the hit shape.
+    pub fn tab(cx: anytype, look: TabLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        const lit = look.hovered and !look.selected;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = if (look.selected) colors.panel else colors.track,
+            .radius = tabs_file.tab_radius,
+            .hover = if (lit) scheme.hover_lighten else 0,
+        });
+        if (look.selected) {
+            const underline: Rect = .{
+                .x = look.rect.x,
+                .y = look.rect.y + look.rect.height - tabs_file.tab_underline_px,
+                .width = look.rect.width,
+                .height = tabs_file.tab_underline_px,
+            };
+            kit.face(cx, underline, look.clip, .{ .fill = scheme.accents[0] });
+        }
+        const inner = ui.cx.inset(look.rect, .xy(tabs_file.tab_pad_x, 0));
+        if (inner.width > 0) {
+            kit.label(cx, scheme.name, look.label, inner, look.clip, tabs_file.tab_text_options);
+        }
+        return .{ .rect = look.rect, .radius = tabs_file.tab_radius };
+    }
+
+    /// A `divider_line_px` line down the middle of the divider in `colors.control`, lightened
+    /// by hover. The whole divider is the hit shape.
+    pub fn divider(cx: anytype, look: DividerLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.rect.height > 0);
+        const scheme = cx.theme();
+        const thin = splitter_file.divider_line_px;
+        const line: Rect = switch (look.axis) {
+            .horizontal => .{
+                .x = look.rect.x + (look.rect.width - thin) * 0.5,
+                .y = look.rect.y,
+                .width = @min(thin, look.rect.width),
+                .height = look.rect.height,
+            },
+            .vertical => .{
+                .x = look.rect.x,
+                .y = look.rect.y + (look.rect.height - thin) * 0.5,
+                .width = look.rect.width,
+                .height = @min(thin, look.rect.height),
+            },
+        };
+        kit.face(cx, line, look.clip, .{
+            .fill = scheme.colors.control,
+            .radius = thin * 0.5,
+            .hover = kit.weight(look.hover, scheme.hover_lighten),
+        });
+        return .{ .rect = look.rect, .radius = 0 };
+    }
+
+    /// A band over the row: `colors.selection` when selected, `colors.track` when hovered,
+    /// nothing otherwise.
+    pub fn list_row(cx: anytype, look: ListRowLook) void {
+        assert(look.rect.width > 0);
+        assert(look.rect.height > 0);
+        if (!look.selected and !look.hovered) return;
+        const colors = &cx.theme().colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = if (look.selected) colors.selection else colors.track,
+            .radius = list_box_file.list_row_radius,
+        });
+    }
+
+    /// A field-like face (`colors.track`, a one-pixel `colors.control` border, lightened by
+    /// hover), then the value in `scheme.value` and the unit in `scheme.name` at
+    /// `number_unit_alpha`, right-aligned on one baseline inside `number_pad_x`. The face is
+    /// the hit shape.
+    pub fn number_face(cx: anytype, look: NumberLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.value_text.len >= 1);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.track,
+            .border_color = colors.control,
+            .border_width = field_file.field_border_px,
+            .radius = number_box_file.number_radius,
+            .hover = kit.weight(look.hover, scheme.hover_lighten),
+        });
+        var unit_style = scheme.name;
+        unit_style.color[3] *= number_box_file.number_unit_alpha;
+        const runs = [_]text.Run{
+            .{ .style = scheme.value, .bytes = look.value_text },
+            .{ .style = unit_style, .bytes = look.unit },
+        };
+        const count: usize = if (look.unit.len > 0) 2 else 1;
+        const inner = ui.cx.inset(look.rect, .xy(number_box_file.number_pad_x, 0));
+        if (inner.width > 0) {
+            const options = number_box_file.number_text_options;
+            text.place_runs(cx.drawing(), runs[0..count], inner, look.clip, options);
+        }
+        return .{ .rect = look.rect, .radius = number_box_file.number_radius };
+    }
 };
 
 comptime {
@@ -496,8 +712,9 @@ const Mixed = struct {
 };
 
 // Locks the contract check (section 2): `Default` covers every widget; a skin covering the
-// knob alone passes for the knob and names the missing `button`; a wrong return type and a
-// wrong look each give their message; a slider skin needs `slider_travel` too.
+// knob alone passes for the knob and names the missing `button` and `tab_bar`; a wrong return
+// type and a wrong look each give their message; a slider skin needs `slider_travel` too, and
+// a number box skin `field` for its editor.
 test "check names the skin and the first problem" {
     inline for (@typeInfo(Kind).@"enum".field_names) |name| {
         const kind = @field(Kind, name);
@@ -528,6 +745,19 @@ test "check names the skin and the first problem" {
         message,
         ": missing `pub fn slider_travel(area: widgets.Rect) [2]f32`",
     ));
+    try testing.expectEqualStrings(
+        "widgets.skin.KnobOnly: missing `pub fn tab_bar(cx, widgets.TabBarLook) void`",
+        comptime check(KnobOnly, .tabs).?,
+    );
+    const FaceOnly = struct {
+        pub fn number_face(cx: anytype, look: NumberLook) ?Shape {
+            _ = cx;
+            return .{ .rect = look.rect, .radius = 0 };
+        }
+    };
+    const editor = comptime check(FaceOnly, .number_box).?;
+    const no_field = ": missing `pub fn field(cx, widgets.FieldLook) void`";
+    try testing.expect(std.mem.endsWith(u8, editor, no_field));
     const not_struct = comptime check(u32, .meter).?;
     try testing.expectEqualStrings("u32: a skin must be a struct type", not_struct);
 }

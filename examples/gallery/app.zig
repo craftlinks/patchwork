@@ -1,4 +1,4 @@
-//! Gallery example: every library widget on one screen, built only from the kit.
+//! Gallery example: every library widget on three tabbed pages, built only from the kit.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -9,38 +9,59 @@
 //! Every widget reports its last action on the status line, for example "knob 1 changed 0.75".
 //! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
 //! with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
-//! behaviour in the gallery's own skin (section 3b). A popups column right of the screen shows
-//! the overlay model: a dropdown, a "File" menu, a context menu, tooltips on every knob, and an
-//! About dialog (section 3c).
+//! behaviour in the gallery's own skin (section 3b). A `widgets.Tabs` bar under the title holds
+//! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32), "popups" (step 33:
+//! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
+//! "containers" (step 34: splitters, a list box, and number boxes). Tooltips show on every
+//! knob of the basics page.
 //!
 //! ## 2. Layout (logical pixels)
 //! A fixed `screen_w` by `screen_h` screen from the top-left, so it fits the 1280 by 720
 //! browser viewport and a native dump and a browser screenshot compare region for region:
 //! ```text
-//! screen   1088 x 704 at (0, 0), flow down, padding 16, spacing 8
+//! screen   1280 x 704 at (0, 0), flow down, padding 16, spacing 8
 //!   title  fill x 40        "gallery", the "light" toggle (160 x 40 at x 156), the status
+//!   tabs   fill x fill      the bar (32), then the selected page from y 104, 1248 x 584
+//! basics
 //!   band   fill x 152       buttons (176) | sliders (288) | knobs (fill: 4 cells of 140)
 //!   band   fill x 152       toggles (176) | meter (176)   | text field (fill; field 240 x 32)
 //!   row    fill x 88        hardware: 4 knob cells of 140 | 2 buttons of 96 | 2 toggles of 116
-//!   list   fill x 208       a view of 40 rows of 28, the selected row highlighted
-//! popups   184 x 672 at (1080, 16), flow down, padding 8, spacing 8
-//!   caption 20 | "wave" dropdown 32 | "File" button 40 | right-click panel 120
-//!   "flip" dropdown 168 x 32 at (1088, 632): 40 px above the frame's bottom
+//!   list   fill x 168       a view of 40 rows of 28, the selected row highlighted
+//! popups
+//!   column 240 x fill       caption 20 | "wave" dropdown 32 | "File" button 40 | right-click
+//!                           panel 120; the "flip" dropdown 224 x 32 at (24, 632), 40 px above
+//!                           the frame's bottom
+//!   notes  fill x fill      three lines on the overlay model
+//! containers
+//!   split  fill x fill      horizontal: the presets (a list box in a panel) | vertical: the
+//!                           parameter grid (2 rows of 3 number boxes) over the preset panel
 //! ```
 //! The frame, `(0, 0, 1280, 704)`, is the 1280 by 720 browser viewport's width and the screen's
-//! height. The popups column sits right of the screen's own 1088 px, so the screen's pixels are
-//! the same as without it.
+//! height.
 //! Each group is a `Panel` with padding 8 that clips its children. The knobs have rings of 56,
 //! 40, 56, and 72 (`Knob.sized`) in 72 px rows, the hardware knobs 56, 48, 64, and 72; the
 //! hardware row spaces its widgets by 8 and centers them vertically; the meter follows
 //! slider 0.
 //!
+//! ## 2a. Pages
+//! The tabs keep no page: `draw` opens the page under the bar (`Tabs.begin`) and draws the
+//! selected one with a `switch`, so a page that is not shown records no area and its widgets'
+//! `handle` sees nothing; switching pages is one redraw ("page containers"). The containers
+//! page is a `widgets.Splitter` (ratio 0.25, panes at least 160 and 400 px) whose left pane is
+//! a `widgets.ListBox` of 1,000 presets ("preset 0001" ...) and whose right pane is a vertical
+//! splitter (ratio 0.4) of six `widgets.NumberBox`es (frequency 20 to 20000 Hz, gain -60 to 12
+//! dB, attack, release, q, mix) over a panel naming the selected preset and the last activated
+//! one. Each reports on the status line: "split 0.15", "preset 0024 selected", "frequency
+//! 4436.0 Hz", "gain = -6.5 dB" (a typed value).
+//!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
-//! to the rows it drew last through `kit.clicked`, which also repaints a row on hover. The
-//! default and hardware rows share one routine per widget kind (`knob_events`, ...), since a
-//! skinned widget has the default one's behaviour and actions.
+//! to the rows it drew last through `kit.clicked`, which also repaints a row on hover, then to
+//! the popups (`popup_events`) and to the tabs and the containers page (`container_events`; the
+//! list box routes its own view). The default and hardware rows share one routine per widget
+//! kind (`knob_events`, ...), since a skinned widget has the default one's behaviour and
+//! actions.
 //!
 //! ## 3a. Theme
 //! Everything the gallery draws reads `cx.theme()`: the group faces, the text styles, the
@@ -67,7 +88,7 @@
 //! closed by its Close button or Escape. A right press on the panel opens the context menu
 //! (Copy, Paste, Reset) at the pointer. Hovering any knob, default or hardware, for
 //! `widgets.tooltip_delay_ms` shows "name value" beside its ring. An outside press only
-//! dismisses: the button under it does not click.
+//! dismisses: the dropdown under it does not open.
 //!
 //! ## 4. Scenarios
 //! `still`; `interact` (click button 0, drag slider 0 by +80 px, click toggle 1, drag knob 1
@@ -79,11 +100,15 @@
 //! hardware button 1, flip hardware toggle 0, then settle). Popups (section 3c): `dropdown`
 //! (click the wave dropdown, Down twice, Enter: "dropdown changed 2", closed); `menu-open`
 //! (click File, wait 2); `menu-flip` (click the flip dropdown, wait 2: its list above it);
-//! `context` (right-click the panel, click Reset); `dismiss` (open the File menu, click button
-//! 0 through the backdrop: no click, the menu closed); `tooltip` (hover knob 0 for 40 frames);
-//! `about` (choose About… from the File menu: the dialog over the dimmed screen). The app tests
-//! replay `interact`, `light`, `hardware`, and the popup scenarios headless and check every
-//! value they leave.
+//! `context` (right-click the panel, click Reset); `dismiss` (open the File menu, click the
+//! wave dropdown through the backdrop: it does not open, the menu closed); `tooltip` (hover
+//! knob 0 for 40 frames); `about` (choose About… from the File menu: the dialog over the dimmed
+//! screen); each popup scenario but `tooltip` first clicks the popups tab. Containers (section
+//! 2a): `tabs` (click each tab: the containers page); `split` (drag the presets' divider 120 px
+//! left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled into view);
+//! `number` (drag the frequency up 40 px, double-click the gain, type "-6.5", Enter). The app
+//! tests replay all but `still` and `hover` headless (`number` a 60 Hz frame apart, so its two
+//! clicks are a double click as in regress) and check every value they leave.
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays, a fixed status buffer, and no allocation; every loop is bounded.
@@ -104,7 +129,7 @@ const hardware = @import("hardware.zig");
 
 const Rect = quads.Rect;
 
-const screen_w: f32 = 1088;
+const screen_w: f32 = 1280;
 const screen_h: f32 = 704;
 const screen_padding: f32 = 16;
 const gap_px: f32 = 8;
@@ -125,16 +150,19 @@ const field_h: f32 = 32;
 const meter_track_px: f32 = 120;
 const row_px: f32 = 28;
 const row_count: u32 = 40;
+/// Where every page starts: under the title, the tab bar, and a gap.
+const page_y: f32 = screen_padding + title_px + gap_px + widgets.tab_bar_h + gap_px;
+/// The page's height: the rest of the screen inside its padding.
+const page_h: f32 = screen_h - screen_padding - page_y;
 const row_inset_px: f32 = 12;
 const title_inset_px: f32 = 12;
 const status_cap: u32 = 48;
 
-/// The frame popups stay inside (section 3c), and the popups column right of the screen.
-const frame_w: f32 = 1280;
+/// The frame popups stay inside (section 3c): the screen.
+const frame_w: f32 = screen_w;
 const frame_rect: Rect = .{ .x = 0, .y = 0, .width = frame_w, .height = screen_h };
-const column_x: f32 = screen_w - screen_padding + gap_px;
-const column_w: f32 = frame_w - screen_padding - column_x;
-const column_h: f32 = screen_h - 2 * screen_padding;
+/// The popups page's column.
+const popups_w: f32 = 240;
 const dropdown_h: f32 = 32;
 const scratch_px: f32 = 120;
 /// The flip dropdown's bottom is this far above the frame's.
@@ -185,6 +213,54 @@ const scratch_id = ui.id("scratch", 0);
 const context_id = ui.id("context", 0);
 const about_id = ui.id("about", 0);
 const close_id = ui.id("close", 0);
+const tabs_id = ui.id("tabs", 0);
+const split_id = ui.id("split", 0);
+const side_id = ui.id("side", 0);
+const presets_id = ui.id("presets", 0);
+
+/// The pages (section 2a), in tab order.
+const page_labels = [_][]const u8{ "basics", "popups", "containers" };
+const page_basics: u32 = 0;
+const page_popups: u32 = 1;
+const page_containers: u32 = 2;
+
+/// The containers page (section 2a): 1,000 presets in a list box beside a splitter of six
+/// number boxes over a panel naming the selected preset.
+const preset_count: u32 = 1000;
+const preset_row_px: f32 = 28;
+/// Rows the presets' viewport (at most the page less the panel's padding) shows partly.
+const preset_rows_max: u32 = 22;
+const split_ratio: f32 = 0.25;
+const split_min_a: f32 = 160;
+const split_min_b: f32 = 400;
+const side_ratio: f32 = 0.4;
+const side_min_b: f32 = 96;
+/// A parameter cell: its caption, a gap, and the box.
+const param_gap_px: f32 = 4;
+const param_row_px: f32 = caption_px + param_gap_px + field_h;
+/// The parameter grid's height: two rows, a gap, and the panel's padding.
+const params_h: f32 = 2 * param_row_px + gap_px + 2 * group_padding;
+const param_names = [_][]const u8{ "frequency", "gain", "attack", "release", "q", "mix" };
+/// Each parameter: its value, range, step, decimals, and unit.
+const Param = struct { value: f64, min: f64, max: f64, step: f64, format: widgets.NumberFormat };
+const params = [_]Param{
+    .{ .value = 440, .min = 20, .max = 20000, .step = 0, .format = .{ .decimals = 1, .unit = " Hz" } },
+    .{ .value = 0, .min = -60, .max = 12, .step = 0.1, .format = .{ .decimals = 1, .unit = " dB" } },
+    .{ .value = 10, .min = 0, .max = 2000, .step = 1, .format = .{ .decimals = 0, .unit = " ms" } },
+    .{ .value = 200, .min = 0, .max = 5000, .step = 1, .format = .{ .decimals = 0, .unit = " ms" } },
+    .{ .value = 0.71, .min = 0.1, .max = 10, .step = 0.01, .format = .{ .decimals = 2, .unit = "" } },
+    .{ .value = 50, .min = 0, .max = 100, .step = 1, .format = .{ .decimals = 0, .unit = " %" } },
+};
+/// Bytes of a preset's name: "preset 0001".
+const preset_name_cap: u32 = 11;
+/// The selected preset's name line.
+const preset_title_px: f32 = 32;
+/// The popups page's notes beside its column.
+const popup_notes = [_][]const u8{
+    "Menus, lists, and dialogs draw last, on the popup layer.",
+    "A press outside a popup only closes it.",
+    "Hover a knob on the basics page for its tooltip.",
+};
 
 /// The "light" toggle's box in the title bar: right of "gallery", one toggle row high.
 const theme_toggle_x: f32 = 156;
@@ -203,8 +279,8 @@ const end: text.Options = .{ .align_x = .end, .align_y = .center, .ellipsis = tr
 
 /// The rows: 40 of 28 px in the list's view.
 const rows: ui.List = .{ .row_height = row_px, .count = row_count };
-/// Rows one viewport can show partly: `ceil(192 / 28) + 1`.
-const rows_drawn_max: u32 = 8;
+/// Rows one viewport can show partly: `ceil(152 / 28) + 1`.
+const rows_drawn_max: u32 = 7;
 
 /// Pool and area capacities; the comptime block checks them against the counts.
 const box_cap: u32 = 64;
@@ -216,6 +292,9 @@ const dial_cap: u32 = 8;
 const bevel_cap: u32 = 8;
 const led_cap: u32 = 4;
 const area_cap: u32 = 56;
+
+/// A page under the tab bar: flowing down, a gap below the bar.
+const page_layout: ui.Layout = .{ .flow = .down, .spacing = gap_px, .padding = .sides(0, gap_px, 0, 0) };
 
 const Context = patchwork.app.Context(App);
 
@@ -231,6 +310,8 @@ const group_layout: ui.Layout = .{
 pub const App = struct {
     /// The title bar's "light" toggle: on is `theme.light`.
     light: widgets.Toggle,
+    /// The pages (section 2a); the app draws the selected one.
+    tabs: widgets.Tabs,
     buttons: [button_labels.len]widgets.Button,
     sliders: [slider_names.len]widgets.Slider,
     knobs: [knob_names.len]widgets.Knob,
@@ -248,6 +329,13 @@ pub const App = struct {
     context: widgets.ContextMenu,
     about: About,
     tooltip: widgets.Tooltip,
+    /// The containers page (section 2a).
+    split: widgets.Splitter,
+    side: widgets.Splitter,
+    presets: widgets.ListBox,
+    params: [param_names.len]widgets.NumberBox,
+    /// The preset last activated (a double click or Enter).
+    activated: ?u32,
     view: ui.ViewState,
     /// The rows drawn last, which `event` routes.
     drawn: ui.List.Range,
@@ -284,6 +372,10 @@ pub const App = struct {
         .{ .name = "dismiss", .setup = &dismiss_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "tooltip", .setup = &tooltip_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "about", .setup = &about_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tabs", .setup = &tabs_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "split", .setup = &split_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "list", .setup = &list_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "number", .setup = &number_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -291,6 +383,14 @@ pub const App = struct {
     pub fn init(app: *App, textures: *quads.Textures) void {
         assert(textures.count >= 1);
         app.light = widgets.Toggle.init(theme_id, "light", false);
+        app.tabs = widgets.Tabs.init(tabs_id, &page_labels, page_basics);
+        app.split = widgets.Splitter.init(split_id, .horizontal, split_ratio, split_min_a, split_min_b);
+        app.side = widgets.Splitter.init(side_id, .vertical, side_ratio, params_h, side_min_b);
+        app.presets = widgets.ListBox.init(presets_id, preset_count, preset_row_px);
+        for (&app.params, params, 0..) |*number, param, index| {
+            number.* = widgets.NumberBox.init(ui.id("param", @intCast(index)), param.value, param.min, param.max, param.step, param.format);
+        }
+        app.activated = null;
         for (&app.buttons, button_labels, 0..) |*button, label, index| {
             button.* = .{
                 .id = ui.id("button", @intCast(index)),
@@ -410,7 +510,49 @@ pub const App = struct {
             if (kit.clicked(cx, ui.id("row", row), event_value)) app.select(cx, row);
         }
         app.popup_events(cx, event_value);
+        app.container_events(cx, event_value);
         assert(app.status_len <= status_cap);
+    }
+
+    /// The tabs and the containers page (section 2a): the splitters, the list box, and the
+    /// number boxes.
+    fn container_events(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.tabs.handle(cx, event_value)) {
+            .changed => |page| app.note(cx, &.{ "page ", page_labels[page] }),
+            .none => {},
+        }
+        app.splitter_events(cx, "split ", &app.split, event_value);
+        app.splitter_events(cx, "side ", &app.side, event_value);
+        var name: [preset_name_cap]u8 = undefined;
+        switch (app.presets.handle(cx, event_value)) {
+            .selected => |row| app.note(cx, &.{ preset_name(&name, row), " selected" }),
+            .activated => |row| {
+                app.activated = row;
+                app.note(cx, &.{ preset_name(&name, row), " activated" });
+            },
+            .none => {},
+        }
+        for (&app.params, param_names) |*number, label| {
+            var bytes: [widgets.number_text_cap]u8 = undefined;
+            switch (number.handle(cx, event_value)) {
+                .changed => app.note(cx, &.{ label, " ", number.text_of(&bytes) }),
+                .committed => app.note(cx, &.{ label, " = ", number.text_of(&bytes) }),
+                .none => {},
+            }
+        }
+    }
+
+    /// Reports a splitter's move or reset after `name`.
+    fn splitter_events(app: *App, cx: *Context, name: []const u8, splitter: *widgets.Splitter, event_value: input.Event) void {
+        var bytes: [8]u8 = undefined;
+        switch (splitter.handle(cx, event_value)) {
+            .moved => |ratio| {
+                widgets.write_hundredths(&bytes, ratio);
+                app.note(cx, &.{ name, bytes[0..4] });
+            },
+            .reset => app.note(cx, &.{ name, "reset" }),
+            .none => {},
+        }
     }
 
     /// The popups column (section 3c): the dropdowns, the File button and its menu, the context
@@ -498,20 +640,15 @@ pub const App = struct {
         const screen: ui.Walk = .{ .width = .{ .fixed = screen_w }, .height = .{ .fixed = screen_h } };
         _ = cx.begin(screen, .{ .flow = .down, .spacing = gap_px, .padding = .all(screen_padding) });
         app.draw_title(cx);
-        _ = cx.begin(ui.sized(.fill, .{ .fixed = band_px }), .{ .flow = .right, .spacing = gap_px });
-        app.draw_buttons(cx);
-        app.draw_sliders(cx);
-        app.draw_knobs(cx);
+        _ = app.tabs.begin(cx, ui.sized(.fill, .fill), page_layout);
+        switch (app.tabs.selected) {
+            page_basics => app.draw_basics(cx),
+            page_popups => app.draw_popups(cx),
+            page_containers => app.draw_containers(cx),
+            else => unreachable,
+        }
         _ = cx.end();
-        _ = cx.begin(ui.sized(.fill, .{ .fixed = band_px }), .{ .flow = .right, .spacing = gap_px });
-        app.draw_toggles(cx);
-        app.draw_meter(cx);
-        app.draw_field(cx);
         _ = cx.end();
-        app.draw_hardware(cx);
-        app.draw_list(cx);
-        _ = cx.end();
-        app.draw_popups(cx);
         ui.overlays(cx, app);
         assert(cx.draw.overflow_count == 0);
         assert(cx.area_overflow == 0);
@@ -555,6 +692,23 @@ pub const App = struct {
         _ = cx.begin_at(cell, .{ .flow = .down });
         app.light.draw(cx, ui.sized(.fill, .fill));
         _ = cx.end();
+    }
+
+    /// The basics page: the widgets of steps 30 to 32 in two bands, the hardware row, and the
+    /// list.
+    fn draw_basics(app: *App, cx: *Context) void {
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = band_px }), .{ .flow = .right, .spacing = gap_px });
+        app.draw_buttons(cx);
+        app.draw_sliders(cx);
+        app.draw_knobs(cx);
+        _ = cx.end();
+        _ = cx.begin(ui.sized(.fill, .{ .fixed = band_px }), .{ .flow = .right, .spacing = gap_px });
+        app.draw_toggles(cx);
+        app.draw_meter(cx);
+        app.draw_field(cx);
+        _ = cx.end();
+        app.draw_hardware(cx);
+        app.draw_list(cx);
     }
 
     fn draw_buttons(app: *const App, cx: *Context) void {
@@ -618,13 +772,12 @@ pub const App = struct {
         _ = cx.end();
     }
 
-    /// The popups column right of the screen (section 2): its widgets; their popups draw in
-    /// `ui.overlays`.
+    /// The popups page (section 2): a column of their widgets beside a panel of notes; the
+    /// popups draw in `ui.overlays`.
     fn draw_popups(app: *const App, cx: *Context) void {
-        const column: Rect = .{ .x = column_x, .y = screen_padding, .width = column_w, .height = column_h };
-        const clip = cx.visible(column) orelse return;
-        kit.face(cx, column, clip, panel_paint(cx).look(cx.theme(), 0, 0));
-        _ = cx.begin_at(column, group_layout);
+        _ = cx.begin(ui.sized(.fill, .fill), .{ .flow = .right, .spacing = gap_px });
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        const column = face.begin(cx, ui.sized(.{ .fixed = popups_w }, .fill), group_layout);
         caption(cx, "popups");
         app.wave.draw(cx, ui.sized(.fill, .{ .fixed = dropdown_h }));
         app.file.draw(cx, ui.sized(.fill, .{ .fixed = button_px }));
@@ -635,14 +788,79 @@ pub const App = struct {
             kit.label(cx, styled(cx, .sans, 14), "right-click me", scratch, inside, widgets.centered);
         }
         const flip: Rect = .{
-            .x = column_x + group_padding,
+            .x = column.x + group_padding,
             .y = frame_rect.height - flip_margin_px - dropdown_h,
-            .width = column_w - 2 * group_padding,
+            .width = popups_w - 2 * group_padding,
             .height = dropdown_h,
         };
         _ = cx.begin_at(flip, .{ .flow = .down });
         app.flip.draw(cx, ui.sized(.fill, .fill));
         _ = cx.end();
+        _ = cx.end();
+        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        for (popup_notes) |line| caption(cx, line);
+        _ = cx.end();
+        _ = cx.end();
+    }
+
+    /// The containers page (section 2a): a horizontal splitter of the presets and a vertical
+    /// splitter of the parameters over the selected preset.
+    fn draw_containers(app: *App, cx: *Context) void {
+        _ = app.split.begin(cx, ui.sized(.fill, .fill));
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        _ = face.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down, .padding = .all(group_padding) });
+        const range = app.presets.begin(cx, ui.sized(.fill, .fill));
+        assert(range.end - range.first <= preset_rows_max);
+        while (app.presets.next(cx)) |row| draw_preset(cx, row);
+        app.presets.end(cx);
+        _ = cx.end();
+        _ = app.split.next(cx);
+        _ = app.side.begin(cx, ui.sized(.fill, .fill));
+        app.draw_params(cx);
+        _ = app.side.next(cx);
+        app.draw_preset_panel(cx);
+        app.side.end(cx);
+        app.split.end(cx);
+    }
+
+    /// Two rows of three number boxes, each under its caption.
+    fn draw_params(app: *const App, cx: *Context) void {
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        var line: u32 = 0;
+        while (line < 2) : (line += 1) {
+            _ = cx.begin(ui.sized(.fill, .{ .fixed = param_row_px }), .{ .flow = .right, .spacing = gap_px });
+            for (0..3) |column| {
+                const index = line * 3 + column;
+                _ = cx.begin(ui.sized(.{ .share = 3 }, .fill), .{ .flow = .down, .spacing = param_gap_px });
+                caption(cx, param_names[index]);
+                app.params[index].draw(cx, ui.sized(.fill, .{ .fixed = field_h }));
+                _ = cx.end();
+            }
+            _ = cx.end();
+        }
+        _ = cx.end();
+    }
+
+    /// The selected preset's name, large, and the last activated one.
+    fn draw_preset_panel(app: *const App, cx: *Context) void {
+        const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        var name: [preset_name_cap]u8 = undefined;
+        const title = cx.walk(ui.sized(.fill, .{ .fixed = preset_title_px }));
+        if (cx.visible(title)) |clip| {
+            const words = if (app.presets.selected) |row| preset_name(&name, row) else "no preset selected";
+            kit.label(cx, styled(cx, .sans_bold, 22), words, title, clip, start);
+        }
+        if (app.activated) |row| {
+            var line: [preset_name_cap + 11]u8 = undefined;
+            const shown = preset_name(&name, row);
+            @memcpy(line[0..11], "activated: ");
+            @memcpy(line[11..][0..shown.len], shown);
+            caption(cx, line[0 .. 11 + shown.len]);
+        } else {
+            caption(cx, "double-click or Enter activates a preset");
+        }
         _ = cx.end();
     }
 
@@ -781,6 +999,28 @@ fn tip_of(bytes: *[16]u8, id: ui.Id, name: []const u8, value: []const u8) widget
     return .{ .anchor = id, .text = bytes[0 .. name.len + 1 + value.len] };
 }
 
+/// Writes "preset 0001" for `row` 0 into `out`.
+fn preset_name(out: *[preset_name_cap]u8, row: u32) []const u8 {
+    assert(row < preset_count);
+    @memcpy(out[0..7], "preset ");
+    var number = row + 1;
+    var place: usize = 4;
+    while (place > 0) {
+        place -= 1;
+        out[7 + place] = '0' + @as(u8, @intCast(number % 10));
+        number /= 10;
+    }
+    assert(number == 0);
+    return out[0..preset_name_cap];
+}
+
+/// One preset row's name, after the list box drew its band.
+fn draw_preset(cx: *Context, row: widgets.ListRow) void {
+    var bytes: [preset_name_cap]u8 = undefined;
+    const inner = ui.cx.inset(row.rect, .xy(row_inset_px, 0));
+    kit.label(cx, styled(cx, .sans, 14), preset_name(&bytes, row.index), inner, row.clip, start);
+}
+
 /// A caption line above a control.
 fn caption(cx: *Context, words: []const u8) void {
     const line = cx.walk(ui.sized(.fill, .{ .fixed = caption_px }));
@@ -868,6 +1108,7 @@ fn file_row(index: u32) bench.Target {
 
 /// `dropdown`: open the wave dropdown, Down twice from "sine", Enter: "dropdown changed 2".
 const dropdown_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .click = bench.area("wave", 0) },
     .{ .key = .{ .key = .down, .text = "" } },
     .{ .key = .{ .key = .down, .text = "" } },
@@ -877,29 +1118,33 @@ const dropdown_steps = [_]bench.Step{
 
 /// `menu-open`: the File menu open below its button.
 const menu_open_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .click = bench.area("file", 0) },
     .{ .wait = 2 },
 };
 
 /// `menu-flip`: the flip dropdown's list, which has no room below it in the frame, above it.
 const menu_flip_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .click = bench.area("flip", 0) },
     .{ .wait = 2 },
 };
 
 /// `context`: a right click 40 px into the panel opens the context menu there; click Reset.
 const context_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .right_click = .{ .target = bench.area("scratch", 0), .x = 40, .y = 30 } },
     .{ .click = context_row(2) },
     .{ .wait = 12 },
 };
 
-/// `dismiss`: open the File menu, then click button 0 through its backdrop: the menu closes,
-/// the button does not click, and the status still reads "file menu".
+/// `dismiss`: open the File menu, then click the wave dropdown through its backdrop: the menu
+/// closes, the dropdown does not open, and the status still reads "file menu".
 const dismiss_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .click = bench.area("file", 0) },
     .{ .wait = 2 },
-    .{ .click = bench.area("button", 0) },
+    .{ .click = bench.area("wave", 0) },
     .{ .wait = 12 },
 };
 
@@ -909,53 +1154,122 @@ const tooltip_steps = [_]bench.Step{
     .{ .wait = 40 },
 };
 
+/// The tab of page `index`, a click target.
+fn tab(index: u32) bench.Target {
+    return .{ .id = tabs_id.derive(index), .name = "tab", .index = index };
+}
+
+/// The containers page's horizontal divider, a drag target.
+fn split_divider() bench.Target {
+    return .{ .id = split_id.derive(widgets.divider_salt), .name = "split divider", .index = 0 };
+}
+
+/// `tabs`: click each tab in turn; the last, containers, stays shown.
+const tabs_steps = [_]bench.Step{
+    .{ .click = tab(page_basics) },
+    .{ .click = tab(page_popups) },
+    .{ .click = tab(page_containers) },
+    .{ .wait = 12 },
+};
+
+/// `split`: drag the presets' divider 120 px left from its middle.
+const split_steps = [_]bench.Step{
+    .{ .click = tab(page_containers) },
+    .{ .drag = .{ .target = split_divider(), .from_x = 3, .from_y = 200, .dx = -120, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `list`: click preset row 3 (preset 0004), then Down 20 times: preset 0024, scrolled into
+/// view.
+const list_steps = blk: {
+    var steps: [2 + 20 + 1]bench.Step = undefined;
+    steps[0] = .{ .click = tab(page_containers) };
+    steps[1] = .{ .click_at = .{ .target = bench.area("presets", 0), .x = 60, .y = 3 * preset_row_px + preset_row_px / 2 } };
+    for (steps[2..22]) |*step| step.* = .{ .key = .{ .key = .down, .text = "" } };
+    steps[22] = .{ .wait = 12 };
+    break :blk steps;
+};
+
+/// `number`: drag the frequency up 40 px (440 to 4436 Hz), then double-click the gain, type
+/// "-6.5", and Enter. The two clicks are one frame apart, a double click on the regress clock.
+const number_steps = [_]bench.Step{
+    .{ .click = tab(page_containers) },
+    .{ .drag = .{ .target = bench.area("param", 0), .from_x = 40, .from_y = 16, .dx = 0, .dy = -40 } },
+    .{ .click = bench.area("param", 1) },
+    .{ .click = bench.area("param", 1) },
+    .{ .key = .{ .key = .other, .text = "-" } },
+    .{ .key = .{ .key = .d6, .text = "6" } },
+    .{ .key = .{ .key = .other, .text = "." } },
+    .{ .key = .{ .key = .d5, .text = "5" } },
+    .{ .key = .{ .key = .enter, .text = "" } },
+    .{ .wait = 12 },
+};
+
 /// `about`: choose About… from the File menu: the dialog over the dimmed screen.
 const about_steps = [_]bench.Step{
+    .{ .click = tab(page_popups) },
     .{ .click = bench.area("file", 0) },
     .{ .click = file_row(file_about) },
     .{ .wait = 12 },
 };
 
 comptime {
-    // The popups column: right of the screen's panels, inside the frame.
-    assert(column_x == screen_w - screen_padding + gap_px);
-    assert(column_x + column_w + screen_padding == frame_w);
-    assert(3 * gap_px + caption_px + dropdown_h + button_px + scratch_px + 2 * group_padding < frame_rect.height - flip_margin_px - dropdown_h - screen_padding);
+    // Every page starts under the title, the tab bar, and a gap: y 104, 584 px tall.
+    assert(page_y == 104 and page_h == 584);
+    // The popups page: the column's widgets end above the flip dropdown, which sits inside the
+    // column 40 px above the frame's bottom.
+    assert(page_y + group_padding + 3 * gap_px + caption_px + dropdown_h + button_px + scratch_px < frame_rect.height - flip_margin_px - dropdown_h);
+    assert(frame_rect.height - flip_margin_px <= page_y + page_h);
     // The title: the toggle sits right of "gallery" and inside the bar.
     assert(theme_toggle_x + theme_toggle_w < screen_w - screen_padding);
     assert(widgets.toggle_height == title_px);
-    // The bands' widths: the knob group fits four cells exactly.
+    // The bands' widths: the knob group holds four cells.
     const inner_w = screen_w - 2 * screen_padding;
-    assert(inner_w - narrow_px - sliders_px - 2 * gap_px == 4 * knob_cell_px + 2 * group_padding);
+    assert(inner_w - narrow_px - sliders_px - 2 * gap_px >= 4 * knob_cell_px + 2 * group_padding);
     // Three 40 px buttons or toggles with two gaps fill a band's inner height.
     assert(3 * button_px + 2 * gap_px == band_px - 2 * group_padding);
     assert(3 * widgets.toggle_height + 2 * gap_px == band_px - 2 * group_padding);
-    // The hardware row: four knob cells, two buttons, and two toggles with seven gaps fill it.
-    assert(4 * knob_cell_px + 2 * hard_button_px + 2 * hard_toggle_px + 7 * gap_px == inner_w - 2 * group_padding);
+    // The hardware row: four knob cells, two buttons, and two toggles with seven gaps fit it.
+    assert(4 * knob_cell_px + 2 * hard_button_px + 2 * hard_toggle_px + 7 * gap_px <= inner_w - 2 * group_padding);
     assert(widgets.knob_height == hardware_px - 2 * group_padding);
     for (hard_knob_rings) |ring| assert(ring <= widgets.knob_height);
-    // The list takes what remains: 208 px, a 192 px viewport.
-    const list_h = screen_h - 2 * screen_padding - title_px - 2 * band_px - hardware_px - 4 * gap_px;
-    assert(list_h == 208);
+    // The list takes what remains of the basics page: 168 px, a 152 px viewport.
+    const list_h = page_h - 2 * band_px - hardware_px - 3 * gap_px;
+    assert(list_h == 168);
     assert(@ceil((list_h - 2 * group_padding) / row_px) + 1 == rows_drawn_max);
     for (knob_rings) |ring| assert(ring <= widgets.knob_height);
-    // Faces: title, 7 groups, 3 buttons, 3 per slider, 2 per toggle (the title's too), 2
-    // meter, 3 field, 2 highlighted rows, the thumb; the popups column, its two dropdowns,
-    // button, and panel; a popup's dim, face, and band or button; the tooltip.
-    assert(1 + 8 + 3 + 3 * 2 + 2 * 4 + 2 + 3 + 2 + 1 + 5 + 3 + 1 <= box_cap);
+    // The containers page: the presets' viewport is at most the page less the panel's padding,
+    // and both splitters' minimums fit.
+    assert(@ceil((page_h - 2 * group_padding) / preset_row_px) + 1 == preset_rows_max);
+    assert(split_min_a + split_min_b + widgets.splitter_px <= inner_w);
+    assert(params_h + side_min_b + widgets.splitter_px <= page_h);
+    assert(params.len == param_names.len and params.len == 6);
+    // Faces, on the busiest page (basics): the title and its toggle (2), the tab bar's line,
+    // three tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
+    // 3 field, 2 highlighted rows, the thumb; a popup's dim, face, and band; the tooltip.
+    assert(1 + 2 + 5 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 1 + 3 + 1 <= box_cap);
+    // The containers page: the title (3), the tabs (5), the list's panel, two bands, and thumb,
+    // two dividers, the grid's panel, six faces (one an editing field: face, band, caret), and
+    // the preset panel.
+    assert(3 + 5 + 4 + 2 + 1 + 6 + 2 + 1 <= box_cap);
     assert(2 * knob_names.len + hard_knob_names.len <= arc_cap);
     // The hardware row: a dial per knob, a bevel per button and toggle, an LED per toggle.
     assert(hard_knob_names.len <= dial_cap);
     assert(hard_button_labels.len + hard_toggle_names.len <= bevel_cap);
     assert(hard_toggle_names.len <= led_cap);
-    // Areas: every widget, the title's toggle, the view and its thumb, the rows drawn, the
-    // hardware row, the popups column (two dropdowns, the button, the panel), and one popup:
-    // its backdrop and at most six rows (the dialog: its backdrop and its button).
-    assert(3 + 2 + 4 + 3 + 1 + 1 + 2 + rows_drawn_max + 4 + 2 + 2 + 4 + 1 + file_items.len <= area_cap);
+    // Areas: the title's toggle, the bar and its tabs, and per page: basics (every widget, the
+    // view and its thumb, the rows drawn, the hardware row); popups (two dropdowns, the button,
+    // the panel, and one popup: its backdrop and at most six rows); containers (the list box's
+    // view, thumb, and rows, two dividers, six number boxes).
+    const chrome = 1 + 1 + page_labels.len;
+    assert(chrome + 3 + 2 + 4 + 3 + 1 + 2 + rows_drawn_max + 8 <= area_cap);
+    assert(chrome + 4 + 1 + file_items.len <= area_cap);
+    assert(chrome + 2 + preset_rows_max + 2 + param_names.len <= area_cap);
     assert(wave_items.len >= file_items.len and file_items.len >= context_items.len);
     // Paths: one chevron per dropdown, three points each.
     assert(2 <= path_cap and 2 * 3 <= point_cap);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
+    assert(preset_count <= 9999);
 }
 
 // ------------------------------------------------------------------------------------ tests
@@ -992,40 +1306,48 @@ fn expect_rect(rect: Rect, x: f32, y: f32, width: f32, height: f32) !void {
     try std.testing.expectEqual(height, rect.height);
 }
 
-// Locks the layout of section 2: the title face, the first button and slider, the knob rings
-// centered in the knob band (56, 40, 56, 72 px), the first toggle's pill, the field, the
-// list's viewport, and that the first frame leaves nothing owed.
+// Locks the layout of section 2: the title face, the tab bar and its first tab, the first
+// button and slider, the knob rings centered in the knob band (56, 40, 56, 72 px), the first
+// toggle's pill, the field, the list's viewport, and that the first frame leaves nothing owed.
 test "gallery layout at 1280 by 720" {
     const app = new_app();
     const cx = frame(app);
-    try expect_rect(area_rect(app.buttons[0].id), 24, 72, 160, 40);
+    // The tab bar: 1248 px under the title at y 16 + 40 + 8 = 64; tab 0 at its left.
+    try expect_rect(area_rect(tabs_id), 16, 64, 1248, 32);
+    try std.testing.expectEqual(@as(f32, 16), area_rect(app.tabs.tab_id(0)).x);
+    try std.testing.expectEqual(@as(f32, 31), area_rect(app.tabs.tab_id(0)).height);
+    // The basics page starts at y 104: its first band's panel padding puts button 0 at 112.
+    try expect_rect(area_rect(app.buttons[0].id), 24, 112, 160, 40);
     // The title's toggle: its pill 8 px into its 160 px cell at x 156, centered in the bar.
     try expect_rect(area_rect(theme_id), 164, 24, 44, 24);
-    try expect_rect(area_rect(app.sliders[0].id), 208, 100, 272, 24);
+    try expect_rect(area_rect(app.sliders[0].id), 208, 140, 272, 24);
     // Knob cells start at 16 + 176 + 8 + 288 + 8 + 8 = 504; the 72 px rows sit at
-    // 64 + 8 + (136 - 72) / 2 = 104, and each ring is centered in its row.
-    try expect_rect(area_rect(app.knobs[0].id), 512, 112, 56, 56);
-    try expect_rect(area_rect(app.knobs[1].id), 652, 120, 40, 40);
-    try expect_rect(area_rect(app.knobs[3].id), 932, 104, 72, 72);
-    try expect_rect(area_rect(app.toggles[0].id), 32, 240, 44, 24);
-    try expect_rect(area_rect(field_id), 392, 260, 240, 32);
-    // The hardware row's panel starts at 16 + 40 + 8 + 2 * (152 + 8) = 384, its cells at 392:
-    // hardware knob 0's 56 px ring at (32, 400), its dial body 9 px inside it; knob 1's 48 px
-    // ring at (180, 404); the buttons after four cells and four gaps at x 616 and 720, centered
+    // 104 + 8 + (136 - 72) / 2 = 144, and each ring is centered in its row.
+    try expect_rect(area_rect(app.knobs[0].id), 512, 152, 56, 56);
+    try expect_rect(area_rect(app.knobs[1].id), 652, 160, 40, 40);
+    try expect_rect(area_rect(app.knobs[3].id), 932, 144, 72, 72);
+    try expect_rect(area_rect(app.toggles[0].id), 32, 280, 44, 24);
+    try expect_rect(area_rect(field_id), 392, 300, 240, 32);
+    // The hardware row's panel starts at 104 + 2 * (152 + 8) = 424, its cells at 432:
+    // hardware knob 0's 56 px ring at (32, 440), its dial body 9 px inside it; knob 1's 48 px
+    // ring at (180, 444); the buttons after four cells and four gaps at x 616 and 720, centered
     // in the 72 px row; the toggles' housings 8 px into their cells at 824 and 948.
-    try expect_rect(area_rect(app.hard_knobs[0].id), 41, 409, 38, 38);
+    try expect_rect(area_rect(app.hard_knobs[0].id), 41, 449, 38, 38);
     try std.testing.expectEqual(@as(f32, 19), cx.find(app.hard_knobs[0].id).?.radius);
-    try expect_rect(area_rect(app.hard_knobs[1].id), 189, 413, 30, 30);
-    try expect_rect(area_rect(app.hard_buttons[0].id), 616, 408, 96, 40);
-    try expect_rect(area_rect(app.hard_buttons[1].id), 720, 408, 96, 40);
-    try expect_rect(area_rect(app.hard_toggles[0].id), 832, 416, 44, 24);
-    try expect_rect(area_rect(app.hard_toggles[1].id), 956, 416, 44, 24);
-    try expect_rect(app.view.viewport, 24, 488, 1040, 192);
+    try expect_rect(area_rect(app.hard_knobs[1].id), 189, 453, 30, 30);
+    try expect_rect(area_rect(app.hard_buttons[0].id), 616, 448, 96, 40);
+    try expect_rect(area_rect(app.hard_buttons[1].id), 720, 448, 96, 40);
+    try expect_rect(area_rect(app.hard_toggles[0].id), 832, 456, 44, 24);
+    try expect_rect(area_rect(app.hard_toggles[1].id), 956, 456, 44, 24);
+    try expect_rect(app.view.viewport, 24, 528, 1232, 152);
     try std.testing.expectEqual(@as(f32, 1120), app.view.content_h);
-    try expect_rect(area_rect(ui.id("row", 0)), 24, 488, 1040 - ui.view.gutter_px, 28);
-    // 192 / 28: row 6 is the last one the viewport shows (partly), so row 7 is not drawn.
-    try std.testing.expect(cx.find(ui.id("row", 6)) != null);
-    try std.testing.expect(cx.find(ui.id("row", 7)) == null);
+    try expect_rect(area_rect(ui.id("row", 0)), 24, 528, 1232 - ui.view.gutter_px, 28);
+    // 152 / 28: row 5 is the last one the viewport shows (partly), so row 6 is not drawn.
+    try std.testing.expect(cx.find(ui.id("row", 5)) != null);
+    try std.testing.expect(cx.find(ui.id("row", 6)) == null);
+    // Only the selected page draws: nothing of the popups or containers pages.
+    try std.testing.expect(cx.find(wave_id) == null);
+    try std.testing.expect(cx.find(presets_id) == null);
     try std.testing.expect(!cx.dirty);
     try std.testing.expect(!ui.draw_frame(App, app, cx, 1280, 720, 120));
 }
@@ -1220,8 +1542,8 @@ test "the file menu opens below its button and the flip list above its dropdown"
 }
 
 // Locks the `context` and `dismiss` scenarios (section 3c): a right click on the panel opens
-// the context menu at the pointer and Reset chooses item 2; a click on button 0 through the
-// File menu's backdrop closes the menu and does not click the button.
+// the context menu at the pointer and Reset chooses item 2; a click on the wave dropdown
+// through the File menu's backdrop closes the menu and does not open the dropdown.
 test "the context menu chooses Reset and an outside click only dismisses" {
     const app = new_app();
     _ = frame(app);
@@ -1233,7 +1555,7 @@ test "the context menu chooses Reset and an outside click only dismisses" {
     try replay(dismiss, "dismiss");
     try std.testing.expect(!dismiss.file_menu.open);
     try std.testing.expectEqualStrings("file menu", dismiss.status_text());
-    try std.testing.expectEqual(@as(f32, 0), dismiss.buttons[0].down.target);
+    try std.testing.expect(!dismiss.wave.menu.open);
 }
 
 // Locks the `tooltip` scenario (section 3c): hovering knob 0 shows nothing until the dwell
@@ -1286,6 +1608,90 @@ test "the about dialog is modal and closes on its button" {
     try std.testing.expect(!app.about.open);
     try std.testing.expectEqualStrings("about closed", app.status_text());
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks the `tabs` scenario (section 4): each tab clicked in turn leaves the containers page
+// selected and reported, the bar focused, and only that page drawn: the list box, its rows,
+// the two dividers, and the six number boxes, with no overflow.
+test "the tabs scenario ends on the containers page" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tabs");
+    try std.testing.expectEqual(page_containers, app.tabs.selected);
+    try std.testing.expectEqualStrings("page containers", app.status_text());
+    try std.testing.expectEqual(tabs_id, test_context.focus);
+    try std.testing.expect(test_context.find(app.buttons[0].id) == null);
+    try std.testing.expect(test_context.find(app.split.divider_id()) != null);
+    try std.testing.expect(test_context.find(app.side.divider_id()) != null);
+    try std.testing.expect(test_context.find(app.presets.row_id(0)) != null);
+    for (&app.params) |*number| try std.testing.expect(test_context.find(number.id) != null);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the containers page's layout (section 2a): the horizontal splitter fills the page
+// (1248 x 584 at (16, 104)), its span 1242 at ratio 0.25 gives the list pane round(310.5) = 311
+// px and the divider at x 327; the vertical splitter in the right pane gives the grid
+// round(0.4 * 578) = 231 px; the list's viewport is the pane inside the panel's padding.
+test "the containers page splits the presets from the parameters" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tabs");
+    try expect_rect(area_rect(app.split.divider_id()), 16 + 311, page_y, widgets.splitter_px, page_h);
+    const right_x = 16 + 311 + widgets.splitter_px;
+    try expect_rect(area_rect(app.side.divider_id()), right_x, page_y + 231, 1264 - right_x, widgets.splitter_px);
+    try expect_rect(app.presets.view.viewport, 24, page_y + 8, 311 - 16, page_h - 16);
+    try std.testing.expectEqual(@as(f32, preset_count * preset_row_px), app.presets.view.content_h);
+    const number = area_rect(app.params[0].id);
+    try std.testing.expectEqual(right_x + group_padding, number.x);
+    try std.testing.expectEqual(page_y + group_padding + caption_px + param_gap_px, number.y);
+}
+
+// Locks the `split` scenario (section 4): the divider dragged 120 px left from its middle
+// leaves the list pane 311 - 120 = 191 px wide (ratio 191 / 1242) and reports it.
+test "the split scenario drags the presets' divider" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "split");
+    try std.testing.expectEqual(@as(f32, 191.0 / 1242.0), app.split.ratio);
+    try std.testing.expectEqualStrings("split 0.15", app.status_text());
+    try std.testing.expectEqual(@as(f32, 16 + 191), area_rect(app.split.divider_id()).x);
+}
+
+// Locks the `list` scenario (section 4): a click on row 3 selects preset 0004 and focuses the
+// list; Down 20 times selects preset 0024 and scrolls it into view: 23 * 28 + 28 - 568 = 104.
+test "the list scenario selects preset 24 and scrolls it into view" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "list");
+    try std.testing.expectEqual(@as(?u32, 23), app.presets.selected);
+    try std.testing.expectEqualStrings("preset 0024 selected", app.status_text());
+    try std.testing.expectEqual(presets_id, test_context.focus);
+    try std.testing.expectEqual(@as(f32, 104), app.presets.view.scroll_y);
+    const row = area_rect(app.presets.row_id(23));
+    const port = app.presets.view.viewport;
+    try std.testing.expectEqual(port.y + port.height, row.y + row.height);
+}
+
+// Locks the `number` scenario (section 4), replayed a 60 Hz frame apart as regress runs it:
+// the frequency dragged up 40 px is 440 + 40 * 19980 / 200 = 4436 Hz; the two clicks on the
+// gain make a double click, "-6.5" and Enter commit -6.5 dB; the editor is closed.
+test "the number scenario drags the frequency and types the gain" {
+    const app = new_app();
+    _ = frame(app);
+    const scenario = bench.find(App.scenarios, "number").?;
+    _ = try bench.replay_headless_paced(App, app, &test_context, scenario, .{ 1280, 720 }, @intCast(scenario.setup.len + 1), 16);
+    try std.testing.expectEqual(@as(f64, 4436), app.params[0].value);
+    try std.testing.expectEqual(@as(f64, -6.5), app.params[1].value);
+    try std.testing.expect(!app.params[1].editing);
+    try std.testing.expectEqualStrings("gain = -6.5 dB", app.status_text());
+}
+
+// Locks the preset names: row 0 is "preset 0001" and row 999 "preset 1000".
+test "preset names count from 0001" {
+    var bytes: [preset_name_cap]u8 = undefined;
+    try std.testing.expectEqualStrings("preset 0001", preset_name(&bytes, 0));
+    try std.testing.expectEqualStrings("preset 1000", preset_name(&bytes, 999));
 }
 
 const Renderer = patchwork.renderer.Renderer(Context.DrawContext);
@@ -1348,9 +1754,10 @@ test "a theme switch records one uniform write and one full repaint" {
         else => {},
     };
     try std.testing.expectEqual(@as(u32, 1), uniform_writes);
-    // The uniform and the seven pools' changed ranges (Box, Arc, Glyph, the hardware row's
-    // Dial, Bevel, and Led, and the dropdowns' chevron Paths): every text and face color moved.
-    try std.testing.expectEqual(@as(u32, 8), writes);
+    // The uniform and the six pools' changed ranges (Box, Arc, Glyph, and the hardware row's
+    // Dial, Bevel, and Led; the dropdowns' chevron Paths are on the popups page): every text
+    // and face color moved.
+    try std.testing.expectEqual(@as(u32, 7), writes);
     try std.testing.expect(written > 256);
     var frames: u32 = 0;
     while (ui.animate(App, app, &test_context, 1000.0 / 60.0)) : (frames += 1) {

@@ -35,7 +35,8 @@
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
 //! no GPU: the app draws a frame, the next step's events are dispatched, and so on. App tests
 //! use it to keep scenarios valid as the app changes. Timer frames are not simulated, so an
-//! empty cycle ends the replay.
+//! empty cycle ends the replay. Steps are a second apart, so no two clicks make a double
+//! click; `replay_headless_paced` sets the spacing (16 ms is the regress clock's frame).
 //!
 //! ## 3. Samples and Summaries
 //! A `Sample` holds one presented frame's phase times in nanoseconds and its shaded area. The
@@ -407,7 +408,23 @@ pub fn replay_headless(
     size: [2]u32,
     steps_limit: u32,
 ) ReplayError!u32 {
+    // A second apart, so no two steps count as one double click.
+    return replay_headless_paced(App, app, cx, scenario, size, steps_limit, 1000);
+}
+
+/// `replay_headless` with presses `step_ms` apart: 16 (a 60 Hz frame, as `--regress` and the
+/// browser replay run) lets two clicks on one spot count as a double click.
+pub fn replay_headless_paced(
+    comptime App: type,
+    app: *App,
+    cx: anytype,
+    scenario: *const Scenario,
+    size: [2]u32,
+    steps_limit: u32,
+    step_ms: u32,
+) ReplayError!u32 {
     assert(steps_limit >= 1);
+    assert(step_ms >= 1);
     assert(size[0] >= 1);
     assert(size[1] >= 1);
     var replay: Replay = .init();
@@ -422,8 +439,7 @@ pub fn replay_headless(
             rect = found.rect;
         }
         var events: [event_cap]input.Event = undefined;
-        // A second apart, so no two steps count as one double click.
-        const time_ms = count * 1000;
+        const time_ms = count * step_ms;
         for (events[0..step_events(step, rect, time_ms, &events)]) |event| {
             ui.dispatch(App, app, cx, event);
         }

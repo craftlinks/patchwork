@@ -1,5 +1,6 @@
 //! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, a text field, menus, a
-//! dropdown, and a tooltip as plain structs, and the kit they are built from.
+//! dropdown, a tooltip, tabs, a splitter, a list box, and a number box as plain structs, and the
+//! kit they are built from.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -48,6 +49,10 @@
 //! widgets/menu.zig        Menu and ContextMenu: a list in a popup (`ui/popup.zig`)
 //! widgets/dropdown.zig    Dropdown: a face and its Menu
 //! widgets/tooltip.zig     Tooltip: one line after a hover dwell, on the tooltip layer
+//! widgets/tabs.zig        Tabs: a bar of tabs over a page the app draws
+//! widgets/splitter.zig    Splitter: two panes and a draggable divider, begin/next/end
+//! widgets/list_box.zig    ListBox: a virtual list with selection, keys, scroll-into-view
+//! widgets/number_box.zig  NumberBox: drag, wheel, or type a value with a unit; format, parse
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
 //! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
@@ -71,7 +76,8 @@
 //! ## 6. Skins
 //! Every widget but `Label` is generic over a skin, a struct of draw functions passed at
 //! compile time (`widgets/skin.zig`): `KnobOf(Skin)`, `ButtonOf`, `SliderOf`, `ToggleOf`,
-//! `MeterOf`, `PanelOf`, and `TextFieldOf` (its face only). The plain names are the default
+//! `MeterOf`, `PanelOf`, `TextFieldOf` (its face only), `MenuOf`, `DropdownOf`, `TabsOf`,
+//! `SplitterOf`, `ListBoxOf`, and `NumberBoxOf`. The plain names are the default
 //! skin, `Knob = KnobOf(skins.Default)`, and draw exactly what they drew before skins. A skin
 //! gets a look struct of values and returns the hit shape; a missing or mistyped function is
 //! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
@@ -82,6 +88,14 @@
 //! and `Layer.tooltip` (`ui/cx.zig`, section 3c). A menu's backdrop takes every press outside
 //! it, so an outside press only dismisses. `bounds` (null for the window) is the rect a popup
 //! stays inside.
+//!
+//! ## 6b. Containers
+//! `Tabs`, `Splitter`, and `ListBox` keep the turtle's begin/end shape: the library owns the
+//! chrome, the geometry, and the input, and the app draws the content between the calls
+//! (`tabs.begin` ... `cx.end()`; `sp.begin`, `sp.next`, `sp.end`; `lb.begin`, `while
+//! (lb.next(cx)) |row|`, `lb.end`). No widget takes a callback. The splitter and the list box
+//! keep state from their draw (the splitter's rect, the list's walked rows), so their draw
+//! calls take `*Self`. `NumberBox` is a leaf that swaps in its `TextField` while editing.
 //!
 //! ## 7. TigerStyle Invariants
 //! - No allocation: label text points at app-owned bytes bounded by `text.byte_cap`; a
@@ -108,6 +122,10 @@ const text_field = @import("widgets/text_field.zig");
 const menu = @import("widgets/menu.zig");
 const dropdown = @import("widgets/dropdown.zig");
 const tooltip = @import("widgets/tooltip.zig");
+const splitter = @import("widgets/splitter.zig");
+const tabs = @import("widgets/tabs.zig");
+const list_box = @import("widgets/list_box.zig");
+const number_box = @import("widgets/number_box.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -138,6 +156,11 @@ pub const FieldLook = skins.FieldLook;
 pub const MenuFaceLook = skins.MenuFaceLook;
 pub const MenuRowLook = skins.MenuRowLook;
 pub const DropdownLook = skins.DropdownLook;
+pub const TabBarLook = skins.TabBarLook;
+pub const TabLook = skins.TabLook;
+pub const DividerLook = skins.DividerLook;
+pub const ListRowLook = skins.ListRowLook;
+pub const NumberLook = skins.NumberLook;
 
 pub const Label = label.Label;
 pub const Panel = panel.Panel;
@@ -224,6 +247,33 @@ pub const Tip = tooltip.Tip;
 pub const tooltip_delay_ms = tooltip.tooltip_delay_ms;
 pub const tooltip_text_cap = tooltip.tooltip_text_cap;
 
+pub const Splitter = splitter.Splitter;
+pub const SplitterOf = splitter.SplitterOf;
+pub const Axis = splitter.Axis;
+pub const Panes = splitter.Panes;
+pub const splitter_px = splitter.splitter_px;
+pub const split = splitter.split;
+pub const divider_salt = splitter.divider_salt;
+
+pub const Tabs = tabs.Tabs;
+pub const TabsOf = tabs.TabsOf;
+pub const tabs_max = tabs.tabs_max;
+pub const tab_bar_h = tabs.tab_bar_h;
+pub const tab_widths = tabs.tab_widths;
+
+pub const ListBox = list_box.ListBox;
+pub const ListBoxOf = list_box.ListBoxOf;
+pub const ListRow = list_box.Row;
+pub const list_rows_max = list_box.list_rows_max;
+
+pub const NumberBox = number_box.NumberBox;
+pub const NumberBoxOf = number_box.NumberBoxOf;
+pub const NumberFormat = number_box.Format;
+pub const number_text_cap = number_box.number_text_cap;
+pub const number_drag_px = number_box.number_drag_px;
+pub const format_number = number_box.format;
+pub const parse_number = number_box.parse;
+
 test {
     _ = kit;
     _ = skins;
@@ -238,6 +288,10 @@ test {
     _ = menu;
     _ = dropdown;
     _ = tooltip;
+    _ = splitter;
+    _ = tabs;
+    _ = list_box;
+    _ = number_box;
 }
 
 /// Every public name of `widgets.zig` at step 29, before the split.
