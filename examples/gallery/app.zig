@@ -14,8 +14,9 @@
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
 //! "containers" (step 34: splitters, a list box, and number boxes), "type" (step 36: an icon
 //! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
-//! dropped files, and a WAV's waveform; section 2c), and "surfaces" (step 39: gradients, rims,
-//! and shadows; section 2d). Tooltips show on every knob of the
+//! dropped files, and a WAV's waveform; section 2c), "surfaces" (step 39: gradients, rims,
+//! and shadows; section 2d), and "glass" (step 40: backdrops, glass, and materials; section
+//! 2e). Tooltips show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
 //! ## 2. Layout (logical pixels)
@@ -104,6 +105,17 @@
 //! selection ("pill Radio", "row Browse"), a card is named ("card Slate"), and each lights on
 //! hover and darkens on press through `kit.lit`.
 //!
+//! ## 2e. Glass
+//! The glass page is `glass.zig`: sixteen album cards (gradients between the scheme's accents)
+//! scroll in a view under a glass sidebar (`widgets.Panel` with the page's material), a
+//! segmented bar that picks that material (Clear, Frosted, Tinted, Solid; "material Clear"),
+//! and a transport bar. The page marks backdrop A at layer 3 for the material; its text sits on
+//! layer 4. The sidebar's output `widgets.Dropdown` opens a glass list on the popup layer
+//! ("output Headphones"), which marks backdrop B, so the list blurs the sidebar under it. The
+//! transport's position slider is `widgets.SliderOf(glass.LensSkin)`: its knob is a clear glass
+//! disc on the popup layer, a lens over the track ("position 0.62"). Solid marks no backdrop A
+//! and draws solid faces.
+//!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
@@ -167,7 +179,11 @@
 //! bytes of a 120 Hz tone in two chunks, `readme.txt`, and a folder: the tone's waveform).
 //! Surfaces (section 2d): `surfaces` (the surfaces page, still); `surfaces-click` (click the
 //! Radio pill, the Browse row, and the Slate card, then rest on Moss: lit); `surfaces-light`
-//! (the light toggle, then the page: restyled from the light scheme). The
+//! (the light toggle, then the page: restyled from the light scheme). Glass (section 2e):
+//! `glass` (the page, still: frosted); `glass-scroll` (scrolled 120 px, then the wheel 24 px
+//! down and back up every frame: a scroll under the glass each frame, for benches);
+//! `glass-popup` (the output list open over the sidebar, Down pressed: row 1 highlighted); `glass-clear` (the Clear segment);
+//! `glass-light` (the light toggle, then the page). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -191,6 +207,7 @@ const hardware = @import("hardware.zig");
 const icons = @import("icons.zig");
 const files_page = @import("files.zig");
 const surfaces_page = @import("surfaces.zig");
+const glass_page = @import("glass.zig");
 
 const Rect = quads.Rect;
 
@@ -302,13 +319,14 @@ const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
 const page_type: u32 = 3;
 const page_files: u32 = 4;
 const page_surfaces: u32 = 5;
+const page_glass: u32 = 6;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -437,8 +455,10 @@ const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
 const glyph_cap: u32 = 2048;
 /// The surfaces page: the backdrop, the panel and a row, the bar and a pill, and three per
-/// card.
-const surface_cap: u32 = 32;
+/// card; the glass page: its gradient and two per card.
+const surface_cap: u32 = 40;
+/// The glass page: the sidebar, the bar, the transport, the lens, and the output list.
+const glass_cap: u32 = 8;
 const path_cap: u32 = 4;
 const point_cap: u32 = 2048;
 const dial_cap: u32 = 8;
@@ -495,6 +515,8 @@ pub const App = struct {
     tools: [tool_icons.len]IconButton,
     /// The surfaces page (section 2d): its selections and its clickables' animators.
     surfaces: surfaces_page.Page,
+    /// The glass page (section 2e): its material, cards' view, output dropdown, and lens.
+    glass: glass_page.Page,
     /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
     type_split: widgets.Splitter,
     wrap_view: ui.ViewState,
@@ -520,6 +542,7 @@ pub const App = struct {
             .{ .type = quads.Path, .cap = path_cap },
             .{ .type = quads.Waveform, .cap = 1 },
             .{ .type = quads.Surface, .cap = surface_cap },
+            .{ .type = quads.Glass, .cap = glass_cap },
         },
         .area_cap = area_cap,
         .point_cap = point_cap,
@@ -553,6 +576,11 @@ pub const App = struct {
         .{ .name = "surfaces", .setup = &surfaces_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "surfaces-click", .setup = &surfaces_click_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "surfaces-light", .setup = &surfaces_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "glass", .setup = &glass_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "glass-scroll", .setup = &glass_scroll_steps, .cycle = &glass_scroll_cycle, .frames = 30 },
+        .{ .name = "glass-popup", .setup = &glass_popup_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "glass-clear", .setup = &glass_clear_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "glass-light", .setup = &glass_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -576,6 +604,7 @@ pub const App = struct {
         app.type_split = widgets.Splitter.init(type_split_id, .horizontal, type_split_ratio, type_split_min_a, type_split_min_b);
         app.wrap_view = ui.ViewState.init();
         app.surfaces.init();
+        app.glass.init(frame_rect);
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -706,6 +735,15 @@ pub const App = struct {
             .pill => |index| app.note(cx, &.{ "pill ", surfaces_page.pill_names[index] }),
             .row => |index| app.note(cx, &.{ "row ", surfaces_page.row_names[index] }),
             .card => |index| app.note(cx, &.{ "card ", surfaces_page.cards[index].name }),
+        };
+        if (app.glass.handle(cx, event_value)) |report| switch (report) {
+            .material => |index| app.note(cx, &.{ "material ", glass_page.material_names[index] }),
+            .output => |index| app.note(cx, &.{ "output ", glass_page.output_names[index] }),
+            .position => |value| {
+                var digits: [8]u8 = undefined;
+                const shown = std.fmt.bufPrint(&digits, "{d:.2}", .{value}) catch unreachable;
+                app.note(cx, &.{ "position ", shown });
+            },
         };
         assert(app.status_len <= status_cap);
     }
@@ -875,6 +913,7 @@ pub const App = struct {
             page_type => app.draw_type(cx),
             page_files => app.drops.draw(cx, gap_px, group_padding, panel_paint(cx)),
             page_surfaces => app.surfaces.draw(cx),
+            page_glass => app.glass.draw(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -1589,6 +1628,48 @@ const surfaces_click_steps = [_]bench.Step{
 const surfaces_light_steps = [_]bench.Step{
     .{ .click = bench.area("theme", 0) },
     .{ .click = tab(page_surfaces) },
+    .{ .wait = 12 },
+};
+
+/// `glass`: the glass page, still: frosted (section 2e).
+const glass_steps = [_]bench.Step{
+    .{ .click = tab(page_glass) },
+    .{ .wait = 12 },
+};
+
+/// `glass-scroll`: the glass page scrolled 120 px, then the wheel over the cards every frame
+/// (each step is one frame), 24 px down and back up: every frame moves the cards under the
+/// glass and blurs them again, for as many frames as a bench asks.
+const glass_scroll_steps = [_]bench.Step{
+    .{ .click = tab(page_glass) },
+    .{ .wheel = .{ .target = bench.area("glass_view", 0), .dx = 0, .dy = 120 } },
+    .{ .wait = 2 },
+};
+const glass_scroll_cycle = [_]bench.Step{
+    .{ .wheel = .{ .target = bench.area("glass_view", 0), .dx = 0, .dy = 24 } },
+    .{ .wheel = .{ .target = bench.area("glass_view", 0), .dx = 0, .dy = -24 } },
+};
+
+/// `glass-popup`: the output dropdown opened and Down pressed: its glass list over the
+/// sidebar's glass, the second row highlighted under its label.
+const glass_popup_steps = [_]bench.Step{
+    .{ .click = tab(page_glass) },
+    .{ .click = .{ .id = glass_page.output_id, .name = "glass output", .index = 0 } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .wait = 12 },
+};
+
+/// `glass-clear`: the Clear segment picked: little blur, a strong lens at every edge.
+const glass_clear_steps = [_]bench.Step{
+    .{ .click = tab(page_glass) },
+    .{ .click = .{ .id = glass_page.segment_id.derive(0), .name = "glass segment", .index = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `glass-light`: the light theme, then the glass page.
+const glass_light_steps = [_]bench.Step{
+    .{ .click = bench.area("theme", 0) },
+    .{ .click = tab(page_glass) },
     .{ .wait = 12 },
 };
 
@@ -2441,9 +2522,85 @@ test "a theme switch records one uniform write and one full repaint" {
     try std.testing.expectEqual(@as(u32, 0), buffer.count);
 }
 
+// Locks the `glass` scenario (section 2e): the seventh tab marks two backdrops, the page's at
+// layer 3 with the frosted blur of 16 and the lens's on the popup layer; four glass faces (the
+// sidebar, the bar, the transport, and the lens) sample them, the first three backdrop A and the
+// lens backdrop B; twelve cards show at the top of the view, so 25 surfaces with the gradient.
+test "the glass scenario marks two backdrops under four glass faces" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "glass");
+    try std.testing.expectEqual(page_glass, app.tabs.selected);
+    try std.testing.expectEqualStrings("page glass", app.status_text());
+    const marked = test_context.draw.backdrop_list();
+    try std.testing.expectEqual(@as(usize, 2), marked.len);
+    try std.testing.expectEqual(@as(u8, 3), marked[0].layer);
+    try std.testing.expectEqual(@as(f32, 16), marked[0].blur);
+    try std.testing.expectEqual(@as(u8, 6), marked[1].layer);
+    const glass = test_context.draw.items(quads.Glass);
+    try std.testing.expectEqual(@as(usize, 4), glass.len);
+    try std.testing.expectEqual(@as(usize, 25), test_context.draw.items(quads.Surface).len);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks `glass-popup` (section 2e): the output list is open on the popup layer with a glass
+// face, a fifth glass that samples backdrop B, which keeps the wider of the list's blur (16)
+// and the lens's (4); and its highlighted band draws under the labels.
+test "the glass-popup scenario opens a glass list over the glass sidebar" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "glass-popup");
+    try std.testing.expect(app.glass.output.menu.open);
+    try std.testing.expectEqual(@as(usize, 5), test_context.draw.items(quads.Glass).len);
+    const marked = test_context.draw.backdrop_list();
+    try std.testing.expectEqual(@as(f32, 16), marked[1].blur);
+    try std.testing.expectEqual(quads.Layer.popup, test_context.draw.layer_at(quads.Glass, 4));
+    // Down highlighted row 1, whose band draws under the labels: on the popup layer the Box
+    // batch (the glass face's hairline) opens before the Glyph batch, which row 0's label
+    // opened.
+    try std.testing.expectEqual(@as(?u32, 1), app.glass.output.menu.highlight);
+    test_context.draw.finalize();
+    var box_at: ?usize = null;
+    var glyph_at: ?usize = null;
+    for (test_context.draw.batch_list(), 0..) |batch, index| {
+        if (batch.layer != @backingInt(quads.Layer.popup)) continue;
+        const box_id = comptime Context.DrawContext.Registry.id(quads.Box);
+        const glyph_id = comptime Context.DrawContext.Registry.id(quads.Glyph);
+        if (batch.type_id == box_id and box_at == null) box_at = index;
+        if (batch.type_id == glyph_id and glyph_at == null) glyph_at = index;
+    }
+    try std.testing.expect(box_at.? < glyph_at.?);
+}
+
+// Locks `glass-clear` and the solid material (section 2e): the Clear segment picks the clear
+// material for the sidebar and the list ("material Clear", backdrop A's blur 4); picking Solid
+// marks no backdrop for the page, so only the lens is glass.
+test "the glass-clear scenario picks the clear material and solid drops the glass" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "glass-clear");
+    try std.testing.expectEqualStrings("material Clear", app.status_text());
+    try std.testing.expectEqual(theme.Material.Kind.clear, app.glass.output.menu.material.?.kind);
+    try std.testing.expectEqual(@as(f32, 4), test_context.draw.backdrop_list()[0].blur);
+    app.glass.material = 3;
+    app.glass.output.menu.material = .solid;
+    _ = frame(app);
+    try std.testing.expectEqual(@as(usize, 1), test_context.draw.backdrop_list().len);
+    try std.testing.expectEqual(@as(usize, 1), test_context.draw.items(quads.Glass).len);
+}
+
+// Locks `glass-scroll` (section 2e): the setup's wheel scrolls the cards 120 px under the glass.
+test "the glass-scroll scenario scrolls the cards under the glass" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "glass-scroll");
+    try std.testing.expectEqual(@as(f32, 120), app.glass.view.scroll_y);
+}
+
 test {
     _ = hardware;
     _ = surfaces_page;
+    _ = glass_page;
 }
 
 comptime {

@@ -27,6 +27,10 @@
 //! and renders it when a layer is bound to it (`draw/fx.zig`, `draw/renderer.zig`, section
 //! 4c). A `.feedback` target is two textures behind one id, so a layer can draw over its own
 //! last frame. At most `target_cap` targets exist, counted against `texture_cap`.
+//! `create_backdrop` reserves a target of kind `.backdrop`: a backdrop's pack, which the draw
+//! context asks for when a frame first marks a backdrop and the renderer sizes and writes with
+//! its blur chain (`draw/backdrop.zig`). At most `backdrop_cap`, also counted against
+//! `texture_cap` but not `target_cap`.
 //!
 //! ## 2a. Sampling
 //! Each texture has a `Sampling`: its filter and its address mode per axis (clamp to the
@@ -90,7 +94,12 @@ pub const TargetKind = enum(u8) {
     single,
     /// Re-rendered every frame it is bound, over its own last frame.
     feedback,
+    /// A backdrop's pack (`draw/backdrop.zig`): the renderer's blur chain writes it.
+    backdrop,
 };
+
+/// Backdrop ids one app may hold, `backdrop.backdrop_cap` (asserted in `draw/pools.zig`).
+pub const backdrop_cap: u32 = 2;
 
 /// Offscreen targets one app may create.
 pub const target_cap: u32 = 4;
@@ -152,6 +161,8 @@ pub const Textures = struct {
     /// The kind of each `.target` entry; meaningless for the others.
     kinds: [texture_cap]TargetKind,
     target_count: u32,
+    /// Backdrop ids created so far (`create_backdrop`); not counted in `target_count`.
+    backdrop_count: u32,
     writes: [write_cap]Write,
     write_count: u32,
     /// Moves on every queued write of a texture: the pixel cache folds it into the tiles that
@@ -164,6 +175,7 @@ pub const Textures = struct {
         self.created = 0;
         self.write_count = 0;
         self.target_count = 0;
+        self.backdrop_count = 0;
         self.revisions = @splat(0);
         assert(self.count == 0);
         assert(self.write_count == 0);
@@ -179,6 +191,7 @@ pub const Textures = struct {
     pub fn create_target(self: *Textures, kind: TargetKind) TextureId {
         assert(self.count < texture_cap);
         assert(self.target_count < target_cap);
+        assert(kind != .backdrop);
         const index = self.count;
         self.formats[index] = .target;
         self.widths[index] = 0;
@@ -189,6 +202,28 @@ pub const Textures = struct {
         self.target_count += 1;
         assert(self.count == index + 1);
         return @fromBackingInt(@intCast(index));
+    }
+
+    /// Reserves the next id for a backdrop's pack (module guide, section 2b). The draw context
+    /// calls it the first time a frame marks more backdrops than it has ids.
+    pub fn create_backdrop(self: *Textures) TextureId {
+        assert(self.count < texture_cap);
+        assert(self.backdrop_count < backdrop_cap);
+        const index = self.count;
+        self.formats[index] = .target;
+        self.widths[index] = 0;
+        self.heights[index] = 0;
+        self.samplings[index] = .{};
+        self.kinds[index] = .backdrop;
+        self.count += 1;
+        self.backdrop_count += 1;
+        assert(self.count == index + 1);
+        return @fromBackingInt(@intCast(index));
+    }
+
+    /// True when `id` is a backdrop's pack.
+    pub fn is_backdrop(self: *const Textures, id: TextureId) bool {
+        return self.format_of(id) == .target and self.kinds[@backingInt(id)] == .backdrop;
     }
 
     /// True when `id` is an offscreen target.

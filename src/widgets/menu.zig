@@ -122,6 +122,9 @@ pub fn MenuOf(comptime Skin: type) type {
         bounds: ?Rect,
         /// The popup is at least as wide as the anchor's area (a dropdown's list).
         fit_anchor: bool,
+        /// The popup's material; null takes the scheme's (`theme.zig`, section 7). A glass one
+        /// marks the popup layer as a backdrop while the menu is open.
+        material: ?kit.Material = null,
 
         pub const Action = MenuAction;
 
@@ -298,9 +301,11 @@ pub fn MenuOf(comptime Skin: type) type {
             const style = cx.theme().name;
             const size = self.size_of(style, if (self.fit_anchor) anchor_width else 0);
             const rect = popup.place(anchor, size, self.bounds orelse cx.window, self.side);
+            const material = self.material orelse cx.theme().material;
+            _ = kit.backdrop(cx, .popup, material);
             _ = cx.begin_popup(self.id, rect, .{ .flow = .down, .clip = true }, 0);
             const clip = cx.clip().?;
-            Skin.menu_face(cx, .{ .rect = rect, .clip = clip });
+            Skin.menu_face(cx, .{ .rect = rect, .clip = clip, .material = material });
             const bottom = rect.y + rect.height - menu_pad_y;
             for (self.items, 0..) |label, index| {
                 const row: u32 = @intCast(index);

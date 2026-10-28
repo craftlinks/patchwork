@@ -95,7 +95,8 @@
 //! With `Options.profile` (the native host's `--bench`, see `bench.zig`) the backend:
 //! - requests `TimestampQuery` when the adapter has it, attaches `timestampWrites` to each of
 //!   the frame's first `pass_cap` passes (pass `i` writes `2i` and `2i + 1`; the offscreen
-//!   targets' passes come before the main one), resolves them after the frame, copies them to
+//!   targets' passes come first, then each backdrop's scene and chain, then the main one),
+//!   resolves them after the frame, copies them to
 //!   a map-read buffer, and blocks on `wgpuDevicePoll` after present to read `pass_ns` (every
 //!   pass and the copy) and `passes_ns` (each pass). Blocking removes CPU and
 //!   GPU overlap, so profiled frames time the pass, not the pipeline;
@@ -2313,12 +2314,21 @@ const buffer_usage_copy_src: Flags = 0x0000000000000004;
 const buffer_usage_query_resolve: Flags = 0x0000000000000200;
 const map_mode_read: Flags = 0x0000000000000001;
 const map_status_success: u32 = 0x00000001;
-/// Passes timed per frame: every offscreen target's and the main one.
-pub const pass_cap: u32 = 1 + @import("../draw/textures.zig").target_cap;
+/// Passes timed per frame: every offscreen target's, every backdrop's scene and chain, and the
+/// main one.
+pub const pass_cap: u32 = 1 + @import("../draw/textures.zig").target_cap +
+    backdrop.backdrop_cap * (1 + backdrop.pass_max);
 /// Two timestamps per pass, then two around the copy.
 const timestamp_count: u32 = 2 * pass_cap + 2;
-/// The copy's pair is resolved at this offset (a resolve offset is a multiple of 256).
-const copy_resolve_offset: u64 = 256;
+/// The copy's pair is resolved at this offset (a resolve offset is a multiple of 256), past the
+/// passes' pairs.
+const copy_resolve_offset: u64 = 512;
+const backdrop = @import("../draw/backdrop.zig");
+
+comptime {
+    assert(2 * pass_cap * 8 <= copy_resolve_offset);
+    assert(copy_resolve_offset % 256 == 0);
+}
 const timestamp_bytes: u64 = copy_resolve_offset + 2 * 8;
 /// `wgpuCommandEncoderCopyTextureToBuffer` needs rows aligned to 256 bytes.
 const copy_row_align: u32 = 256;

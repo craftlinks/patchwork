@@ -155,6 +155,7 @@ pub fn DropdownOf(comptime Skin: type) type {
                 .label = self.label(),
                 .hover = self.hover.value,
                 .open = self.menu.open,
+                .material = self.menu.material orelse cx.theme().material,
             }) orelse return;
             cx.area(self.id, shape.rect, shape.radius, dropdown_flags);
         }

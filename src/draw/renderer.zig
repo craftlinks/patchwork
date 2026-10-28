@@ -42,7 +42,8 @@
 //!                                 time moved (section 4b)
 //! [buffer_create, bind_group_create] per viewed layer at its first view (section 4d)
 //! buffer_write view uniform       per viewed layer whose uniform changed (section 4d)
-//! then, by the frame's kind (section 4a), nothing (skipped), present_copy (copied), or:
+//! then, by the frame's kind (section 4a), nothing (skipped), present_copy (copied), the
+//! backdrop passes of section 4e when a backdrop is marked, or:
 //! [target_create]                 the kept target, at its first use or a new size
 //! pass_begin                      the surface (direct), or the kept target, cleared (full)
 //!                                 or loaded (cached); the clear value is the theme's
@@ -179,6 +180,38 @@
 //! `direct`. A layer is never both viewed and bound to a target, so a target pass binds only
 //! its own group. An app that never calls `view` records the same stream as before views.
 //!
+//! ## 4e. Backdrops
+//! A frame with backdrops (`Context.backdrop`, `draw/backdrop.zig`) splits the main pass at
+//! each marked layer, lowest first. Before choosing the frame's kind, each backdrop takes its
+//! chain (`backdrop.chain_for` of its blur times the scale), the region its glass reads
+//! (`glass_region`: the union of the rects of every instance that samples it, grown by the
+//! chain's reach), and its content key: the unbound batches below its layer folded as a
+//! target's (section 4c), with views, the device size, scale, theme, chain, and region. A key
+//! that differs from the one its pack holds, a new size, or a pack never rendered makes the
+//! chain due, and a due chain moves the pack's revision, which every glass batch folds into its
+//! seed, so the glass tiles are dirty. A backdrop nothing samples renders no chain.
+//! ```text
+//! per backdrop, lowest layer first (layers [low, layer), low the previous one's or 0):
+//!   [target_create, bind_group_create] x2   its scene and pack, at first use or a new size
+//!   pass_begin scene                        whole (cleared) unless a cached frame and a valid
+//!                                           scene: then loaded, and per dirty rect a scissor
+//!     the lower scene's copy, or the clear  the copy pipeline loads each texel: exact bytes
+//!     the batches of [low, layer)
+//!   pass_end
+//!   when due: [buffer_write chain records], [target_create, bind_group_create] temporaries,
+//!     per pass: pass_begin, scissor (the region), pipeline (down or up), source group,
+//!               unit quad, chain records, draw (first_instance = the pass's record), pass_end
+//! main pass: the surface (direct) or the kept target (full, or cached with its rects):
+//!   the top scene's copy, then the batches of [top layer, 8); pass_end(_present)
+//! ```
+//! A scene is drawn by the same batches with the same frame group as the main pass would draw
+//! them, cleared to the same background, so the copy makes a frame with a backdrop and no
+//! glass equal one without it. The dirty rects are the frame's, a superset of what changed
+//! below, so a cached scene equals a whole one and the cache stays exact. A frame that records
+//! no pass (skipped, copied) leaves its due chains for the next one that does
+//! (`defer_chains`). Glass draws in the scene passes above its own backdrop and in the main
+//! pass; its pack is bound only once its chain has rendered (`group_of`).
+//!
 //! ## 5. Lifetime
 //! Spans point into the context's pools, `Textures`' queued writes (the glyph cache's mirror
 //! among them), `Renderer.uniform`, and static data, so all of them must stay put until the
@@ -195,6 +228,7 @@ const textures = @import("textures.zig");
 const theme = @import("../theme.zig");
 const tiles_module = @import("tiles.zig");
 const fx = @import("fx.zig");
+const backdrop = @import("backdrop.zig");
 const types = @import("types.zig");
 
 /// Straight (non-premultiplied) RGBA color with components in `[0, 1]`.
@@ -251,6 +285,20 @@ const rect_op_cap: u32 = 6;
 /// which every cached rect already counts.
 const target_op_cap: u32 = 2 + 2 + 2 + 1 + 4;
 
+/// Ops one backdrop records at most besides the batches (section 4e): its scene and pack
+/// creates with their bind groups, its scene pass (begin, frame group, end), and its chain
+/// (a pass begin, scissor, pipeline, source group, two vertex buffers, draw, and end per pass).
+const backdrop_op_cap: u32 = 4 + 3 + 8 * backdrop.pass_max;
+
+/// Ops a backdrop adds to each cached rect (section 4e): the scissor of its scene pass, the
+/// copy (pipeline, source group, unit quad, draw), and the frame group and unit quad that
+/// `draw_batches` binds again after it.
+const backdrop_rect_op_cap: u32 = 1 + 4 + 2;
+
+/// Ops shared by every backdrop of a frame: the temporaries' creates and bind groups, and the
+/// chain records' write.
+const chain_shared_op_cap: u32 = 2 * backdrop.temp_count + 1;
+
 /// Layers that can have a view: every layer but the base one (section 4d).
 const view_layers: u32 = pools.layer_count - 1;
 
@@ -260,34 +308,37 @@ const view_op_cap: u32 = 3;
 
 /// Upper bound on the ops `frame` records: a cached frame of `rects_max` rects (module guide,
 /// sections 3 and 4a), which is longer than a direct one.
-pub fn frame_op_cap(type_count: u32, batch_cap: u32) u32 {
+pub fn frame_op_cap(type_count: u32, batch_cap: u32, backdrops: u32) u32 {
     const texture_ops = textures.sampling_count + 2 * textures.texture_cap + textures.write_cap;
-    const rects = rects_max(type_count, batch_cap);
+    const rects = rects_max(type_count, batch_cap, backdrops);
+    const shared: u32 = if (backdrops == 0) 0 else chain_shared_op_cap;
     // Uniform, textures, up to `upload_range_cap` writes per pool and for the points, the
     // time, the target, the pass and its frame group (for the clear pipeline), the rects with
-    // their batches and view binds, the pass end, and the present.
+    // their batches and view binds, the pass end, and the present; then the backdrops.
     return 1 + texture_ops + (type_count + 1) * draw.upload_range_cap + 1 + 1 + 1 + 1 +
         rects * (rect_op_cap + batch_cap * batch_op_cap + view_layers) + 1 + 1 +
-        textures.target_cap * target_op_cap + view_layers * view_op_cap;
+        textures.target_cap * target_op_cap + view_layers * view_op_cap +
+        backdrops * (backdrop_op_cap + rects * (backdrop_rect_op_cap + view_layers)) + shared;
 }
 
 /// Upper bound on the bytes `frame` records, for the same shape as `frame_op_cap`.
-pub fn frame_bytes_max(type_count: u32, batch_cap: u32) u32 {
-    return frame_bytes_for(type_count, batch_cap, rects_max(type_count, batch_cap));
+pub fn frame_bytes_max(type_count: u32, batch_cap: u32, backdrops: u32) u32 {
+    const rects = rects_max(type_count, batch_cap, backdrops);
+    return frame_bytes_for(type_count, batch_cap, rects, backdrops);
 }
 
 /// Most rects a cached frame repaints for an app: up to `tiles.rect_cap`, as many as fit one
 /// command buffer with every batch replayed per rect, and at least 1.
-pub fn rects_max(type_count: u32, batch_cap: u32) u32 {
+pub fn rects_max(type_count: u32, batch_cap: u32, backdrops: u32) u32 {
     var rects: u32 = tiles_module.rect_cap;
     while (rects > 1) : (rects -= 1) {
-        if (frame_bytes_for(type_count, batch_cap, rects) <= commands.capacity) break;
+        if (frame_bytes_for(type_count, batch_cap, rects, backdrops) <= commands.capacity) break;
     }
     assert(rects >= 1);
     return rects;
 }
 
-fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
+fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32, backdrops: u32) u32 {
     const texture_bytes = textures.sampling_count * op_bytes(commands.SamplerCreate) +
         textures.texture_cap *
             (op_bytes(commands.TextureCreate) + op_bytes(commands.BindGroupCreate)) +
@@ -309,8 +360,22 @@ fn frame_bytes_for(type_count: u32, batch_cap: u32, rects: u32) u32 {
         op_bytes(commands.BindGroupSet) + op_bytes(commands.VertexBufferSet) +
         op_bytes(commands.PassEnd);
     const write_count = 2 + (type_count + 1) * draw.upload_range_cap;
+    const per_chain_pass = op_bytes(commands.PassBegin) + op_bytes(commands.ScissorSet) +
+        op_bytes(commands.PipelineSet) +
+        op_bytes(commands.BindGroupSet) + 2 * op_bytes(commands.VertexBufferSet) +
+        op_bytes(commands.Draw) + op_bytes(commands.PassEnd);
+    const creates = op_bytes(commands.TargetCreate) + op_bytes(commands.BindGroupCreate);
+    const scene_pass = op_bytes(commands.PassBegin) + op_bytes(commands.BindGroupSet) +
+        op_bytes(commands.PassEnd);
+    const per_backdrop = 2 * creates + scene_pass + backdrop.pass_max * per_chain_pass;
+    const per_backdrop_rect = op_bytes(commands.ScissorSet) + op_bytes(commands.PipelineSet) +
+        3 * op_bytes(commands.BindGroupSet) + 2 * op_bytes(commands.VertexBufferSet) +
+        op_bytes(commands.Draw) + view_layers * op_bytes(commands.BindGroupSet);
+    const shared = if (backdrops == 0) 0 else backdrop.temp_count * creates +
+        op_bytes(commands.BufferWrite);
     return write_count * op_bytes(commands.BufferWrite) + texture_bytes + pass_bytes +
-        rects * per_rect + textures.target_cap * per_target + view_layers * per_view;
+        rects * per_rect + textures.target_cap * per_target + view_layers * per_view +
+        backdrops * (per_backdrop + rects * per_backdrop_rect) + shared;
 }
 
 /// What a recorded frame does (module guide, section 4a).
@@ -360,8 +425,12 @@ pub fn Renderer(comptime Cx: type) type {
         for (0..R.count) |index| out[index] = Shadow(R.Type(index), R.caps[index]);
         break :blk out;
     };
+    const backdrop_slots: u32 = Cx.backdrop_capacity;
+    // At least one slot, so code that indexes the arrays compiles for an app without backdrops,
+    // where `order_count` and `backdrop_count` stay 0.
+    const slot_array: u32 = @max(backdrop_slots, 1);
     comptime {
-        assert(frame_bytes_max(R.count, Cx.batch_capacity) <= commands.capacity);
+        assert(frame_bytes_max(R.count, Cx.batch_capacity, backdrop_slots) <= commands.capacity);
     }
     return struct {
         const Self = @This();
@@ -409,8 +478,59 @@ pub fn Renderer(comptime Cx: type) type {
         /// The GPU side of each layer's view (section 4d), and this frame's viewed layers.
         view_slots: [pools.layer_count]ViewSlot,
         view_mask: u8,
+        /// Each backdrop id's GPU state, in `Textures` order (section 4e).
+        backdrops: [slot_array]BackdropSlot,
+        backdrop_count: u32,
+        /// This frame's backdrops, lowest layer first: the slot, layer, and blur of each.
+        order: [slot_array]u8,
+        order_layers: [slot_array]u8,
+        order_blurs: [slot_array]f32,
+        order_count: u32,
+        /// The temporaries of levels 2 to `backdrop.level_max`, shared by every chain.
+        temps: [backdrop.temp_count]Temp,
+        /// The chain records by position and pass, and what the chain buffer holds.
+        chain_records: [chain_record_cap]backdrop.Pass,
+        chain_shadow: [chain_record_cap]backdrop.Pass,
+        chain_written: bool,
 
         const no_target: u8 = 0xFF;
+        const chain_record_cap: u32 = slot_array * backdrop.pass_max;
+
+        /// One backdrop id's scene and pack (section 4e).
+        const BackdropSlot = struct {
+            /// Its pack's index in `Textures`.
+            index: u32,
+            /// Its textures and groups exist, at `width` by `height`.
+            ready: bool,
+            width: u32,
+            height: u32,
+            scene: u16,
+            scene_group: u16,
+            pack: u16,
+            pack_group: u16,
+            /// The scene holds the last recorded frame's layers below `scene_layer`.
+            scene_valid: bool,
+            scene_layer: u8,
+            /// The pack holds the chain of the content `key` names.
+            chain_valid: bool,
+            key: u64,
+            /// This frame's content key, chain, and region (the device rect its glass reads,
+            /// grown by the chain's reach; `backdrop.zig`, section 2a), and whether the chain
+            /// renders.
+            next_key: u64,
+            chain: backdrop.Chain,
+            region: [4]u32,
+            due: bool,
+        };
+
+        /// A chain temporary (section 4e).
+        const Temp = struct {
+            ready: bool,
+            id: u16,
+            group: u16,
+            width: u32,
+            height: u32,
+        };
 
         /// One offscreen target's GPU state (section 4c).
         const Target = struct {
@@ -446,12 +566,15 @@ pub fn Renderer(comptime Cx: type) type {
         const Filter = union(enum) {
             main,
             layer: u8,
+            /// The unbound layers in `[low, high)`: a backdrop's scene or the main pass over
+            /// the top one (section 4e).
+            range: struct { low: u8, high: u8 },
         };
 
         /// Most ops one `frame` records.
-        pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity);
+        pub const op_cap: u32 = frame_op_cap(R.count, Cx.batch_capacity, backdrop_slots);
         /// Most rects one cached frame repaints (module guide, section 4a).
-        pub const rect_count_max: u32 = rects_max(R.count, Cx.batch_capacity);
+        pub const rect_count_max: u32 = rects_max(R.count, Cx.batch_capacity, backdrop_slots);
 
         /// True when the frame group carries the point buffer (module guide, section 2).
         const uses_points: bool = Cx.point_capacity != 0;
@@ -476,6 +599,12 @@ pub fn Renderer(comptime Cx: type) type {
             clear_pipeline: u16,
             textures: [textures.texture_cap]u16,
             texture_groups: [textures.texture_cap]u16,
+            /// The backdrop pipelines and the chain records' buffer (section 4e); meaningful
+            /// only when the registry samples backdrops.
+            copy_pipeline: u16,
+            down_pipeline: u16,
+            up_pipeline: u16,
+            chain_buffer: u16,
         };
 
         /// Out-pointer init so a static renderer needs no stack copy.
@@ -514,6 +643,10 @@ pub fn Renderer(comptime Cx: type) type {
                 slot.written = false;
             }
             self.view_mask = 0;
+            self.backdrop_count = 0;
+            self.order_count = 0;
+            for (&self.temps) |*temp| temp.ready = false;
+            self.chain_written = false;
             assert(!self.ready);
             assert(self.width_px == 0);
         }
@@ -558,6 +691,7 @@ pub fn Renderer(comptime Cx: type) type {
                 self.setup_type(buffer, index);
             }
             self.setup_clear(buffer);
+            if (backdrop_slots > 0) self.setup_backdrops(buffer);
             buffer.push(.{ .buffer_write = .{
                 .id = r.unit_buffer,
                 .offset = 0,
@@ -665,6 +799,52 @@ pub fn Renderer(comptime Cx: type) type {
             assert(r.clear_shader >= R.count);
         }
 
+        /// The copy, down, and up pipelines and the chain records' buffer (section 4e). Each
+        /// reads one texture through group 0, the filterable texture layout.
+        fn setup_backdrops(self: *Self, buffer: *commands.CommandBuffer) void {
+            const r = &self.resources;
+            const layout = r.texture_layouts[@backingInt(textures.Class.filterable)];
+            const sources = [3][]const u8{
+                backdrop.copy_wgsl,
+                backdrop.down_wgsl,
+                backdrop.up_wgsl,
+            };
+            const labels = [3][]const u8{ "backdrop copy", "backdrop down", "backdrop up" };
+            var pipelines: [3]u16 = undefined;
+            for (sources, labels, &pipelines, 0..) |source, label, *pipeline, which| {
+                const shader = self.ids.take(.shader);
+                buffer.push(.{ .shader_create = .{
+                    .id = shader,
+                    .source = .of(source),
+                    .label = .of(label),
+                } });
+                pipeline.* = self.ids.take(.pipeline);
+                const chained = which != 0;
+                buffer.push(.{ .pipeline_create = .{
+                    .id = pipeline.*,
+                    .shader = shader,
+                    .layout_count = 1,
+                    .buffer_count = if (chained) 2 else 1,
+                    .blend = .none,
+                    .layouts = .{ layout, 0, 0, 0 },
+                    .vertex = .{
+                        unit_layout(),
+                        if (chained) chain_layout() else std.mem.zeroes(commands.VertexBuffer),
+                    },
+                } });
+            }
+            r.copy_pipeline = pipelines[0];
+            r.down_pipeline = pipelines[1];
+            r.up_pipeline = pipelines[2];
+            r.chain_buffer = self.create_buffer(
+                buffer,
+                commands.usage_vertex | commands.usage_copy_dst,
+                chain_record_cap * @sizeOf(backdrop.Pass),
+            );
+            assert(r.copy_pipeline != r.down_pipeline);
+            assert(r.up_pipeline > r.down_pipeline);
+        }
+
         /// The sampler for `sampling`, created in `buffer` the first time a texture needs it.
         fn sampler_for(
             self: *Self,
@@ -709,6 +889,30 @@ pub fn Renderer(comptime Cx: type) type {
             const r = &self.resources;
             while (table.created < table.count) : (table.created += 1) {
                 const index = table.created;
+                if (table.formats[index] == .target and table.kinds[index] == .backdrop) {
+                    // Sized and created at its first frame (section 4e).
+                    assert(self.backdrop_count < backdrop_slots);
+                    self.backdrops[self.backdrop_count] = .{
+                        .index = index,
+                        .ready = false,
+                        .width = 0,
+                        .height = 0,
+                        .scene = 0,
+                        .scene_group = 0,
+                        .pack = 0,
+                        .pack_group = 0,
+                        .scene_valid = false,
+                        .scene_layer = 0,
+                        .chain_valid = false,
+                        .key = 0,
+                        .next_key = 0,
+                        .chain = .{ .levels = backdrop.level_min, .offset = 1 },
+                        .region = .{ 0, 0, 1, 1 },
+                        .due = false,
+                    };
+                    self.backdrop_count += 1;
+                    continue;
+                }
                 if (table.formats[index] == .target) {
                     // Sized and created when a layer first renders it (section 4c).
                     assert(self.target_count < textures.target_cap);
@@ -814,7 +1018,9 @@ pub fn Renderer(comptime Cx: type) type {
             if (uses_points) self.upload_points(buffer, cx);
             var targets_animating = false;
             self.rendered = self.render_targets(buffer, cx, size, time_s, &targets_animating);
-            const kind = self.choose(cx, size, uniform_changed, unchanged and self.rendered == 0);
+            const due = self.prepare_backdrops(cx, size, time_s, &targets_animating);
+            const quiet = unchanged and self.rendered == 0 and due == 0;
+            const kind = self.choose(cx, size, uniform_changed, quiet);
             if (targets_animating) self.animating = true;
             if (R.any_animated and self.animating and self.uniform.time[0] != time_s) {
                 self.uniform.time[0] = time_s;
@@ -825,16 +1031,29 @@ pub fn Renderer(comptime Cx: type) type {
                 } });
             }
             self.write_views(buffer, cx);
+            const split = self.order_count > 0;
             switch (kind) {
-                .skipped => {},
-                .copied => buffer.push(.{ .present_copy = .{ .target = self.kept.? } }),
-                .cached => self.record_kept(buffer, cx, size, .load),
-                .full => self.record_kept(buffer, cx, size, .clear),
-                .direct => self.record_direct(buffer, cx, size),
+                .skipped => self.defer_chains(),
+                .copied => {
+                    self.defer_chains();
+                    buffer.push(.{ .present_copy = .{ .target = self.kept.? } });
+                },
+                .cached => if (split)
+                    self.record_backdrops(buffer, cx, size, kind)
+                else
+                    self.record_kept(buffer, cx, size, .load),
+                .full => if (split)
+                    self.record_backdrops(buffer, cx, size, kind)
+                else
+                    self.record_kept(buffer, cx, size, .clear),
+                .direct => if (split)
+                    self.record_backdrops(buffer, cx, size, kind)
+                else
+                    self.record_direct(buffer, cx, size),
             }
             self.last = kind;
             assert(buffer.count <= op_cap);
-            assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity));
+            assert(buffer.len <= frame_bytes_max(R.count, Cx.batch_capacity, backdrop_slots));
         }
 
         /// Creates each viewed layer's uniform and frame group at its first use and writes its
@@ -1258,6 +1477,8 @@ pub fn Renderer(comptime Cx: type) type {
             return switch (filter) {
                 .main => !self.is_bound(batch.layer),
                 .layer => |layer| batch.layer == layer,
+                .range => |range| !self.is_bound(batch.layer) and batch.layer >= range.low and
+                    batch.layer < range.high,
             };
         }
 
@@ -1265,6 +1486,12 @@ pub fn Renderer(comptime Cx: type) type {
         /// rendered yet (section 4c).
         fn group_of(self: *const Self, id: textures.TextureId) ?u16 {
             const index = @backingInt(id);
+            for (self.backdrops[0..self.backdrop_count]) |*marked| {
+                if (marked.index != index) continue;
+                // A pack whose chain has not rendered has nothing to show (section 4e).
+                if (!marked.ready or !marked.chain_valid) return null;
+                return marked.pack_group;
+            }
             const slot = self.target_slots[index];
             if (slot == no_target) return self.resources.texture_groups[index];
             const target = &self.targets[slot];
@@ -1445,6 +1672,479 @@ pub fn Renderer(comptime Cx: type) type {
             return key;
         }
 
+        /// Sorts this frame's backdrops by layer, takes each one's chain and content key, and
+        /// moves the revision of every pack whose chain is due, so the tiles of the glass
+        /// that samples it are dirty (section 4e). Returns how many are due; sets `animating`
+        /// when an animated instance lies under one.
+        fn prepare_backdrops(
+            self: *Self,
+            cx: *Cx,
+            size: Size,
+            time_s: f32,
+            animating: *bool,
+        ) u32 {
+            self.order_count = 0;
+            if (comptime backdrop_slots == 0) return 0;
+            for (cx.backdrop_list()) |marked| {
+                var at = self.order_count;
+                while (at > 0 and self.order_layers[at - 1] > marked.layer) : (at -= 1) {
+                    self.order[at] = self.order[at - 1];
+                    self.order_layers[at] = self.order_layers[at - 1];
+                    self.order_blurs[at] = self.order_blurs[at - 1];
+                }
+                self.order[at] = self.slot_of(marked.id);
+                self.order_layers[at] = marked.layer;
+                self.order_blurs[at] = marked.blur;
+                self.order_count += 1;
+            }
+            const scale = @as(f32, @floatFromInt(size.scale_120)) / 120;
+            var due: u32 = 0;
+            for (0..self.order_count) |position| {
+                const slot = &self.backdrops[self.order[position]];
+                slot.chain = backdrop.chain_for(self.order_blurs[position] * scale);
+                const id: textures.TextureId = @fromBackingInt(@intCast(slot.index));
+                // Nothing samples it: no chain, and its key waits for the glass (section 4e).
+                const region = self.glass_region(cx, id, size, slot.chain) orelse {
+                    slot.due = false;
+                    continue;
+                };
+                slot.region = region;
+                var animated = false;
+                const layer = self.order_layers[position];
+                slot.next_key = self.below_key(cx, layer, size, slot.chain, time_s, &animated);
+                slot.next_key = tiles_module.key_of(slot.next_key, std.mem.asBytes(&region));
+                if (animated) animating.* = true;
+                const sized = slot.ready and slot.width == size.width_px and
+                    slot.height == size.height_px;
+                slot.due = !sized or !slot.chain_valid or slot.key != slot.next_key;
+                if (slot.due) {
+                    cx.textures.revisions[slot.index] +%= 1;
+                    due += 1;
+                }
+            }
+            assert(due <= self.order_count);
+            return due;
+        }
+
+        /// The device rect the glass sampling backdrop `id` covers, grown by the chain's reach
+        /// and clamped to the window, as x0, y0, x1, y1; null when nothing samples it
+        /// (`backdrop.zig`, section 2a).
+        fn glass_region(
+            self: *const Self,
+            cx: *const Cx,
+            id: textures.TextureId,
+            size: Size,
+            chain: backdrop.Chain,
+        ) ?[4]u32 {
+            const inf = std.math.inf(f32);
+            var bounds: [4]f32 = .{ inf, inf, -inf, -inf };
+            for (cx.batch_list()) |batch| {
+                if (batch.texture != id or self.is_bound(batch.layer)) continue;
+                const view = cx.view_of(batch.layer) orelse pools.View.identity;
+                inline for (0..R.count) |index| {
+                    if (comptime R.samples[index]) {
+                        if (batch.type_id == index) {
+                            const items = cx.items(R.Type(index))[batch.first..][0..batch.count];
+                            for (items) |*item| {
+                                const x0 = @max(item.rect[0], item.clip[0]);
+                                const y0 = @max(item.rect[1], item.clip[1]);
+                                const x1 = @min(item.rect[0] + item.rect[2], item.clip[2]);
+                                const y1 = @min(item.rect[1] + item.rect[3], item.clip[3]);
+                                if (!(x1 > x0 and y1 > y0)) continue;
+                                const low = view.apply(x0, y0);
+                                const high = view.apply(x1, y1);
+                                bounds[0] = @min(bounds[0], low[0]);
+                                bounds[1] = @min(bounds[1], low[1]);
+                                bounds[2] = @max(bounds[2], high[0]);
+                                bounds[3] = @max(bounds[3], high[1]);
+                            }
+                        }
+                    }
+                }
+            }
+            if (!(bounds[2] > bounds[0] and bounds[3] > bounds[1])) return null;
+            const scale = @as(f32, @floatFromInt(size.scale_120)) / 120;
+            const grow = backdrop.reach(chain);
+            const width: f32 = @floatFromInt(size.width_px);
+            const height: f32 = @floatFromInt(size.height_px);
+            const x0 = std.math.clamp(@floor(bounds[0] * scale - grow), 0, width);
+            const y0 = std.math.clamp(@floor(bounds[1] * scale - grow), 0, height);
+            const x1 = std.math.clamp(@ceil(bounds[2] * scale + grow), 0, width);
+            const y1 = std.math.clamp(@ceil(bounds[3] * scale + grow), 0, height);
+            if (!(x1 > x0 and y1 > y0)) return null;
+            const out: [4]u32 = .{
+                @intFromFloat(x0),
+                @intFromFloat(y0),
+                @intFromFloat(x1),
+                @intFromFloat(y1),
+            };
+            assert(out[2] <= size.width_px and out[3] <= size.height_px);
+            return out;
+        }
+
+        /// The slot of backdrop `id`.
+        fn slot_of(self: *const Self, id: textures.TextureId) u8 {
+            const index = @backingInt(id);
+            for (self.backdrops[0..self.backdrop_count], 0..) |*marked, slot| {
+                if (marked.index == index) return @intCast(slot);
+            }
+            unreachable; // Flushed before any frame that marks it.
+        }
+
+        /// The content key of the unbound layers below `layer` (section 4e): their batches
+        /// as `content_key` folds them, with any view, the device size, scale, theme, and
+        /// chain, and the time when an animated instance is there.
+        fn below_key(
+            self: *Self,
+            cx: *const Cx,
+            layer: u8,
+            size: Size,
+            chain: backdrop.Chain,
+            time_s: f32,
+            animated: *bool,
+        ) u64 {
+            assert(layer >= 1 and layer < pools.layer_count);
+            const head = [6]u32{
+                size.width_px,
+                size.height_px,
+                size.scale_120,
+                layer,
+                chain.levels,
+                @bitCast(chain.offset),
+            };
+            var key = tiles_module.key_of(0, std.mem.asBytes(&head));
+            key = tiles_module.key_of(key, std.mem.asBytes(&self.uniform.theme));
+            if (whole_points_key) key = tiles_module.key_of(key, std.mem.sliceAsBytes(cx.point_items()));
+            var local: u32 = 0;
+            for (cx.batch_list()) |batch| {
+                if (batch.layer >= layer or self.is_bound(batch.layer)) continue;
+                if (cx.view_of(batch.layer)) |view| {
+                    key = tiles_module.key_of(key, std.mem.asBytes(&view));
+                }
+                inline for (0..R.count) |index| {
+                    if (batch.type_id == index) {
+                        if (R.animates[index]) animated.* = true;
+                        key = self.fold_batch(index, cx, batch, local, key);
+                    }
+                }
+                local += 1;
+            }
+            if (animated.*) key = tiles_module.key_of(key, std.mem.asBytes(&@as(u64, @as(u32, @bitCast(time_s)))));
+            return key;
+        }
+
+        /// A frame that records no pass leaves its due chains for the next one that does.
+        fn defer_chains(self: *Self) void {
+            for (self.order[0..self.order_count]) |slot_index| {
+                const slot = &self.backdrops[slot_index];
+                if (!slot.due) continue;
+                slot.chain_valid = false;
+                slot.due = false;
+            }
+        }
+
+        /// A frame with backdrops (section 4e): per backdrop, lowest first, its scene pass
+        /// (whole, or the dirty rects of a cached frame) and its chain when due; then the main
+        /// pass over a copy of the top scene.
+        fn record_backdrops(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            cx: *Cx,
+            size: Size,
+            kind: Kind,
+        ) void {
+            assert(self.order_count >= 1);
+            assert(kind == .cached or kind == .full or kind == .direct);
+            const r = &self.resources;
+            var rects: [rect_count_max]tiles_module.Rect = undefined;
+            const rect_count: u32 = if (kind == .cached) self.tiles.rects(&rects) else 0;
+            if (kind == .cached) assert(rect_count >= 1);
+            self.write_chain_records(buffer, size);
+            var lower: ?*const BackdropSlot = null;
+            var low: u8 = 0;
+            const count = self.order_count;
+            const layers = self.order_layers[0..count];
+            for (self.order[0..count], layers, 0..) |slot_index, layer, position| {
+                const slot = &self.backdrops[slot_index];
+                self.prepare_backdrop(buffer, slot, size);
+                if (slot.scene_layer != layer) slot.scene_valid = false;
+                const whole = kind != .cached or !slot.scene_valid;
+                buffer.push(.{ .pass_begin = .{
+                    .width_px = size.width_px,
+                    .height_px = size.height_px,
+                    .clear = self.uniform.theme.background,
+                    .target = slot.scene,
+                    .load = if (whole) .clear else .load,
+                } });
+                const range: Filter = .{ .range = .{ .low = low, .high = layer } };
+                if (whole) {
+                    if (lower) |below| self.draw_copy(buffer, below.scene_group);
+                    self.draw_batches(buffer, cx.batch_list(), r.frame_group, range);
+                } else {
+                    // The clear pipeline reads the frame group (section 4a).
+                    if (lower == null) {
+                        buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = r.frame_group } });
+                    }
+                    for (rects[0..rect_count]) |rect| {
+                        push_scissor(buffer, rect);
+                        if (lower) |below| {
+                            self.draw_copy(buffer, below.scene_group);
+                        } else {
+                            self.draw_clear(buffer);
+                        }
+                        self.draw_batches(buffer, cx.batch_list(), r.frame_group, range);
+                    }
+                }
+                buffer.push(.{ .pass_end = .{} });
+                slot.scene_valid = true;
+                slot.scene_layer = layer;
+                if (slot.due) {
+                    self.record_chain(buffer, slot, @intCast(position), size);
+                    slot.key = slot.next_key;
+                    slot.chain_valid = true;
+                    slot.due = false;
+                }
+                lower = slot;
+                low = layer;
+            }
+            const top = lower.?;
+            const range: Filter = .{ .range = .{ .low = low, .high = pools.layer_count } };
+            if (kind == .direct) {
+                buffer.push(.{ .pass_begin = .{
+                    .width_px = size.width_px,
+                    .height_px = size.height_px,
+                    .clear = self.uniform.theme.background,
+                    .target = commands.surface_target,
+                    .load = .clear,
+                } });
+                self.draw_copy(buffer, top.scene_group);
+                self.draw_batches(buffer, cx.batch_list(), r.frame_group, range);
+                buffer.push(.{ .pass_end_present = .{} });
+                return;
+            }
+            const kept = self.kept_target(buffer, size);
+            if (kind == .cached) assert(self.kept_valid);
+            buffer.push(.{ .pass_begin = .{
+                .width_px = size.width_px,
+                .height_px = size.height_px,
+                .clear = self.uniform.theme.background,
+                .target = kept,
+                .load = if (kind == .cached) .load else .clear,
+            } });
+            if (kind == .full) {
+                self.draw_copy(buffer, top.scene_group);
+                self.draw_batches(buffer, cx.batch_list(), r.frame_group, range);
+            } else {
+                for (rects[0..rect_count]) |rect| {
+                    push_scissor(buffer, rect);
+                    self.draw_copy(buffer, top.scene_group);
+                    self.draw_batches(buffer, cx.batch_list(), r.frame_group, range);
+                }
+            }
+            buffer.push(.{ .pass_end = .{} });
+            buffer.push(.{ .present_copy = .{ .target = kept } });
+            self.kept_valid = true;
+        }
+
+        /// Creates a backdrop's scene and pack at its first frame, and again at a new size,
+        /// which loses their pixels (section 4e).
+        fn prepare_backdrop(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            slot: *BackdropSlot,
+            size: Size,
+        ) void {
+            const sized = slot.width == size.width_px and slot.height == size.height_px;
+            if (slot.ready and sized) return;
+            const first = !slot.ready;
+            if (first) {
+                slot.scene = self.ids.take(.texture);
+                slot.scene_group = self.ids.take(.bind_group);
+                slot.pack = self.ids.take(.texture);
+                slot.pack_group = self.ids.take(.bind_group);
+            }
+            const pack = backdrop.pack_size(size.width_px, size.height_px);
+            const window: [2]u32 = .{ size.width_px, size.height_px };
+            self.create_sampled_target(buffer, slot.scene, slot.scene_group, window, first);
+            self.create_sampled_target(buffer, slot.pack, slot.pack_group, pack, first);
+            slot.ready = true;
+            slot.width = size.width_px;
+            slot.height = size.height_px;
+            slot.scene_valid = false;
+            slot.chain_valid = false;
+            assert(slot.due);
+        }
+
+        /// A render target `id` of `extent` and its bind group `group` for sampling, replacing
+        /// the group's old texture unless `first`.
+        fn create_sampled_target(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            id: u16,
+            group: u16,
+            extent: [2]u32,
+            first: bool,
+        ) void {
+            assert(extent[0] >= 1 and extent[1] >= 1);
+            buffer.push(.{ .target_create = .{
+                .id = id,
+                .width = extent[0],
+                .height = extent[1],
+            } });
+            var bindings = std.mem.zeroes(BindGroupEntries);
+            bindings[0] = .{ .binding = 0, .resource = id };
+            bindings[1] = .{ .binding = 1, .resource = self.sampler_for(buffer, .{}) };
+            buffer.push(.{ .bind_group_create = .{
+                .id = group,
+                .layout = self.resources.texture_layouts[@backingInt(textures.Class.filterable)],
+                .entry_count = 2,
+                .replace = if (first) 0 else 1,
+                .entries = bindings,
+            } });
+        }
+
+        /// Fills the records of every due chain at its position and writes the chain buffer
+        /// when they differ from what it holds (section 4e).
+        fn write_chain_records(self: *Self, buffer: *commands.CommandBuffer, size: Size) void {
+            var any = false;
+            for (self.order[0..self.order_count], 0..) |slot_index, position| {
+                const slot = &self.backdrops[slot_index];
+                if (!slot.due) continue;
+                any = true;
+                var routes: [backdrop.pass_max]backdrop.Route = undefined;
+                const first = position * backdrop.pass_max;
+                const records = self.chain_records[first..][0..backdrop.pass_max];
+                _ = backdrop.passes(slot.chain, size.width_px, size.height_px, records, &routes);
+            }
+            if (!any) return;
+            const bytes = std.mem.sliceAsBytes(&self.chain_records);
+            const held = std.mem.sliceAsBytes(&self.chain_shadow);
+            if (self.chain_written and std.mem.eql(u8, bytes, held)) return;
+            buffer.push(.{ .buffer_write = .{
+                .id = self.resources.chain_buffer,
+                .offset = 0,
+                .data = .of(bytes),
+            } });
+            self.chain_shadow = self.chain_records;
+            self.chain_written = true;
+        }
+
+        /// The chain of the backdrop at `position` (section 4e): one pass per route, each a
+        /// full quad of its record over the target's texels.
+        fn record_chain(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            slot: *const BackdropSlot,
+            position: u32,
+            size: Size,
+        ) void {
+            const r = &self.resources;
+            var records: [backdrop.pass_max]backdrop.Pass = undefined;
+            var routes: [backdrop.pass_max]backdrop.Route = undefined;
+            const width = size.width_px;
+            const count = backdrop.passes(slot.chain, width, size.height_px, &records, &routes);
+            self.prepare_temps(buffer, slot.chain.levels, size);
+            for (routes[0..count], 0..) |route, pass| {
+                const extent = backdrop.surface_size(size.width_px, size.height_px, route.target);
+                // The last up pass writes the pack's right half and keeps the left one.
+                const keep = route.target == 1 and !route.down;
+                buffer.push(.{ .pass_begin = .{
+                    .width_px = extent[0],
+                    .height_px = extent[1],
+                    .clear = .{ 0, 0, 0, 0 },
+                    .target = self.surface_texture(slot, route.target),
+                    .load = if (keep) .load else .clear,
+                } });
+                const height = size.height_px;
+                const scissor = backdrop.scissor_of(slot.region, width, height, route.target, keep);
+                push_scissor(buffer, .{
+                    .x = scissor[0],
+                    .y = scissor[1],
+                    .width = scissor[2],
+                    .height = scissor[3],
+                });
+                const pipeline = if (route.down) r.down_pipeline else r.up_pipeline;
+                const source = self.surface_group(slot, route.source);
+                buffer.push(.{ .pipeline_set = .{ .id = pipeline } });
+                buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = source } });
+                push_vertices(buffer, 0, r.unit_buffer);
+                push_vertices(buffer, 1, r.chain_buffer);
+                buffer.push(.{ .draw = .{
+                    .vertex_count = draw.vertex_count,
+                    .instance_count = 1,
+                    .first_vertex = 0,
+                    .first_instance = position * backdrop.pass_max + @as(u32, @intCast(pass)),
+                } });
+                buffer.push(.{ .pass_end = .{} });
+            }
+        }
+
+        /// Creates the temporaries a chain of `levels` needs, at their first use and again at
+        /// a new size.
+        fn prepare_temps(
+            self: *Self,
+            buffer: *commands.CommandBuffer,
+            levels: u32,
+            size: Size,
+        ) void {
+            assert(levels >= backdrop.level_min and levels <= backdrop.level_max);
+            var level: u32 = 2;
+            while (level <= levels) : (level += 1) {
+                const temp = &self.temps[level - 2];
+                const surface: backdrop.Surface = @intCast(level);
+                const extent = backdrop.surface_size(size.width_px, size.height_px, surface);
+                if (temp.ready and temp.width == extent[0] and temp.height == extent[1]) continue;
+                const first = !temp.ready;
+                if (first) {
+                    temp.id = self.ids.take(.texture);
+                    temp.group = self.ids.take(.bind_group);
+                }
+                self.create_sampled_target(buffer, temp.id, temp.group, extent, first);
+                temp.ready = true;
+                temp.width = extent[0];
+                temp.height = extent[1];
+            }
+        }
+
+        /// The texture a chain pass writes (`backdrop.Surface`).
+        fn surface_texture(
+            self: *const Self,
+            slot: *const BackdropSlot,
+            surface: backdrop.Surface,
+        ) u16 {
+            assert(surface >= 1);
+            if (surface == 1) return slot.pack;
+            assert(self.temps[surface - 2].ready);
+            return self.temps[surface - 2].id;
+        }
+
+        /// The bind group a chain pass reads (`backdrop.Surface`).
+        fn surface_group(
+            self: *const Self,
+            slot: *const BackdropSlot,
+            surface: backdrop.Surface,
+        ) u16 {
+            if (surface == 0) return slot.scene_group;
+            if (surface == 1) return slot.pack_group;
+            assert(self.temps[surface - 2].ready);
+            return self.temps[surface - 2].group;
+        }
+
+        /// The copy pipeline's quad over the whole target, loading `group`'s texture (section
+        /// 4e). `draw_batches` binds the frame group and the unit quad again after it.
+        fn draw_copy(self: *const Self, buffer: *commands.CommandBuffer, group: u16) void {
+            const r = &self.resources;
+            buffer.push(.{ .pipeline_set = .{ .id = r.copy_pipeline } });
+            buffer.push(.{ .bind_group_set = .{ .slot = 0, .id = group } });
+            push_vertices(buffer, 0, r.unit_buffer);
+            buffer.push(.{ .draw = .{
+                .vertex_count = draw.vertex_count,
+                .instance_count = 1,
+                .first_vertex = 0,
+                .first_instance = 0,
+            } });
+        }
+
         fn draw_batches(
             self: *const Self,
             buffer: *commands.CommandBuffer,
@@ -1535,6 +2235,39 @@ fn in_range(range: draw.Range, first: u32, end: u32) bool {
     return first < range.end and range.first < end;
 }
 
+fn push_scissor(buffer: *commands.CommandBuffer, rect: tiles_module.Rect) void {
+    assert(rect.width >= 1 and rect.height >= 1);
+    buffer.push(.{ .scissor_set = .{
+        .x = rect.x,
+        .y = rect.y,
+        .width = rect.width,
+        .height = rect.height,
+    } });
+}
+
+fn push_vertices(buffer: *commands.CommandBuffer, slot: u16, id: u16) void {
+    assert(slot < commands.vertex_buffer_cap);
+    buffer.push(.{ .vertex_buffer_set = .{ .slot = slot, .buffer = id, .offset = 0 } });
+}
+
+/// Vertex buffer 1 of the chain pipelines: one `backdrop.Pass` per instance at locations 1 to 4.
+fn chain_layout() commands.VertexBuffer {
+    var attributes = std.mem.zeroes([commands.attribute_cap]commands.VertexAttribute);
+    for (0..4) |group| {
+        attributes[group] = .{
+            .location = @intCast(group + 1),
+            .format = .float32x4,
+            .offset = @intCast(16 * group),
+        };
+    }
+    return .{
+        .stride = @sizeOf(backdrop.Pass),
+        .step = .instance,
+        .attribute_count = 4,
+        .attributes = attributes,
+    };
+}
+
 fn unit_layout() commands.VertexBuffer {
     var attributes = std.mem.zeroes([commands.attribute_cap]commands.VertexAttribute);
     attributes[0] = .{ .location = 0, .format = .float32x2, .offset = 0 };
@@ -1556,6 +2289,15 @@ comptime {
     assert(@offsetOf(Uniform, "theme") == draw.theme_offset);
     assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
     assert(batch_op_cap == 4);
+    // Every texture, a feedback target's second texture, the kept target, and each backdrop's
+    // scene beside its pack's id, and the chain's temporaries.
+    const backdrop_textures = backdrop.backdrop_cap + backdrop.temp_count;
+    assert(textures.texture_cap + textures.target_cap + 1 + backdrop_textures <=
+        commands.caps.get(.texture));
+    // Texture groups, targets' second groups, the frame, view, and target frame groups, and
+    // the backdrops' scene and the temporaries' groups.
+    assert(textures.texture_cap + textures.target_cap + 1 + view_layers + textures.target_cap +
+        backdrop_textures <= commands.caps.get(.bind_group));
 }
 
 const testing = std.testing;
@@ -2400,10 +3142,10 @@ test "a feedback target renders every frame over its own last frame" {
 // Locks the bound that keeps the worst cached frame in one command buffer: an app of few
 // batches gets every rect, the default `batch_cap` of 256 fewer, and never zero.
 test "the rect count fits the command buffer" {
-    try testing.expectEqual(tiles_module.rect_cap, rects_max(5, 16));
-    try testing.expect(rects_max(16, 256) >= 1);
-    try testing.expect(rects_max(16, 256) < tiles_module.rect_cap);
-    try testing.expect(frame_bytes_max(16, 256) <= commands.capacity);
+    try testing.expectEqual(tiles_module.rect_cap, rects_max(5, 16, 0));
+    try testing.expect(rects_max(16, 256, 0) >= 1);
+    try testing.expect(rects_max(16, 256, 0) < tiles_module.rect_cap);
+    try testing.expect(frame_bytes_max(16, 256, 0) <= commands.capacity);
 }
 
 /// Two boxes, an arc, and a text label drawn through the glyph cache at `scale_120`, the way
@@ -2476,7 +3218,7 @@ test "changing one pool writes only that pool" {
 // Locks the worst-case bound the comptime check relies on.
 test "the frame op bound covers every batch" {
     try testing.expect(TestRenderer.op_cap >= 1 + 3 + 1 + 3 + 8 * 4 + 1);
-    try testing.expect(frame_bytes_max(16, 256) <= commands.capacity);
+    try testing.expect(frame_bytes_max(16, 256, 2) <= commands.capacity);
 }
 
 const path_draw = [_]registry.DrawType{
@@ -2600,4 +3342,149 @@ test "points upload by range and a recolor writes no points" {
     PathFixture.record();
     const moved = writes(&PathFixture.buffer, &write_storage);
     try testing.expectEqual(r.points_buffer, moved[moved.len - 1].id);
+}
+
+const backdrop_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 8 },
+    .{ .type = backdrop.Glass, .cap = 4 },
+};
+
+const BackdropContext = draw.Context(&backdrop_draw, 16, 0);
+
+const Backdrops = struct {
+    var context: BackdropContext = undefined;
+    var renderer: Renderer(BackdropContext) = undefined;
+    var buffer: commands.CommandBuffer = undefined;
+
+    fn start() void {
+        context.init();
+        renderer.init();
+        buffer = .init();
+        renderer.setup(&buffer, &context);
+    }
+
+    /// A box at `below_x` on the base layer; layer 2 a backdrop of blur 8 with a glass over the
+    /// window's left 256 px (four tile columns); a box at `above_x` on layer 3.
+    fn scene(below_x: f32, above_x: f32) void {
+        const cx = &context;
+        cx.text.scale_120 = 120;
+        cx.reset();
+        cx.append(types.Box, null, wide(below_x)) catch unreachable;
+        const id = cx.backdrop(@fromBackingInt(2), 8);
+        _ = cx.layer(@fromBackingInt(2));
+        const glass: draw.Rect = .{ .x = 0, .y = 0, .width = 256, .height = 480 };
+        cx.append(backdrop.Glass, id, .of(glass, window_clip, .{ .radius = 12 })) catch unreachable;
+        _ = cx.layer(@fromBackingInt(3));
+        cx.append(types.Box, null, wide(above_x)) catch unreachable;
+        _ = cx.layer(.base);
+    }
+
+    const window_clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 640, .y1 = 480 };
+
+    fn wide(x: f32) types.Box {
+        const rect: draw.Rect = .{ .x = x, .y = 100, .width = 40, .height = 40 };
+        return .of(rect, window_clip, .{ .fill = .{ 1, 1, 1, 1 } });
+    }
+
+    fn record() void {
+        buffer.reset();
+        renderer.frame(&buffer, &context, .{
+            .width_logical = 640,
+            .height_logical = 480,
+            .width_px = 640,
+            .height_px = 480,
+            .scale_120 = 120,
+        }, 0);
+    }
+
+    /// The passes this frame: scene, chain, and main passes by target.
+    const Passes = struct { scene: u32, chain: u32, main: u32 };
+
+    fn passes() Passes {
+        const slot = &renderer.backdrops[0];
+        var out: Passes = .{ .scene = 0, .chain = 0, .main = 0 };
+        var reader = buffer.reader();
+        while (reader.next()) |op| {
+            if (op != .pass_begin) continue;
+            const target = op.pass_begin.target;
+            if (target == slot.scene) {
+                out.scene += 1;
+            } else if (target == commands.surface_target or target == renderer.kept) {
+                out.main += 1;
+            } else {
+                out.chain += 1;
+            }
+        }
+        return out;
+    }
+};
+
+// Locks the backdrop's frame (module guide, section 4e) at 640 x 480, blur 8 (three levels,
+// five chain passes): the first frame is direct with the scene pass, the chain, and the main
+// pass, whose first draw is the copy of the scene; an identical frame records nothing and is
+// skipped (the idle invariant); moving the box under the glass renders the scene and the
+// chain again and dirties the glass; moving only the box above it repaints the scene's dirty
+// rects but no chain.
+test "a backdrop splits the frame into its scene, its chain, and the main pass" {
+    const chained: Backdrops.Passes = .{ .scene = 1, .chain = 5, .main = 1 };
+    const unchained: Backdrops.Passes = .{ .scene = 1, .chain = 0, .main = 1 };
+    Backdrops.start();
+    Backdrops.scene(40, 400);
+    Backdrops.record();
+    const r = &Backdrops.renderer;
+    try testing.expectEqual(Kind.direct, r.last);
+    try testing.expectEqual(@as(u32, 3), r.backdrops[0].chain.levels);
+    try testing.expectEqual(chained, Backdrops.passes());
+    var reader = Backdrops.buffer.reader();
+    var main = false;
+    var first_pipeline: ?u16 = null;
+    while (reader.next()) |op| switch (op) {
+        .pass_begin => |pass| main = pass.target == commands.surface_target,
+        .pipeline_set => |set| if (main and first_pipeline == null) {
+            first_pipeline = set.id;
+        },
+        else => {},
+    };
+    try testing.expectEqual(r.resources.copy_pipeline, first_pipeline.?);
+    try testing.expect(r.backdrops[0].chain_valid);
+
+    Backdrops.scene(40, 400);
+    Backdrops.record();
+    try testing.expectEqual(Kind.skipped, r.last);
+    try testing.expectEqual(@as(u32, 0), Backdrops.buffer.count);
+
+    const revisions = &Backdrops.context.textures.revisions;
+    const revision = revisions[r.backdrops[0].index];
+    Backdrops.scene(80, 400);
+    Backdrops.record();
+    try testing.expect(r.last == .cached or r.last == .full);
+    try testing.expectEqual(chained, Backdrops.passes());
+    try testing.expectEqual(revision +% 1, revisions[r.backdrops[0].index]);
+
+    Backdrops.scene(80, 440);
+    Backdrops.record();
+    try testing.expectEqual(Kind.cached, r.last);
+    try testing.expectEqual(unchained, Backdrops.passes());
+    try testing.expectEqual(revision +% 1, revisions[r.backdrops[0].index]);
+}
+
+// Locks the cache-off path (section 4e): every frame is direct, and the scene pass clears and
+// draws whole, with no scissor; an unchanged frame renders no chain.
+test "a backdrop with the cache off renders its scene whole every frame" {
+    const unchained: Backdrops.Passes = .{ .scene = 1, .chain = 0, .main = 1 };
+    Backdrops.start();
+    Backdrops.renderer.cache = false;
+    Backdrops.scene(40, 400);
+    Backdrops.record();
+    try testing.expectEqual(Kind.direct, Backdrops.renderer.last);
+    Backdrops.scene(40, 400);
+    Backdrops.record();
+    try testing.expectEqual(Kind.direct, Backdrops.renderer.last);
+    try testing.expectEqual(unchained, Backdrops.passes());
+    var reader = Backdrops.buffer.reader();
+    while (reader.next()) |op| switch (op) {
+        .pass_begin => |pass| try testing.expectEqual(commands.LoadOp.clear, pass.load),
+        .scissor_set => return error.TestUnexpectedResult,
+        else => {},
+    };
 }
