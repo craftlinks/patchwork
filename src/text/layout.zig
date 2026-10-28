@@ -23,6 +23,34 @@
 //! style of the run being cut) would exceed `rect.width`, and U+2026 is appended; the cut
 //! width replaces `width` in the alignment. If not even the ellipsis fits, nothing is drawn.
 //!
+//! ## 2b. Wrapping
+//! `Lines` walks runs and cuts them into lines no wider than `width` (at least 0), greedily.
+//! A line breaks only at a break opportunity, between two codepoints:
+//! - after the last of a run of U+0020 spaces (U+00A0 and tab are not spaces here);
+//! - after U+002D when the codepoint before it on the line is not a space and the one after
+//!   it is not an ASCII digit ("-6.5" stays whole), and after U+2010, U+2013, and U+2014
+//!   when something precedes them on the line;
+//! - never at the start of a line (leading spaces are indentation) or at a run boundary.
+//! U+000A ends the line (U+000D directly before it is dropped with it); a text ending in it
+//! ends with one empty line, and empty text has no lines. A line takes every segment (text up
+//! to and including the next opportunity) that fits, comparing with `<=`. Trailing spaces
+//! hang: they are in neither the line's `end` nor its width. A segment that does not fit an
+//! empty line breaks before the first codepoint that does not fit, after at least one, so
+//! every line consumes a byte and `next` is bounded by the bytes.
+//!
+//! A block of runs has one line height, the tallest run's, so lines are evenly spaced:
+//! ```text
+//! line_height(style) = ceil((ascent + descent + line_gap) * size / units_per_em)
+//! lead               = (line_height - (ascent + descent)) / 2          (block maxima)
+//! top                = rect.y + offset(align_y, rect.height - lines * line_height)
+//! baseline_px(i)     = round((top + i * line_height + lead + ascent) * s)
+//! pen_x(line)        = rect.x + offset(align_x, rect.width - line.width)
+//! ```
+//! Whole logical pixels keep the spacing exact at integer scales; at a fractional scale each
+//! baseline rounds on its own, so gaps differ by at most one device pixel. In a rect one line
+//! high, a line lands where `place` with `align_y = .center` puts it. A line whose box
+//! `[top + i h, top + (i + 1) h)` misses the clip appends nothing and costs no cache lookup.
+//!
 //! ## 3. Device Snapping
 //! With `s = cx.text.device_scale()` (`scale_120 / 120`, times the glyph zoom inside a canvas,
 //! `text/cache.zig` section 2a) and the cache entry's raster pixel box (`left`, `top`, `width`,
@@ -53,7 +81,8 @@
 //! counted for the overflow report (`cache.miss_icon`).
 //!
 //! ## 4. TigerStyle Invariants
-//! - Loops are bounded by `text.byte_cap` bytes and `text.run_cap` runs.
+//! - Loops are bounded by `text.byte_cap` bytes and `text.run_cap` runs; each `Lines.next`
+//!   consumes at least one byte, so a wrapped text has at most `byte_cap + 1` lines.
 //! - `measure` is pure; only `place_runs` touches the cache, through `cx.text`.
 
 const std = @import("std");
@@ -140,6 +169,298 @@ pub fn index_at(style: text.Style, utf8: []const u8, x: f32) u32 {
     return index;
 }
 
+/// The line pitch of `style`: ascent, descent, and line gap rounded up to a whole logical
+/// pixel. See the module guide, section 2b.
+pub fn line_height(style: text.Style) f32 {
+    assert(style.size > 0);
+    assert(style.size <= text.size_max);
+    const font = text.font_of(style.face);
+    const em = style.size / @as(f32, @floatFromInt(font.units_per_em));
+    const extent = @as(f32, @floatFromInt(font.ascent + font.descent + font.line_gap)) * em;
+    const height = @ceil(extent);
+    assert(height >= 1);
+    return height;
+}
+
+/// The vertical metrics a wrapped block shares: the tallest run's line height, ascent, and
+/// descent, and the baseline's offset from the top of a line box.
+const Block = struct {
+    line_height: f32,
+    ascent: f32,
+    descent: f32,
+
+    fn of(runs: []const text.Run) Block {
+        assert(runs.len >= 1);
+        assert(runs.len <= text.run_cap);
+        var block: Block = .{ .line_height = 0, .ascent = 0, .descent = 0 };
+        for (runs) |run| {
+            const font = text.font_of(run.style.face);
+            const em = run.style.size / @as(f32, @floatFromInt(font.units_per_em));
+            block.line_height = @max(block.line_height, line_height(run.style));
+            block.ascent = @max(block.ascent, @as(f32, @floatFromInt(font.ascent)) * em);
+            block.descent = @max(block.descent, @as(f32, @floatFromInt(font.descent)) * em);
+        }
+        assert(block.line_height >= block.ascent + block.descent);
+        return block;
+    }
+
+    /// The baseline below the top of a line box: half the leading, then the ascent.
+    fn baseline(self: Block) f32 {
+        const lead = (self.line_height - self.ascent - self.descent) * 0.5;
+        assert(lead >= 0);
+        return lead + self.ascent;
+    }
+};
+
+/// One codepoint of a text and where it starts and ends (`next`).
+const Step = struct {
+    at: text.Position,
+    next: text.Position,
+    codepoint: u21,
+};
+
+/// The codepoint at `position`, past the ends of runs, or null at the end of the text.
+fn step_at(runs: []const text.Run, position: text.Position) ?Step {
+    var at = position;
+    assert(at.run <= runs.len);
+    while (at.run < runs.len and at.byte == runs[at.run].bytes.len) {
+        at = .{ .run = at.run + 1, .byte = 0 };
+    }
+    if (at.run == runs.len) return null;
+    var index = at.byte;
+    const codepoint = decode(runs[at.run].bytes, &index);
+    assert(index > at.byte);
+    return .{ .at = at, .next = .{ .run = at.run, .byte = index }, .codepoint = codepoint };
+}
+
+fn bytes_of(runs: []const text.Run) u32 {
+    var bytes: u32 = 0;
+    for (runs) |run| bytes += @intCast(run.bytes.len);
+    return bytes;
+}
+
+fn is_digit(codepoint: u21) bool {
+    return codepoint >= '0' and codepoint <= '9';
+}
+
+/// Greedy lines of `runs` no wider than `width`. See the module guide, section 2b. `runs`
+/// must outlive the iterator; each `next` is O(bytes of its line and the spaces after it).
+pub const Lines = struct {
+    runs: []const text.Run,
+    width: f32,
+    /// Where the next line starts.
+    at: text.Position,
+    /// A hard break ended the text, so one empty line is still owed.
+    owed_empty: bool,
+    done: bool,
+
+    pub fn init(runs: []const text.Run, width: f32) Lines {
+        assert(runs.len <= text.run_cap);
+        assert(width >= 0);
+        assert(bytes_of(runs) <= text.byte_cap);
+        return .{
+            .runs = runs,
+            .width = width,
+            .at = .{ .run = 0, .byte = 0 },
+            .owed_empty = false,
+            .done = false,
+        };
+    }
+
+    pub fn next(self: *Lines) ?text.Line {
+        if (self.done) return null;
+        const start = self.at;
+        if (step_at(self.runs, start) == null) {
+            self.done = true;
+            if (!self.owed_empty) return null;
+            self.owed_empty = false;
+            return .{ .start = start, .end = start, .width = 0 };
+        }
+        // `content_*` is the line so far without its trailing spaces; `pen` includes them.
+        var content_end = start;
+        var content_width: f32 = 0;
+        var pen: f32 = 0;
+        var consumed = false;
+        var previous: ?u21 = null;
+        var after_space = false;
+        var after_hyphen = false;
+        var opportunity: ?Opportunity = null;
+        var position = start;
+        var budget: u32 = bytes_of(self.runs) + 1;
+        while (step_at(self.runs, position)) |step| {
+            assert(budget > 0);
+            budget -= 1;
+            const codepoint = step.codepoint;
+            if (codepoint == '\n') {
+                self.at = step.next;
+                self.owed_empty = step_at(self.runs, step.next) == null;
+                return .{ .start = start, .end = content_end, .width = content_width };
+            }
+            if (codepoint == '\r') {
+                if (step_at(self.runs, step.next)) |after| {
+                    if (after.codepoint == '\n') {
+                        position = step.next;
+                        continue;
+                    }
+                }
+            }
+            const style = self.runs[step.at.run].style;
+            const advance = glyph_width(text.font_of(style.face), codepoint, style.size);
+            if (codepoint == ' ') {
+                pen += advance;
+                consumed = true;
+                after_space = previous != null;
+                after_hyphen = false;
+                position = step.next;
+                continue;
+            }
+            if (after_space or after_hyphen) {
+                opportunity = .{ .end = content_end, .width = content_width, .next = step.at };
+            }
+            if (pen + advance > self.width) {
+                if (opportunity) |taken| {
+                    self.at = taken.next;
+                    return .{ .start = start, .end = taken.end, .width = taken.width };
+                }
+                if (consumed) {
+                    self.at = step.at;
+                    return .{ .start = start, .end = content_end, .width = content_width };
+                }
+            }
+            after_hyphen = switch (codepoint) {
+                '-' => hyphen: {
+                    const before = previous orelse break :hyphen false;
+                    if (before == ' ') break :hyphen false;
+                    const after = step_at(self.runs, step.next) orelse break :hyphen false;
+                    break :hyphen !is_digit(after.codepoint);
+                },
+                0x2010, 0x2013, 0x2014 => previous != null,
+                else => false,
+            };
+            pen += advance;
+            content_end = step.next;
+            content_width = pen;
+            consumed = true;
+            previous = codepoint;
+            after_space = false;
+            position = step.next;
+        }
+        self.done = true;
+        self.at = position;
+        assert(consumed);
+        return .{ .start = start, .end = content_end, .width = content_width };
+    }
+
+    /// The last break opportunity seen on a line: the line's end and width if it breaks
+    /// there, and where the next line starts.
+    const Opportunity = struct {
+        end: text.Position,
+        width: f32,
+        next: text.Position,
+    };
+};
+
+/// The height `utf8` in `style` takes wrapped to `width`. See the module guide, section 2b.
+pub fn measure_wrapped(style: text.Style, utf8: []const u8, width: f32) f32 {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
+    return measure_runs_wrapped(&runs, width);
+}
+
+/// The height `runs` take wrapped to `width`: lines times the block's line height.
+pub fn measure_runs_wrapped(runs: []const text.Run, width: f32) f32 {
+    assert(runs.len >= 1);
+    assert(width >= 0);
+    const count = count_lines(runs, width);
+    return @as(f32, @floatFromInt(count)) * Block.of(runs).line_height;
+}
+
+fn count_lines(runs: []const text.Run, width: f32) u32 {
+    var lines = Lines.init(runs, width);
+    var count: u32 = 0;
+    while (lines.next()) |_| {
+        count += 1;
+        assert(count <= text.byte_cap + 1);
+    }
+    return count;
+}
+
+/// Lays out `utf8` wrapped in `rect`; see `place_runs_wrapped`.
+pub fn place_wrapped(
+    cx: anytype,
+    style: text.Style,
+    utf8: []const u8,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.WrapOptions,
+) void {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
+    place_runs_wrapped(cx, &runs, rect, clip, options);
+}
+
+/// Lays out `runs` wrapped to `rect.width`, one snapped baseline per line, and appends one
+/// `draw.Glyph` per inked glyph of every line that meets `clip`. See the module guide,
+/// section 2b.
+pub fn place_runs_wrapped(
+    cx: anytype,
+    runs: []const text.Run,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.WrapOptions,
+) void {
+    assert(runs.len >= 1);
+    assert(runs.len <= text.run_cap);
+    assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
+    const width = @max(rect.width, 0);
+    const block = Block.of(runs);
+    var top = rect.y;
+    if (options.align_y != .start) {
+        const height = @as(f32, @floatFromInt(count_lines(runs, width))) * block.line_height;
+        top += offset(options.align_y, rect.height - height);
+    }
+    const scale = cx.text.device_scale();
+    var lines = Lines.init(runs, width);
+    var y = top;
+    while (lines.next()) |line| : (y += block.line_height) {
+        if (y >= clip.y1) break;
+        if (y + block.line_height <= clip.y0) continue;
+        const pen: Pen = .{
+            .x = rect.x + offset(options.align_x, width - line.width),
+            .baseline_px = @round((y + block.baseline()) * scale),
+            .scale = scale,
+        };
+        emit_span(cx, runs, line, pen, clip);
+    }
+}
+
+/// Appends the glyphs of `line` from `start`'s pen; the spaces inside it advance the pen.
+fn emit_span(
+    cx: anytype,
+    runs: []const text.Run,
+    line: text.Line,
+    start: Pen,
+    clip: draw.Clip,
+) void {
+    var pen = start;
+    var position = line.start;
+    var budget: u32 = bytes_of(runs) + 1;
+    while (!std.meta.eql(position, line.end)) {
+        assert(budget > 0);
+        budget -= 1;
+        const run = runs[position.run];
+        if (position.byte == run.bytes.len) {
+            position = .{ .run = position.run + 1, .byte = 0 };
+            continue;
+        }
+        const font = text.font_of(run.style.face);
+        const size_q = cx.text.size_key_of(run.style.size);
+        var index = position.byte;
+        const codepoint = decode(run.bytes, &index);
+        pen.x += emit(cx, run.style, font, size_q, codepoint, pen, clip);
+        position.byte = index;
+    }
+}
+
 /// Lays out one run; see `place_runs`.
 pub fn place(
     cx: anytype,
@@ -189,15 +510,15 @@ pub fn place_runs(
     emit_runs(cx, runs, pen, clip, cut);
 }
 
-const Line = struct {
+const Extent = struct {
     width: f32,
     ascent: f32,
     descent: f32,
 };
 
 /// Width and the shared vertical metrics of `runs`, in logical pixels.
-fn line_of(runs: []const text.Run) Line {
-    var line: Line = .{ .width = 0, .ascent = 0, .descent = 0 };
+fn line_of(runs: []const text.Run) Extent {
+    var line: Extent = .{ .width = 0, .ascent = 0, .descent = 0 };
     var bytes: u32 = 0;
     for (runs) |run| {
         const font = text.font_of(run.style.face);
@@ -630,4 +951,188 @@ test "icon of an unmapped codepoint appends nothing and is counted" {
     try testing.expectEqual(@as(u32, 1 << 21 | 0x0416), cx.text.icon_last);
     cx.reset();
     try testing.expectEqual(@as(u32, 0), cx.text.icon_missing);
+}
+
+const mono_10: text.Style = .{ .face = .mono, .size = 10, .color = .{ 1, 1, 1, 1 } };
+
+// Locks the line pitch (section 2b): ascent 1069 plus descent 293 units (line gap 0) of a
+// 1000-unit em, rounded up: 21.792 -> 22 for Sans and Sans Bold at 16, 20.43 -> 21 for Mono at
+// 15 (the editor's line), and 13.62 -> 14 for Mono at 10.
+test "line height rounds the face's line up to a whole pixel" {
+    try testing.expectEqual(@as(u32, 0), text.font_of(.sans).line_gap);
+    try testing.expectEqual(@as(u32, 0), text.font_of(.mono).line_gap);
+    try testing.expectEqual(@as(f32, 22), line_height(sans_16));
+    const bold_16: text.Style = .{ .face = .sans_bold, .size = 16, .color = .{ 1, 1, 1, 1 } };
+    const mono_15: text.Style = .{ .face = .mono, .size = 15, .color = .{ 1, 1, 1, 1 } };
+    try testing.expectEqual(@as(f32, 22), line_height(bold_16));
+    try testing.expectEqual(@as(f32, 21), line_height(mono_15));
+    try testing.expectEqual(@as(f32, 14), line_height(mono_10));
+}
+
+/// One expected line: start byte, end byte, width.
+const Expected = [3]f32;
+
+fn expect_lines(utf8: []const u8, width: f32, expected: []const Expected) !void {
+    const runs = [1]text.Run{.{ .style = mono_10, .bytes = utf8 }};
+    var lines = Lines.init(&runs, width);
+    for (expected) |want| {
+        const line = lines.next() orelse return error.TooFewLines;
+        try testing.expectEqual(@as(u32, 0), line.start.run);
+        try testing.expectEqual(want[0], @as(f32, @floatFromInt(line.start.byte)));
+        try testing.expectEqual(want[1], @as(f32, @floatFromInt(line.end.byte)));
+        try testing.expectEqual(want[2], line.width);
+    }
+    try testing.expect(lines.next() == null);
+    try testing.expect(lines.next() == null);
+}
+
+// Locks the break rules (section 2b) in Mono 10, 6 px a codepoint, as [start, end, width]:
+// spaces hang, a hyphen breaks after it but not before a digit, the no-break space does not
+// break, a too-long word breaks at the last codepoint that fits, leading spaces stay, hard
+// breaks (and CR LF) end lines with a trailing one owing an empty line, and width 0 puts one
+// codepoint on each line.
+test "lines break after spaces and hyphens, at hard breaks, and inside long words" {
+    const fox = "the quick brown fox";
+    try expect_lines(fox, 60, &.{ .{ 0, 9, 54 }, .{ 10, 19, 54 } });
+    try expect_lines(fox, 30, &.{ .{ 0, 3, 18 }, .{ 4, 9, 30 }, .{ 10, 15, 30 }, .{ 16, 19, 18 } });
+    try expect_lines(fox, 1000, &.{.{ 0, 19, 114 }});
+    try expect_lines("abcdefghij", 24, &.{ .{ 0, 4, 24 }, .{ 4, 8, 24 }, .{ 8, 10, 12 } });
+    try expect_lines("well-known", 36, &.{ .{ 0, 5, 30 }, .{ 5, 10, 30 } });
+    try expect_lines("x -6.5", 30, &.{ .{ 0, 1, 6 }, .{ 2, 6, 24 } });
+    try expect_lines("a\u{a0}b", 12, &.{ .{ 0, 3, 12 }, .{ 3, 4, 6 } });
+    try expect_lines("a   b", 6, &.{ .{ 0, 1, 6 }, .{ 4, 5, 6 } });
+    try expect_lines("  a b", 18, &.{ .{ 0, 3, 18 }, .{ 4, 5, 6 } });
+    try expect_lines("a\n\nb", 1000, &.{ .{ 0, 1, 6 }, .{ 2, 2, 0 }, .{ 3, 4, 6 } });
+    try expect_lines("a\n", 1000, &.{ .{ 0, 1, 6 }, .{ 2, 2, 0 } });
+    try expect_lines("a\r\nb", 1000, &.{ .{ 0, 1, 6 }, .{ 3, 4, 6 } });
+    try expect_lines("   ", 1000, &.{.{ 0, 0, 0 }});
+    try expect_lines("", 1000, &.{});
+    try expect_lines("ab", 0, &.{ .{ 0, 1, 6 }, .{ 1, 2, 6 } });
+}
+
+// Locks run boundaries (section 2b): "the qu" + "ick brown fox" at 60 breaks where the joined
+// text does, with positions in the runs: {0,0}..{1,3} width 54, then {1,4}..{1,13} width 54.
+test "a run boundary is not a break opportunity" {
+    const runs = [_]text.Run{
+        .{ .style = mono_10, .bytes = "the qu" },
+        .{ .style = mono_10, .bytes = "ick brown fox" },
+    };
+    var lines = Lines.init(&runs, 60);
+    const first = lines.next().?;
+    try testing.expectEqual(text.Position{ .run = 0, .byte = 0 }, first.start);
+    try testing.expectEqual(text.Position{ .run = 1, .byte = 3 }, first.end);
+    try testing.expectEqual(@as(f32, 54), first.width);
+    const second = lines.next().?;
+    try testing.expectEqual(text.Position{ .run = 1, .byte = 4 }, second.start);
+    try testing.expectEqual(text.Position{ .run = 1, .byte = 13 }, second.end);
+    try testing.expectEqual(@as(f32, 54), second.width);
+    try testing.expect(lines.next() == null);
+}
+
+// Locks the iterator's bound (section 4): on texts of spaces, newlines, and one long word at
+// width 0, `next` returns null within bytes + 1 calls.
+test "every wrapped text ends within its bytes plus one lines" {
+    const texts = [_][]const u8{ "", "a", "   ", "\n\n\n", "abcdefghij", "a b c", "-\u{2014}-" };
+    for (texts) |utf8| {
+        const runs = [1]text.Run{.{ .style = mono_10, .bytes = utf8 }};
+        var lines = Lines.init(&runs, 0);
+        var count: u32 = 0;
+        while (lines.next()) |_| count += 1;
+        try testing.expect(count <= utf8.len + 1);
+    }
+}
+
+// Locks the wrapped height: the fox at 30 is 4 lines of 14 px.
+test "measure_wrapped is lines times the line height" {
+    try testing.expectEqual(@as(f32, 56), measure_wrapped(mono_10, "the quick brown fox", 30));
+    try testing.expectEqual(@as(f32, 14), measure_wrapped(mono_10, "the quick brown fox", 1000));
+    try testing.expectEqual(@as(f32, 0), measure_wrapped(mono_10, "", 30));
+}
+
+/// The device row of the bottom of each line's first "n", which sits flat on the baseline, for
+/// a text that wraps like the fox at 30.
+fn fox_baselines(scale_120: u32, out: *[4]f32) !void {
+    const cx = test_context(scale_120);
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 100 };
+    place_wrapped(cx, mono_10, "nnn nnnnn nnnnn nnn", rect, window, .{});
+    const glyphs = cx.items(types.Glyph);
+    try testing.expectEqual(@as(usize, 16), glyphs.len);
+    const firsts = [_]usize{ 0, 3, 8, 13 };
+    const scale = @as(f32, @floatFromInt(scale_120)) / 120;
+    for (firsts, out) |index, *row| {
+        const glyph = glyphs[index];
+        row.* = @round((glyph.rect[1] + glyph.rect[3]) * scale);
+    }
+}
+
+// Locks the baselines (section 2b) of 14 px lines with baseline 10.88 below each box's top:
+// rows 11, 25, 39, 53 at scale 1; at 1.25 rows 14, 31, 49, 66 (13.6, 31.1, 48.6, 66.1
+// rounded), so gaps of 17, 18, 17 device pixels.
+test "wrapped baselines snap per line" {
+    var rows: [4]f32 = undefined;
+    try fox_baselines(120, &rows);
+    try testing.expectEqual([4]f32{ 11, 25, 39, 53 }, rows);
+    try fox_baselines(150, &rows);
+    try testing.expectEqual([4]f32{ 14, 31, 49, 66 }, rows);
+}
+
+// Locks the alignments (section 2b): the fox's lines are 18, 30, 30, 18 wide in a 30 px rect,
+// so center moves their first glyphs 6, 0, 0, 6 and end 12, 0, 0, 12; the 56 px block in a
+// 100 px rect starts 22 lower centered and 44 lower at the end.
+test "wrapped lines align per line and as a block" {
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 100 };
+    const firsts = [_]usize{ 0, 3, 8, 13 };
+    var starts: [3][4]f32 = undefined;
+    var tops: [3]f32 = undefined;
+    for ([_]text.Align{ .start, .center, .end }, 0..) |alignment, a| {
+        const cx = test_context(120);
+        place_wrapped(cx, mono_10, "the quick brown fox", rect, window, .{
+            .align_x = alignment,
+            .align_y = alignment,
+        });
+        const glyphs = cx.items(types.Glyph);
+        for (firsts, 0..) |index, line| starts[a][line] = glyphs[index].rect[0];
+        tops[a] = glyphs[0].rect[1];
+    }
+    for (0..4) |line| {
+        const center = [4]f32{ 6, 0, 0, 6 };
+        const end = [4]f32{ 12, 0, 0, 12 };
+        try testing.expectEqual(center[line], starts[1][line] - starts[0][line]);
+        try testing.expectEqual(end[line], starts[2][line] - starts[0][line]);
+    }
+    try testing.expectEqual(@as(f32, 22), tops[1] - tops[0]);
+    try testing.expectEqual(@as(f32, 44), tops[2] - tops[0]);
+}
+
+// Locks culling (section 2b): with the clip over the second line's box only, the fox at 30
+// appends the five glyphs of "quick".
+test "lines outside the clip append nothing" {
+    const cx = test_context(120);
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 100 };
+    const band: draw.Clip = .{ .x0 = 0, .y0 = 14, .x1 = 100, .y1 = 28 };
+    place_wrapped(cx, mono_10, "the quick brown fox", rect, band, .{});
+    try testing.expectEqual(@as(usize, 5), cx.items(types.Glyph).len);
+}
+
+// Locks one-line equality (section 2b): in a rect one line high, a wrapped line writes the
+// records `place` writes with `align_y = .center`, at scales 1 and 1.25.
+test "a one-line wrapped text places like place" {
+    for ([_]u32{ 120, 150 }) |scale_120| {
+        const rect: draw.Rect = .{ .x = 3.3, .y = 7.1, .width = 200, .height = 22 };
+        const placed = test_context(scale_120);
+        place(placed, sans_16, "Wrapped line", rect, window, .{
+            .align_x = .start,
+            .align_y = .center,
+            .ellipsis = false,
+        });
+        var expected: [16]types.Glyph = undefined;
+        const count = placed.items(types.Glyph).len;
+        @memcpy(expected[0..count], placed.items(types.Glyph));
+        const wrapped = test_context(scale_120);
+        place_wrapped(wrapped, sans_16, "Wrapped line", rect, window, .{});
+        try testing.expectEqual(count, wrapped.items(types.Glyph).len);
+        for (expected[0..count], wrapped.items(types.Glyph)) |want, got| {
+            try testing.expectEqual(want, got);
+        }
+    }
 }

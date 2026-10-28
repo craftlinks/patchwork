@@ -13,7 +13,7 @@
 //! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32), "popups" (step 33:
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
 //! "containers" (step 34: splitters, a list box, and number boxes), "type" (step 36: an icon
-//! face beside the library's three; section 2b), and "files" (step 37: a drop zone, the
+//! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
 //! dropped files, and a WAV's waveform; section 2c). Tooltips show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
@@ -74,7 +74,11 @@
 //! shows play again. The toolbar (open, save, settings) reports "toolbar save", and each of its
 //! buttons shows a tooltip. The size ladder draws the settings icon at 12, 16, 24, 32, and 48
 //! px, each centred in a cell, and the icon set every icon at 24 px; no hinting, so the
-//! smallest is soft. Last, a line in each Noto face.
+//! smallest is soft. Last, a horizontal `widgets.Splitter` (ratio 0.5, panes at least 240 and
+//! 200 px; step 38): a line in each Noto face, which stays one line and is cut at the pane's
+//! edge, beside a panel of wrapped text: three bullets, each a bold lead and the rest as two
+//! runs wrapped with `text.place_runs_wrapped` beside a dot, and a `widgets.Paragraph` whose fit
+//! height is the height of its lines. Moving the divider reports "type split 0.31".
 //!
 //! ## 2c. Files
 //! The files page is `files.zig`: one area flagged `drop` (step 37) over a panel that highlights
@@ -139,7 +143,10 @@
 //! 2a): `tabs` (click each tab in turn, ending on containers); `split` (drag the presets'
 //! divider 120 px left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled
 //! into view); `number` (drag the frequency up 40 px, double-click the gain, type "-6.5",
-//! Enter). Type (section 2b): `type` (the type page, still); `transport` (click play: its icon
+//! Enter). Type (section 2b): `type` (the type page, still); `wrap` (the
+//! type divider dragged 240 px left: the wrapped text widens); `wrap-narrow` (dragged right to
+//! the wrapped pane's 200 px minimum: "antidisestablishmentarianism" breaks between letters);
+//! `transport` (click play: its icon
 //! is pause). Files (section 2c): `files` (the files page, empty); `drop-hover` (files dragged
 //! over the zone: its border lit); `drop` (three files dropped on the zone: `tone.wav`, 96,044
 //! bytes of a 120 Hz tone in two chunks, `readme.txt`, and a folder: the tone's waveform). The
@@ -271,6 +278,7 @@ const close_id = ui.id("close", 0);
 const tabs_id = ui.id("tabs", 0);
 const split_id = ui.id("split", 0);
 const side_id = ui.id("side", 0);
+const type_split_id = ui.id("type_split", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
@@ -296,6 +304,24 @@ const set_icon_px: f32 = 24;
 const set_cell_px: f32 = 40;
 const set_px: f32 = 2 * group_padding + caption_px + gap_px + set_cell_px;
 const face_line_px: f32 = 28;
+/// The type page's splitter (step 38): the face lines | the wrapped text, half and half.
+const type_split_ratio: f32 = 0.5;
+const type_split_min_a: f32 = 240;
+const type_split_min_b: f32 = 200;
+/// A bullet's gutter, and its dot centred on the first line.
+const bullet_gutter_px: f32 = 16;
+const bullet_dot_px: f32 = 4;
+const wrap_size: f32 = 16;
+const wrap_words =
+    "Text in a paragraph wraps to the width it is given: at spaces, after hyphens, and at a " ++
+    "new line. Drag the divider to the left and the lines grow; drag it to the right and they " ++
+    "shrink, while the face lines beside it keep their single line and are cut at the pane's edge.";
+/// The bullets: a bold lead and the rest, one block of runs each.
+const bullets = [_][2][]const u8{
+    .{ "Spaces", " at the end of a line hang outside it, so a centred or right-aligned line ends at its last letter." },
+    .{ "Hyphens", " allow a break after them, but a minus before a digit stays with it: -6.5 never splits." },
+    .{ "Long words", " such as antidisestablishmentarianism break between letters when nothing else fits." },
+};
 const transport_icons = [_]u21{ icons.skip_back, icons.play, icons.stop, icons.record, icons.loop };
 const transport_names = [_][]const u8{ "skip back", "play", "stop", "record", "loop" };
 const transport_play: u32 = 1;
@@ -388,7 +414,7 @@ const rows_drawn_max: u32 = 7;
 /// Pool and area capacities; the comptime block checks them against the counts.
 const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
-const glyph_cap: u32 = 1024;
+const glyph_cap: u32 = 2048;
 const path_cap: u32 = 4;
 const point_cap: u32 = 2048;
 const dial_cap: u32 = 8;
@@ -443,6 +469,8 @@ pub const App = struct {
     transport: [transport_icons.len]IconButton,
     playing: bool,
     tools: [tool_icons.len]IconButton,
+    /// The face lines | the wrapped text (step 38).
+    type_split: widgets.Splitter,
     /// The files page (section 2c): the drop zone, the dropped files, and a WAV's samples.
     drops: files_page.Page,
     view: ui.ViewState,
@@ -488,6 +516,8 @@ pub const App = struct {
         .{ .name = "number", .setup = &number_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "type", .setup = &type_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "transport", .setup = &transport_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "wrap", .setup = &wrap_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "wrap-narrow", .setup = &wrap_narrow_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "files", .setup = &files_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop-hover", .setup = &drop_hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop", .setup = &drop_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
@@ -511,6 +541,7 @@ pub const App = struct {
             button.* = icon_button(ui.id("transport", @intCast(index)), label, transport_button_w, color);
         }
         app.playing = false;
+        app.type_split = widgets.Splitter.init(type_split_id, .horizontal, type_split_ratio, type_split_min_a, type_split_min_b);
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -674,6 +705,7 @@ pub const App = struct {
         }
         app.splitter_events(cx, "split ", &app.split, event_value);
         app.splitter_events(cx, "side ", &app.side, event_value);
+        app.splitter_events(cx, "type split ", &app.type_split, event_value);
         var name: [preset_name_cap]u8 = undefined;
         switch (app.presets.handle(cx, event_value)) {
             .selected => |row| app.note(cx, &.{ preset_name(&name, row), " selected" }),
@@ -982,7 +1014,7 @@ pub const App = struct {
 
     /// The type page (section 2b): the transport, the toolbar, and the size ladder in a band,
     /// the icon set, and a line in each library face.
-    fn draw_type(app: *const App, cx: *Context) void {
+    fn draw_type(app: *App, cx: *Context) void {
         const face: widgets.Panel = .{ .paint = panel_paint(cx) };
         _ = cx.begin(ui.sized(.fill, .{ .fixed = type_band_px }), .{ .flow = .right, .spacing = gap_px });
         _ = face.begin(cx, ui.sized(.{ .fixed = transport_w }, .fill), group_layout);
@@ -1019,6 +1051,7 @@ pub const App = struct {
         }
         _ = cx.end();
         _ = cx.end();
+        _ = app.type_split.begin(cx, ui.sized(.fill, .fill));
         _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
         for (face_lines) |line| {
             const row = cx.walk(ui.sized(.fill, .{ .fixed = face_line_px }));
@@ -1026,6 +1059,9 @@ pub const App = struct {
             kit.label(cx, styled(cx, line.face, 16), line.words, row, clip, start);
         }
         _ = cx.end();
+        _ = app.type_split.next(cx);
+        draw_wrapped(cx);
+        app.type_split.end(cx);
     }
 
     /// Two rows of three number boxes, each under its caption.
@@ -1245,6 +1281,36 @@ fn draw_preset(cx: *Context, row: widgets.ListRow) void {
     kit.label(cx, styled(cx, .sans, 14), preset_name(&bytes, row.index), inner, row.clip, start);
 }
 
+/// The type page's wrapped text (step 38): the bullets, each a bold lead and the rest wrapped
+/// with `text.place_runs_wrapped` beside a dot, then a `widgets.Paragraph` of `wrap_words`.
+fn draw_wrapped(cx: *Context) void {
+    const face: widgets.Panel = .{ .paint = panel_paint(cx) };
+    _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+    caption(cx, "wrapped: drag the divider");
+    const bold = styled(cx, .sans_bold, wrap_size);
+    const regular = styled(cx, .sans, wrap_size);
+    for (bullets) |bullet| {
+        const runs = [_]text.Run{ .{ .style = bold, .bytes = bullet[0] }, .{ .style = regular, .bytes = bullet[1] } };
+        const width = cx.peek(ui.sized(.fill, .{ .fixed = 0 })).width - bullet_gutter_px;
+        const height = text.measure_runs_wrapped(&runs, @max(width, 0));
+        const row = cx.walk(ui.sized(.fill, .{ .fixed = height }));
+        const clip = cx.visible(row) orelse continue;
+        const line_h = text.line_height(regular);
+        const dot: Rect = .{
+            .x = row.x + (bullet_gutter_px - bullet_dot_px) * 0.5,
+            .y = row.y + (line_h - bullet_dot_px) * 0.5,
+            .width = bullet_dot_px,
+            .height = bullet_dot_px,
+        };
+        kit.face(cx, dot, clip, .{ .fill = regular.color, .radius = bullet_dot_px * 0.5 });
+        const body = ui.cx.inset(row, .sides(bullet_gutter_px, 0, 0, 0));
+        text.place_runs_wrapped(cx.drawing(), &runs, body, clip, .{});
+    }
+    const paragraph: widgets.Paragraph = .{ .text = wrap_words, .style = regular };
+    _ = paragraph.draw(cx, ui.sized(.fill, .fit));
+    _ = cx.end();
+}
+
 /// A caption line above a control.
 fn caption(cx: *Context, words: []const u8) void {
     const line = cx.walk(ui.sized(.fill, .{ .fixed = caption_px }));
@@ -1426,6 +1492,26 @@ const number_steps = [_]bench.Step{
     .{ .key = .{ .key = .other, .text = "." } },
     .{ .key = .{ .key = .d5, .text = "5" } },
     .{ .key = .{ .key = .enter, .text = "" } },
+    .{ .wait = 12 },
+};
+
+/// The type page's divider (step 38), a drag target.
+fn type_divider() bench.Target {
+    return .{ .id = type_split_id.derive(widgets.divider_salt), .name = "type divider", .index = 0 };
+}
+
+/// `wrap`: the type page with its divider dragged 240 px left: the wrapped text widens.
+const wrap_steps = [_]bench.Step{
+    .{ .click = tab(page_type) },
+    .{ .drag = .{ .target = type_divider(), .from_x = 3, .from_y = 100, .dx = -240, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `wrap-narrow`: the divider dragged right to the wrapped pane's 200 px minimum: the long
+/// word breaks between letters.
+const wrap_narrow_steps = [_]bench.Step{
+    .{ .click = tab(page_type) },
+    .{ .drag = .{ .target = type_divider(), .from_x = 3, .from_y = 100, .dx = 600, .dy = 0 } },
     .{ .wait = 12 },
 };
 
@@ -2046,6 +2132,25 @@ test "the type scenario centres each icon in its button" {
 
 // Locks the `transport` scenario (section 2b): play shows pause while playing and reports
 // "transport play"; a second click pauses; stop while playing shows play again.
+// Locks the `wrap` scenarios (section 2b): the type splitter starts at half its 1242 px span
+// (pane a 621); dragging 240 px left leaves 381 ("type split 0.31", divider at 16 + 381), and
+// dragging far right stops at the wrapped pane's 200 px minimum (1042, "0.84", divider at
+// 1058). Nothing overflows the pools on either.
+test "the wrap scenarios move the type divider" {
+    const wide = new_app();
+    _ = frame(wide);
+    try replay(wide, "wrap");
+    try std.testing.expectEqual(@as(f32, 381.0 / 1242.0), wide.type_split.ratio);
+    try std.testing.expectEqualStrings("type split 0.31", wide.status_text());
+    try std.testing.expectEqual(@as(f32, 16 + 381), area_rect(wide.type_split.divider_id()).x);
+    const narrow = new_app();
+    _ = frame(narrow);
+    try replay(narrow, "wrap-narrow");
+    try std.testing.expectEqualStrings("type split 0.84", narrow.status_text());
+    try std.testing.expectEqual(@as(f32, 16 + 1042), area_rect(narrow.type_split.divider_id()).x);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
 test "the transport scenario turns play into pause" {
     const app = new_app();
     _ = frame(app);

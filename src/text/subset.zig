@@ -805,6 +805,7 @@ test "the default subset draws every kept codepoint as the full face does" {
         try testing.expectEqual(full.units_per_em, sub.units_per_em);
         try testing.expectEqual(full.ascent, sub.ascent);
         try testing.expectEqual(full.descent, sub.descent);
+        try testing.expectEqual(full.line_gap, sub.line_gap);
         try testing.expect(!sub.loca_long);
         for (default_ranges) |range| {
             var codepoint: u21 = range[0];

@@ -6,6 +6,9 @@
 //! ```text
 //! compile time  parse the embedded faces (text/ttf.zig): tables, cmap, ASCII ids
 //! frame         text.place(cx, style, utf8, rect, clip, options)
+//!               text.place_wrapped(cx, style, utf8, rect, clip, wrap_options)
+//!                 text.Lines breaks the text into lines (text/layout.zig, 2b), then each
+//!                 line is placed as below on its own snapped baseline
 //!                 decode UTF-8 (U+FFFD per invalid byte) -> glyph id -> advance
 //!                 cx.text.glyph(face, glyph, size_q)            (text/cache.zig)
 //!                   hit: entry      miss: rasterize within the frame budget (text/raster.zig)
@@ -53,7 +56,8 @@
 //! `.notdef` box.
 //!
 //! ## 5. TigerStyle Invariants
-//! - `byte_cap` bounds the bytes of one `place` or `place_runs` call, `run_cap` its runs.
+//! - `byte_cap` bounds the bytes of one `place`, `place_runs`, or wrapped call, `run_cap` its
+//!   runs.
 //! - All cache and scratch state lives in `draw.Context`; nothing here allocates.
 
 const std = @import("std");
@@ -120,6 +124,27 @@ pub const Run = struct {
     bytes: []const u8,
 };
 
+/// Where wrapped text sits in its rect: each line by `align_x`, the block of lines by
+/// `align_y`. There is no ellipsis: text taller than the rect is clipped.
+pub const WrapOptions = struct {
+    align_x: Align = .start,
+    align_y: Align = .start,
+};
+
+/// A byte of one run of a text: `runs[run].bytes[byte]`, or the end of that run.
+pub const Position = struct {
+    run: u32,
+    byte: u32,
+};
+
+/// One wrapped line: the bytes `start .. end` (hanging spaces and the hard break excluded)
+/// and their width in logical pixels. An empty line has `start == end` and width 0.
+pub const Line = struct {
+    start: Position,
+    end: Position,
+    width: f32,
+};
+
 /// Width of `utf8` in `style`, in logical pixels: the sum of its advances. O(bytes); never
 /// touches the cache.
 pub const measure = layout.measure;
@@ -133,6 +158,26 @@ pub const place = layout.place;
 
 /// Lays out `runs` as one line sharing a baseline. See `text/layout.zig`.
 pub const place_runs = layout.place_runs;
+
+/// The line pitch of `style` in whole logical pixels: ascent, descent, and line gap, rounded
+/// up. Pure. See `text/layout.zig`, section 2b.
+pub const line_height = layout.line_height;
+
+/// The greedy line iterator over runs and a width. Pure. See `text/layout.zig`, section 2b.
+pub const Lines = layout.Lines;
+
+/// The height `utf8` in `style` takes wrapped to `width`: lines times the line height. Pure.
+pub const measure_wrapped = layout.measure_wrapped;
+
+/// `measure_wrapped` for runs: the block's line height is the tallest run's. Pure.
+pub const measure_runs_wrapped = layout.measure_runs_wrapped;
+
+/// Lays out `utf8` wrapped to `rect.width`, one snapped baseline per line; lines outside
+/// `clip` append nothing. See `text/layout.zig`, section 2b.
+pub const place_wrapped = layout.place_wrapped;
+
+/// `place_wrapped` for runs: a run boundary is not a break opportunity.
+pub const place_runs_wrapped = layout.place_runs_wrapped;
 
 /// Draws one glyph with its ink box centred on a rect: an icon from an icon face. A codepoint
 /// the face does not map draws nothing and is counted in the overflow report. See
