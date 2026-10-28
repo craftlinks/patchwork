@@ -1,6 +1,10 @@
-//! The patch language tokenizer: a per-line state machine with one carried state.
+//! The patch language, the editor's default: a per-line state machine with one carried state.
 //!
 //! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 0. A Language
+//! This file is the reference implementation of the contract in `language.zig`: `State`,
+//! `Class`, `palette`, and `next`. `editor.Editor` is `EditorOf` this language.
 //!
 //! ## 1. Why Per Line With a Start State
 //! The editor colours only the visible lines, every frame, so tokenizing must start at any
@@ -32,6 +36,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const language = @import("language.zig");
 
 /// The state carried from the end of one line to the start of the next.
 pub const State = enum(u8) {
@@ -53,10 +58,28 @@ pub const Class = enum(u8) {
 pub const class_count: u32 = 7;
 
 /// Bytes `start .. end` of the line, of `class`.
-pub const Token = struct {
-    start: u32,
-    end: u32,
-    class: Class,
+pub const Token = language.Token(Class);
+
+/// The default colours, straight RGBA, indexed by `Class`.
+pub const palette: [class_count][4]f32 = .{
+    .{ 0.47, 0.53, 0.58, 1 },
+    .{ 0.95, 0.68, 0.40, 1 },
+    .{ 0.62, 0.82, 0.52, 1 },
+    .{ 0.80, 0.55, 0.92, 1 },
+    .{ 0.86, 0.87, 0.84, 1 },
+    .{ 0.45, 0.78, 0.92, 1 },
+    .{ 0.62, 0.64, 0.68, 1 },
+};
+
+/// The colours on a light background (`EditorOf(L).light_palette`), indexed by `Class`.
+pub const palette_light: [class_count][4]f32 = .{
+    .{ 0.45, 0.50, 0.55, 1 },
+    .{ 0.72, 0.38, 0.08, 1 },
+    .{ 0.20, 0.50, 0.22, 1 },
+    .{ 0.50, 0.25, 0.70, 1 },
+    .{ 0.15, 0.16, 0.18, 1 },
+    .{ 0.10, 0.45, 0.65, 1 },
+    .{ 0.40, 0.42, 0.46, 1 },
 };
 
 pub const keywords = [_][]const u8{
@@ -116,15 +139,7 @@ pub fn next(line: []const u8, at: *u32, state: *State) ?Token {
 
 /// The state at the end of `line` when it starts in `start`.
 pub fn end_state(line: []const u8, start: State) State {
-    var state = start;
-    var at: u32 = 0;
-    var tokens: u32 = 0;
-    while (next(line, &at, &state)) |_| {
-        tokens += 1;
-        assert(tokens <= line.len);
-    }
-    assert(at == line.len);
-    return state;
+    return language.end_state(@This(), line, start);
 }
 
 /// Inside a block comment from `start`: the index after `*/` (the state becomes normal), or
@@ -205,6 +220,7 @@ fn is_keyword(word: []const u8) bool {
 comptime {
     assert(@typeInfo(Class).@"enum".field_names.len == class_count);
     assert(@sizeOf(State) == 1);
+    assert(language.check(@This()) == null);
 }
 
 const testing = std.testing;

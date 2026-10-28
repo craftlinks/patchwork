@@ -146,9 +146,10 @@ patchwork/
 │   ├── widgets/window_chrome.zig # WindowButtons, the drag area, and the resize edges
 │   ├── widgets/menu_bar.zig    # MenuBar: menus side by side; hover and Left / Right switch them
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
-│   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
+│   ├── editor.zig              # Code editor namespace: EditorOf, Editor, Style, Decoration
+│   ├── editor/language.zig     # The language contract (State, Class, palette, next), its check
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
-│   ├── editor/tokenizer.zig    # Patch language tokenizer: per-line states, seven classes
+│   ├── editor/tokenizer.zig    # The patch language (the default): per-line states, seven classes
 │   ├── editor/editor.zig       # The editor widget: grid, view, keys, selection, rows
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
@@ -236,6 +237,11 @@ patchwork/
 │       ├── wav.zig             # A streaming 16-bit PCM WAV decoder fed chunk by chunk
 │       ├── surfaces.zig        # The surfaces page: gradient cards, rims, and shadows
 │       ├── glass.zig           # The glass page: cards under glass, materials, a lens slider
+│       ├── code.zig            # The code page: the editor in C and XML side by side
+│       ├── c.zig               # A C language for the editor (a recipe to copy)
+│       ├── xml.zig             # An XML language for the editor (a recipe to copy)
+│       ├── sample.c            # The C page's sample
+│       ├── layout.xml          # The XML page's sample, every XML state across a line
 │       └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
@@ -315,8 +321,9 @@ zig build test            # Run unit tests across the library and the nine examp
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
                           # `Audio` source without `audio`, a theme color of 1.5, a
-                          # knob skin without `knob`, and `ui.overlays` of a target
-                          # with no `draw_overlay`
+                          # knob skin without `knob`, `ui.overlays` of a target
+                          # with no `draw_overlay`, and an editor language without
+                          # `next`
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -1080,6 +1087,10 @@ blue.
 - **data** (step 42, see Trees and Tables): a project tree of the repository's own files beside
   a table of the selected folder's children under a name / kind / size `ColumnHeader` (the page
   sorts them), and a property grid of three `Disclosure` groups (`examples/gallery/data.zig`).
+- **code** (step 44, see Code Editor): the code editor in two languages side by side in a
+  `Splitter`: `EditorOf(c)` on a C sample and `EditorOf(xml)` on a designer-like XML layout
+  (`examples/gallery/code.zig`). `c.zig` and `xml.zig` are recipes, languages an app copies
+  rather than imports; the light toggle gives both editors their light palettes.
 - **glass** (step 40, see Backdrops and Glass): sixteen album cards (gradients between the
   scheme's accents) scroll in a view under a glass sidebar (`widgets.Panel` with the page's
   material), a segmented bar that picks it (Clear, Frosted, Tinted, Solid), and a transport
@@ -1117,7 +1128,9 @@ and `data` (the page), `tree` (keys from src into widgets, expanded), `sort` (sr
 size, descending, and the name column dragged wider), and `groups` (transform closed, layout
 opened) for the data page; `menubar` (File clicked, Edit hovered, Right to View, Down: Dark
 highlighted) and `chrome` (a double click on the bar, which the replay maximizes: restore
-shows; Run clicked; close hovered) for the title bar.
+shows; Run clicked; close hovered) for the title bar; `code` (the page) and `code-edit` (`/*`
+typed before `typedef struct {`: the lines below turn to comment down to the next `*/`), and
+`code-light` (both editors in their light palettes) for the code page.
 
 ## File Drops
 
@@ -1680,7 +1693,23 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   and caret move keeps the caret visible.
 - **Bounds.** At most `editor.lines_max` (128, which fills a 2,688 px viewport) lines of
   `editor.columns_max` (200) columns draw, so a draw appends at most `editor.glyph_max`
-  (26,112) glyphs; an app asserts that against its glyph pool.
+  (26,112) glyphs. A known viewport bounds it tighter: `editor.glyph_bound(width, height,
+  size)` is its lines (`lines_bound`: those whose tops fall inside, plus the cut one) times
+  its visible columns plus the gutter digits, callable at compile time, and every draw
+  asserts it. The gallery budgets its two editors with it: 6,608 glyphs, not 52,224.
+- **Languages.** `editor.EditorOf(L)` is the editor of language `L`, and `editor.Editor` is
+  `EditorOf` the patch language (`editor/tokenizer.zig`). A language is a file or struct that
+  declares `State` (an `enum(u8)` with a `normal` tag, kept per line: one byte each), `Class`
+  (an `enum(u8)` of 1 to 16 tags), `palette` (one colour per class), and
+  `next(line, at, state) ?editor.Token(Class)`, which returns a line's tokens one at a time.
+  Tokens come in order and are not empty, every byte between them is a space, and they depend
+  only on the line and its start state, so the buffer caches start states and re-tokenizes
+  after an edit until one matches. `editor.language.check` names the first problem, and
+  `EditorOf` makes it a compile error (`"c.Bare: missing ``pub fn next(...)``"`). Colours are
+  per instance: `EditorOf(L).default_palette` puts `L.palette` over a dark chrome and
+  `light_palette` the optional `L.palette_light` (else `L.palette`) over a light one; an app
+  sets `style.palette` when its scheme changes, since the editor never reads the theme. The gallery's `c.zig` and `xml.zig` are recipes:
+  copy one into your app; a language moves into the library when three apps need it.
 - **Decorations and rows.** The app sets up to 2,048 `Decoration{start, end, kind}` (`box`,
   `strike` over the text on layer 1, `error`) and 32 `InlineRow{after_line, height}`, and
   rebuilds them on a new `revision()`. Rows are filled through

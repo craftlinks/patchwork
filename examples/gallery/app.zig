@@ -1,4 +1,4 @@
-//! Gallery example: every library widget on five tabbed pages, built only from the kit.
+//! Gallery example: every library widget on nine tabbed pages, built only from the kit.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -18,7 +18,8 @@
 //! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
 //! dropped files, and a WAV's waveform; section 2c), "surfaces" (step 39: gradients, rims,
 //! and shadows; section 2d), and "glass" (step 40: backdrops, glass, and materials; section
-//! 2e), and "data" (step 42: a tree, a sortable table, and folding groups; section 2g). Tooltips
+//! 2e), "data" (step 42: a tree, a sortable table, and folding groups; section 2g), and "code"
+//! (step 44: the code editor in C and XML from recipe tokenizers; section 2i). Tooltips
 //! show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
@@ -154,6 +155,16 @@
 //! Copy", "view Dark" (which also sets the toggle), "run", "window maximize", and, from the
 //! window's state, "window maximized" or "window normal". Quit calls `cx.close()`.
 //!
+//! ## 2i. Code
+//! The code page is `code.zig` (step 44): a horizontal `widgets.Splitter` of two editors,
+//! `editor.EditorOf(c)` on `sample.c` and `editor.EditorOf(xml)` on `layout.xml`. `c.zig` and
+//! `xml.zig` are recipes: languages for the editor's language contract that an app copies
+//! rather than imports, kept here until three apps need the same one. `restyle` gives both
+//! editors their light palettes on the light scheme (`code.zig`). The glyph pool budgets
+//! both editors with `editor.glyph_bound` at their largest viewports, not twice
+//! `editor.glyph_max` (`code.zig`, section 3). The status line reports "c changed", "xml
+//! changed", "c refused", and "code split 0.42".
+//!
 //! ## 3. Events
 //! `event` hands every event first to the window chrome (`chrome_events`: the menu bar before
 //! anything its open menu's backdrop covers), then to each widget itself, because the status line needs each
@@ -231,7 +242,10 @@
 //! 60 px wider); `groups` (transform closed, layout open). Chrome (section 2h): `menubar`
 //! (click File, hover Edit, Right to View, Down: Dark highlighted); `chrome` (a double click on
 //! the bar's bare middle, which the replay's window manager answers by maximizing, so maximize
-//! shows restore; click Run; rest on close: its red band). The
+//! shows restore; click Run; rest on close: its red band). Code (section 2i): `code` (the
+//! page, still); `code-edit` (click the start of `typedef struct {` and type `/*`: the lines
+//! below turn to comment down to the next `*/`, after which the colours return);
+//! `code-light` (the light toggle, then the page: both editors in their light palettes). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -257,6 +271,8 @@ const files_page = @import("files.zig");
 const surfaces_page = @import("surfaces.zig");
 const glass_page = @import("glass.zig");
 const data_page = @import("data.zig");
+const code_page = @import("code.zig");
+const c_language = @import("c.zig");
 
 const Rect = quads.Rect;
 
@@ -380,7 +396,7 @@ const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass", "data" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass", "data", "code" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
@@ -389,6 +405,7 @@ const page_files: u32 = 4;
 const page_surfaces: u32 = 5;
 const page_glass: u32 = 6;
 const page_data: u32 = 7;
+const page_code: u32 = 8;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -539,9 +556,12 @@ const rows: ui.List = .{ .row_height = row_px, .count = row_count };
 const rows_drawn_max: u32 = 7;
 
 /// Pool and area capacities; the comptime block checks them against the counts.
-const box_cap: u32 = 64;
+/// Beside the busiest page's 64, the code page's two editors (`code.zig`, section 3).
+const box_cap: u32 = 64 + code_page.box_max;
 const arc_cap: u32 = 16;
-const glyph_cap: u32 = 2048;
+/// Beside the busiest page's 2,048, the code page's two editors at their largest viewports
+/// (`code.zig`, section 3: `editor.glyph_bound`, not twice `editor.glyph_max`).
+const glyph_cap: u32 = 2048 + code_page.glyph_max;
 /// The surfaces page: the backdrop, the panel and a row, the bar and a pill, and three per
 /// card; the glass page: its gradient and two per card.
 const surface_cap: u32 = 40;
@@ -618,6 +638,8 @@ pub const App = struct {
     surfaces: surfaces_page.Page,
     /// The data page (section 2g): the tree, the sortable table, and the property groups.
     data: data_page.Page,
+    /// The code page (section 2i): the editor in C and XML, from recipe tokenizers.
+    code: code_page.Page,
     /// The glass page (section 2e): its material, cards' view, output dropdown, and lens.
     glass: glass_page.Page,
     /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
@@ -692,6 +714,9 @@ pub const App = struct {
         .{ .name = "groups", .setup = &groups_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "menubar", .setup = &menubar_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "chrome", .setup = &chrome_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "code", .setup = &code_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "code-edit", .setup = &code_edit_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "code-light", .setup = &code_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -732,6 +757,7 @@ pub const App = struct {
         app.surfaces.init();
         app.glass.init(frame_rect);
         app.data.init();
+        app.code.init();
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -875,6 +901,8 @@ pub const App = struct {
             .card => |index| app.note(cx, &.{ "card ", surfaces_page.cards[index].name }),
         };
         if (app.data.handle(cx, event_value)) |report| app.data_note(cx, report);
+        app.splitter_events(cx, "code split ", &app.code.split, event_value);
+        if (app.code.handle(cx, event_value)) |report| app.note(cx, &.{ report.language, " ", @tagName(report.action) });
         if (app.glass.handle(cx, event_value)) |report| switch (report) {
             .material => |index| app.note(cx, &.{ "material ", glass_page.material_names[index] }),
             .output => |index| app.note(cx, &.{ "output ", glass_page.output_names[index] }),
@@ -1148,6 +1176,7 @@ pub const App = struct {
             page_surfaces => app.surfaces.draw(cx),
             page_glass => app.glass.draw(cx),
             page_data => app.data.draw(cx),
+            page_code => app.code.draw(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -1175,6 +1204,7 @@ pub const App = struct {
             knob.accent = widgets.paint_of(color, widgets.kit.accent_radius);
         }
         app.field.style = field_style(scheme);
+        app.code.restyle(scheme);
         app.password.style = field_style(scheme);
         app.search.style = field_style(scheme);
         assert(app.sliders[0].track.radius == widgets.track_radius);
@@ -1988,6 +2018,32 @@ const data_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+const code_steps = [_]bench.Step{
+    .{ .click = tab(page_code) },
+    .{ .wait = 12 },
+};
+
+/// `code-light`: the light toggle, then the code page: both editors in their light palettes.
+const code_light_steps = [_]bench.Step{
+    .{ .click = bench.area("theme", 0) },
+    .{ .click = tab(page_code) },
+    .{ .wait = 12 },
+};
+
+/// The C editor (section 2i); `code_edit_line` is the sample's `typedef struct {` line.
+const code_c_target: bench.Target = .{ .id = code_page.c_id, .name = "code c", .index = 0 };
+const code_edit_line: u32 = 11;
+
+/// Types `/*` at the start of `typedef struct {`: the lines below turn to comment down to the
+/// sample's next `*/`.
+const code_edit_steps = [_]bench.Step{
+    .{ .click = tab(page_code) },
+    .{ .click_at = .{ .target = code_c_target, .x = 51, .y = 4 + code_edit_line * 21 + 10 } },
+    .{ .key = .{ .key = .other, .text = "/" } },
+    .{ .key = .{ .key = .other, .text = "*" } },
+    .{ .wait = 12 },
+};
+
 /// Menu bar title `index` (section 2h), a target.
 fn bar_title(index: u32) bench.Target {
     return .{ .id = menubar_id.derive(index), .name = "menubar title", .index = index };
@@ -2228,6 +2284,11 @@ comptime {
     assert(files_page.zone_h + gap_px + 2 * group_padding + files_page.row_px <= page_h - gap_px);
     assert(3 + 7 + 1 + 1 + 2 + 2 <= box_cap);
     assert(chrome + 3 + 14 <= area_cap);
+    // The code page (section 2i): its budgets assume the gallery's page, and its boxes and
+    // areas sit beside the title's (3) and the tabs' (7).
+    assert(code_page.page_w == inner_w and code_page.page_h == page_h);
+    assert(3 + 7 + code_page.box_max <= box_cap);
+    assert(chrome + code_page.area_max <= area_cap);
     // Points: the waveform's columns with RMS, then the dropdowns' chevrons.
     assert(2 * (inner_w - files_page.zone_w - gap_px - 2 * group_padding) + 2 * 3 <= point_cap);
 }
@@ -2611,6 +2672,56 @@ test "the data page lays out the tree, the table, and the groups" {
     try expect_rect(area_rect(ui.id("group", 0)), 952, 112, 304, 28);
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
     try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the code page's layout (section 2i): the C editor under its caption at (16, 132),
+// the divider, and the XML editor beside it, both the page's height less the caption; both
+// samples loaded, and nothing overflows.
+test "the code page lays out two editors beside each other" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "code");
+    try expect_rect(app.code.c_editor.viewport(), 16, 132, 621, 556);
+    try expect_rect(app.code.xml_editor.viewport(), 643, 132, 621, 556);
+    try std.testing.expectEqual(@as(u32, 44), app.code.c_editor.buffer.line_count);
+    try std.testing.expectEqualStrings(code_page.layout_xml, app.code.xml_editor.text());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the `code-light` scenario (section 2i): the light toggle gives both editors their
+// light palettes (the recipes' light class colours over the light chrome), and the dark
+// toggle gives the dark ones back.
+test "the code-light scenario restyles both editors" {
+    const app = new_app();
+    _ = frame(app);
+    try std.testing.expectEqual(code_page.CEditor.default_palette, app.code.c_editor.style.palette);
+    try replay(app, "code-light");
+    try std.testing.expectEqual(code_page.CEditor.light_palette, app.code.c_editor.style.palette);
+    try std.testing.expectEqual(code_page.XmlEditor.light_palette, app.code.xml_editor.style.palette);
+    try std.testing.expectEqual(c_language.palette_light, app.code.c_editor.style.palette.classes);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    test_context.event_begin(.{ .frame = 0 });
+    app.restyle(&theme.dark);
+    test_context.event_end();
+    try std.testing.expectEqual(code_page.XmlEditor.default_palette, app.code.xml_editor.style.palette);
+}
+
+// Locks the `code-edit` scenario (section 2i): `/*` typed at the start of line 11 turns the
+// start states of lines 12 to 22 to block_comment, line 22's own `*/` closes it, so line 23
+// starts normal again; the C editor keeps focus and the status line says "c changed".
+test "the code-edit scenario opens a block comment that stops at the next close" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "code-edit");
+    const buffer = &app.code.c_editor.buffer;
+    try std.testing.expect(std.mem.startsWith(u8, buffer.line_bytes(code_edit_line), "/*typedef"));
+    try std.testing.expectEqual(c_language.State.normal, buffer.states[code_edit_line]);
+    for (buffer.states[code_edit_line + 1 .. 23]) |state| try std.testing.expectEqual(c_language.State.block_comment, state);
+    try std.testing.expectEqual(c_language.State.normal, buffer.states[23]);
+    try std.testing.expectEqual(code_page.c_id, test_context.focus);
+    try std.testing.expectEqualStrings("c changed", app.status_text());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
 }
 
 // Locks the `tree` scenario (section 2g): the keys end on widgets, expanded and selected, and
@@ -3217,6 +3328,9 @@ test {
     _ = surfaces_page;
     _ = glass_page;
     _ = data_page;
+    _ = code_page;
+    _ = c_language;
+    _ = @import("xml.zig");
 }
 
 comptime {

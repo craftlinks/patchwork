@@ -22,7 +22,7 @@
 //!          by (added - removed) slots and its starts by (inserted - removed) bytes; the
 //!          inserted LFs add their starts. `states` moves with the index.
 //! states   from the first edited line: compute its end state; continue while the next
-//!          line is new or its cached start state differs (tokenizer guide, section 1)
+//!          line is new or its cached start state differs (`language.zig`, section 1)
 //! longest  the longest line in bytes, rescanned over the index (O(lines))
 //! revision += 1
 //! ```
@@ -68,6 +68,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const edit = @import("../ui/edit.zig");
+const language = @import("language.zig");
 const tokenizer = @import("tokenizer.zig");
 
 /// Bytes the text holds.
@@ -123,407 +124,419 @@ const Entry = struct {
     sealed: bool,
 };
 
-pub const Buffer = struct {
-    bytes: [buffer_cap]u8,
-    len: u32,
-    line_starts: [line_cap]u32,
-    line_count: u32,
-    /// The tokenizer state at the start of each line.
-    states: [line_cap]tokenizer.State,
-    /// Bytes of the longest line, LF excluded.
-    longest: u32,
-    /// Moves on every change of the text, undo and redo included.
-    revision: u64,
-    refusal: Refusal,
-    entries: [entry_cap]Entry,
-    entry_count: u32,
-    /// Entries `0 .. undo_count` are undoable, `undo_count .. entry_count` redoable.
-    undo_count: u32,
-    arena: [arena_cap]u8,
-    arena_used: u32,
-    gesture: bool,
-    mark_next: u64,
-    /// The mark of the state before the oldest kept entry.
-    mark_base: u64,
+/// The buffer of a text in language `L` (`language.zig`): its start states are `L.State`.
+pub fn BufferOf(comptime L: type) type {
+    if (comptime language.check(L)) |problem| @compileError(problem);
+    comptime assert(@sizeOf([line_cap]L.State) == line_cap);
+    return struct {
+        const Self = @This();
 
-    /// An empty text with no history. Out-pointer init: the buffer is about 220 KiB.
-    pub fn init(self: *Buffer) void {
-        self.revision = 0;
-        self.mark_next = 1;
-        self.refusal = .none;
-        self.gesture = false;
-        const loaded = self.load("");
-        assert(loaded);
-        assert(self.line_count == 1);
-    }
+        bytes: [buffer_cap]u8,
+        len: u32,
+        line_starts: [line_cap]u32,
+        line_count: u32,
+        /// The language's state at the start of each line, one byte each.
+        states: [line_cap]L.State,
+        /// Bytes of the longest line, LF excluded.
+        longest: u32,
+        /// Moves on every change of the text, undo and redo included.
+        revision: u64,
+        refusal: Refusal,
+        entries: [entry_cap]Entry,
+        entry_count: u32,
+        /// Entries `0 .. undo_count` are undoable, `undo_count .. entry_count` redoable.
+        undo_count: u32,
+        arena: [arena_cap]u8,
+        arena_used: u32,
+        gesture: bool,
+        mark_next: u64,
+        /// The mark of the state before the oldest kept entry.
+        mark_base: u64,
 
-    /// Replaces the whole text with `utf8` (valid UTF-8 without tabs or CRs; see
-    /// `edit.sanitize_text`) and clears the history. False, with the text kept, when it
-    /// does not fit.
-    pub fn load(self: *Buffer, utf8: []const u8) bool {
-        assert(!self.gesture);
-        if (utf8.len > buffer_cap) return self.refuse(.bytes);
-        const lines = 1 + std.mem.count(u8, utf8, "\n");
-        if (lines > line_cap) return self.refuse(.lines);
-        @memcpy(self.bytes[0..utf8.len], utf8);
-        self.len = @intCast(utf8.len);
-        self.line_starts[0] = 0;
-        self.line_count = 1;
-        for (utf8, 0..) |byte, index| {
-            if (byte != '\n') continue;
-            self.line_starts[self.line_count] = @intCast(index + 1);
-            self.line_count += 1;
+        /// An empty text with no history. Out-pointer init: the buffer is about 220 KiB.
+        pub fn init(self: *Self) void {
+            self.revision = 0;
+            self.mark_next = 1;
+            self.refusal = .none;
+            self.gesture = false;
+            const loaded = self.load("");
+            assert(loaded);
+            assert(self.line_count == 1);
         }
-        self.states[0] = .normal;
-        self.retokenize(0, self.line_count - 1);
-        self.longest = self.longest_line();
-        self.entry_count = 0;
-        self.undo_count = 0;
-        self.arena_used = 0;
-        self.mark_base = self.take_mark();
-        self.revision += 1;
-        self.refusal = .none;
-        assert(self.line_count == lines);
-        return true;
-    }
 
-    pub fn text(self: *const Buffer) []const u8 {
-        assert(self.len <= buffer_cap);
-        return self.bytes[0..self.len];
-    }
-
-    /// The bytes of line `line`, LF excluded.
-    pub fn line_range(self: *const Buffer, line: u32) Range {
-        assert(line < self.line_count);
-        const start = self.line_starts[line];
-        const end = if (line + 1 < self.line_count) self.line_starts[line + 1] - 1 else self.len;
-        assert(start <= end);
-        return .{ .start = start, .end = end };
-    }
-
-    pub fn line_bytes(self: *const Buffer, line: u32) []const u8 {
-        const range = self.line_range(line);
-        return self.bytes[range.start..range.end];
-    }
-
-    /// The line holding byte `byte` (the last line for the end). Binary search.
-    pub fn line_of(self: *const Buffer, byte: u32) u32 {
-        assert(byte <= self.len);
-        var low: u32 = 0;
-        var high: u32 = self.line_count;
-        // Invariant: line_starts[low] <= byte, and every line from high on starts after it.
-        while (high - low > 1) {
-            const middle = low + (high - low) / 2;
-            if (self.line_starts[middle] <= byte) low = middle else high = middle;
+        /// Replaces the whole text with `utf8` (valid UTF-8 without tabs or CRs; see
+        /// `edit.sanitize_text`) and clears the history. False, with the text kept, when it
+        /// does not fit.
+        pub fn load(self: *Self, utf8: []const u8) bool {
+            assert(!self.gesture);
+            if (utf8.len > buffer_cap) return self.refuse(.bytes);
+            const lines = 1 + std.mem.count(u8, utf8, "\n");
+            if (lines > line_cap) return self.refuse(.lines);
+            @memcpy(self.bytes[0..utf8.len], utf8);
+            self.len = @intCast(utf8.len);
+            self.line_starts[0] = 0;
+            self.line_count = 1;
+            for (utf8, 0..) |byte, index| {
+                if (byte != '\n') continue;
+                self.line_starts[self.line_count] = @intCast(index + 1);
+                self.line_count += 1;
+            }
+            self.states[0] = .normal;
+            self.retokenize(0, self.line_count - 1);
+            self.longest = self.longest_line();
+            self.entry_count = 0;
+            self.undo_count = 0;
+            self.arena_used = 0;
+            self.mark_base = self.take_mark();
+            self.revision += 1;
+            self.refusal = .none;
+            assert(self.line_count == lines);
+            return true;
         }
-        assert(self.line_starts[low] <= byte);
-        if (low + 1 < self.line_count) assert(self.line_starts[low + 1] > byte);
-        return low;
-    }
 
-    /// Replaces `range` with `utf8` (valid UTF-8 without tabs or CRs, `range` on codepoint
-    /// boundaries) and records it for undo. False, with nothing changed, when the result
-    /// would exceed a cap. See the module guide, sections 2 and 4.
-    pub fn replace(self: *Buffer, range: Range, utf8: []const u8, change: Change) bool {
-        assert(range.start <= range.end);
-        assert(range.end <= self.len);
-        assert(edit.is_boundary(self.text(), range.start));
-        assert(edit.is_boundary(self.text(), range.end));
-        const removed = self.bytes[range.start..range.end];
-        if (self.len - removed.len + utf8.len > buffer_cap) return self.refuse(.bytes);
-        const lines_removed = std.mem.count(u8, removed, "\n");
-        const lines_added = std.mem.count(u8, utf8, "\n");
-        if (self.line_count - lines_removed + lines_added > line_cap) return self.refuse(.lines);
-        self.refusal = .none;
-        self.record(range, @intCast(utf8.len), change);
-        self.apply(range, utf8);
-        assert(self.len <= buffer_cap);
-        return true;
-    }
-
-    /// Closes the open entry, so the next edit opens its own (section 4).
-    pub fn seal(self: *Buffer) void {
-        const index = self.open_index() orelse return;
-        const entry = self.entries[index];
-        self.make_room(entry.new_len, false);
-        const open = &self.entries[self.entry_count - 1];
-        assert(self.arena_used == open.offset + open.old_len);
-        const new_bytes = self.bytes[open.start..][0..open.new_len];
-        @memcpy(self.arena[self.arena_used..][0..open.new_len], new_bytes);
-        self.arena_used += open.new_len;
-        open.sealed = true;
-        assert(self.open_index() == null);
-    }
-
-    /// Starts a gesture: every edit until `gesture_end` merges into one entry.
-    pub fn gesture_begin(self: *Buffer) void {
-        assert(!self.gesture);
-        self.seal();
-        self.gesture = true;
-        assert(self.open_index() == null);
-    }
-
-    pub fn gesture_end(self: *Buffer) void {
-        assert(self.gesture);
-        self.gesture = false;
-        self.seal();
-        assert(self.open_index() == null);
-    }
-
-    /// Replaces the selection the open entry restores on redo, for an edit whose final
-    /// selection is known only after its last replace (an indent of several lines).
-    pub fn amend_after(self: *Buffer, after: Selection) void {
-        const index = self.open_index() orelse return;
-        assert(after.caret <= self.len);
-        assert(after.anchor <= self.len);
-        self.entries[index].after = after;
-    }
-
-    /// Reverts the newest undoable entry and returns the selection before it, or null.
-    pub fn undo(self: *Buffer) ?Selection {
-        assert(!self.gesture);
-        self.seal();
-        if (self.undo_count == 0) return null;
-        const entry = self.entries[self.undo_count - 1];
-        assert(entry.sealed);
-        const range: Range = .{ .start = entry.start, .end = entry.start + entry.new_len };
-        self.apply(range, self.arena[entry.offset..][0..entry.old_len]);
-        self.undo_count -= 1;
-        return entry.before;
-    }
-
-    /// Re-applies the oldest redoable entry and returns the selection after it, or null.
-    pub fn redo(self: *Buffer) ?Selection {
-        assert(!self.gesture);
-        if (self.undo_count == self.entry_count) return null;
-        const entry = self.entries[self.undo_count];
-        assert(entry.sealed);
-        const range: Range = .{ .start = entry.start, .end = entry.start + entry.old_len };
-        self.apply(range, self.arena[entry.offset + entry.old_len ..][0..entry.new_len]);
-        self.undo_count += 1;
-        return entry.after;
-    }
-
-    /// The mark of the current state of the history (section 4).
-    pub fn history_mark(self: *const Buffer) u64 {
-        assert(self.undo_count <= self.entry_count);
-        if (self.undo_count == 0) return self.mark_base;
-        return self.entries[self.undo_count - 1].mark;
-    }
-
-    /// Checks every invariant of the module guide, section 5. O(text); for tests.
-    pub fn verify(self: *const Buffer) void {
-        assert(self.line_count >= 1);
-        assert(self.line_starts[0] == 0);
-        var line: u32 = 1;
-        for (self.text(), 0..) |byte, index| {
-            if (byte != '\n') continue;
-            assert(self.line_starts[line] == index + 1);
-            line += 1;
+        pub fn text(self: *const Self) []const u8 {
+            assert(self.len <= buffer_cap);
+            return self.bytes[0..self.len];
         }
-        assert(line == self.line_count);
-        var state: tokenizer.State = .normal;
-        line = 0;
-        while (line < self.line_count) : (line += 1) {
-            assert(self.states[line] == state);
-            state = tokenizer.end_state(self.line_bytes(line), state);
+
+        /// The bytes of line `line`, LF excluded.
+        pub fn line_range(self: *const Self, line: u32) Range {
+            assert(line < self.line_count);
+            const start = self.line_starts[line];
+            const last = line + 1 == self.line_count;
+            const end = if (last) self.len else self.line_starts[line + 1] - 1;
+            assert(start <= end);
+            return .{ .start = start, .end = end };
         }
-        assert(self.longest == self.longest_line());
-        assert(self.undo_count <= self.entry_count);
-        assert(std.unicode.utf8ValidateSlice(self.text()));
-    }
 
-    fn refuse(self: *Buffer, refusal: Refusal) bool {
-        assert(refusal != .none);
-        self.refusal = refusal;
-        return false;
-    }
+        pub fn line_bytes(self: *const Self, line: u32) []const u8 {
+            const range = self.line_range(line);
+            return self.bytes[range.start..range.end];
+        }
 
-    fn take_mark(self: *Buffer) u64 {
-        const mark = self.mark_next;
-        self.mark_next += 1;
-        assert(mark != 0);
-        return mark;
-    }
+        /// The line holding byte `byte` (the last line for the end). Binary search.
+        pub fn line_of(self: *const Self, byte: u32) u32 {
+            assert(byte <= self.len);
+            var low: u32 = 0;
+            var high: u32 = self.line_count;
+            // Invariant: line_starts[low] <= byte, and every line from high on starts after it.
+            while (high - low > 1) {
+                const middle = low + (high - low) / 2;
+                if (self.line_starts[middle] <= byte) low = middle else high = middle;
+            }
+            assert(self.line_starts[low] <= byte);
+            if (low + 1 < self.line_count) assert(self.line_starts[low + 1] > byte);
+            return low;
+        }
 
-    /// The index of the open (unsealed, newest, undoable) entry, or null.
-    fn open_index(self: *const Buffer) ?u32 {
-        if (self.entry_count == 0) return null;
-        const index = self.entry_count - 1;
-        if (self.entries[index].sealed) return null;
-        assert(self.undo_count == self.entry_count);
-        return index;
-    }
+        /// Replaces `range` with `utf8` (valid UTF-8 without tabs or CRs, `range` on codepoint
+        /// boundaries) and records it for undo. False, with nothing changed, when the result
+        /// would exceed a cap. See the module guide, sections 2 and 4.
+        pub fn replace(self: *Self, range: Range, utf8: []const u8, change: Change) bool {
+            assert(range.start <= range.end);
+            assert(range.end <= self.len);
+            assert(edit.is_boundary(self.text(), range.start));
+            assert(edit.is_boundary(self.text(), range.end));
+            const removed = self.bytes[range.start..range.end];
+            if (self.len - removed.len + utf8.len > buffer_cap) return self.refuse(.bytes);
+            const lines_removed = std.mem.count(u8, removed, "\n");
+            const lines_added = std.mem.count(u8, utf8, "\n");
+            const lines = self.line_count - lines_removed + lines_added;
+            if (lines > line_cap) return self.refuse(.lines);
+            self.refusal = .none;
+            self.record(range, @intCast(utf8.len), change);
+            self.apply(range, utf8);
+            assert(self.len <= buffer_cap);
+            return true;
+        }
 
-    /// The undo half of `replace`: merge into the open entry or open a new one.
-    fn record(self: *Buffer, range: Range, inserted: u32, change: Change) void {
-        if (self.open_index()) |index| {
-            if (self.merges(self.entries[index], range, change.kind)) {
-                self.merge(range, inserted, change.after);
+        /// Closes the open entry, so the next edit opens its own (section 4).
+        pub fn seal(self: *Self) void {
+            const index = self.open_index() orelse return;
+            const entry = self.entries[index];
+            self.make_room(entry.new_len, false);
+            const open = &self.entries[self.entry_count - 1];
+            assert(self.arena_used == open.offset + open.old_len);
+            const new_bytes = self.bytes[open.start..][0..open.new_len];
+            @memcpy(self.arena[self.arena_used..][0..open.new_len], new_bytes);
+            self.arena_used += open.new_len;
+            open.sealed = true;
+            assert(self.open_index() == null);
+        }
+
+        /// Starts a gesture: every edit until `gesture_end` merges into one entry.
+        pub fn gesture_begin(self: *Self) void {
+            assert(!self.gesture);
+            self.seal();
+            self.gesture = true;
+            assert(self.open_index() == null);
+        }
+
+        pub fn gesture_end(self: *Self) void {
+            assert(self.gesture);
+            self.gesture = false;
+            self.seal();
+            assert(self.open_index() == null);
+        }
+
+        /// Replaces the selection the open entry restores on redo, for an edit whose final
+        /// selection is known only after its last replace (an indent of several lines).
+        pub fn amend_after(self: *Self, after: Selection) void {
+            const index = self.open_index() orelse return;
+            assert(after.caret <= self.len);
+            assert(after.anchor <= self.len);
+            self.entries[index].after = after;
+        }
+
+        /// Reverts the newest undoable entry and returns the selection before it, or null.
+        pub fn undo(self: *Self) ?Selection {
+            assert(!self.gesture);
+            self.seal();
+            if (self.undo_count == 0) return null;
+            const entry = self.entries[self.undo_count - 1];
+            assert(entry.sealed);
+            const range: Range = .{ .start = entry.start, .end = entry.start + entry.new_len };
+            self.apply(range, self.arena[entry.offset..][0..entry.old_len]);
+            self.undo_count -= 1;
+            return entry.before;
+        }
+
+        /// Re-applies the oldest redoable entry and returns the selection after it, or null.
+        pub fn redo(self: *Self) ?Selection {
+            assert(!self.gesture);
+            if (self.undo_count == self.entry_count) return null;
+            const entry = self.entries[self.undo_count];
+            assert(entry.sealed);
+            const range: Range = .{ .start = entry.start, .end = entry.start + entry.old_len };
+            self.apply(range, self.arena[entry.offset + entry.old_len ..][0..entry.new_len]);
+            self.undo_count += 1;
+            return entry.after;
+        }
+
+        /// The mark of the current state of the history (section 4).
+        pub fn history_mark(self: *const Self) u64 {
+            assert(self.undo_count <= self.entry_count);
+            if (self.undo_count == 0) return self.mark_base;
+            return self.entries[self.undo_count - 1].mark;
+        }
+
+        /// Checks every invariant of the module guide, section 5. O(text); for tests.
+        pub fn verify(self: *const Self) void {
+            assert(self.line_count >= 1);
+            assert(self.line_starts[0] == 0);
+            var line: u32 = 1;
+            for (self.text(), 0..) |byte, index| {
+                if (byte != '\n') continue;
+                assert(self.line_starts[line] == index + 1);
+                line += 1;
+            }
+            assert(line == self.line_count);
+            var state: L.State = .normal;
+            line = 0;
+            while (line < self.line_count) : (line += 1) {
+                assert(self.states[line] == state);
+                state = language.verify_line(L, self.line_bytes(line), state);
+            }
+            assert(self.longest == self.longest_line());
+            assert(self.undo_count <= self.entry_count);
+            assert(std.unicode.utf8ValidateSlice(self.text()));
+        }
+
+        fn refuse(self: *Self, refusal: Refusal) bool {
+            assert(refusal != .none);
+            self.refusal = refusal;
+            return false;
+        }
+
+        fn take_mark(self: *Self) u64 {
+            const mark = self.mark_next;
+            self.mark_next += 1;
+            assert(mark != 0);
+            return mark;
+        }
+
+        /// The index of the open (unsealed, newest, undoable) entry, or null.
+        fn open_index(self: *const Self) ?u32 {
+            if (self.entry_count == 0) return null;
+            const index = self.entry_count - 1;
+            if (self.entries[index].sealed) return null;
+            assert(self.undo_count == self.entry_count);
+            return index;
+        }
+
+        /// The undo half of `replace`: merge into the open entry or open a new one.
+        fn record(self: *Self, range: Range, inserted: u32, change: Change) void {
+            if (self.open_index()) |index| {
+                if (self.merges(self.entries[index], range, change.kind)) {
+                    self.merge(range, inserted, change.after);
+                    return;
+                }
+                self.seal();
+            }
+            self.drop_redo();
+            const old_len = range.end - range.start;
+            self.make_room(old_len, true);
+            const offset = self.arena_used;
+            @memcpy(self.arena[offset..][0..old_len], self.bytes[range.start..range.end]);
+            self.arena_used += old_len;
+            self.entries[self.entry_count] = .{
+                .start = range.start,
+                .old_len = old_len,
+                .new_len = inserted,
+                .offset = offset,
+                .before = change.before,
+                .after = change.after,
+                .mark = self.take_mark(),
+                .kind = change.kind,
+                .sealed = false,
+            };
+            self.entry_count += 1;
+            self.undo_count = self.entry_count;
+            assert(self.arena_used <= arena_cap);
+        }
+
+        fn merges(self: *const Self, entry: Entry, range: Range, kind: Kind) bool {
+            assert(!entry.sealed);
+            if (self.gesture) return true;
+            if (kind == .other) return false;
+            if (kind != entry.kind) return false;
+            if (range.start > entry.start + entry.new_len) return false;
+            return range.end >= entry.start;
+        }
+
+        /// Widens the open entry to the union of its span and `range` (section 4).
+        fn merge(self: *Self, range: Range, inserted: u32, after: Selection) void {
+            const open = self.entries[self.entry_count - 1];
+            const low = @min(open.start, range.start);
+            const high = @max(open.start + open.new_len, range.end);
+            const prefix = open.start - low;
+            const suffix = high - (open.start + open.new_len);
+            self.make_room(prefix + suffix, false);
+            const entry = &self.entries[self.entry_count - 1];
+            assert(self.arena_used == entry.offset + entry.old_len);
+            const old = self.arena[entry.offset..][0 .. entry.old_len + prefix];
+            @memmove(old[prefix..][0..entry.old_len], old[0..entry.old_len]);
+            @memcpy(old[0..prefix], self.bytes[low..entry.start]);
+            const tail = entry.start + entry.new_len;
+            const after_old = entry.offset + prefix + entry.old_len;
+            @memcpy(self.arena[after_old..][0..suffix], self.bytes[tail..high]);
+            entry.old_len += prefix + suffix;
+            entry.start = low;
+            entry.new_len = (high - low) - (range.end - range.start) + inserted;
+            entry.after = after;
+            entry.mark = self.take_mark();
+            self.arena_used = entry.offset + entry.old_len;
+            assert(self.arena_used <= arena_cap);
+        }
+
+        fn drop_redo(self: *Self) void {
+            if (self.undo_count == self.entry_count) return;
+            self.entry_count = self.undo_count;
+            if (self.entry_count == 0) {
+                self.arena_used = 0;
                 return;
             }
-            self.seal();
+            const last = self.entries[self.entry_count - 1];
+            assert(last.sealed);
+            self.arena_used = last.offset + last.old_len + last.new_len;
         }
-        self.drop_redo();
-        const old_len = range.end - range.start;
-        self.make_room(old_len, true);
-        const offset = self.arena_used;
-        @memcpy(self.arena[offset..][0..old_len], self.bytes[range.start..range.end]);
-        self.arena_used += old_len;
-        self.entries[self.entry_count] = .{
-            .start = range.start,
-            .old_len = old_len,
-            .new_len = inserted,
-            .offset = offset,
-            .before = change.before,
-            .after = change.after,
-            .mark = self.take_mark(),
-            .kind = change.kind,
-            .sealed = false,
-        };
-        self.entry_count += 1;
-        self.undo_count = self.entry_count;
-        assert(self.arena_used <= arena_cap);
-    }
 
-    fn merges(self: *const Buffer, entry: Entry, range: Range, kind: Kind) bool {
-        assert(!entry.sealed);
-        if (self.gesture) return true;
-        if (kind == .other) return false;
-        if (kind != entry.kind) return false;
-        if (range.start > entry.start + entry.new_len) return false;
-        return range.end >= entry.start;
-    }
-
-    /// Widens the open entry to the union of its span and `range` (section 4).
-    fn merge(self: *Buffer, range: Range, inserted: u32, after: Selection) void {
-        const open = self.entries[self.entry_count - 1];
-        const low = @min(open.start, range.start);
-        const high = @max(open.start + open.new_len, range.end);
-        const prefix = open.start - low;
-        const suffix = high - (open.start + open.new_len);
-        self.make_room(prefix + suffix, false);
-        const entry = &self.entries[self.entry_count - 1];
-        assert(self.arena_used == entry.offset + entry.old_len);
-        const old = self.arena[entry.offset..][0 .. entry.old_len + prefix];
-        @memmove(old[prefix..][0..entry.old_len], old[0..entry.old_len]);
-        @memcpy(old[0..prefix], self.bytes[low..entry.start]);
-        const tail = entry.start + entry.new_len;
-        const after_old = entry.offset + prefix + entry.old_len;
-        @memcpy(self.arena[after_old..][0..suffix], self.bytes[tail..high]);
-        entry.old_len += prefix + suffix;
-        entry.start = low;
-        entry.new_len = (high - low) - (range.end - range.start) + inserted;
-        entry.after = after;
-        entry.mark = self.take_mark();
-        self.arena_used = entry.offset + entry.old_len;
-        assert(self.arena_used <= arena_cap);
-    }
-
-    fn drop_redo(self: *Buffer) void {
-        if (self.undo_count == self.entry_count) return;
-        self.entry_count = self.undo_count;
-        if (self.entry_count == 0) {
-            self.arena_used = 0;
-            return;
+        /// Drops the oldest entries until `bytes` more arena bytes (and a free slot, when
+        /// `slot`) fit, with one memmove (section 4). The open entry is never dropped.
+        fn make_room(self: *Self, bytes: u32, slot: bool) void {
+            assert(bytes <= arena_cap);
+            assert(self.undo_count == self.entry_count);
+            var dropped: u32 = 0;
+            var freed: u32 = 0;
+            while (dropped < self.entry_count) {
+                const fits = self.arena_used - freed + bytes <= arena_cap;
+                const room = !slot or self.entry_count - dropped < entry_cap;
+                if (fits and room) break;
+                dropped += 1;
+                freed = if (dropped < self.entry_count)
+                    self.entries[dropped].offset
+                else
+                    self.arena_used;
+            }
+            if (dropped == 0) return;
+            if (self.open_index() != null) assert(dropped < self.entry_count);
+            self.mark_base = self.entries[dropped - 1].mark;
+            const kept = self.entry_count - dropped;
+            @memmove(self.arena[0 .. self.arena_used - freed], self.arena[freed..self.arena_used]);
+            @memmove(self.entries[0..kept], self.entries[dropped..self.entry_count]);
+            for (self.entries[0..kept]) |*entry| entry.offset -= freed;
+            self.arena_used -= freed;
+            self.entry_count = kept;
+            self.undo_count = kept;
+            assert(self.arena_used + bytes <= arena_cap);
         }
-        const last = self.entries[self.entry_count - 1];
-        assert(last.sealed);
-        self.arena_used = last.offset + last.old_len + last.new_len;
-    }
 
-    /// Drops the oldest entries until `bytes` more arena bytes (and a free slot, when
-    /// `slot`) fit, with one memmove (section 4). The open entry is never dropped.
-    fn make_room(self: *Buffer, bytes: u32, slot: bool) void {
-        assert(bytes <= arena_cap);
-        assert(self.undo_count == self.entry_count);
-        var dropped: u32 = 0;
-        var freed: u32 = 0;
-        while (dropped < self.entry_count) {
-            const fits = self.arena_used - freed + bytes <= arena_cap;
-            const room = !slot or self.entry_count - dropped < entry_cap;
-            if (fits and room) break;
-            dropped += 1;
-            freed = if (dropped < self.entry_count)
-                self.entries[dropped].offset
-            else
-                self.arena_used;
+        /// The text half of `replace`, also used by undo and redo (section 2).
+        fn apply(self: *Self, range: Range, utf8: []const u8) void {
+            const removed = range.end - range.start;
+            const inserted: u32 = @intCast(utf8.len);
+            assert(self.len - removed + inserted <= buffer_cap);
+            const first = self.line_of(range.start);
+            const last = self.line_of(range.end);
+            const tail_bytes = self.len - range.end;
+            @memmove(
+                self.bytes[range.start + inserted ..][0..tail_bytes],
+                self.bytes[range.end..self.len],
+            );
+            @memcpy(self.bytes[range.start..][0..inserted], utf8);
+            self.len = self.len - removed + inserted;
+            const added: u32 = @intCast(std.mem.count(u8, utf8, "\n"));
+            const tail = self.line_count - (last + 1);
+            assert(first + 1 + added + tail <= line_cap);
+            const target = first + 1 + added;
+            @memmove(self.line_starts[target..][0..tail], self.line_starts[last + 1 ..][0..tail]);
+            @memmove(self.states[target..][0..tail], self.states[last + 1 ..][0..tail]);
+            for (self.line_starts[target..][0..tail]) |*start| {
+                start.* = start.* - removed + inserted;
+            }
+            var line = first + 1;
+            for (utf8, 0..) |byte, index| {
+                if (byte != '\n') continue;
+                self.line_starts[line] = range.start + @as(u32, @intCast(index)) + 1;
+                line += 1;
+            }
+            assert(line == target);
+            self.line_count = target + tail;
+            self.retokenize(first, first + added);
+            self.longest = self.longest_line();
+            self.revision += 1;
+            assert(self.line_starts[0] == 0);
         }
-        if (dropped == 0) return;
-        if (self.open_index() != null) assert(dropped < self.entry_count);
-        self.mark_base = self.entries[dropped - 1].mark;
-        const kept = self.entry_count - dropped;
-        @memmove(self.arena[0 .. self.arena_used - freed], self.arena[freed..self.arena_used]);
-        @memmove(self.entries[0..kept], self.entries[dropped..self.entry_count]);
-        for (self.entries[0..kept]) |*entry| entry.offset -= freed;
-        self.arena_used -= freed;
-        self.entry_count = kept;
-        self.undo_count = kept;
-        assert(self.arena_used + bytes <= arena_cap);
-    }
 
-    /// The text half of `replace`, also used by undo and redo (section 2).
-    fn apply(self: *Buffer, range: Range, utf8: []const u8) void {
-        const removed = range.end - range.start;
-        const inserted: u32 = @intCast(utf8.len);
-        assert(self.len - removed + inserted <= buffer_cap);
-        const first = self.line_of(range.start);
-        const last = self.line_of(range.end);
-        const tail_bytes = self.len - range.end;
-        @memmove(
-            self.bytes[range.start + inserted ..][0..tail_bytes],
-            self.bytes[range.end..self.len],
-        );
-        @memcpy(self.bytes[range.start..][0..inserted], utf8);
-        self.len = self.len - removed + inserted;
-        const added: u32 = @intCast(std.mem.count(u8, utf8, "\n"));
-        const tail = self.line_count - (last + 1);
-        assert(first + 1 + added + tail <= line_cap);
-        const target = first + 1 + added;
-        @memmove(self.line_starts[target..][0..tail], self.line_starts[last + 1 ..][0..tail]);
-        @memmove(self.states[target..][0..tail], self.states[last + 1 ..][0..tail]);
-        for (self.line_starts[target..][0..tail]) |*start| {
-            start.* = start.* - removed + inserted;
+        /// Recomputes start states from line `first` on: through `last` always, then until a
+        /// computed start state equals the cached one (`language.zig`, section 1).
+        fn retokenize(self: *Self, first: u32, last: u32) void {
+            assert(first <= last);
+            assert(last < self.line_count);
+            var line = first;
+            while (line + 1 < self.line_count) : (line += 1) {
+                const state = language.end_state(L, self.line_bytes(line), self.states[line]);
+                if (line + 1 > last and self.states[line + 1] == state) break;
+                self.states[line + 1] = state;
+            }
+            assert(line < self.line_count);
         }
-        var line = first + 1;
-        for (utf8, 0..) |byte, index| {
-            if (byte != '\n') continue;
-            self.line_starts[line] = range.start + @as(u32, @intCast(index)) + 1;
-            line += 1;
-        }
-        assert(line == target);
-        self.line_count = target + tail;
-        self.retokenize(first, first + added);
-        self.longest = self.longest_line();
-        self.revision += 1;
-        assert(self.line_starts[0] == 0);
-    }
 
-    /// Recomputes start states from line `first` on: through `last` always, then until a
-    /// computed start state equals the cached one (tokenizer guide, section 1).
-    fn retokenize(self: *Buffer, first: u32, last: u32) void {
-        assert(first <= last);
-        assert(last < self.line_count);
-        var line = first;
-        while (line + 1 < self.line_count) : (line += 1) {
-            const state = tokenizer.end_state(self.line_bytes(line), self.states[line]);
-            if (line + 1 > last and self.states[line + 1] == state) break;
-            self.states[line + 1] = state;
+        fn longest_line(self: *const Self) u32 {
+            var longest: u32 = 0;
+            var line: u32 = 0;
+            while (line < self.line_count) : (line += 1) {
+                const range = self.line_range(line);
+                longest = @max(longest, range.end - range.start);
+            }
+            assert(longest <= self.len);
+            return longest;
         }
-        assert(line < self.line_count);
-    }
+    };
+}
 
-    fn longest_line(self: *const Buffer) u32 {
-        var longest: u32 = 0;
-        var line: u32 = 0;
-        while (line < self.line_count) : (line += 1) {
-            const range = self.line_range(line);
-            longest = @max(longest, range.end - range.start);
-        }
-        assert(longest <= self.len);
-        return longest;
-    }
-};
+/// The patch language's buffer, the editor's default.
+pub const Buffer = BufferOf(tokenizer);
 
 comptime {
     assert(arena_cap == 2 * buffer_cap);
@@ -697,6 +710,59 @@ test "a block comment edit re-tokenizes until the states settle" {
     try testing.expect(buffer.replace(span(5, 5), "*/", change_of(.other, 5, 7)));
     try testing.expectEqual(tokenizer.State.block_comment, buffer.states[1]);
     try testing.expectEqual(tokenizer.State.normal, buffer.states[2]);
+    buffer.verify();
+}
+
+/// A three-state test language: `>` raises the state one level and `<` lowers it, so a
+/// change ripples through later lines by level, not just on and off.
+const Levels = struct {
+    pub const State = enum(u8) { normal, one, two };
+    pub const Class = enum(u8) { word, shift };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 0, 0, 1 } };
+
+    pub fn next(line: []const u8, at_byte: *u32, state: *State) ?language.Token(Class) {
+        assert(at_byte.* <= line.len);
+        var index = at_byte.*;
+        while (index < line.len and line[index] == ' ') index += 1;
+        at_byte.* = index;
+        if (index == line.len) return null;
+        const start = index;
+        const byte = line[index];
+        at_byte.* = index + 1;
+        if (byte == '>') {
+            state.* = if (state.* == .normal) .one else .two;
+            return .{ .start = start, .end = start + 1, .class = .shift };
+        }
+        if (byte == '<') {
+            state.* = if (state.* == .two) .one else .normal;
+            return .{ .start = start, .end = start + 1, .class = .shift };
+        }
+        return .{ .start = start, .end = start + 1, .class = .word };
+    }
+};
+
+const levels_fixture = struct {
+    var buffer: BufferOf(Levels) = undefined;
+};
+
+// Locks re-tokenizing with three states: ">" on line 0 raises lines 1 to 3 to `one` and the
+// "<" on line 3 brings line 4 back to `normal`, its cached value, where the ripple stops; a
+// second ">" raises lines 1 to 3 to `two` and line 4 to `one`, and removing both restores
+// every line, as a full recomputation would (`verify`).
+test "a three-state language ripples by level and stops where states match" {
+    const buffer = &levels_fixture.buffer;
+    buffer.init();
+    try testing.expect(buffer.load("a\nb\nc\n<\nd"));
+    try testing.expect(buffer.replace(span(0, 0), ">", change_of(.other, 0, 1)));
+    const one = [_]Levels.State{ .normal, .one, .one, .one, .normal };
+    try testing.expectEqualSlices(Levels.State, &one, buffer.states[0..5]);
+    buffer.verify();
+    try testing.expect(buffer.replace(span(0, 0), ">", change_of(.other, 0, 1)));
+    const two = [_]Levels.State{ .normal, .two, .two, .two, .one };
+    try testing.expectEqualSlices(Levels.State, &two, buffer.states[0..5]);
+    buffer.verify();
+    try testing.expect(buffer.replace(span(0, 2), "", change_of(.other, 2, 0)));
+    for (buffer.states[0..5]) |state| try testing.expectEqual(Levels.State.normal, state);
     buffer.verify();
 }
 
