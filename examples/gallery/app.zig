@@ -14,7 +14,8 @@
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
 //! "containers" (step 34: splitters, a list box, and number boxes), "type" (step 36: an icon
 //! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
-//! dropped files, and a WAV's waveform; section 2c). Tooltips show on every knob of the
+//! dropped files, and a WAV's waveform; section 2c), and "surfaces" (step 39: gradients, rims,
+//! and shadows; section 2d). Tooltips show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
 //! ## 2. Layout (logical pixels)
@@ -92,6 +93,17 @@
 //! status line reports "drop 3 files", "file tone.wav done", "file long.wav cut", and "drop on
 //! nothing".
 //!
+//! ## 2d. Surfaces
+//! The surfaces page is `surfaces.zig`: a music-player-like screen of `draw.Surface`s alone, a
+//! faint gradient backdrop, a glass-like side panel and pill bar (translucent fill, rim-lit
+//! border, shadow; no blur), and six cards, each a diagonal gradient, a radial highlight, and a
+//! label pill, with shadows. Its colours come from the theme (muted cards in dark, pale tints in
+//! light), so the light toggle restyles it. Its surfaces draw on layer 1 and its text on
+//! layer 2, so the labels sit on the faces although the title bar put `Glyph` first. The pills,
+//! rows, and cards are clickable (`surfaces.zig`, section 1a): a pill or row becomes the
+//! selection ("pill Radio", "row Browse"), a card is named ("card Slate"), and each lights on
+//! hover and darkens on press through `kit.lit`.
+//!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
@@ -152,7 +164,10 @@
 //! `transport` (click play: its icon
 //! is pause). Files (section 2c): `files` (the files page, empty); `drop-hover` (files dragged
 //! over the zone: its border lit); `drop` (three files dropped on the zone: `tone.wav`, 96,044
-//! bytes of a 120 Hz tone in two chunks, `readme.txt`, and a folder: the tone's waveform). The
+//! bytes of a 120 Hz tone in two chunks, `readme.txt`, and a folder: the tone's waveform).
+//! Surfaces (section 2d): `surfaces` (the surfaces page, still); `surfaces-click` (click the
+//! Radio pill, the Browse row, and the Slate card, then rest on Moss: lit); `surfaces-light`
+//! (the light toggle, then the page: restyled from the light scheme). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -175,6 +190,7 @@ const bench = patchwork.bench;
 const hardware = @import("hardware.zig");
 const icons = @import("icons.zig");
 const files_page = @import("files.zig");
+const surfaces_page = @import("surfaces.zig");
 
 const Rect = quads.Rect;
 
@@ -286,12 +302,13 @@ const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
 const page_type: u32 = 3;
 const page_files: u32 = 4;
+const page_surfaces: u32 = 5;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -419,6 +436,9 @@ const rows_drawn_max: u32 = 7;
 const box_cap: u32 = 64;
 const arc_cap: u32 = 16;
 const glyph_cap: u32 = 2048;
+/// The surfaces page: the backdrop, the panel and a row, the bar and a pill, and three per
+/// card.
+const surface_cap: u32 = 32;
 const path_cap: u32 = 4;
 const point_cap: u32 = 2048;
 const dial_cap: u32 = 8;
@@ -473,6 +493,8 @@ pub const App = struct {
     transport: [transport_icons.len]IconButton,
     playing: bool,
     tools: [tool_icons.len]IconButton,
+    /// The surfaces page (section 2d): its selections and its clickables' animators.
+    surfaces: surfaces_page.Page,
     /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
     type_split: widgets.Splitter,
     wrap_view: ui.ViewState,
@@ -497,6 +519,7 @@ pub const App = struct {
             .{ .type = hardware.Led, .cap = led_cap },
             .{ .type = quads.Path, .cap = path_cap },
             .{ .type = quads.Waveform, .cap = 1 },
+            .{ .type = quads.Surface, .cap = surface_cap },
         },
         .area_cap = area_cap,
         .point_cap = point_cap,
@@ -527,6 +550,9 @@ pub const App = struct {
         .{ .name = "files", .setup = &files_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop-hover", .setup = &drop_hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop", .setup = &drop_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "surfaces", .setup = &surfaces_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "surfaces-click", .setup = &surfaces_click_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "surfaces-light", .setup = &surfaces_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -549,6 +575,7 @@ pub const App = struct {
         app.playing = false;
         app.type_split = widgets.Splitter.init(type_split_id, .horizontal, type_split_ratio, type_split_min_a, type_split_min_b);
         app.wrap_view = ui.ViewState.init();
+        app.surfaces.init();
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -675,6 +702,11 @@ pub const App = struct {
         app.container_events(cx, event_value);
         app.type_events(cx, event_value);
         if (app.drops.handle(cx, event_value)) |report| app.note(cx, report.slice());
+        if (app.surfaces.handle(cx, event_value)) |report| switch (report) {
+            .pill => |index| app.note(cx, &.{ "pill ", surfaces_page.pill_names[index] }),
+            .row => |index| app.note(cx, &.{ "row ", surfaces_page.row_names[index] }),
+            .card => |index| app.note(cx, &.{ "card ", surfaces_page.cards[index].name }),
+        };
         assert(app.status_len <= status_cap);
     }
 
@@ -842,6 +874,7 @@ pub const App = struct {
             page_containers => app.draw_containers(cx),
             page_type => app.draw_type(cx),
             page_files => app.drops.draw(cx, gap_px, group_padding, panel_paint(cx)),
+            page_surfaces => app.surfaces.draw(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -1536,6 +1569,35 @@ const wrap_scroll_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// A clickable of the surfaces page: `id` derived by `index`, a click or hover target.
+fn surface_target(id: ui.Id, name: []const u8, index: u32) bench.Target {
+    return .{ .id = id.derive(index), .name = name, .index = index };
+}
+
+/// `surfaces-click`: select the Radio pill and the Browse row, click the Slate card, then rest
+/// the pointer on Moss: its gradient lit, the status "card Slate".
+const surfaces_click_steps = [_]bench.Step{
+    .{ .click = tab(page_surfaces) },
+    .{ .click = surface_target(surfaces_page.pill_id, "surface pill", 2) },
+    .{ .click = surface_target(surfaces_page.row_id, "surface row", 1) },
+    .{ .click = surface_target(surfaces_page.card_id, "surface card", 0) },
+    .{ .hover = .{ .target = surface_target(surfaces_page.card_id, "surface card", 1), .x = 144, .y = 60 } },
+    .{ .wait = 12 },
+};
+
+/// `surfaces-light`: the light theme, then the surfaces page: its palette restyled.
+const surfaces_light_steps = [_]bench.Step{
+    .{ .click = bench.area("theme", 0) },
+    .{ .click = tab(page_surfaces) },
+    .{ .wait = 12 },
+};
+
+/// `surfaces`: the surfaces page, still (section 2d).
+const surfaces_steps = [_]bench.Step{
+    .{ .click = tab(page_surfaces) },
+    .{ .wait = 12 },
+};
+
 /// `type`: the type page, still (section 2b).
 const type_steps = [_]bench.Step{
     .{ .click = tab(page_type) },
@@ -2192,6 +2254,65 @@ test "the wrapped text scrolls only when it does not fit" {
     try std.testing.expectEqual(scrolled.wrap_view.max_scroll(), scrolled.wrap_view.scroll_y);
 }
 
+// Locks the `surfaces` scenario (section 2d): the sixth tab draws 23 surfaces (the backdrop,
+// the panel and its selected row, the bar and its selected pill, and three per card),
+// the first card's shadow grows its record by 30 px a side, and nothing overflows.
+test "the surfaces scenario draws the page of surfaces" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "surfaces");
+    try std.testing.expectEqual(page_surfaces, app.tabs.selected);
+    try std.testing.expectEqualStrings("page surfaces", app.status_text());
+    const drawn = test_context.draw.items(quads.Surface);
+    try std.testing.expectEqual(@as(usize, 23), drawn.len);
+    var card: ?quads.Surface = null;
+    for (drawn) |surface| {
+        if (surface.rect[0] == 320 - 30 and surface.rect[1] == 232 - 30) card = surface;
+    }
+    try std.testing.expectEqual([4]f32{ 290, 202, 348, 240 }, card.?.rect);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks the surfaces page's interaction (section 2d): a click on the Radio pill and on the
+// Browse row selects them, a click on Slate names it, and the pointer resting on Moss aims its
+// hover at 1 with no press (Slate's back at 0); the lit gradient leaves the count of surfaces at
+// 23.
+test "the surfaces-click scenario selects, names, and lights" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "surfaces-click");
+    try std.testing.expectEqual(@as(u32, 2), app.surfaces.pill);
+    try std.testing.expectEqual(@as(u32, 1), app.surfaces.row);
+    try std.testing.expectEqualStrings("card Slate", app.status_text());
+    try std.testing.expectEqual(surfaces_page.card_id.derive(1), test_context.hovered());
+    try std.testing.expectEqual(@as(f32, 1), app.surfaces.cards[1].hover.target);
+    try std.testing.expectEqual(@as(f32, 0), app.surfaces.cards[1].down.?.target);
+    try std.testing.expectEqual(@as(f32, 0), app.surfaces.cards[0].hover.target);
+    try std.testing.expectEqual(@as(usize, 23), test_context.draw.items(quads.Surface).len);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks `surfaces-light` (section 2d): after the light toggle the page's first card draws the
+// light palette's tinted stops, which are lighter than the dark ones, and the backdrop starts
+// above the light scheme's background.
+test "the surfaces-light scenario restyles the page from the light scheme" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "surfaces-light");
+    try std.testing.expect(app.light.on);
+    try std.testing.expectEqual(page_surfaces, app.tabs.selected);
+    const palette = surfaces_page.Palette.of(&theme.light);
+    var found = false;
+    for (test_context.draw.items(quads.Surface)) |surface| {
+        if (surface.rect[0] != 320 - 30 or surface.rect[1] != 232 - 30) continue;
+        found = true;
+        try std.testing.expect(surface.fill_a[0] > surfaces_page.cards[0].from[0]);
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(palette.backdrop_from[1] > theme.light.colors.background[1]);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
 test "the transport scenario turns play into pause" {
     const app = new_app();
     _ = frame(app);
@@ -2322,6 +2443,7 @@ test "a theme switch records one uniform write and one full repaint" {
 
 test {
     _ = hardware;
+    _ = surfaces_page;
 }
 
 comptime {

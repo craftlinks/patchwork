@@ -14,7 +14,7 @@
 //! ```text
 //! draw/registry.zig   DrawType, the instance convention check, WGSL assembly, layouts
 //! draw/prelude.wgsl   vs_main, fs_main, coverage, clip_mask, sdf_* shared by every type
-//! draw/types.zig      Box, Arc, Glyph, Image, Path, AppendError, and the CPU distance twins
+//! draw/types.zig      Box, Arc, Surface, Glyph, Image, Path, AppendError, and the CPU twins
 //! draw/pools.zig      Context: per-type pools, the point pool, layers, sort, sticky batches
 //! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
 //! draw/wave.zig       Waveform and Ring types, the waveform appender, the zoom pyramid
@@ -192,6 +192,12 @@ pub const Box = types.Box;
 /// `Box.of`'s look and `Arc.of`'s (`draw/types.zig`, section 5).
 pub const BoxLook = types.BoxLook;
 pub const ArcLook = types.ArcLook;
+/// A rounded rect with one gradient, a rim-lit border, and a soft shadow, and its look
+/// (`draw/types.zig`, section 6).
+pub const Surface = types.Surface;
+pub const SurfaceLook = types.SurfaceLook;
+pub const Gradient = types.Gradient;
+pub const Shadow = types.Shadow;
 pub const transparent = types.transparent;
 pub const Arc = types.Arc;
 pub const Glyph = types.Glyph;
@@ -205,6 +211,10 @@ pub const TargetKind = textures_module.TargetKind;
 pub const Point = pools.Point;
 pub const point_cap_max = pools.point_cap_max;
 pub const sdf_box = types.sdf_box;
+pub const erf = types.erf;
+pub const gradient_t = types.gradient_t;
+pub const mix_premultiplied = types.mix_premultiplied;
+pub const shadow_alpha = types.shadow_alpha;
 pub const sdf_segment = types.sdf_segment;
 pub const sdf_arc = types.sdf_arc;
 pub const contains_box = types.contains_box;
