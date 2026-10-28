@@ -17,7 +17,8 @@
 //! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
 //! dropped files, and a WAV's waveform; section 2c), "surfaces" (step 39: gradients, rims,
 //! and shadows; section 2d), and "glass" (step 40: backdrops, glass, and materials; section
-//! 2e). Tooltips show on every knob of the
+//! 2e), and "data" (step 42: a tree, a sortable table, and folding groups; section 2g). Tooltips
+//! show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
 //! ## 2. Layout (logical pixels)
@@ -128,6 +129,15 @@
 //! page's set (`icons.fields`). The status line reports "password changed" (never its text),
 //! "search saw", "wave Saw", and "checkbox 0 on".
 //!
+//! ## 2g. Data
+//! The data page is `data.zig` (step 42): a `widgets.TreeView` of the repository's own tree
+//! (folders bold, `patchwork` and `src` expanded) beside a `widgets.ColumnHeader` (name, kind,
+//! size) over a `widgets.ListBox` of the tree's folder's children, which the page sorts by the
+//! header, and a property grid of three `widgets.Disclosure`s (transform and appearance open,
+//! layout closed; appearance holds a checkbox). The status line reports "node widgets selected",
+//! "node widgets expanded", "open kit.zig", "sort size descending", "column name 280", "file
+//! kit.zig", and "group layout open".
+//!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
@@ -198,7 +208,10 @@
 //! `glass-light` (the light toggle, then the page). Form (section 2f): `form` (click Saw, tick
 //! "loop", click the password field and type "hunter2": seven bullets and the caret);
 //! `form-search` (click the mixed "all voices": on; click the search field and type "saw": the
-//! hint gone, the text after the icon). The
+//! hint gone, the text after the icon). Data (section 2g): `data` (the page, still); `tree`
+//! (click src, then Right, Down, Down, Right, Right, Down, Left: widgets expanded and selected,
+//! its nine files in the table); `sort` (src's children by size, descending, the name column
+//! 60 px wider); `groups` (transform closed, layout open). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -223,6 +236,7 @@ const icons = @import("icons.zig");
 const files_page = @import("files.zig");
 const surfaces_page = @import("surfaces.zig");
 const glass_page = @import("glass.zig");
+const data_page = @import("data.zig");
 
 const Rect = quads.Rect;
 
@@ -346,7 +360,7 @@ const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass", "data" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
@@ -354,6 +368,7 @@ const page_type: u32 = 3;
 const page_files: u32 = 4;
 const page_surfaces: u32 = 5;
 const page_glass: u32 = 6;
+const page_data: u32 = 7;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -486,12 +501,12 @@ const glyph_cap: u32 = 2048;
 const surface_cap: u32 = 40;
 /// The glass page: the sidebar, the bar, the transport, the lens, and the output list.
 const glass_cap: u32 = 8;
-const path_cap: u32 = 4;
+const path_cap: u32 = 48;
 const point_cap: u32 = 2048;
 const dial_cap: u32 = 8;
 const bevel_cap: u32 = 8;
 const led_cap: u32 = 4;
-const area_cap: u32 = 56;
+const area_cap: u32 = 128;
 
 /// A page under the tab bar: flowing down, a gap below the bar.
 const page_layout: ui.Layout = .{ .flow = .down, .spacing = gap_px, .padding = .sides(0, gap_px, 0, 0) };
@@ -548,6 +563,8 @@ pub const App = struct {
     tools: [tool_icons.len]IconButton,
     /// The surfaces page (section 2d): its selections and its clickables' animators.
     surfaces: surfaces_page.Page,
+    /// The data page (section 2g): the tree, the sortable table, and the property groups.
+    data: data_page.Page,
     /// The glass page (section 2e): its material, cards' view, output dropdown, and lens.
     glass: glass_page.Page,
     /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
@@ -616,6 +633,10 @@ pub const App = struct {
         .{ .name = "glass-light", .setup = &glass_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "form", .setup = &form_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "form-search", .setup = &form_search_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "data", .setup = &data_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tree", .setup = &tree_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "sort", .setup = &sort_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "groups", .setup = &groups_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -640,6 +661,7 @@ pub const App = struct {
         app.wrap_view = ui.ViewState.init();
         app.surfaces.init();
         app.glass.init(frame_rect);
+        app.data.init();
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -785,6 +807,7 @@ pub const App = struct {
             .row => |index| app.note(cx, &.{ "row ", surfaces_page.row_names[index] }),
             .card => |index| app.note(cx, &.{ "card ", surfaces_page.cards[index].name }),
         };
+        if (app.data.handle(cx, event_value)) |report| app.data_note(cx, report);
         if (app.glass.handle(cx, event_value)) |report| switch (report) {
             .material => |index| app.note(cx, &.{ "material ", glass_page.material_names[index] }),
             .output => |index| app.note(cx, &.{ "output ", glass_page.output_names[index] }),
@@ -795,6 +818,25 @@ pub const App = struct {
             },
         };
         assert(app.status_len <= status_cap);
+    }
+
+    /// The data page's report (section 2g) on the status line.
+    fn data_note(app: *App, cx: *Context, report: data_page.Report) void {
+        const names = data_page.entries;
+        switch (report) {
+            .selected => |node| app.note(cx, &.{ "node ", names[node].name, " selected" }),
+            .toggled => |toggled| app.note(cx, &.{ "node ", names[toggled.node].name, if (toggled.expanded) " expanded" else " collapsed" }),
+            .opened => |node| app.note(cx, &.{ "open ", names[node].name }),
+            .sorted => |sort| app.note(cx, &.{ "sort ", data_page.columns[sort.column].label, if (sort.descending) " descending" else " ascending" }),
+            .resized => |resized| {
+                var digits: [8]u8 = undefined;
+                const width = std.fmt.bufPrint(&digits, "{d:.0}", .{resized.width}) catch unreachable;
+                app.note(cx, &.{ "column ", data_page.columns[resized.column].label, " ", width });
+            },
+            .file => |node| app.note(cx, &.{ "file ", names[node].name }),
+            .group => |group| app.note(cx, &.{ "group ", data_page.group_names[group.index], if (group.open) " open" else " closed" }),
+            .visible => |on| app.note(cx, &.{ "visible ", if (on) "on" else "off" }),
+        }
     }
 
     /// The form group (section 2): the password field reports only that it changed, never its
@@ -990,6 +1032,7 @@ pub const App = struct {
             page_files => app.drops.draw(cx, gap_px, group_padding, panel_paint(cx)),
             page_surfaces => app.surfaces.draw(cx),
             page_glass => app.glass.draw(cx),
+            page_data => app.data.draw(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -1802,6 +1845,52 @@ const glass_light_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `data`: the data page, still (section 2g).
+const data_steps = [_]bench.Step{
+    .{ .click = tab(page_data) },
+    .{ .wait = 12 },
+};
+
+/// Visible row `row` of the data page's tree, a click target.
+fn tree_row(row: u32) bench.Target {
+    return .{ .id = data_page.tree_id.derive(widgets.list_row_salt + row), .name = "tree row", .index = row };
+}
+
+/// `tree` (section 2g): click "src" (row 2), Right into its first child (draw), Down twice to
+/// widgets, Right to expand it, Right into checkbox.zig, Down to column_header.zig, and Left
+/// back out to widgets: the table lists widgets' nine files.
+const tree_steps = [_]bench.Step{
+    .{ .click = tab(page_data) },
+    .{ .click = tree_row(2) },
+    .{ .key = .{ .key = .right, .text = "" } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .key = .{ .key = .right, .text = "" } },
+    .{ .key = .{ .key = .right, .text = "" } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .key = .{ .key = .left, .text = "" } },
+    .{ .wait = 12 },
+};
+
+/// `sort` (section 2g): select "src", sort its children by size (ascending, then descending),
+/// and drag the name column's right edge 60 px right.
+const sort_steps = [_]bench.Step{
+    .{ .click = tab(page_data) },
+    .{ .click = tree_row(2) },
+    .{ .click = .{ .id = data_page.header_id.derive(2), .name = "header size", .index = 2 } },
+    .{ .click = .{ .id = data_page.header_id.derive(2), .name = "header size", .index = 2 } },
+    .{ .drag = .{ .target = .{ .id = data_page.header_id.derive(widgets.column_divider_salt), .name = "header divider", .index = 0 }, .from_x = 4, .from_y = 14, .dx = 60, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `groups` (section 2g): close "transform", open "layout", and let the chevrons settle.
+const groups_steps = [_]bench.Step{
+    .{ .click = tab(page_data) },
+    .{ .click = bench.area("group", 0) },
+    .{ .click = bench.area("group", 2) },
+    .{ .wait = 12 },
+};
+
 /// `surfaces`: the surfaces page, still (section 2d).
 const surfaces_steps = [_]bench.Step{
     .{ .click = tab(page_surfaces) },
@@ -1924,6 +2013,15 @@ comptime {
     // each.
     assert(2 <= path_cap and 2 * 3 <= point_cap);
     assert(checkbox_names.len <= path_cap and 3 * checkbox_names.len <= point_cap);
+    // The data page (section 2g): its tree shows at most ceil(540 / 24) + 1 = 24 rows, each
+    // with a row area and a chevron (area and Path), beside the header's 3 cells and 2
+    // dividers, the table's rows, two views with thumbs, three group headers and their
+    // chevrons, and the checkbox and its mark.
+    assert(data_page.tree_w + data_page.table_w + data_page.props_w + 2 * data_page.gap_px == inner_w);
+    const tree_rows_max: u32 = 24;
+    const data_areas = chrome + 2 * 2 + 2 * tree_rows_max + 3 + 2 + data_page.children_max + 3 + 1;
+    assert(data_areas <= area_cap);
+    assert(tree_rows_max + 3 + 1 <= path_cap and 3 * (tree_rows_max + 4) <= point_cap);
     // The form group: two field columns and the checkboxes' column fit its inner width; two
     // captioned fields fit its inner height, as do the caption and the checkboxes.
     const form_w = inner_w - 2 * narrow_px - 2 * gap_px - 2 * group_padding;
@@ -2226,6 +2324,68 @@ test "the form-search scenario turns the mixed box on and searches" {
     try std.testing.expectEqualStrings("saw", app.search.bytes());
     try std.testing.expectEqualStrings("search saw", app.status_text());
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks the data page's layout (section 2g): the tree under its caption at (24, 140), 284 x
+// 540, with 14 rows (patchwork and src expanded); the header at (332, 140), 596 x 28, over the
+// table of the root's five children; the first group's header at (952, 112), 304 x 28.
+test "the data page lays out the tree, the table, and the groups" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "data");
+    try expect_rect(area_rect(data_page.tree_id), 24, 140, 284, 540);
+    try std.testing.expectEqual(@as(u32, 14), app.data.tree.count);
+    try expect_rect(area_rect(data_page.header_id.derive(0)), 332, 140, 220, 28);
+    try expect_rect(app.data.header.drawn, 332, 140, 596, 28);
+    try expect_rect(area_rect(data_page.table_id), 332, 176, 596, 504);
+    try std.testing.expectEqual(@as(u32, 5), app.data.file_count);
+    try expect_rect(area_rect(ui.id("group", 0)), 952, 112, 304, 28);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the `tree` scenario (section 2g): the keys end on widgets, expanded and selected, and
+// the table lists its nine files.
+test "the tree scenario walks into widgets with the keys" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tree");
+    try std.testing.expectEqual(@as(?u32, data_page.node_widgets), app.data.tree.selected);
+    try std.testing.expect(app.data.nodes[data_page.node_widgets].expanded);
+    try std.testing.expectEqual(data_page.node_widgets, app.data.folder);
+    try std.testing.expectEqual(@as(u32, 9), app.data.file_count);
+    try std.testing.expectEqualStrings("node widgets selected", app.status_text());
+}
+
+// Locks the `sort` scenario (section 2g): src's children sorted by size descending put draw
+// (the largest folder) first and widgets.zig's 18.8 KB after the folders; the name column is
+// 280 wide.
+test "the sort scenario sorts by size and widens the name column" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "sort");
+    try std.testing.expectEqual(widgets.ColumnSort{ .column = 2, .descending = true }, app.data.header.sort.?);
+    try std.testing.expectEqual(@as(u32, 11), app.data.files[0]);
+    try std.testing.expectEqual(@as(u32, 8), app.data.file_count);
+    var index: u32 = 1;
+    while (index < app.data.file_count) : (index += 1) {
+        try std.testing.expect(app.data.sizes[app.data.files[index - 1]] >= app.data.sizes[app.data.files[index]]);
+    }
+    try std.testing.expectEqual(@as(f32, 280), app.data.header.columns[0].width);
+    try std.testing.expectEqualStrings("column name 280", app.status_text());
+}
+
+// Locks the `groups` scenario (section 2g): transform closed, layout open with its chevron
+// aimed down, and the status line on the last.
+test "the groups scenario folds transform and opens layout" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "groups");
+    try std.testing.expect(!app.data.groups[0].open);
+    try std.testing.expect(app.data.groups[1].open);
+    try std.testing.expect(app.data.groups[2].open);
+    try std.testing.expectEqual(@as(f32, 1), app.data.groups[2].turn.target);
+    try std.testing.expectEqualStrings("group layout open", app.status_text());
 }
 
 // Locks the `dropdown` scenario (section 4): the click opens the wave list with "sine"
@@ -2787,6 +2947,7 @@ test {
     _ = hardware;
     _ = surfaces_page;
     _ = glass_page;
+    _ = data_page;
 }
 
 comptime {

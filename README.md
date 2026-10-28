@@ -68,8 +68,8 @@ point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Paragraph`, `Button`,
 `Toggle`, `Checkbox`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`,
-`Dropdown`, `Tooltip`), and the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
-`ListBox`, `NumberBox`);
+`Dropdown`, `Tooltip`), the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
+`ListBox`, `NumberBox`), and trees and tables (`TreeView`, `Disclosure`, `ColumnHeader`);
 the code editor
 (`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
 when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
@@ -138,6 +138,9 @@ patchwork/
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
 │   ├── widgets/list_box.zig    # ListBox: a virtual list with selection, keys, scroll-into-view
 │   ├── widgets/number_box.zig  # NumberBox: drag, wheel, or type a value with a unit
+│   ├── widgets/tree_view.zig   # TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
+│   ├── widgets/disclosure.zig  # Disclosure: a header with a chevron over a section drawn while open
+│   ├── widgets/column_header.zig # ColumnHeader: resizable, sortable columns and a row's spans
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
@@ -630,7 +633,9 @@ A widget's behaviour (its fields, `handle`, and actions) is written once; how it
 where it takes presses belong to a skin, a struct of draw functions passed at compile time.
 `widgets.Knob` is `widgets.KnobOf(widgets.skins.Default)`; `ButtonOf`, `SliderOf`, `ToggleOf`,
 `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`,
-`DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, and `NumberBoxOf` work the same way. A
+`DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TreeViewOf` (its bands are
+the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, and `ColumnHeaderOf` work
+the same way. A
 `TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
@@ -771,6 +776,34 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
       .none => {},
   }
   ```
+
+### Trees and Tables
+
+- **TreeView.** `widgets.TreeView(capacity)` over a slice of `widgets.TreeNode` the app owns
+  (`parent`, `expanded`, `has_children`) in pre-order: a parent before its children, every
+  subtree contiguous. Each draw flattens the visible rows in one linear pass with a fixed stack
+  (at most 32 deep, no recursion) into a `ListBox`, so the rows, wheel, and Up, Down, Page Up,
+  Page Down, Home, and End are the list box's. `next` hands each row its node, depth, and the
+  content rect after the indent and chevron. A chevron press toggles its node; Right expands a
+  collapsed parent or steps into an expanded one's first child; Left collapses or steps out to
+  the parent; a double click or Enter toggles a parent and activates a leaf. The selection is
+  a node, so it survives re-flattening; a collapse that hides it moves it to the ancestor.
+
+  ```zig
+  _ = app.tree.begin(cx, ui.sized(.fill, .fill));
+  while (app.tree.next(cx)) |row| kit.label(cx, style, names[row.node], row.rect, row.clip, start);
+  app.tree.end(cx);
+  ```
+- **Disclosure.** `if (group.begin(cx, ui.sized(.fill, .fit), .{ .flow = .down })) { ... }`
+  then `group.end(cx)`: a 28 px header with a chevron that eases between closed and open, over
+  a section the app draws only while open; with a fit height it folds. A click, or Space or
+  Enter while focused, flips it (`Action.toggled`).
+- **ColumnHeader.** Up to 16 labelled columns, each with a width and a minimum; the last spans
+  the rest. A click on a label sorts by it (again flips the direction, `Action.sorted`), the
+  right edge of every column but the last drags to resize within its minimum and the room the
+  other columns leave (`Action.resized`; a double press restores it), and `cell(row_rect, i)`
+  is the span a table's row draws column `i` into. The header sorts nothing: the app sorts
+  its rows by `sort`.
 
 ## Example Applications
 
@@ -1003,6 +1036,9 @@ blue.
   "done", "folder"), and the first WAV among them decoded chunk by chunk
   (`examples/gallery/wav.zig`) and drawn as a waveform. A WAV longer than 21.8 s cancels itself
   at the sample cap ("cut at 21.8 s"); other files are counted, not stored.
+- **data** (step 42, see Trees and Tables): a project tree of the repository's own files beside
+  a table of the selected folder's children under a name / kind / size `ColumnHeader` (the page
+  sorts them), and a property grid of three `Disclosure` groups (`examples/gallery/data.zig`).
 - **glass** (step 40, see Backdrops and Glass): sixteen album cards (gradients between the
   scheme's accents) scroll in a view under a glass sidebar (`widgets.Panel` with the page's
   material), a segmented bar that picks it (Clear, Frosted, Tinted, Solid), and a transport
@@ -1035,7 +1071,10 @@ Slate card clicked, then Moss hovered), and `surfaces-light` (the page in the li
 `glass` (frosted), `glass-scroll` (the wheel every frame, for benches), `glass-popup` (the
 output list over the sidebar), `glass-clear`, and `glass-light` for the glass page; `form`
 (Saw picked, "loop" ticked, "hunter2" typed into the password field: seven bullets) and
-`form-search` (the mixed box turned on, "saw" typed into the search field) for the form group.
+`form-search` (the mixed box turned on, "saw" typed into the search field) for the form group;
+and `data` (the page), `tree` (keys from src into widgets, expanded), `sort` (src's children by
+size, descending, and the name column dragged wider), and `groups` (transform closed, layout
+opened) for the data page.
 
 ## File Drops
 

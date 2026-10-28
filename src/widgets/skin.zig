@@ -44,6 +44,10 @@
 //! ListBoxOf(S)    list_row(cx, ListRowLook)            void     the band under one row
 //! NumberBoxOf(S)  number_face(cx, NumberLook)          ?Shape
 //!                 field(cx, FieldLook)                 void     its editor is TextFieldOf(S)
+//! TreeViewOf(S)   list_row(cx, ListRowLook)            void     its rows are ListBoxOf(S)
+//!                 tree_chevron(cx, ChevronLook)        void     a parent's chevron
+//! DisclosureOf(S) disclosure(cx, DisclosureLook)       ?Shape   the header
+//! ColumnHeaderOf(S) header_cell(cx, HeaderCellLook)    ?Shape   one column's cell
 //! ```
 //! `check` reads the table of each widget's functions (`functions_of`), in this order.
 //! - A look carries values, never the widget, so a skin cannot change state. Animator values
@@ -103,6 +107,8 @@ const tabs_file = @import("tabs.zig");
 const splitter_file = @import("splitter.zig");
 const list_box_file = @import("list_box.zig");
 const number_box_file = @import("number_box.zig");
+const disclosure_file = @import("disclosure.zig");
+const column_header_file = @import("column_header.zig");
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -261,6 +267,36 @@ pub const ListRowLook = struct {
     hovered: bool,
 };
 
+/// A tree row's chevron: its cell, `turn` from 0 (pointing right, collapsed) to 1 (down,
+/// expanded), and whether the pointer is on it.
+pub const ChevronLook = struct {
+    rect: Rect,
+    clip: Clip,
+    turn: f32,
+    hovered: bool,
+};
+
+/// A disclosure's header: its label, the chevron's eased `turn` (0 closed, 1 open), the raw
+/// hover value, and whether it has keyboard focus.
+pub const DisclosureLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    turn: f32,
+    hover: f32,
+    focused: bool,
+};
+
+/// One column header cell: its label, `sorted` (null, or whether it sorts descending), and
+/// whether the pointer is on it.
+pub const HeaderCellLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    sorted: ?bool,
+    hovered: bool,
+};
+
 /// A number box's face: the formatted value, its unit, and the raw hover value.
 pub const NumberLook = struct {
     rect: Rect,
@@ -286,6 +322,9 @@ pub const Kind = enum {
     splitter,
     list_box,
     number_box,
+    tree,
+    disclosure,
+    column_header,
 };
 
 /// One skin function: its name, its look's type and name, and whether it returns the hit
@@ -337,6 +376,27 @@ fn functions_of(comptime widget: Kind) []const Function {
             .{ .name = "number_face", .look = "NumberLook", .Look = NumberLook, .shape = true },
             .{ .name = "field", .look = "FieldLook", .Look = FieldLook, .shape = false },
         },
+        .tree => &.{
+            .{ .name = "list_row", .look = "ListRowLook", .Look = ListRowLook, .shape = false },
+            .{
+                .name = "tree_chevron",
+                .look = "ChevronLook",
+                .Look = ChevronLook,
+                .shape = false,
+            },
+        },
+        .disclosure => &.{.{
+            .name = "disclosure",
+            .look = "DisclosureLook",
+            .Look = DisclosureLook,
+            .shape = true,
+        }},
+        .column_header => &.{.{
+            .name = "header_cell",
+            .look = "HeaderCellLook",
+            .Look = HeaderCellLook,
+            .shape = true,
+        }},
     };
 }
 
@@ -413,6 +473,25 @@ fn mix(a: [4]f32, b: [4]f32, amount: f32) [4]f32 {
     var out: [4]f32 = undefined;
     for (&out, a, b) |*channel, from, to| channel.* = from + (to - from) * amount;
     return out;
+}
+
+/// The chevrons' half length, in logical pixels.
+const chevron_half: f32 = 4;
+
+/// A chevron centred in `rect` turned by `turn`, in the text colour (lit while `lit`), or the
+/// "+" / "−" glyph without `draw.Path`.
+fn chevron_in(cx: anytype, rect: Rect, clip: Clip, turn: f32, lit: bool) void {
+    assert(turn >= 0 and turn <= 1);
+    assert(rect.width > 0);
+    const scheme = cx.theme();
+    const colors = &scheme.colors;
+    const color = if (lit) mix(colors.text, colors.lighten, scheme.hover_lighten) else colors.text;
+    const centre: [2]f32 = .{ rect.x + rect.width * 0.5, rect.y + rect.height * 0.5 };
+    if (kit.chevron(cx, centre, chevron_half, turn, clip, color)) return;
+    const sign = if (turn >= 0.5) "\u{2212}" else "+";
+    var style = scheme.name;
+    style.color = color;
+    kit.label(cx, style, sign, rect, clip, kit.centered);
 }
 
 /// A checkbox label starts at its box's left and is centred vertically, never cut.
@@ -784,6 +863,96 @@ pub const Default = struct {
             .fill = if (look.selected) colors.selection else colors.track,
             .radius = list_box_file.list_row_radius,
         });
+    }
+
+    /// A chevron centred in the cell in `colors.text` (lightened toward `colors.lighten` while
+    /// hovered), turned by `turn` (`kit.chevron`); without `draw.Path`, "+" closed or "−" open
+    /// in the name style.
+    pub fn tree_chevron(cx: anytype, look: ChevronLook) void {
+        assert(look.turn >= 0 and look.turn <= 1);
+        assert(look.rect.width > 0);
+        chevron_in(cx, look.rect, look.clip, look.turn, look.hovered);
+    }
+
+    /// The header in `colors.track` (lightened by hover) with a one-pixel `colors.focus` border
+    /// while focused, the chevron in its left cell turned by `turn`, and the label in the name
+    /// style's bold face. The header is the hit shape.
+    pub fn disclosure(cx: anytype, look: DisclosureLook) ?Shape {
+        assert(look.turn >= 0 and look.turn <= 1);
+        assert(look.rect.width > 0);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        const radius = disclosure_file.disclosure_radius;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.track,
+            .border_color = colors.focus,
+            .border_width = if (look.focused) field_file.field_border_px else 0,
+            .radius = radius,
+            .hover = kit.weight(look.hover, scheme.hover_lighten),
+        });
+        const cell: Rect = .{
+            .x = look.rect.x,
+            .y = look.rect.y,
+            .width = disclosure_file.disclosure_chevron_w,
+            .height = look.rect.height,
+        };
+        chevron_in(cx, cell, look.clip, look.turn, false);
+        const start = disclosure_file.disclosure_chevron_w;
+        const label: Rect = .{
+            .x = look.rect.x + start,
+            .y = look.rect.y,
+            .width = @max(0, look.rect.width - start),
+            .height = look.rect.height,
+        };
+        var style = scheme.name;
+        style.face = .sans_bold;
+        if (label.width > 0) {
+            kit.label(cx, style, look.label, label, look.clip, checkbox_text_options);
+        }
+        return .{ .rect = look.rect, .radius = radius };
+    }
+
+    /// The cell in `colors.track` (lightened while hovered), a one-pixel `colors.control` line
+    /// at its right, the label at the left inside `header_pad_x`, and on the sorted column "↑"
+    /// (ascending) or "↓" (descending) at the right, in the mono face (Noto Sans has no arrows).
+    /// The cell is the hit shape.
+    pub fn header_cell(cx: anytype, look: HeaderCellLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.track,
+            .hover = if (look.hovered) scheme.hover_lighten else 0,
+        });
+        const line_px = column_header_file.header_line_px;
+        const line: Rect = .{
+            .x = look.rect.x + look.rect.width - line_px,
+            .y = look.rect.y,
+            .width = line_px,
+            .height = look.rect.height,
+        };
+        kit.face(cx, line, look.clip, .{ .fill = colors.control });
+        var inner = ui.cx.inset(look.rect, .xy(column_header_file.header_pad_x, 0));
+        if (look.sorted) |descending| {
+            const arrow = if (descending) "\u{2193}" else "\u{2191}";
+            const at_end: text.Options = .{
+                .align_x = .end,
+                .align_y = .center,
+                .ellipsis = false,
+            };
+            // Only the mono face has the arrows; it takes the name style's size and colour.
+            var style = scheme.value;
+            style.size = scheme.name.size;
+            style.color = scheme.name.color;
+            if (inner.width > 0) kit.label(cx, style, arrow, inner, look.clip, at_end);
+            inner.width -= @ceil(text.measure(style, arrow)) + 4;
+        }
+        if (inner.width > 0) {
+            const options = column_header_file.header_text_options;
+            kit.label(cx, scheme.name, look.label, inner, look.clip, options);
+        }
+        return .{ .rect = look.rect, .radius = 0 };
     }
 
     /// A field-like face (`colors.track`, a one-pixel `colors.control` border, lightened by
