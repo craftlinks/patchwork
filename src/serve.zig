@@ -16,8 +16,11 @@
 //!   `build.zig` (`add_serve`) passes them. Relative paths resolve against the working
 //!   directory.
 //! - Routes are exact path matches after the query string is dropped. Anything else gets 404.
-//! - The server binds loopback only on `listen_port`, handles one connection at a time, and
-//!   closes each connection after one response. That is sufficient for a single developer
+//! - The server binds loopback only, on `listen_port` (8080) or on the port the environment
+//!   variable `PATCHWORK_SERVE_PORT` names (decimal, 1 to 65535; anything else fails at
+//!   startup), handles one connection at a time, and closes each connection after one
+//!   response. The variable lets a tool (`tools/browser_check.py`) run its own server beside
+//!   one already on 8080. That is sufficient for a single developer
 //!   browser and keeps the control flow bounded.
 //!
 //! ## 3. TigerStyle Invariants
@@ -35,6 +38,8 @@ const header_cap: u32 = 4096;
 const file_cap: u32 = 4 * 1024 * 1024;
 /// Loopback TCP port. A fixed port keeps the URL stable between runs.
 const listen_port: u16 = 8080;
+/// The environment variable that overrides `listen_port`.
+pub const port_env: []const u8 = "PATCHWORK_SERVE_PORT";
 
 const Paths = struct {
     index: []const u8,
@@ -45,6 +50,7 @@ const Paths = struct {
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const paths = try parse_paths(init.args);
+    const port = try port_of(std.process.Environ.getPosix(init.environ, port_env));
     var threaded: std.Io.Threaded = .init(std.mem.Allocator.failing, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
         .async_limit = .nothing,
@@ -55,7 +61,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     defer threaded.deinit();
     const io = threaded.io();
-    try serve_forever(io, paths);
+    try serve_forever(io, paths, port);
+}
+
+/// The port to listen on: `listen_port` without the variable, else its decimal value.
+pub fn port_of(value: ?[]const u8) error{BadPort}!u16 {
+    const text = value orelse return listen_port;
+    if (text.len == 0 or text.len > 5) return error.BadPort;
+    var port: u32 = 0;
+    for (text) |byte| {
+        if (byte < '0' or byte > '9') return error.BadPort;
+        port = port * 10 + (byte - '0');
+    }
+    if (port == 0 or port > std.math.maxInt(u16)) return error.BadPort;
+    assert(port <= 65535);
+    return @intCast(port);
 }
 
 /// Reads the four required file paths from the command line, in the order the module guide
@@ -72,8 +92,9 @@ fn parse_paths(args: std.process.Args) !Paths {
     return .{ .index = index, .shell = shell, .wasm = wasm, .worklet = worklet };
 }
 
-fn serve_forever(io: std.Io, paths: Paths) !void {
-    var address = try std.Io.net.IpAddress.parse("127.0.0.1", listen_port);
+fn serve_forever(io: std.Io, paths: Paths, listen: u16) !void {
+    assert(listen != 0);
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", listen);
     var server = try address.listen(io, .{
         .kernel_backlog = 1,
         .reuse_address = true,
@@ -213,4 +234,15 @@ fn strip_query(target: []const u8) []const u8 {
     const q = std.mem.findScalar(u8, target, '?') orelse return target;
     assert(q <= target.len);
     return target[0..q];
+}
+
+// Locks the port override (section 2): no variable is 8080; a decimal port in 1 to 65535 is
+// taken; empty, zero, too large, signed, or non-decimal values are refused.
+test "the serve port comes from the environment or defaults to 8080" {
+    try std.testing.expectEqual(@as(u16, 8080), try port_of(null));
+    try std.testing.expectEqual(@as(u16, 8123), try port_of("8123"));
+    try std.testing.expectEqual(@as(u16, 65535), try port_of("65535"));
+    for ([_][]const u8{ "", "0", "65536", "123456", "-1", "80a", " 80" }) |bad| {
+        try std.testing.expectError(error.BadPort, port_of(bad));
+    }
 }

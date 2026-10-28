@@ -7,4 +7,5 @@ test {
     _ = @import("host/xkb.zig");
     _ = @import("host/audio_thread.zig");
     _ = @import("host/dnd_test.zig");
+    _ = @import("serve.zig");
 }
