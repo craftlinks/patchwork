@@ -4,9 +4,9 @@
 //!
 //! ## 1. Behaviour and Look
 //! A library widget is generic over a skin: `KnobOf(Skin)`, `ButtonOf(Skin)`, `SliderOf(Skin)`,
-//! `ToggleOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, `TextFieldOf(Skin)`, `MenuOf(Skin)` (and
-//! `ContextMenuOf`), `DropdownOf(Skin)`, `TabsOf(Skin)`, `SplitterOf(Skin)`, `ListBoxOf(Skin)`,
-//! and `NumberBoxOf(Skin)`. The behaviour
+//! `ToggleOf(Skin)`, `CheckboxOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, `TextFieldOf(Skin)`,
+//! `MenuOf(Skin)` (and `ContextMenuOf`), `DropdownOf(Skin)`, `TabsOf(Skin)`, `SplitterOf(Skin)`,
+//! `ListBoxOf(Skin)`, and `NumberBoxOf(Skin)`. The behaviour
 //! (fields, `init`, `handle`, `Action`) is written once in the widget's file. Its `draw` asks
 //! the turtle for the box, culls it, builds a look struct of plain values, and hands it to the
 //! skin, which appends the instances and returns the hit shape the behaviour records:
@@ -31,6 +31,7 @@
 //!                 slider_travel(area: Rect)            [2]f32   the x span a press maps onto
 //! KnobOf(S)       knob(cx, KnobLook)                   ?Shape
 //! ToggleOf(S)     toggle(cx, ToggleLook)               ?Shape
+//! CheckboxOf(S)   checkbox(cx, CheckboxLook)           ?Shape
 //! MeterOf(S)      meter(cx, MeterLook)                 void     passive
 //! PanelOf(S)      panel(cx, PanelLook)                 void     passive
 //! TextFieldOf(S)  field(cx, FieldLook)                 void     the face and border only
@@ -73,6 +74,12 @@
 //! layer follows first appearance, so each appends in exactly the order it always did. The
 //! geometry helpers (`ring_sized`, `name_box`, `pill_of`, ...) stay in the widget files.
 //!
+//! ## 4a. `Segmented`
+//! The library's second skin, for `TabsOf` only: `widgets.Segmented` is
+//! `TabsOf(skins.Segmented)`. It declares `tab_arrange = .even` (`widgets/tabs.zig`, section
+//! 2a), the one optional declaration `check` reads besides the functions: when present it
+//! must be a `widgets.TabArrange`.
+//!
 //! ## 5. TigerStyle Invariants
 //! - Skin functions are stateless: everything they need is in the look and `cx.theme()`.
 //! - `check` runs at compile time only; a skin that does not satisfy it does not compile.
@@ -87,6 +94,7 @@ const theme = @import("../theme.zig");
 const slider_file = @import("slider.zig");
 const knob_file = @import("knob.zig");
 const toggle_file = @import("toggle.zig");
+const checkbox_file = @import("checkbox.zig");
 const meter_file = @import("meter.zig");
 const field_file = @import("text_field.zig");
 const menu_file = @import("menu.zig");
@@ -148,6 +156,18 @@ pub const ToggleLook = struct {
     thumb: f32,
     hover: f32,
     name: []const u8,
+};
+
+/// A checkbox row: its label, the check's eased value in `[0, 1]`, whether it is mixed, the raw
+/// hover value, and whether it has keyboard focus.
+pub const CheckboxLook = struct {
+    row: Rect,
+    clip: Clip,
+    label: []const u8,
+    check: f32,
+    mixed: bool,
+    hover: f32,
+    focused: bool,
 };
 
 /// A meter row: the level, the track's height, and the name.
@@ -256,6 +276,7 @@ pub const Kind = enum {
     slider,
     knob,
     toggle,
+    checkbox,
     meter,
     panel,
     field,
@@ -288,6 +309,9 @@ fn functions_of(comptime widget: Kind) []const Function {
         .knob => &.{.{ .name = "knob", .look = "KnobLook", .Look = KnobLook, .shape = true }},
         .toggle => &.{
             .{ .name = "toggle", .look = "ToggleLook", .Look = ToggleLook, .shape = true },
+        },
+        .checkbox => &.{
+            .{ .name = "checkbox", .look = "CheckboxLook", .Look = CheckboxLook, .shape = true },
         },
         .meter => &.{.{ .name = "meter", .look = "MeterLook", .Look = MeterLook, .shape = false }},
         .panel => &.{.{ .name = "panel", .look = "PanelLook", .Look = PanelLook, .shape = false }},
@@ -329,6 +353,11 @@ pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
             result;
         const params: []const ?type = &.{ null, function.Look };
         if (problem(S, function.name, params, Result, shown, result)) |message| return message;
+    }
+    if (widget == .tabs and @hasDecl(S, "tab_arrange")) {
+        if (@TypeOf(S.tab_arrange) != tabs_file.TabArrange) {
+            return @typeName(S) ++ ": `tab_arrange` must be a `widgets.TabArrange`";
+        }
     }
     if (widget != .slider) return null;
     const travel = "pub fn slider_travel(area: widgets.Rect) [2]f32";
@@ -376,6 +405,22 @@ pub fn travel_value(travel: [2]f32, x: f32) f32 {
     assert(unit <= 1);
     return unit;
 }
+
+/// `a` moved toward `b` by `amount` in `[0, 1]`, alpha included.
+fn mix(a: [4]f32, b: [4]f32, amount: f32) [4]f32 {
+    assert(amount >= 0);
+    assert(amount <= 1);
+    var out: [4]f32 = undefined;
+    for (&out, a, b) |*channel, from, to| channel.* = from + (to - from) * amount;
+    return out;
+}
+
+/// A checkbox label starts at its box's left and is centred vertically, never cut.
+const checkbox_text_options: text.Options = .{
+    .align_x = .start,
+    .align_y = .center,
+    .ellipsis = false,
+};
 
 /// The library's look (section 4): `widgets.Knob` is `KnobOf(Default)`, and so on.
 pub const Default = struct {
@@ -462,6 +507,62 @@ pub const Default = struct {
         const side_box = knob_file.side_box(look.row);
         kit.label(cx, scheme.name, look.name, side_box, look.clip, kit.centered);
         return .{ .rect = pill, .radius = pill_radius };
+    }
+
+    /// The box in `colors.track` moving toward `colors.focus` with the check (all the way when
+    /// mixed), lightened by hover, its border `colors.focus` while focused, the fill once
+    /// checked, and `colors.control` otherwise; then the mark in `colors.panel` at the check's
+    /// alpha (a `draw.Path`, or a small square without one) or the mixed bar; then the label in
+    /// the name style. The box and the label are the hit shape.
+    pub fn checkbox(cx: anytype, look: CheckboxLook) ?Shape {
+        assert(look.check >= 0);
+        assert(look.check <= 1);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        const box = checkbox_file.box_of(look.row);
+        const amount: f32 = if (look.mixed) 1 else look.check;
+        const fill = mix(colors.track, colors.focus, amount);
+        const border = if (look.focused)
+            colors.focus
+        else
+            mix(colors.control, colors.focus, amount);
+        kit.face(cx, box, look.clip, .{
+            .fill = fill,
+            .border_color = border,
+            .border_width = field_file.field_border_px,
+            .radius = checkbox_file.box_radius,
+            .hover = kit.weight(look.hover, scheme.hover_lighten),
+        });
+        var ink = colors.panel;
+        if (look.mixed) {
+            const bar: Rect = .{
+                .x = box.x + (box.width - checkbox_file.mixed_w) * 0.5,
+                .y = box.y + (box.height - checkbox_file.mixed_h) * 0.5,
+                .width = checkbox_file.mixed_w,
+                .height = checkbox_file.mixed_h,
+            };
+            kit.face(cx, bar, look.clip, .{ .fill = ink, .radius = checkbox_file.mixed_h * 0.5 });
+        } else if (look.check > 0) {
+            ink[3] *= look.check;
+            const points = checkbox_file.mark_points(box);
+            const width = checkbox_file.mark_width;
+            if (!kit.stroke(cx, &points, look.clip, ink, width)) {
+                const side = checkbox_file.mark_square;
+                const square: Rect = .{
+                    .x = box.x + (box.width - side) * 0.5,
+                    .y = box.y + (box.height - side) * 0.5,
+                    .width = side,
+                    .height = side,
+                };
+                kit.face(cx, square, look.clip, .{ .fill = ink, .radius = 1 });
+            }
+        }
+        const label = checkbox_file.label_of(look.row);
+        if (label.width > 0) {
+            kit.label(cx, scheme.name, look.label, label, look.clip, checkbox_text_options);
+        }
+        const hit = checkbox_file.hit_of(look.row, scheme.name, look.label);
+        return .{ .rect = hit, .radius = 0 };
     }
 
     /// The track, the fill growing up from its bottom (omitted at 0), and the name.
@@ -723,6 +824,50 @@ comptime {
     }
 }
 
+/// The segmented control's look (`widgets.Segmented`, `widgets/tabs.zig`, section 2a): the
+/// tabs arranged `even` in a track capsule, the selected segment raised.
+pub const Segmented = struct {
+    pub const tab_arrange: tabs_file.TabArrange = .even;
+
+    /// The track: a capsule in `colors.track`, bordered in `colors.focus` while focused.
+    pub fn tab_bar(cx: anytype, look: TabBarLook) void {
+        assert(look.rect.width > 0);
+        assert(look.rect.height > 0);
+        const colors = &cx.theme().colors;
+        kit.face(cx, look.rect, look.clip, .{
+            .fill = colors.track,
+            .border_color = colors.focus,
+            .border_width = if (look.focused) field_file.field_border_px else 0,
+            .radius = look.rect.height * 0.5,
+        });
+    }
+
+    /// The selected segment a capsule in `colors.panel`, a hovered one the track lightened,
+    /// the others bare; the label centred inside `segment_pad_x`, cut with an ellipsis. The
+    /// capsule is the hit shape.
+    pub fn tab(cx: anytype, look: TabLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        const radius = look.rect.height * 0.5;
+        if (look.selected) {
+            kit.face(cx, look.rect, look.clip, .{ .fill = colors.panel, .radius = radius });
+        } else if (look.hovered) {
+            kit.face(cx, look.rect, look.clip, .{
+                .fill = colors.track,
+                .radius = radius,
+                .hover = scheme.hover_lighten,
+            });
+        }
+        const inner = ui.cx.inset(look.rect, .xy(tabs_file.segment_pad_x, 0));
+        if (inner.width > 0) {
+            kit.label(cx, scheme.name, look.label, inner, look.clip, tabs_file.tab_text_options);
+        }
+        return .{ .rect = look.rect, .radius = radius };
+    }
+};
+
 const testing = std.testing;
 const input = @import("../input.zig");
 const fixture = @import("fixture.zig");
@@ -878,4 +1023,27 @@ test "ui.route reaches a skinned widget field" {
     cx.event_end();
     try testing.expectEqual(@as(f32, 0.75), panel.skinned.value);
     try testing.expectEqual(@as(f32, 0.25), panel.plain.value);
+}
+
+// Locks the optional `tab_arrange` (section 4a): a skin whose `tab_arrange` is not a
+// `widgets.TabArrange` is refused by name; `Segmented` and `Default` pass.
+test "check refuses a tab_arrange of the wrong type" {
+    const Wrong = struct {
+        pub const tab_arrange: u8 = 1;
+        pub fn tab_bar(cx: anytype, look: TabBarLook) void {
+            _ = cx;
+            _ = look;
+        }
+        pub fn tab(cx: anytype, look: TabLook) ?Shape {
+            _ = cx;
+            _ = look;
+            return null;
+        }
+    };
+    try std.testing.expectEqualStrings(
+        @typeName(Wrong) ++ ": `tab_arrange` must be a `widgets.TabArrange`",
+        comptime check(Wrong, .tabs).?,
+    );
+    try std.testing.expect(comptime check(Segmented, .tabs) == null);
+    try std.testing.expect(comptime check(Default, .tabs) == null);
 }

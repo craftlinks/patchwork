@@ -11,7 +11,8 @@
 //! ## 2. Ranges
 //! `build.zig` imports this file and passes `ranges` as the `icons` face's ranges
 //! (`AppOptions.fonts`), so the build subsets the 917 KB face to exactly the icons below. The
-//! ranges are `all` with consecutive codepoints merged: increasing and apart, as `addApp`
+//! ranges are `kept` (the type page's set, `all`, and the form's field icons, `fields`) with
+//! consecutive codepoints merged: increasing and apart, as `addApp`
 //! requires. This file depends on nothing but `std`, because the build runner compiles it too.
 
 const std = @import("std");
@@ -31,12 +32,21 @@ pub const save: u21 = 0xE14D;
 pub const plus: u21 = 0xE13D;
 pub const minus: u21 = 0xE11C;
 pub const close: u21 = 0xE1B2; // x
+/// The form group's field icons (step 41), outside the type page's set.
+pub const search: u21 = 0xE151;
+pub const lock: u21 = 0xE10B;
 
 /// Every icon the gallery draws, in its icon set's order.
 pub const all = [_]u21{
     play,   pause,    stop,        record, loop, skip_back, skip_forward,
     volume, settings, folder_open, save,   plus, minus,     close,
 };
+
+/// The fields' icons (step 41): kept by the face, not drawn in the icon set.
+pub const fields = [_]u21{ search, lock };
+
+/// Every codepoint the face keeps: the set, then the fields' icons.
+pub const kept = all ++ fields;
 
 /// The codepoints the `icons` face keeps (section 2).
 pub const ranges: [range_count][2]u21 = merged: {
@@ -55,7 +65,7 @@ pub const ranges: [range_count][2]u21 = merged: {
     break :merged list;
 };
 
-/// Runs of consecutive codepoints in `all`.
+/// Runs of consecutive codepoints in `kept`.
 const range_count: u32 = counted: {
     const sorted = sorted_all();
     var count: u32 = 0;
@@ -65,32 +75,33 @@ const range_count: u32 = counted: {
     break :counted count;
 };
 
-fn sorted_all() [all.len]u21 {
-    var sorted = all;
+fn sorted_all() [kept.len]u21 {
+    var sorted = kept;
     std.mem.sort(u21, &sorted, {}, std.sort.asc(u21));
     return sorted;
 }
 
 comptime {
     assert(all.len == 14);
-    for (all, 0..) |codepoint, index| {
+    assert(kept.len == 16);
+    for (kept, 0..) |codepoint, index| {
         assert(codepoint >= 0xE000 and codepoint <= 0xF8FF);
-        for (all[0..index]) |before| assert(before != codepoint);
+        for (kept[0..index]) |before| assert(before != codepoint);
     }
 }
 
-// Locks the ranges (section 2): they increase and are apart, and they cover exactly the 14
-// icons: play and plus, and skip-back and skip-forward, are adjacent, so 12 ranges.
+// Locks the ranges (section 2): they increase and are apart, and they cover exactly the 16
+// kept icons: play and plus, and skip-back and skip-forward, are adjacent, so 14 ranges.
 test "the ranges cover exactly the icons" {
-    try std.testing.expectEqual(@as(usize, 12), ranges.len);
+    try std.testing.expectEqual(@as(usize, 14), ranges.len);
     var covered: u32 = 0;
     for (ranges, 0..) |range, index| {
         try std.testing.expect(range[0] <= range[1]);
         if (index > 0) try std.testing.expect(range[0] > ranges[index - 1][1] + 1);
         covered += range[1] - range[0] + 1;
     }
-    try std.testing.expectEqual(@as(u32, all.len), covered);
-    for (all) |codepoint| {
+    try std.testing.expectEqual(@as(u32, kept.len), covered);
+    for (kept) |codepoint| {
         var inside = false;
         for (ranges) |range| inside = inside or (codepoint >= range[0] and codepoint <= range[1]);
         try std.testing.expect(inside);

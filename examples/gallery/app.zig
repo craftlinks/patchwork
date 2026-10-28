@@ -10,7 +10,8 @@
 //! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
 //! with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
 //! behaviour in the gallery's own skin (section 3b). A `widgets.Tabs` bar under the title holds
-//! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32), "popups" (step 33:
+//! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32, and step 41's form
+//! group, section 2f), "popups" (step 33:
 //! a dropdown, a "File" menu, a context menu, and an About dialog; section 3c), and
 //! "containers" (step 34: splitters, a list box, and number boxes), "type" (step 36: an icon
 //! face beside the library's three; step 38: wrapped text; section 2b), and "files" (step 37: a drop zone, the
@@ -28,7 +29,9 @@
 //!   tabs   fill x fill      the bar (32), then the selected page from y 104, 1248 x 584
 //! basics
 //!   band   fill x 152       buttons (176) | sliders (288) | knobs (fill: 4 cells of 140)
-//!   band   fill x 152       toggles (176) | meter (176)   | text field (fill; field 240 x 32)
+//!   band   fill x 152       toggles (176) | meter (176)   | form (fill, three columns 16 apart):
+//!                           name and password fields (240) | search field and segments
+//!                           (240) | three checkboxes of 28 (fill); fields 240 x 32
 //!   row    fill x 88        hardware: 4 knob cells of 140 | 2 buttons of 96 | 2 toggles of 116
 //!   list   fill x 168       a view of 40 rows of 28, the selected row highlighted
 //! popups
@@ -116,11 +119,20 @@
 //! disc on the popup layer, a lens over the track ("position 0.62"). Solid marks no backdrop A
 //! and draws solid faces.
 //!
+//! ## 2f. Form
+//! The basics page's third group (step 41) holds the form controls in three columns: the name
+//! field (hint "untitled") over a secret password field (a lock icon, hint "password"); a
+//! search field (a search icon, hint "search presets") over a `widgets.Segmented` bar (Sine,
+//! Saw, Square) drawn with `bar`; and three `widgets.Checkbox`es, "loop", "sync" (on), and "all
+//! voices" (mixed). The two icons are Lucide codepoints kept by the icons face beside the type
+//! page's set (`icons.fields`). The status line reports "password changed" (never its text),
+//! "search saw", "wave Saw", and "checkbox 0 on".
+//!
 //! ## 3. Events
 //! `event` hands every event to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
 //! to the rows it drew last through `kit.clicked`, which also repaints a row on hover, then to
-//! the popups (`popup_events`) and to the tabs and the containers page (`container_events`; the
+//! the form group (`form_events`), the popups (`popup_events`) and to the tabs and the containers page (`container_events`; the
 //! list box routes its own view). The default and hardware rows share one routine per widget
 //! kind (`knob_events`, ...), since a skinned widget has the default one's behaviour and
 //! actions.
@@ -183,7 +195,10 @@
 //! `glass` (the page, still: frosted); `glass-scroll` (scrolled 120 px, then the wheel 24 px
 //! down and back up every frame: a scroll under the glass each frame, for benches);
 //! `glass-popup` (the output list open over the sidebar, Down pressed: row 1 highlighted); `glass-clear` (the Clear segment);
-//! `glass-light` (the light toggle, then the page). The
+//! `glass-light` (the light toggle, then the page). Form (section 2f): `form` (click Saw, tick
+//! "loop", click the password field and type "hunter2": seven bullets and the caret);
+//! `form-search` (click the mixed "all voices": on; click the search field and type "saw": the
+//! hint gone, the text after the icon). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -276,6 +291,15 @@ const file_disabled: u32 = 3;
 const file_about: u32 = 4;
 const context_items = [_][]const u8{ "Copy", "Paste", "Reset" };
 
+/// The form group (section 2): two columns of `form_column_w` and the checkboxes, 16 apart.
+const form_column_w: f32 = 240;
+const form_gap_px: f32 = 16;
+const checkbox_names = [_][]const u8{ "loop", "sync", "all voices" };
+const checkbox_values = [_]bool{ false, true, false };
+/// The checkbox that starts mixed: a parent of differing children.
+const checkbox_mixed: u32 = 2;
+const segment_labels = [_][]const u8{ "Sine", "Saw", "Square" };
+
 /// The hardware row's widgets: the library behaviour in the gallery's skin (`hardware.zig`).
 const HardKnob = widgets.KnobOf(hardware.Skin);
 const HardButton = widgets.ButtonOf(hardware.Skin);
@@ -302,6 +326,9 @@ const meter_slider: u32 = 0;
 
 const view_id = ui.id("view", 0);
 const field_id = ui.id("field", 0);
+const password_id = ui.id("password", 0);
+const search_id = ui.id("search", 0);
+const segments_id = ui.id("segments", 0);
 const theme_id = ui.id("theme", 0);
 const wave_id = ui.id("wave", 0);
 const flip_id = ui.id("flip", 0);
@@ -494,6 +521,12 @@ pub const App = struct {
     hard_toggles: [hard_toggle_names.len]HardToggle,
     meter: widgets.Meter,
     field: widgets.TextField,
+    /// The form group (section 2): a secret field, a search field, a segmented control, and
+    /// checkboxes.
+    password: widgets.TextField,
+    search: widgets.TextField,
+    segments: widgets.Segmented,
+    checkboxes: [checkbox_names.len]widgets.Checkbox,
     /// The popups column (section 3c). Overlays draw in this field order.
     wave: widgets.Dropdown,
     flip: widgets.Dropdown,
@@ -581,6 +614,8 @@ pub const App = struct {
         .{ .name = "glass-popup", .setup = &glass_popup_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "glass-clear", .setup = &glass_clear_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "glass-light", .setup = &glass_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "form", .setup = &form_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "form-search", .setup = &form_search_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -657,6 +692,19 @@ pub const App = struct {
         }
         app.meter = .{ .name = "level", .value = slider_values[meter_slider], .track_h = meter_track_px };
         app.field = widgets.TextField.init(field_id, 32, field_style(&config.theme));
+        app.field.hint = "untitled";
+        app.password = widgets.TextField.init(password_id, 32, field_style(&config.theme));
+        app.password.secret = true;
+        app.password.hint = "password";
+        app.password.icon = .{ .face = .icons, .codepoint = icons.lock };
+        app.search = widgets.TextField.init(search_id, 32, field_style(&config.theme));
+        app.search.hint = "search presets";
+        app.search.icon = .{ .face = .icons, .codepoint = icons.search };
+        app.segments = widgets.Segmented.init(segments_id, &segment_labels, 0);
+        for (&app.checkboxes, checkbox_names, checkbox_values, 0..) |*checkbox, name, on, index| {
+            checkbox.* = widgets.Checkbox.init(ui.id("checkbox", @intCast(index)), name, on);
+        }
+        app.checkboxes[checkbox_mixed].mixed = true;
         app.view = ui.ViewState.init();
         app.wave = widgets.Dropdown.init(wave_id, &wave_items, 0);
         app.wave.menu.bounds = frame_rect;
@@ -722,6 +770,7 @@ pub const App = struct {
             .cancelled => app.note(cx, &.{"field cancelled"}),
             .none => {},
         }
+        app.form_events(cx, event_value);
         _ = app.view.handle(cx, view_id, event_value);
         var row = app.drawn.first;
         while (row < app.drawn.end) : (row += 1) {
@@ -746,6 +795,33 @@ pub const App = struct {
             },
         };
         assert(app.status_len <= status_cap);
+    }
+
+    /// The form group (section 2): the password field reports only that it changed, never its
+    /// text; the search field its text; the segments the wave; a checkbox its new value.
+    fn form_events(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.password.handle(cx, event_value)) {
+            .changed => app.note(cx, &.{"password changed"}),
+            .committed => app.note(cx, &.{"password committed"}),
+            .cancelled => app.note(cx, &.{"password cancelled"}),
+            .none => {},
+        }
+        switch (app.search.handle(cx, event_value)) {
+            .changed => app.note(cx, &.{ "search ", app.search.bytes() }),
+            .committed => app.note(cx, &.{"search committed"}),
+            .cancelled => app.note(cx, &.{"search cancelled"}),
+            .none => {},
+        }
+        switch (app.segments.handle(cx, event_value)) {
+            .changed => |index| app.note(cx, &.{ "wave ", segment_labels[index] }),
+            .none => {},
+        }
+        for (&app.checkboxes, 0..) |*checkbox, index| {
+            switch (checkbox.handle(cx, event_value)) {
+                .toggled => |on| app.note(cx, &.{ "checkbox ", digit(index), if (on) " on" else " off" }),
+                .none => {},
+            }
+        }
     }
 
     /// The type page's transport and toolbar (section 2b): play toggles to pause and back, and
@@ -940,6 +1016,8 @@ pub const App = struct {
             knob.accent = widgets.paint_of(color, widgets.kit.accent_radius);
         }
         app.field.style = field_style(scheme);
+        app.password.style = field_style(scheme);
+        app.search.style = field_style(scheme);
         assert(app.sliders[0].track.radius == widgets.track_radius);
         assert(app.field.style.face == .mono);
     }
@@ -974,7 +1052,7 @@ pub const App = struct {
         _ = cx.begin(ui.sized(.fill, .{ .fixed = band_px }), .{ .flow = .right, .spacing = gap_px });
         app.draw_toggles(cx);
         app.draw_meter(cx);
-        app.draw_field(cx);
+        app.draw_form(cx);
         _ = cx.end();
         app.draw_hardware(cx);
         app.draw_list(cx);
@@ -1020,11 +1098,30 @@ pub const App = struct {
         _ = cx.end();
     }
 
-    fn draw_field(app: *const App, cx: *Context) void {
+    /// The form group (section 2): the name and password fields, the search field and the
+    /// segments, and the checkboxes, in three columns.
+    fn draw_form(app: *const App, cx: *Context) void {
         const face: widgets.Panel = .{ .paint = panel_paint(cx) };
-        _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
+        const row: ui.Layout = .{ .flow = .right, .spacing = form_gap_px, .padding = .all(group_padding), .clip = true };
+        _ = face.begin(cx, ui.sized(.fill, .fill), row);
+        const column: ui.Layout = .{ .flow = .down, .spacing = gap_px };
+        const field = ui.sized(.{ .fixed = field_w }, .{ .fixed = field_h });
+        _ = cx.begin(ui.sized(.{ .fixed = form_column_w }, .fill), column);
         caption(cx, "name");
-        app.field.draw(cx, ui.sized(.{ .fixed = field_w }, .{ .fixed = field_h }));
+        app.field.draw(cx, field);
+        caption(cx, "password");
+        app.password.draw(cx, field);
+        _ = cx.end();
+        _ = cx.begin(ui.sized(.{ .fixed = form_column_w }, .fill), column);
+        caption(cx, "search");
+        app.search.draw(cx, field);
+        caption(cx, "wave");
+        app.segments.bar(cx, field);
+        _ = cx.end();
+        _ = cx.begin(ui.sized(.fill, .fill), column);
+        caption(cx, "options");
+        for (&app.checkboxes) |*checkbox| checkbox.draw(cx, ui.sized(.fill, .{ .fixed = widgets.checkbox_height }));
+        _ = cx.end();
         _ = cx.end();
     }
 
@@ -1460,6 +1557,38 @@ const light_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// `form` (section 4): the Saw segment, the "loop" checkbox, then the password field with
+/// "hunter2" typed: seven bullets and the caret, the focus on the password field.
+const form_steps = [_]bench.Step{
+    .{ .click = segment(1) },
+    .{ .click = bench.area("checkbox", 0) },
+    .{ .click = bench.area("password", 0) },
+    .{ .key = .{ .key = .h, .text = "h" } },
+    .{ .key = .{ .key = .u, .text = "u" } },
+    .{ .key = .{ .key = .n, .text = "n" } },
+    .{ .key = .{ .key = .t, .text = "t" } },
+    .{ .key = .{ .key = .e, .text = "e" } },
+    .{ .key = .{ .key = .r, .text = "r" } },
+    .{ .key = .{ .key = .d2, .text = "2" } },
+    .{ .wait = 12 },
+};
+
+/// `form-search` (section 4): the mixed "all voices" checkbox clicked (on), then "saw" typed
+/// into the search field: its hint gone, the text after the icon.
+const form_search_steps = [_]bench.Step{
+    .{ .click = bench.area("checkbox", checkbox_mixed) },
+    .{ .click = bench.area("search", 0) },
+    .{ .key = .{ .key = .s, .text = "s" } },
+    .{ .key = .{ .key = .a, .text = "a" } },
+    .{ .key = .{ .key = .w, .text = "w" } },
+    .{ .wait = 12 },
+};
+
+/// Segment `index` of the form's segmented control, a click target.
+fn segment(index: u32) bench.Target {
+    return .{ .id = segments_id.derive(index), .name = "segment", .index = index };
+}
+
 /// `hardware`: drag hardware knob 0 (a 56 px dial) from its center up 40 px, a third of
 /// `drag_span_px` (0.50 to 0.83), click hardware button 1, flip hardware toggle 0, then let the
 /// animations settle.
@@ -1765,8 +1894,10 @@ comptime {
     assert(params.len == param_names.len and params.len == 6);
     // Faces, on the busiest page (basics): the title and its toggle (2), the tab bar's line,
     // four tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
-    // 3 field, 2 highlighted rows, the thumb; a popup's dim, face, and band; the tooltip.
-    assert(1 + 2 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 1 + 3 + 1 <= box_cap);
+    // 3 for the focused field and 1 for each other field, the segments' track, selected, and
+    // hovered segment, a box per checkbox and the mixed bar, 2 highlighted rows, the thumb; a
+    // popup's dim, face, and band; the tooltip.
+    assert(1 + 2 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 3 + checkbox_names.len + 1 + 2 + 1 + 3 + 1 <= box_cap);
     // The containers page: the title (3), the tabs (6), the list's panel, two bands, and thumb,
     // two dividers, the grid's panel, six faces (one an editing field: face, band, caret), and
     // the preset panel.
@@ -1780,16 +1911,27 @@ comptime {
     assert(hard_button_labels.len + hard_toggle_names.len <= bevel_cap);
     assert(hard_toggle_names.len <= led_cap);
     // Areas: the title's toggle, the bar and its tabs, and per page: basics (every widget, the
-    // view and its thumb, the rows drawn, the hardware row); popups (two dropdowns, the button,
+    // form's three fields, segments bar and segments, and checkboxes, the view and its thumb,
+    // the rows drawn, the hardware row); popups (two dropdowns, the button,
     // the panel, and one popup: its backdrop and at most six rows); containers (the list box's
     // view, thumb, and rows, two dividers, six number boxes).
     const chrome = 1 + 1 + page_labels.len;
-    assert(chrome + 3 + 2 + 4 + 3 + 1 + 2 + rows_drawn_max + 8 <= area_cap);
+    assert(chrome + 3 + 2 + 4 + 3 + 3 + 1 + segment_labels.len + checkbox_names.len + 2 + rows_drawn_max + 8 <= area_cap);
     assert(chrome + 4 + 1 + file_items.len <= area_cap);
     assert(chrome + 2 + preset_rows_max + 2 + param_names.len <= area_cap);
     assert(wave_items.len >= file_items.len and file_items.len >= context_items.len);
-    // Paths: one chevron per dropdown, three points each.
+    // Paths: one chevron per dropdown (popups) or one mark per checkbox (basics), three points
+    // each.
     assert(2 <= path_cap and 2 * 3 <= point_cap);
+    assert(checkbox_names.len <= path_cap and 3 * checkbox_names.len <= point_cap);
+    // The form group: two field columns and the checkboxes' column fit its inner width; two
+    // captioned fields fit its inner height, as do the caption and the checkboxes.
+    const form_w = inner_w - 2 * narrow_px - 2 * gap_px - 2 * group_padding;
+    assert(2 * form_column_w + 2 * form_gap_px + 160 <= form_w);
+    assert(field_w == form_column_w);
+    assert(2 * (caption_px + gap_px + field_h) + gap_px <= band_px - 2 * group_padding);
+    const checks_h: f32 = @as(f32, @floatFromInt(checkbox_names.len)) * widgets.checkbox_height;
+    assert(caption_px + gap_px + checks_h + 2 * gap_px <= band_px - 2 * group_padding);
     assert(knob_names.len <= 10 and button_labels.len <= 10);
     assert(preset_count <= 9999);
     // The type page: the transport's five buttons and the toolbar's three fit their panels, the
@@ -1871,6 +2013,18 @@ test "gallery layout at 1280 by 720" {
     try expect_rect(area_rect(app.knobs[3].id), 932, 144, 72, 72);
     try expect_rect(area_rect(app.toggles[0].id), 32, 280, 44, 24);
     try expect_rect(area_rect(field_id), 392, 300, 240, 32);
+    // The form group (section 2f): its columns at 392, 648, and 904; a caption (20), a gap,
+    // a field (32), a gap, then the second caption and field at 368.
+    try expect_rect(area_rect(password_id), 392, 368, 240, 32);
+    try expect_rect(area_rect(search_id), 648, 300, 240, 32);
+    try expect_rect(area_rect(segments_id), 648, 368, 240, 32);
+    try expect_rect(area_rect(segments_id.derive(0)), 651, 371, 77, 26);
+    for (0..checkbox_names.len) |index| {
+        const box = area_rect(ui.id("checkbox", @intCast(index)));
+        try std.testing.expectEqual(@as(f32, 904), box.x);
+        try std.testing.expectEqual(300 + @as(f32, @floatFromInt(index)) * 36, box.y);
+        try std.testing.expectEqual(widgets.checkbox_height, box.height);
+    }
     // The hardware row's panel starts at 104 + 2 * (152 + 8) = 424, its cells at 432:
     // hardware knob 0's 56 px ring at (32, 440), its dial body 9 px inside it; knob 1's 48 px
     // ring at (180, 444); the buttons after four cells and four gaps at x 616 and 720, centered
@@ -2041,6 +2195,37 @@ fn replay(app: *App, name: []const u8) !void {
 /// The rect of the area `id` in the last frame.
 fn area_of(id: ui.Id) Rect {
     return area_rect(id);
+}
+
+// Locks the `form` scenario (section 2f): Saw is the selected segment, "loop" is ticked, and
+// the password field holds "hunter2" and has focus; the status line says only that it
+// changed, and nothing overflows.
+test "the form scenario picks Saw, ticks loop, and types a secret" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "form");
+    try std.testing.expectEqual(@as(u32, 1), app.segments.selected);
+    try std.testing.expect(app.checkboxes[0].on);
+    try std.testing.expectEqualStrings("hunter2", app.password.bytes());
+    try std.testing.expectEqual(password_id, test_context.focus);
+    try std.testing.expectEqualStrings("password changed", app.status_text());
+    try std.testing.expect(app.search.bytes().len == 0);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks the `form-search` scenario (section 2f): the mixed checkbox's click turns it on and
+// clears `mixed`, and "saw" typed into the search field reports on the status line.
+test "the form-search scenario turns the mixed box on and searches" {
+    const app = new_app();
+    _ = frame(app);
+    try std.testing.expect(app.checkboxes[checkbox_mixed].mixed);
+    try replay(app, "form-search");
+    try std.testing.expect(app.checkboxes[checkbox_mixed].on);
+    try std.testing.expect(!app.checkboxes[checkbox_mixed].mixed);
+    try std.testing.expectEqualStrings("saw", app.search.bytes());
+    try std.testing.expectEqualStrings("search saw", app.status_text());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
 }
 
 // Locks the `dropdown` scenario (section 4): the click opens the wave list with "sine"
@@ -2231,8 +2416,9 @@ test "the number scenario drags the frequency and types the gain" {
 }
 
 // Locks the generated faces (section 2b): the gallery's `text.Face` has the library's three
-// tags at 0 to 2 and `icons` at 3, and its icons face is the Lucide subset: 14 icons and
-// `.notdef`, each icon mapped, its ranges exactly `icons.ranges`, at 1000 units per em.
+// tags at 0 to 2 and `icons` at 3, and its icons face is the Lucide subset: 16 icons (the
+// set's 14 and the form's 2) and `.notdef`, each icon mapped, its ranges exactly
+// `icons.ranges`, at 1000 units per em.
 test "the gallery adds an icons face after the library's three" {
     const names = @typeInfo(text.Face).@"enum".field_names;
     try std.testing.expectEqual(@as(usize, 4), names.len);
@@ -2242,9 +2428,9 @@ test "the gallery adds an icons face after the library's three" {
     try std.testing.expectEqual(@as(u8, 3), @backingInt(text.Face.icons));
     try std.testing.expectEqualStrings("icons", text.font_data.names[3]);
     const font = text.font_of(.icons);
-    try std.testing.expectEqual(@as(u32, icons.all.len + 1), font.glyph_count);
+    try std.testing.expectEqual(@as(u32, icons.kept.len + 1), font.glyph_count);
     try std.testing.expectEqual(@as(u32, 1000), font.units_per_em);
-    for (icons.all) |codepoint| try std.testing.expect(text.ttf.glyph_id(font, codepoint) != 0);
+    for (icons.kept) |codepoint| try std.testing.expect(text.ttf.glyph_id(font, codepoint) != 0);
     try std.testing.expectEqualSlices([2]u21, &icons.ranges, text.font_data.face_ranges[3]);
     // The library's faces keep the default ranges.
     try std.testing.expect(text.font_data.subset);
@@ -2503,10 +2689,10 @@ test "a theme switch records one uniform write and one full repaint" {
         else => {},
     };
     try std.testing.expectEqual(@as(u32, 1), uniform_writes);
-    // The uniform and the six pools' changed ranges (Box, Arc, Glyph, and the hardware row's
-    // Dial, Bevel, and Led; the dropdowns' chevron Paths are on the popups page): every text
-    // and face color moved.
-    try std.testing.expectEqual(@as(u32, 7), writes);
+    // The uniform and the seven pools' changed ranges (Box, Arc, Glyph, the hardware row's
+    // Dial, Bevel, and Led, and the checked checkbox's mark, a Path): every text and face
+    // color moved. The mark's points do not move, so the point buffer is not written.
+    try std.testing.expectEqual(@as(u32, 8), writes);
     try std.testing.expect(written > 256);
     var frames: u32 = 0;
     while (ui.animate(App, app, &test_context, 1000.0 / 60.0)) : (frames += 1) {
