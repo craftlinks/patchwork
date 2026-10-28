@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Browser check: an app's scenario replayed in Chromium against its headless regress frame.
 
-Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port 8080] [--cdp 9333]
+Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port N] [--cdp N] [--reuse]
 
 1. Renders the scenario headless on the high adapter with `zig-out/bin/<app> --regress --only
    <scenario> --adapter high --keep`, which leaves the reference frame in
    `zig-out/regress/<app>/<scenario>-high-on.png` (build the examples first with
    `zig build -Doptimize=ReleaseFast`).
-2. Uses the server already on `--port`, or starts `zig build serve-<app>` (`serve` for the
-   rack) and waits for it.
-3. Starts system Chromium with WebGPU and remote debugging on `--cdp`, sets the viewport to
+2. Starts its own `zig build serve-<app>` (`serve` for the rack), which builds the wasm from
+   this tree, on a free port (or `--port`) through `PATCHWORK_SERVE_PORT` (src/serve.zig), and
+   waits for it. It never uses a server it did not start, since one already on a port may serve
+   another tree's or an older build (another session in this repository runs its own), unless
+   `--reuse` says to use the one on `--port` (default 8080) as it is.
+3. Starts system Chromium with WebGPU and remote debugging on a free port (or `--cdp`), sets
+   the viewport to
    1280 x 720 at scale 1, loads `?bench=<scenario>` (web/shell.js, section 8a), waits for the
    console line `bench done <scenario>`, and screenshots the canvas at the regress size.
 4. Prints `differ N px, max level M`; passes when M <= 3 and N <= 0.1% of the pixels (Tint and
    naga round trigonometry differently). On a failure, or with --keep, writes the screenshot
    and a diff picture beside the reference (`<scenario>-browser.png`, `.diff.png`).
 5. Reports console errors and warnings (an error fails the check) and stops what it started,
-   then checks both ports are free.
+   its whole process groups, also on SIGTERM, SIGHUP, or Ctrl+C. It never kills a process it did
+   not start; a port still taken afterwards is reported with its pid.
 
 Python standard library only, so it runs with `python3 -I`. Exit status 0 on a pass.
 """
@@ -253,24 +258,49 @@ def stop(process):
             pass
 
 
-def free_port(port):
-    """Kills whatever still listens on `port` (found with `ss`), by pid, never by name."""
-    if not port_open(port):
-        return
+def listeners(port):
+    """The pids listening on `port` (from `ss`)."""
     listing = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True)
-    for part in listing.stdout.split("pid=")[1:]:
-        pid = int(part.split(",")[0])
+    return sorted({int(part.split(",")[0]) for part in listing.stdout.split("pid=")[1:]})
+
+
+def free_tcp_port():
+    """A loopback port nothing listens on now (the kernel's pick for port 0)."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def check_released(port, process):
+    """Reports a listener left on `port` by `process`'s group (a bug); kills only that group."""
+    if process is None:
+        return
+    end = time.time() + 5
+    while port_open(port) and time.time() < end:
+        time.sleep(0.1)
+    for pid in listeners(port):
         try:
-            os.kill(pid, signal.SIGTERM)
+            ours = os.getpgid(pid) == process.pid
         except ProcessLookupError:
-            pass
+            continue
+        if ours:
+            print(f"browser_check: pid {pid} of our group still held :{port}; killed")
+            os.kill(pid, signal.SIGKILL)
+        else:
+            print(f"browser_check: :{port} is held by pid {pid}, which this check did not start")
+
+
+def exit_on_signal(signum, _frame):
+    """Turns SIGTERM and SIGHUP into SystemExit, so `main`'s cleanup runs."""
+    raise SystemExit(128 + signum)
 
 
 def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     keep = "--keep" in argv
-    port = 8080
-    cdp_port = 9333
+    reuse = "--reuse" in argv
+    port = None
+    cdp_port = None
     for flag in ("--port", "--cdp"):
         if flag in argv:
             value = int(argv[argv.index(flag) + 1])
@@ -279,6 +309,12 @@ def main(argv):
                 port = value
             else:
                 cdp_port = value
+    if reuse and port is None:
+        port = 8080
+    if port is None:
+        port = free_tcp_port()
+    if cdp_port is None:
+        cdp_port = free_tcp_port()
     if len(args) != 2:
         print(__doc__.strip().splitlines()[2])
         return 2
@@ -305,17 +341,24 @@ def main(argv):
     server = None
     chromium = None
     profile = tempfile.mkdtemp(prefix="browser_check-")
+    signal.signal(signal.SIGTERM, exit_on_signal)
+    signal.signal(signal.SIGHUP, exit_on_signal)
     try:
-        if http_ok(port):
-            print(f"server: using the one already on :{port} (it must serve {app})")
+        if reuse:
+            if not http_ok(port):
+                print(f"browser_check: --reuse, but nothing serves :{port}")
+                return 2
+            print(f"server: reusing the one on :{port} as it is (it must serve {app})")
         else:
             if port_open(port):
-                print(f"browser_check: :{port} is taken by something that is not serving")
+                print(f"browser_check: :{port} is taken; pass another --port, or --reuse")
                 return 2
             step = "serve" if app == "rack" else f"serve-{app}"
+            print(f"server: zig build {step} on :{port}")
             server = subprocess.Popen(
                 [os.environ.get("ZIG", "zig"), "build", step],
                 cwd=ROOT,
+                env=dict(os.environ, PATCHWORK_SERVE_PORT=str(port)),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -406,9 +449,8 @@ def main(argv):
     finally:
         stop(chromium)
         stop(server)
-        for each in (cdp_port, port if server is not None else None):
-            if each is not None:
-                free_port(each)
+        check_released(cdp_port, chromium)
+        check_released(port, server)
         shutil.rmtree(profile, ignore_errors=True)
 
 
