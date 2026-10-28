@@ -21,6 +21,7 @@
 //! has(Cx, T)                       whether the app registers draw type T (comptime)
 //! stroke(cx, points, clip, color, width)  a draw.Path polyline, or false without draw.Path
 //! is_space(press)                  Space without modifiers (`other` typing " ")
+//! chevron(cx, centre, half, turn, clip, color)  a "›" turned by `turn` quarter turns, or false
 //! label(cx, style, bytes, rect, clip, options)   text.place with the kit's asserts
 //! paragraph(cx, style, bytes, rect, clip, wrap)  text.place_wrapped, label's wrapped twin
 //! icon(cx, face, codepoint, size, rect, clip, color)  text.icon: one glyph centred by its ink
@@ -306,6 +307,43 @@ pub fn stroke(
     const line: draw.path.Stroke = .{ .color = color, .width = width, .hover = 0 };
     _ = draw.path.polyline(cx.drawing(), points, line, clip);
     return true;
+}
+
+/// A chevron's stroke width.
+pub const chevron_width: f32 = 2;
+
+/// The three points of a chevron centred on `centre`, `half` from it along its axis: a "›"
+/// rotated by `turn` quarter turns clockwise, so 0 points right and 1 points down.
+pub fn chevron_points(centre: [2]f32, half: f32, turn: f32) [3][2]f32 {
+    assert(half > 0);
+    assert(turn >= 0 and turn <= 1);
+    const angle = turn * std.math.pi * 0.5;
+    const cos = @cos(angle);
+    const sin = @sin(angle);
+    const base = [3][2]f32{ .{ -half * 0.5, -half }, .{ half * 0.5, 0 }, .{ -half * 0.5, half } };
+    var out: [3][2]f32 = undefined;
+    for (base, &out) |point, *rotated| {
+        rotated.* = .{
+            centre[0] + point[0] * cos - point[1] * sin,
+            centre[1] + point[0] * sin + point[1] * cos,
+        };
+    }
+    assert(out[1][0] >= centre[0] - half and out[1][0] <= centre[0] + half);
+    return out;
+}
+
+/// A chevron (`chevron_points`) stroked `chevron_width` wide in `color` under `clip`; false,
+/// with nothing appended, without `draw.Path` (`stroke`), so a skin draws a glyph instead.
+pub fn chevron(
+    cx: anytype,
+    centre: [2]f32,
+    half: f32,
+    turn: f32,
+    clip: Clip,
+    color: [4]f32,
+) bool {
+    const points = chevron_points(centre, half, turn);
+    return stroke(cx, &points, clip, color, chevron_width);
 }
 
 /// True when `press` is Space without modifiers: no host names the key, so it arrives as
@@ -700,4 +738,17 @@ test "lit mixes a surface's colours as a box's shader does" {
     const lifted = 0.5 + (light[1] - 0.5) * 0.18;
     try testing.expectApproxEqAbs(lifted + (dark[1] - lifted) * 0.30, pressed.border[1], 1e-6);
     try testing.expect(std.meta.eql(look.shadow, pressed.shadow));
+}
+
+// Locks `chevron_points`: turn 0 is a "›" (the tip 2 px right of the centre for half 4), turn 1
+// is a "v" (the tip 2 px below), and the ends rotate with it.
+test "a chevron turns from right to down" {
+    const right = chevron_points(.{ 10, 10 }, 4, 0);
+    try std.testing.expectEqual([2]f32{ 12, 10 }, right[1]);
+    try std.testing.expectEqual([2]f32{ 8, 6 }, right[0]);
+    const down = chevron_points(.{ 10, 10 }, 4, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), down[1][0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), down[1][1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 14), down[0][0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), down[0][1], 0.0001);
 }

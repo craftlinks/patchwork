@@ -57,6 +57,9 @@
 //! widgets/splitter.zig    Splitter: two panes and a draggable divider, begin/next/end
 //! widgets/list_box.zig    ListBox: a virtual list with selection, keys, scroll-into-view
 //! widgets/number_box.zig  NumberBox: drag, wheel, or type a value with a unit; format, parse
+//! widgets/tree_view.zig   TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
+//! widgets/disclosure.zig  Disclosure: a header with a chevron over a section drawn while open
+//! widgets/column_header.zig  ColumnHeader: resizable, sortable columns and a row's spans
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
 //! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
@@ -132,6 +135,9 @@ const splitter = @import("widgets/splitter.zig");
 const tabs = @import("widgets/tabs.zig");
 const list_box = @import("widgets/list_box.zig");
 const number_box = @import("widgets/number_box.zig");
+const tree_view = @import("widgets/tree_view.zig");
+const disclosure = @import("widgets/disclosure.zig");
+const column_header = @import("widgets/column_header.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -168,6 +174,9 @@ pub const TabLook = skins.TabLook;
 pub const DividerLook = skins.DividerLook;
 pub const ListRowLook = skins.ListRowLook;
 pub const NumberLook = skins.NumberLook;
+pub const ChevronLook = skins.ChevronLook;
+pub const DisclosureLook = skins.DisclosureLook;
+pub const HeaderCellLook = skins.HeaderCellLook;
 
 pub const Label = label.Label;
 pub const Paragraph = paragraph.Paragraph;
@@ -284,6 +293,28 @@ pub const ListBox = list_box.ListBox;
 pub const ListBoxOf = list_box.ListBoxOf;
 pub const ListRow = list_box.Row;
 pub const list_rows_max = list_box.list_rows_max;
+pub const list_row_salt = list_box.row_salt;
+
+pub const TreeView = tree_view.TreeView;
+pub const TreeViewOf = tree_view.TreeViewOf;
+pub const TreeNode = tree_view.TreeNode;
+pub const TreeRow = tree_view.TreeRow;
+pub const tree_root = tree_view.tree_root;
+pub const tree_depth_max = tree_view.tree_depth_max;
+pub const tree_nodes_max = tree_view.tree_nodes_max;
+pub const tree_flatten = tree_view.flatten;
+
+pub const Disclosure = disclosure.Disclosure;
+pub const DisclosureOf = disclosure.DisclosureOf;
+pub const disclosure_h = disclosure.disclosure_h;
+
+pub const ColumnHeader = column_header.ColumnHeader;
+pub const ColumnHeaderOf = column_header.ColumnHeaderOf;
+pub const Column = column_header.Column;
+pub const ColumnSort = column_header.Sort;
+pub const columns_max = column_header.columns_max;
+pub const header_h = column_header.header_h;
+pub const column_divider_salt = column_header.divider_salt;
 
 pub const NumberBox = number_box.NumberBox;
 pub const NumberBoxOf = number_box.NumberBoxOf;
@@ -313,6 +344,9 @@ test {
     _ = tabs;
     _ = list_box;
     _ = number_box;
+    _ = tree_view;
+    _ = disclosure;
+    _ = column_header;
 }
 
 /// Every public name of `widgets.zig` at step 29, before the split.
