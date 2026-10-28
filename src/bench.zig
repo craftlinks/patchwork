@@ -42,6 +42,13 @@
 //! deliver the same chunks. `validate` bounds a step to `input.drop_files_max` files of at most
 //! `drop_file_max` bytes.
 //!
+//! ## 2c. The Window
+//! A step that asks the window manager for something (a window button, a double press on a
+//! drag area; `ui/cx.zig`, section 5a) is never sent to a real one: `serve_window` simulates
+//! `toggle_maximize` by flipping `maximized` and dispatching the new `window_state`, and drops
+//! the other requests, so a run never moves, resizes, or closes its window and every host
+//! shows the same picture.
+//!
 //! ## 2a. Headless Replay
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
 //! no GPU: the app draws a frame, the next step's events are dispatched, and so on. App tests
@@ -600,10 +607,27 @@ pub fn replay_headless_paced(
             ui.dispatch(App, app, cx, event);
         }
         if (step == .drop) replay_drop(App, app, cx, step.drop, rect.?);
+        serve_window(App, app, cx);
         _ = replay.presented(scenario);
     }
     assert(count <= steps_limit);
     return count;
+}
+
+/// A bench run's window manager (section 2c): takes the step's window request and simulates
+/// it. `toggle_maximize` flips `maximized` and dispatches the new state; the rest are dropped,
+/// so no replay moves, resizes, minimizes, or closes a window. Every replay calls it after a
+/// step's events.
+pub fn serve_window(comptime App: type, app: *App, cx: anytype) void {
+    assert(cx.phase == .idle);
+    const request = cx.take_window_request() orelse return;
+    if (request != .toggle_maximize) return;
+    var state = cx.window_state();
+    state.maximized = !state.maximized;
+    ui.dispatch(App, app, cx, .{ .window_state = state });
+    // The app's answer to the new state is not served: one simulated request per step.
+    _ = cx.take_window_request();
+    assert(cx.window_state().maximized == state.maximized);
 }
 
 /// The regress frame in logical pixels at scale 1 when the app declares no
@@ -703,6 +727,9 @@ pub const Options = struct {
     only: ?[]const u8,
     /// `--keep`: write every regressed frame as a PNG, passing or not.
     keep: bool,
+    /// `--decorations client|server`: who draws the window's frame, over the app's
+    /// `config.decorations` (native windows only; `host/linux_window.zig`, section 5e).
+    decorations: ?input.Decorations,
     /// The program's file name without its directory, set by the native entry point: the
     /// golden file's name (`host/headless.zig`).
     program: []const u8,
@@ -721,18 +748,25 @@ pub const Options = struct {
         .bless = false,
         .only = null,
         .keep = false,
+        .decorations = null,
         .program = "",
     };
 };
 
 pub const usage =
-    \\usage: <app> [--adapter low|high] [--no-cache] [--check] [--bench [scenario]
-    \\       [--frames N] [--dump out.ppm] [--csv out.csv]]
+    \\usage: <app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
+    \\       [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
     \\       <app> --regress [--adapter high|low|both] [--bless] [--only scenario] [--keep]
     \\
 ;
 
-pub const ParseError = error{ UnknownArgument, MissingValue, BadNumber, BadAdapter };
+pub const ParseError = error{
+    UnknownArgument,
+    MissingValue,
+    BadNumber,
+    BadAdapter,
+    BadDecorations,
+};
 
 /// Parses the arguments after the program name. `--bench` takes an optional scenario name,
 /// `--no-cache`, `--check`, `--regress`, `--bless`, and `--keep` take none, and every other
@@ -793,6 +827,9 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
             options.dump = value;
         } else if (std.mem.eql(u8, arg, "--csv")) {
             options.csv = value;
+        } else if (std.mem.eql(u8, arg, "--decorations")) {
+            options.decorations = std.meta.stringToEnum(input.Decorations, value) orelse
+                return error.BadDecorations;
         } else {
             return error.UnknownArgument;
         }
@@ -812,7 +849,14 @@ fn flag(arg: []const u8) ?Flag {
 }
 
 fn is_option(arg: []const u8) bool {
-    const names = [_][]const u8{ "--frames", "--adapter", "--dump", "--csv", "--only" };
+    const names = [_][]const u8{
+        "--frames",
+        "--adapter",
+        "--dump",
+        "--csv",
+        "--only",
+        "--decorations",
+    };
     for (names) |name| {
         if (std.mem.eql(u8, arg, name)) return true;
     }
@@ -1395,6 +1439,11 @@ test "arguments parse into options and reject mistakes" {
     try testing.expectError(error.BadNumber, parse_args(&.{ "--frames", "0" }));
     try testing.expectError(error.BadAdapter, parse_args(&.{ "--adapter", "fast" }));
     try testing.expectError(error.UnknownArgument, parse_args(&.{"stray"}));
+    const decorated = try parse_args(&.{ "--decorations", "client" });
+    try testing.expectEqual(@as(?input.Decorations, .client), decorated.decorations);
+    try testing.expectEqual(@as(?input.Decorations, null), (try parse_args(&.{})).decorations);
+    try testing.expectError(error.BadDecorations, parse_args(&.{ "--decorations", "none" }));
+    try testing.expectError(error.MissingValue, parse_args(&.{"--decorations"}));
 }
 
 // Locks the percentile rule `sorted[(count - 1) * q / 100]` on eleven values.
@@ -1648,6 +1697,70 @@ const DropApp = struct {
         cx.area(zone, .{ .x = 0, .y = 0, .width = 100, .height = 100 }, 0, ui.cx.drop_flag);
     }
 };
+
+const WindowApp = struct {
+    const app_module = @import("app.zig");
+    const bar = areas.id("bar", 0);
+    const quit = areas.id("quit", 0);
+    const Cx = app_module.Context(WindowApp);
+
+    pub const config: app_module.Config = .{
+        .title = "window",
+        .timer_period_ms = 0,
+        .draw = &.{.{ .type = @import("draw.zig").Box, .cap = 4 }},
+    };
+
+    states: u32,
+
+    pub fn init(app: *WindowApp, pool: *textures.Textures) void {
+        _ = pool;
+        app.states = 0;
+    }
+    pub fn event(app: *WindowApp, cx: *Cx, event_value: input.Event) void {
+        if (event_value == .window_state) app.states += 1;
+        switch (cx.hit(quit, event_value)) {
+            .up => |up| if (up.inside) cx.close(),
+            else => {},
+        }
+    }
+    pub fn timer(app: *WindowApp, cx: *Cx, now_ms: u64) void {
+        _ = app;
+        _ = cx;
+        _ = now_ms;
+    }
+    pub fn draw(app: *WindowApp, cx: *Cx) void {
+        _ = app;
+        var drag = ui.cx.plain;
+        drag.window = .drag;
+        cx.area(bar, .{ .x = 0, .y = 0, .width = 100, .height = 20 }, 0, drag);
+        cx.area(quit, .{ .x = 0, .y = 40, .width = 20, .height = 20 }, 0, ui.cx.plain);
+    }
+};
+
+// Locks `serve_window` (section 2c): two clicks on the drag area 16 ms apart are a double
+// press, so the replay maximizes the window and dispatches the state once; a click that asks
+// to close is dropped, and the window state is unchanged.
+test "a bench replay simulates maximize and drops the other window requests" {
+    const steps = [_]Step{
+        .{ .click_at = .{ .target = comptime area("bar", 0), .x = 50, .y = 10 } },
+        .{ .click_at = .{ .target = comptime area("bar", 0), .x = 50, .y = 10 } },
+        .{ .click = comptime area("quit", 0) },
+        .{ .wait = 1 },
+    };
+    const scenario: Scenario = .{ .name = "window", .setup = &steps, .cycle = &.{}, .frames = 1 };
+    try testing.expectEqual(@as(?[]const u8, null), comptime validate(&.{scenario}));
+    var app: WindowApp = undefined;
+    WindowApp.init(&app, undefined);
+    const static = struct {
+        var context: WindowApp.Cx = undefined;
+    };
+    static.context.init();
+    const size: [2]u32 = .{ 200, 200 };
+    _ = try replay_headless_paced(WindowApp, &app, &static.context, &scenario, size, 8, 16);
+    try testing.expect(static.context.window_state().maximized);
+    try testing.expectEqual(@as(u32, 1), app.states);
+    try testing.expectEqual(@as(?ui.WindowRequest, null), static.context.take_window_request());
+}
 
 // Locks `replay_drop` (section 2b): three files dropped on the zone (70,000 bytes from a
 // repeated part, an empty one, and a folder) arrive as 65,536 more, 4,464 done, an empty

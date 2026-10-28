@@ -88,7 +88,16 @@
 //! So chunk boundaries are the same on every host. `drop` and `file` point into host storage
 //! that is valid only while they are dispatched; neither enters the queue.
 //!
-//! ## 7. TigerStyle Invariants
+//! ## 7. The Window
+//! `WindowState` is what the window manager last said about the window: maximized,
+//! fullscreen, activated, the tiled sides, who draws the decorations, and which requests it
+//! honours. The native host decodes it from `xdg_toplevel.configure` (and
+//! `wm_capabilities`, and the decoration's `configure`) and dispatches `window_state` when it
+//! changes. Headless and the browser never send it, so the context's default stands there: an
+//! activated, client-decorated window that can do everything. `Button.serial` carries the
+//! press's `wl_pointer.button` serial, which `xdg_toplevel.move` and `resize` require.
+//!
+//! ## 8. TigerStyle Invariants
 //! - Capacity is fixed by `queue_cap`; there is no allocation.
 //! - `push`, `pop`, and `index_at` are O(1); the key maps are O(1) switches or O(name) compares.
 //! - Dropped events are counted, never silent.
@@ -158,6 +167,41 @@ pub const Button = struct {
     time_ms: u32,
     button: MouseButton,
     mods: Mods,
+    /// The `wl_pointer.button` serial natively, 0 elsewhere: a window move or resize the press
+    /// asks for must carry it (section 7).
+    serial: u32 = 0,
+};
+
+/// Who draws the window's title bar and frame.
+pub const Decorations = enum(u1) {
+    /// The app (`widgets.WindowButtons`, `widgets.window_edges`).
+    client,
+    /// The window manager.
+    server,
+};
+
+/// The window's state from the window manager (section 7). The default is the state headless
+/// and the browser report.
+pub const WindowState = packed struct(u16) {
+    maximized: bool = false,
+    fullscreen: bool = false,
+    activated: bool = true,
+    tiled_left: bool = false,
+    tiled_right: bool = false,
+    tiled_top: bool = false,
+    tiled_bottom: bool = false,
+    decorations: Decorations = .client,
+    can_minimize: bool = true,
+    can_maximize: bool = true,
+    can_fullscreen: bool = true,
+    window_menu: bool = true,
+    unused: u4 = 0,
+
+    /// Edges fit their neighbours: maximized, fullscreen, or tiled on any side.
+    pub fn snapped(self: WindowState) bool {
+        if (self.maximized or self.fullscreen) return true;
+        return self.tiled_left or self.tiled_right or self.tiled_top or self.tiled_bottom;
+    }
 };
 
 /// A left-button sample at `point` with no modifiers at time 0: the press tests and synthetic
@@ -319,7 +363,8 @@ pub const Chunk = struct {
 /// milliseconds; the native loop injects it from `sync_clock`. `paste` is the pasted UTF-8,
 /// valid only during its dispatch (section 1). `window_focus` reports keyboard focus of the
 /// window: false releases held keys. `drop_over`, `drop_leave`, `drop`, and `file` are a file
-/// drag and the bytes of the files it delivered (section 6).
+/// drag and the bytes of the files it delivered (section 6). `close_requested` and
+/// `window_state` come from the window manager (section 7).
 pub const Event = union(enum) {
     pointer_move: Point,
     pointer_down: Button,
@@ -339,6 +384,11 @@ pub const Event = union(enum) {
     drop: *const Drop,
     /// Bytes of an accepted file; valid only during the dispatch.
     file: *const Chunk,
+    /// The window manager asks the window to close: it closes unless the app calls
+    /// `cx.keep_open()` during this event (`ui/cx.zig`, section 5a).
+    close_requested,
+    /// The window's state changed (section 7).
+    window_state: WindowState,
 
     /// True for the events whose payload points into host storage: they never enter the queue.
     pub fn borrowed(self: Event) bool {
@@ -824,7 +874,8 @@ comptime {
     assert(key_count <= 64);
     assert(@sizeOf(Pointer) <= 16);
     assert(@sizeOf(Point) == 8);
-    assert(@sizeOf(Button) == 16);
+    assert(@sizeOf(Button) == 20);
+    assert(@sizeOf(WindowState) == 2);
     assert(@sizeOf(Wheel) == 16);
     assert(@sizeOf(KeyPress) == 8);
     assert(@sizeOf(Mods) == 1);

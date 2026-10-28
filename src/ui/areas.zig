@@ -22,9 +22,9 @@
 //! `flags` are `wheel` (the area takes wheel input), `focusable` (a left press focuses it and
 //! Tab visits it; the area list in draw order is the Tab order), `tab` (while focused, Tab
 //! and Shift+Tab go to its widget instead of moving focus), `cursor` (the pointer shape
-//! over it, resolved with the hot area), and `drop` (the area takes dropped files). A point
-//! hits a box area (`point_count == 0`) when the clip contains it and `draw.contains_box`
-//! accepts it.
+//! over it, resolved with the hot area), `drop` (the area takes dropped files), and `window`
+//! (a press on it moves or resizes the window, `WindowPart`). A point hits a box area
+//! (`point_count == 0`) when the clip contains it and `draw.contains_box` accepts it.
 //!
 //! A path area (`ui.Context.path_area`) is the set of points within `radius` of a stroked
 //! polyline whose points are in the draw context's point pool, relative to the path origin
@@ -86,7 +86,7 @@ pub const Id = enum(u64) {
 
 /// The pointer shape over an area. The tag names are the CSS cursor names with `_` for `-`;
 /// the native host maps them onto `wp_cursor_shape_device_v1` shapes.
-pub const Cursor = enum(u3) {
+pub const Cursor = enum(u4) {
     default,
     pointer,
     text,
@@ -94,10 +94,27 @@ pub const Cursor = enum(u3) {
     grabbing,
     ew_resize,
     ns_resize,
+    nwse_resize,
+    nesw_resize,
+};
+
+/// The part of the window an area stands for: a press on it goes to the compositor as a move
+/// (`drag`) or a resize from that edge (`ui/cx.zig`, section 5a). `none` for every other area.
+pub const WindowPart = enum(u4) {
+    none,
+    drag,
+    top,
+    bottom,
+    left,
+    right,
+    top_left,
+    top_right,
+    bottom_left,
+    bottom_right,
 };
 
 /// What an area takes besides presses and hover. See the module guide, section 3.
-pub const Flags = packed struct(u8) {
+pub const Flags = packed struct(u16) {
     wheel: bool,
     /// A left press focuses the area, and Tab visits it in draw order.
     focusable: bool,
@@ -107,7 +124,9 @@ pub const Flags = packed struct(u8) {
     cursor: Cursor,
     /// The area takes dropped files: the topmost one under a file drag is its target.
     drop: bool = false,
-    unused: u1 = 0,
+    /// The window part a press on the area moves or resizes; `none` for a widget's area.
+    window: WindowPart = .none,
+    unused: u4 = 0,
 };
 
 /// One hit area. See the module guide, section 3.
@@ -117,8 +136,8 @@ pub const Area = extern struct {
     clip: [4]f32,
     radius: f32,
     layer: u8,
+    pad: u8,
     flags: Flags,
-    pad: u16,
     /// A path area's points in the point pool; `point_count == 0` for a box area.
     first_point: u32,
     point_count: u32,
@@ -145,8 +164,10 @@ comptime {
     assert(@offsetOf(Area, "first_point") == 48);
     assert(@offsetOf(Area, "rect") == 8);
     assert(@offsetOf(Area, "clip") == 24);
-    assert(@sizeOf(Flags) == 1);
-    assert(@typeInfo(Cursor).@"enum".field_names.len == 7);
+    assert(@offsetOf(Area, "flags") == 46);
+    assert(@sizeOf(Flags) == 2);
+    assert(@typeInfo(Cursor).@"enum".field_names.len == 9);
+    assert(@typeInfo(WindowPart).@"enum".field_names.len == 10);
     assert(area_cap_max <= std.math.maxInt(u16) + 1);
 }
 

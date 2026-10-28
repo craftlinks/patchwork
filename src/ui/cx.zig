@@ -99,6 +99,24 @@
 //! the press count of the click sequence (`Press.clicks`, `input.count_click`). Only the left
 //! button captures, so a right release never ends a left drag.
 //!
+//! ## 5a. The Window
+//! An area whose `Flags.window` is not `none` stands for a part of the window (`ui/areas.zig`,
+//! section 3), and a press on it is a request to the window manager, not a widget's press:
+//! ```text
+//! left down on drag, a double press   toggle_maximize
+//! left down on drag                   move { the press's serial }
+//! left down on an edge                resize { edge, serial }
+//! right down on drag                  menu { x, y, serial } (the window manager's menu)
+//! ```
+//! A window area never captures: the window manager takes the pointer, and the release may
+//! never come. Focus is cleared, as for any unfocusable press. The app asks with `minimize`,
+//! `toggle_maximize`, and `close`; the last request of a dispatch wins. `close_requested`
+//! sets `close` before the app sees it, and `keep_open` during that event cancels it, so an
+//! app that ignores the event closes. The host takes the request after each dispatch
+//! (`take_window_request`): natively it becomes an `xdg_toplevel` request, and in the browser
+//! it is dropped; a bench run simulates it (`bench.serve_window`). `window_state` events store
+//! the window's state, which `window_state()` reports in any phase, and owe a draw.
+//!
 //! ## 6. Hover After a Redraw
 //! Areas are single-buffered: drawing never interleaves with events. After a draw moved
 //! things, `end_frame` re-resolves the stored pointer; if the hot id changed and nothing is
@@ -223,6 +241,22 @@ pub const Press = struct {
     rect: Rect,
     clicks: u8,
     mods: input.Mods,
+};
+
+/// What the app or a window area asked of the window manager (module guide, section 5a). The
+/// host takes it after the dispatch (`take_window_request`).
+pub const WindowRequest = union(enum) {
+    /// Move the window with the pointer, from the press with this serial.
+    move: u32,
+    /// Resize the window from `edge` (never `none` or `drag`), from the press with `serial`.
+    resize: struct { edge: areas.WindowPart, serial: u32 },
+    /// Show the window manager's window menu at the point, for the press with `serial`.
+    menu: struct { x: f32, y: f32, serial: u32 },
+    minimize,
+    /// Maximize, or restore while maximized.
+    toggle_maximize,
+    /// End the app: the host leaves its loop.
+    close,
 };
 
 /// A release sample. `inside` is true when the pointer is still over the captured area.
@@ -364,6 +398,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         hot_rect: Rect,
         hot_focusable: bool,
         hot_cursor: Cursor,
+        /// The hot area's window part (section 5a).
+        hot_window: areas.WindowPart,
         wheel: Id,
         hover: Id,
         hover_prev: Id,
@@ -427,6 +463,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// safe builds check at `end_frame` that a request was met (section 3c).
         popup_requested: Id,
         popup_met: Id,
+        /// The window manager's last word on the window, and the request for the host to take
+        /// (section 5a).
+        window_state_value: input.WindowState,
+        window_request: ?WindowRequest,
         /// The app's scheme (section 9b); `draw.theme` is its record.
         scheme: theme_module.Scheme,
         /// What `overflow_report` last returned or saw (section 10).
@@ -452,6 +492,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.hot_rect = self.window;
             self.hot_focusable = false;
             self.hot_cursor = .default;
+            self.hot_window = .none;
             self.wheel = .none;
             self.hover = .none;
             self.hover_prev = .none;
@@ -492,6 +533,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.popup_requested = .none;
             self.popup_met = .none;
             self.overflow_seen = .zero;
+            self.window_state_value = .{};
+            self.window_request = null;
             self.scheme = theme_module.dark;
             self.draw.theme = self.scheme.record();
             assert(self.phase == .idle);
@@ -1198,6 +1241,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     self.hot = .none;
                     self.hot_focusable = false;
                     self.hot_cursor = .default;
+                    self.hot_window = .none;
                     self.wheel = .none;
                     self.hover = .none;
                 },
@@ -1222,6 +1266,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                         self.keys_held = 0;
                         self.mods = .none;
                     }
+                },
+                // Closing is the default; the app may answer with `keep_open` (section 5a).
+                .close_requested => self.window_request = .close,
+                .window_state => |state| {
+                    self.window_state_value = state;
+                    self.dirty = true;
                 },
             }
             assert(self.phase == .event);
@@ -1253,6 +1303,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             switch (event) {
                 .frame, .key_down, .key_up, .paste, .window_focus => return .none,
                 .drop_over, .drop_leave, .drop, .file => return .none,
+                .close_requested, .window_state => return .none,
                 .pointer_move => |point| {
                     if (self.capture != .none) return self.drag_of(id, point.x, point.y);
                     return self.hover_change(id);
@@ -1442,6 +1493,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.hot = .none;
             self.hot_focusable = false;
             self.hot_cursor = .default;
+            self.hot_window = .none;
             self.wheel = .none;
             if (found.hot) |index| {
                 const hot_area = &self.areas[index];
@@ -1449,6 +1501,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 self.hot_rect = rect_of(hot_area.rect);
                 self.hot_focusable = hot_area.flags.focusable;
                 self.hot_cursor = hot_area.flags.cursor;
+                self.hot_window = hot_area.flags.window;
             }
             if (found.wheel) |index| self.wheel = self.areas[index].id;
             if (self.capture == .none or releasing) self.hover = self.hot;
@@ -1462,11 +1515,17 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.clicks = input.count_click(self.clicks, down);
             if (down.button != .left) {
                 self.point_at(down.x, down.y, false);
+                if (down.button == .right and self.capture == .none) _ = self.window_press(down);
                 return;
             }
             self.pointer.button(true);
             self.point_at(down.x, down.y, false);
             if (self.capture != .none) return;
+            if (self.window_press(down)) {
+                // The window manager takes the pointer: no capture, as for an unfocusable press.
+                self.focus = .none;
+                return;
+            }
             if (self.hot != .none) {
                 self.capture = self.hot;
                 self.capture_rect = self.hot_rect;
@@ -1476,6 +1535,28 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.focus = if (self.hot_focusable) self.hot else .none;
             if (self.focus != .none) self.focus_rect = self.hot_rect;
             assert(self.clicks.count >= 1);
+        }
+
+        /// A press on a window area: the request it makes (section 5a), and true when it made
+        /// one with the left button.
+        fn window_press(self: *Self, down: input.Button) bool {
+            assert(self.phase == .event);
+            const part = self.hot_window;
+            if (part == .none) return false;
+            if (down.button == .right) {
+                if (part != .drag) return false;
+                self.window_request = .{
+                    .menu = .{ .x = down.x, .y = down.y, .serial = down.serial },
+                };
+                return false;
+            }
+            assert(down.button == .left);
+            self.window_request = switch (part) {
+                .none => unreachable,
+                .drag => if (self.clicks.count == 2) .toggle_maximize else .{ .move = down.serial },
+                else => .{ .resize = .{ .edge = part, .serial = down.serial } },
+            };
+            return true;
         }
 
         /// A key press: holds the key, cycles focus on Tab, notes Escape, and decides whether
@@ -1650,6 +1731,54 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.paste_pending = false;
             assert(!self.paste_pending);
             return pending;
+        }
+
+        // ------------------------------------------------------------------ window
+
+        /// The window manager's last word on the window (section 5a). Any phase.
+        pub fn window_state(self: *const Self) input.WindowState {
+            assert(self.window_state_value.unused == 0);
+            return self.window_state_value;
+        }
+
+        /// Asks the window manager to minimize the window. Event phase.
+        pub fn minimize(self: *Self) void {
+            self.request_window(.minimize);
+        }
+
+        /// Asks the window manager to maximize the window, or to restore it while maximized.
+        /// Event phase.
+        pub fn toggle_maximize(self: *Self) void {
+            self.request_window(.toggle_maximize);
+        }
+
+        /// Ends the app after the current event (natively; the browser ignores it). Event phase.
+        pub fn close(self: *Self) void {
+            self.request_window(.close);
+        }
+
+        /// Cancels a pending close: during `close_requested`, the window stays. Event phase.
+        pub fn keep_open(self: *Self) void {
+            assert(self.phase == .event);
+            if (self.window_request) |request| {
+                if (request == .close) self.window_request = null;
+            }
+            assert(self.window_request == null or self.window_request.? != .close);
+        }
+
+        fn request_window(self: *Self, request: WindowRequest) void {
+            assert(self.phase == .event);
+            assert(request != .move and request != .resize and request != .menu);
+            self.window_request = request;
+        }
+
+        /// Host side: the request the last dispatches left, once (section 5a).
+        pub fn take_window_request(self: *Self) ?WindowRequest {
+            assert(self.phase == .idle);
+            const request = self.window_request;
+            self.window_request = null;
+            assert(self.window_request == null);
+            return request;
         }
 
         // ------------------------------------------------------------- internals
@@ -2190,6 +2319,98 @@ test "the cursor follows the hot area and a held grab reads grabbing" {
     try testing.expectEqual(Cursor.default, context.cursor());
     send(context, .pointer_leave, &.{knob}, &out);
     try testing.expectEqual(Cursor.default, context.cursor());
+}
+
+fn press_with(x: f32, y: f32, time_ms: u32, which: input.MouseButton, serial: u32) input.Event {
+    return .{ .pointer_down = .{
+        .x = x,
+        .y = y,
+        .time_ms = time_ms,
+        .button = which,
+        .mods = .none,
+        .serial = serial,
+    } };
+}
+
+/// A bar flagged `drag` at (0, 0, 200, 40), a bottom-right corner at (180, 180, 20, 20), and a
+/// plain button on the bar at (10, 10, 20, 20), recorded after it.
+fn draw_chrome(context: *TestContext) void {
+    const drag: Flags = .{
+        .wheel = false,
+        .focusable = false,
+        .tab = false,
+        .cursor = .default,
+        .window = .drag,
+    };
+    const corner: Flags = .{
+        .wheel = false,
+        .focusable = false,
+        .tab = false,
+        .cursor = .nwse_resize,
+        .window = .bottom_right,
+    };
+    context.begin_frame(200, 200, 120);
+    context.area(areas.id("bar", 0), rect_at(0, 0, 200, 40), 0, drag);
+    context.area(areas.id("corner", 0), rect_at(180, 180, 20, 20), 0, corner);
+    context.area(areas.id("button", 0), rect_at(10, 10, 20, 20), 0, focusable_text);
+    _ = context.end_frame();
+}
+
+// Locks section 5a: a press on the drag area requests a move with its serial and captures
+// nothing (the button under it is not pressed), a second press within the click interval
+// toggles maximize, a corner press resizes from that edge, a right press asks for the window
+// menu at the point, and a press on the button over the bar makes no request.
+test "a press on a window area becomes the window manager's request" {
+    const context = new_context();
+    draw_chrome(context);
+    const bar = areas.id("bar", 0);
+    var out: [1]Hit = undefined;
+    send(context, press_with(100, 20, 0, .left, 7), &.{bar}, &out);
+    try testing.expectEqual(Hit.hover_in, out[0]);
+    try testing.expectEqual(Id.none, context.capture);
+    try testing.expectEqual(@as(?WindowRequest, .{ .move = 7 }), context.take_window_request());
+    try testing.expectEqual(@as(?WindowRequest, null), context.take_window_request());
+    send(context, button_event(100, 20, .left, false), &.{bar}, &out);
+    send(context, press_with(101, 21, 100, .left, 8), &.{bar}, &out);
+    try testing.expectEqual(@as(?WindowRequest, .toggle_maximize), context.take_window_request());
+    send(context, press_with(190, 190, 5000, .left, 9), &.{bar}, &out);
+    const resize: WindowRequest = .{ .resize = .{ .edge = .bottom_right, .serial = 9 } };
+    try testing.expectEqual(@as(?WindowRequest, resize), context.take_window_request());
+    try testing.expectEqual(Cursor.nwse_resize, context.cursor());
+    send(context, press_with(150, 30, 9000, .right, 10), &.{bar}, &out);
+    const menu: WindowRequest = .{ .menu = .{ .x = 150, .y = 30, .serial = 10 } };
+    try testing.expectEqual(@as(?WindowRequest, menu), context.take_window_request());
+    send(context, press_with(15, 15, 12000, .left, 11), &.{bar}, &out);
+    try testing.expectEqual(@as(?WindowRequest, null), context.take_window_request());
+    try testing.expectEqual(areas.id("button", 0), context.capture);
+}
+
+// Locks section 5a: `close_requested` leaves `close` for the host unless the app calls
+// `keep_open`; the app's own requests are taken once and the last one wins; a `window_state`
+// event is stored and owes a draw.
+test "a close request closes unless kept open, and the state is stored" {
+    const context = new_context();
+    try testing.expect(context.window_state().activated);
+    try testing.expectEqual(input.Decorations.client, context.window_state().decorations);
+    context.event_begin(.close_requested);
+    context.event_end();
+    try testing.expectEqual(@as(?WindowRequest, .close), context.take_window_request());
+    context.event_begin(.close_requested);
+    context.keep_open();
+    context.event_end();
+    try testing.expectEqual(@as(?WindowRequest, null), context.take_window_request());
+    context.event_begin(.{ .key_down = input.key_press(.m, .none, false, "m") });
+    context.minimize();
+    context.toggle_maximize();
+    context.event_end();
+    try testing.expectEqual(@as(?WindowRequest, .toggle_maximize), context.take_window_request());
+    context.dirty = false;
+    const state: input.WindowState = .{ .maximized = true, .tiled_left = true };
+    context.event_begin(.{ .window_state = state });
+    context.event_end();
+    try testing.expectEqual(state, context.window_state());
+    try testing.expect(context.window_state().snapped());
+    try testing.expect(context.dirty);
 }
 
 // Locks the clipboard handshake: `copy` keeps the bytes and flags the host once, a copy over

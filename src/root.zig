@@ -45,6 +45,10 @@ pub const host = struct {
     /// so it has its own root (`native_tests.zig`).
     pub const wl_seat = @import("host/wl_seat.zig");
     pub const wp_cursor_shape = @import("host/wp_cursor_shape.zig");
+    /// `xdg-shell` and `xdg-decoration` tables and their state decoders; listed in the test
+    /// root for the same reason.
+    pub const xdg_shell = @import("host/xdg_shell.zig");
+    pub const xdg_decoration = @import("host/xdg_decoration.zig");
     pub const wl_data_device = @import("host/wl_data_device.zig");
     pub const clipboard = @import("host/clipboard.zig");
     /// File drops (`wl_data_offer` drag-and-drop); its tests are `host/dnd_test.zig`, run
@@ -72,6 +76,8 @@ test {
     _ = host.wp_fractional_scale;
     _ = host.wl_seat;
     _ = host.wp_cursor_shape;
+    _ = host.xdg_shell;
+    _ = host.xdg_decoration;
     _ = host.wl_data_device;
     _ = host.clipboard;
     _ = host.headless;

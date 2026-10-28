@@ -105,6 +105,14 @@
 //! refuses a color component outside `[0, 1]`, a weight outside `[0, 1]`, or a text size
 //! outside `(0, text.size_max]`, naming the field (`theme.problem`).
 //!
+//! ## 4c. Window Decorations
+//! `config.decorations` is the app's preference for who draws the window's title bar and
+//! frame. Natively, `server` asks the window manager through `zxdg_decoration_manager_v1` and
+//! `cx.window_state().decorations` reports its answer (`client` where it offers no manager);
+//! `client` asks nothing, so the window manager leaves the frame to the app. The app reads
+//! `window_state()` to know whether to draw its own (`widgets.WindowButtons` draws nothing
+//! under `server`). Headless and the browser report `client` (`input.zig`, section 7).
+//!
 //! ## 5. TigerStyle Invariants
 //! The contract is checked at compile time and costs nothing at run time. The app owns all
 //! of its storage, sized by its own comptime constants.
@@ -143,6 +151,10 @@ pub const Config = struct {
     point_cap: u32 = 65536,
     /// The scheme the app starts with (`theme.zig`); `cx.set_theme` switches it at run time.
     theme: theme.Scheme = theme.dark,
+    /// Who should draw the window's frame natively (section 4c): `server` asks the window
+    /// manager; `client` means the app draws it (`widgets.WindowButtons`). `--decorations`
+    /// overrides it.
+    decorations: input.Decorations = .server,
 };
 
 /// The UI context type `App.event`, `App.timer`, and `App.draw` receive, built from

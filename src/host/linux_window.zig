@@ -172,6 +172,24 @@
 //! ready, so while the transfer runs `ppoll` does not sleep (a zero timeout) and the loop
 //! keeps reading between frames; once it ends the loop sleeps as before. No drag, no wake.
 //!
+//! ## 5e. Window Chrome
+//! - Decorations: with `config.decorations = .server` (or `--decorations server`) and a bound
+//!   `zxdg_decoration_manager_v1`, `create_toplevel` asks for `server_side` before the first
+//!   commit; the compositor's `configure(mode)` is what the app is told. `.client`, or no
+//!   manager, creates no decoration object, and the app draws its own frame. The startup log
+//!   names what was asked and what was answered (`xdg_decoration.zig`).
+//! - State: `xdg_wm_base` is bound at `min(advertised, 5)`. `toplevel_configure`, the
+//!   capabilities, and the decoration's mode write `window_pending`; `ack_if_needed` queues one
+//!   `window_state` event when it differs from what the app last saw, so `sync_input` in the
+//!   same iteration dispatches it before the draw.
+//! - Requests: after each dispatch, `take_window_request` (`ui/cx.zig`, section 5a) becomes
+//!   `xdg_toplevel.move`, `resize`, or `show_window_menu` with the press's serial
+//!   (`input.Button.serial`, copied in `pointer_button`), `set_minimized`, `set_maximized` or
+//!   `unset_maximized` by the last state, or the end of the loop for `close`. A bench run
+//!   leaves them to `bench.serve_window`, so it never moves or closes its window.
+//! - Close: `xdg_toplevel.close` queues `close_requested` instead of ending the loop; the
+//!   context turns it into a `close` request unless the app keeps the window open.
+//!
 //! ## 6. TigerStyle Invariants
 //! - `State` lives on the stack of `run`; the app, the draw context, and the renderer are
 //!   static in `Host(App)`, because their sizes follow the app (an editor holds hundreds of
@@ -196,6 +214,7 @@ const wl_seat = @import("wl_seat.zig");
 const wp_fractional_scale = @import("wp_fractional_scale.zig");
 const wp_presentation = @import("wp_presentation.zig");
 const xdg = @import("xdg_shell.zig");
+const xdg_decoration = @import("xdg_decoration.zig");
 const xkb = @import("xkb.zig");
 const wp_cursor_shape = @import("wp_cursor_shape.zig");
 const wl_data_device = @import("wl_data_device.zig");
@@ -323,6 +342,15 @@ pub const State = struct {
     pending_width: u32,
     pending_height: u32,
     global_count: u32,
+    /// Bound `zxdg_decoration_manager_v1` and the toplevel's decoration; null without the
+    /// protocol, and the decoration also when the app draws its own frame (section 5e).
+    decoration_manager: ?*xdg_decoration.Manager,
+    decoration: ?*xdg_decoration.Decoration,
+    /// The window state the callbacks are assembling, and the one last dispatched to the app.
+    window_pending: input.WindowState,
+    window_applied: input.WindowState,
+    /// True after the first configure was acknowledged: the decoration mode is logged once.
+    configured: bool,
 };
 
 // libwayland-client symbols. A request is not its own C function:
@@ -463,6 +491,12 @@ const xdg_surface_listener: xdg.XdgSurfaceListener = .{
 const toplevel_listener: xdg.XdgToplevelListener = .{
     .configure = toplevel_configure,
     .close = toplevel_close,
+    .configure_bounds = toplevel_configure_bounds,
+    .wm_capabilities = toplevel_wm_capabilities,
+};
+
+const decoration_listener: xdg_decoration.DecorationListener = .{
+    .configure = decoration_configure,
 };
 
 const seat_listener: wl_seat.SeatListener = .{
@@ -530,6 +564,7 @@ comptime {
     wp_presentation.assert_interface_tables();
     wp_fractional_scale.assert_interface_tables();
     wp_cursor_shape.assert_interface_tables();
+    xdg_decoration.assert_interface_tables();
 }
 
 /// Orchestrates the entire Wayland application lifecycle for one app type:
@@ -567,7 +602,8 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     defer _ = std.os.linux.close(state.repeat_fd);
     try connect(&state);
     try bind_globals(&state);
-    try create_toplevel(&state, App.config.title);
+    const decorations = options.decorations orelse App.config.decorations;
+    try create_toplevel(&state, App.config.title, decorations);
     try create_device(&state, .{ .adapter = options.adapter, .profile = options.bench });
     var host: AppHost = .{
         .state = &state,
@@ -654,6 +690,11 @@ fn initial_state() State {
         .pending_width = 0,
         .pending_height = 0,
         .global_count = 0,
+        .decoration_manager = null,
+        .decoration = null,
+        .window_pending = .{},
+        .window_applied = .{},
+        .configured = false,
     };
     assert(state.repeat_fd == no_timer_fd);
     assert(state.seat == null);
@@ -890,6 +931,7 @@ fn Host(comptime App: type) type {
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| self.dispatch(event);
             if (step == .drop) bench.replay_drop(App, self.app, &context, step.drop, rect.?);
+            bench.serve_window(App, self.app, &context);
             state.frame.request_redraw();
             assert(state.frame.redraw);
         }
@@ -1256,6 +1298,8 @@ fn Host(comptime App: type) type {
             while (state.frame.running) {
                 ack_if_needed(state);
                 self.sync_input();
+                // A dispatch that left `close` ended the run (section 5e).
+                if (!state.frame.running) break;
                 self.sync_audio();
                 self.bench_step();
                 self.sync_clock();
@@ -1277,12 +1321,12 @@ fn Host(comptime App: type) type {
             while (guard < input.queue_cap) : (guard += 1) {
                 const event = state.queue.pop() orelse break;
                 self.dispatch(event);
+                if (!state.frame.running) return;
             }
             assert(guard <= input.queue_cap);
             if (state.clipboard.take_received()) |pasted| self.dispatch(.{ .paste = pasted });
             self.sync_drops();
             apply_cursor(state, context.cursor());
-            assert(state.frame.running);
         }
 
         /// A finished drop list becomes one `drop` (a transfer still running is cancelled
@@ -1334,6 +1378,10 @@ fn Host(comptime App: type) type {
                 state.frame.request_redraw();
             }
             self.serve_files();
+            // A bench run's steps are served by `bench.serve_window` (`bench.zig`, section 2c).
+            if (!bench_run.active) {
+                if (context.take_window_request()) |request| serve_window(state, request);
+            }
             if (context.take_copy()) state.clipboard.copy(state.input_serial);
             if (!context.take_paste_request()) return;
             if (state.clipboard.owns_selection()) {
@@ -1533,7 +1581,8 @@ fn Host(comptime App: type) type {
             if (fds[@backingInt(Slot.receive)].revents != 0) clipboard.pump_receive();
             if (fds[@backingInt(Slot.audio)].revents != 0) drain_wake(wake.fd);
             if (fds[@backingInt(Slot.drop_list)].revents != 0) clipboard.dnd.pump_list();
-            // A close event read above stops the loop. That wake is not a failure.
+            // A bench run that ended in a callback read above stops the loop. That wake is not
+            // a failure.
             if (!state.frame.running) {
                 assert(!state.frame.running);
                 return;
@@ -1697,8 +1746,9 @@ fn bind_globals(state: *State) !void {
     }
 }
 
-/// Creates a Wayland surface, wraps it in an `xdg_surface` and `xdg_toplevel` window.
-fn create_toplevel(state: *State, title: [:0]const u8) !void {
+/// Creates a Wayland surface, wraps it in an `xdg_surface` and `xdg_toplevel` window, and asks
+/// for `decorations` (section 5e).
+fn create_toplevel(state: *State, title: [:0]const u8, decorations: input.Decorations) !void {
     const compositor = state.compositor orelse return error.MissingCompositor;
     const base = state.xdg_base orelse return error.MissingXdgWmBase;
     const surface = create_surface(compositor);
@@ -1714,10 +1764,33 @@ fn create_toplevel(state: *State, title: [:0]const u8) !void {
     xdg.add_toplevel_listener(toplevel, &toplevel_listener, state);
     xdg.set_title(toplevel, title.ptr);
     xdg.set_app_id(toplevel, "patchwork");
+    ask_decorations(state, toplevel, decorations);
     choose_scale_mode(state, surface);
     commit_surface(surface);
     assert(state.surface != null);
     assert(state.toplevel != null);
+}
+
+/// Asks the compositor to draw the frame for `.server` when it offers the manager; `.client`
+/// creates no decoration object, which leaves the frame to the app (section 5e). Until the
+/// compositor answers, the state says `client`.
+fn ask_decorations(state: *State, toplevel: *xdg.XdgToplevel, wanted: input.Decorations) void {
+    assert(state.decoration == null);
+    assert(state.window_pending.decorations == .client);
+    const manager = state.decoration_manager orelse {
+        std.log.info("decorations: no zxdg_decoration_manager_v1, the app draws its frame", .{});
+        return;
+    };
+    if (wanted == .client) {
+        std.log.info("decorations: client asked, none negotiated", .{});
+        return;
+    }
+    const decoration = xdg_decoration.get_decoration(manager, toplevel);
+    xdg_decoration.add_listener(decoration, &decoration_listener, state);
+    xdg_decoration.set_mode(decoration, xdg_decoration.mode_server_side);
+    state.decoration = decoration;
+    std.log.info("decorations: server asked", .{});
+    assert(state.decoration != null);
 }
 
 /// Enters fractional mode when both `wp_fractional_scale_manager_v1` and `wp_viewporter` are
@@ -1757,7 +1830,70 @@ fn ack_if_needed(state: *State) void {
     xdg.ack_configure(xdg_surface, state.configure_serial);
     state.frame.apply_configure(state.pending_width, state.pending_height);
     state.ack_pending = false;
+    if (!state.configured) log_window(state.window_pending, state.decoration != null);
+    state.configured = true;
+    // The state the callbacks assembled reaches the app as one event (section 5e).
+    if (state.window_pending != state.window_applied) {
+        state.window_applied = state.window_pending;
+        state.queue.push(.{ .window_state = state.window_applied });
+    }
     assert(!state.ack_pending);
+}
+
+/// Logs the first configure's window state: the decoration answer when one was asked, the
+/// capabilities, and the tiled sides.
+fn log_window(window: input.WindowState, asked: bool) void {
+    if (asked) std.log.info("decorations: {t} answered", .{window.decorations});
+    std.log.info("window: minimize {}, maximize {}, menu {}, tiled {}{}{}{}", .{
+        window.can_minimize,
+        window.can_maximize,
+        window.window_menu,
+        @intFromBool(window.tiled_left),
+        @intFromBool(window.tiled_right),
+        @intFromBool(window.tiled_top),
+        @intFromBool(window.tiled_bottom),
+    });
+}
+
+/// Sends the window request a dispatch left (section 5e). Without a seat the requests that
+/// need one are dropped.
+fn serve_window(state: *State, request: ui.WindowRequest) void {
+    const toplevel = state.toplevel orelse return;
+    switch (request) {
+        .minimize => xdg.set_minimized(toplevel),
+        .toggle_maximize => xdg.set_maximized(toplevel, !state.window_applied.maximized),
+        .close => state.frame.close(),
+        .move => |serial| {
+            const seat = state.seat orelse return;
+            xdg.move(toplevel, @ptrCast(seat), serial);
+        },
+        .resize => |resize| {
+            const seat = state.seat orelse return;
+            xdg.resize(toplevel, @ptrCast(seat), resize.serial, resize_edge_of(resize.edge));
+        },
+        .menu => |menu| {
+            const seat = state.seat orelse return;
+            const x: i32 = @intFromFloat(@round(menu.x));
+            const y: i32 = @intFromFloat(@round(menu.y));
+            xdg.show_window_menu(toplevel, @ptrCast(seat), menu.serial, x, y);
+        },
+    }
+}
+
+/// The `xdg_toplevel.resize_edge` of an edge part; `none` and `drag` never resize.
+fn resize_edge_of(part: ui.WindowPart) xdg.ResizeEdge {
+    assert(part != .none and part != .drag);
+    return switch (part) {
+        .none, .drag => unreachable,
+        .top => .top,
+        .bottom => .bottom,
+        .left => .left,
+        .right => .right,
+        .top_left => .top_left,
+        .top_right => .top_right,
+        .bottom_left => .bottom_left,
+        .bottom_right => .bottom_right,
+    };
 }
 
 /// Requests one frame callback before the commit. `wl_surface.frame` takes effect
@@ -2058,7 +2194,15 @@ fn registry_global(
         return;
     }
     if (std.mem.eql(u8, iface, "xdg_wm_base")) {
-        state.xdg_base = @ptrCast(bind_global(live_registry, name, &xdg.xdg_wm_base_interface, 1));
+        const bind_version = @min(version, xdg.wm_base_version_max);
+        const interface = &xdg.xdg_wm_base_interface;
+        state.xdg_base = @ptrCast(bind_global(live_registry, name, interface, bind_version));
+        return;
+    }
+    if (std.mem.eql(u8, iface, "zxdg_decoration_manager_v1")) {
+        if (state.decoration_manager != null) return;
+        const interface = &xdg_decoration.zxdg_decoration_manager_interface;
+        state.decoration_manager = @ptrCast(bind_global(live_registry, name, interface, 1));
         return;
     }
     if (std.mem.eql(u8, iface, "wp_presentation")) {
@@ -2238,7 +2382,7 @@ fn xdg_surface_configure(
     state.ack_pending = true;
 }
 
-/// Records the new window dimensions suggested by the window manager.
+/// Records the new window dimensions suggested by the window manager, and its states.
 fn toplevel_configure(
     data: ?*anyopaque,
     toplevel: ?*xdg.XdgToplevel,
@@ -2247,11 +2391,46 @@ fn toplevel_configure(
     states: ?*xdg.WlArray,
 ) callconv(.c) void {
     _ = toplevel;
-    _ = states;
     assert(data != null);
     const state: *State = @ptrCast(@alignCast(data.?));
     state.pending_width = if (width > 0) @intCast(width) else 0;
     state.pending_height = if (height > 0) @intCast(height) else 0;
+    state.window_pending = xdg.states_of(state.window_pending, states);
+}
+
+/// `xdg_toplevel.configure_bounds` (version 4): unused, the window takes the size it is given.
+fn toplevel_configure_bounds(
+    data: ?*anyopaque,
+    toplevel: ?*xdg.XdgToplevel,
+    width: i32,
+    height: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = toplevel;
+    _ = width;
+    _ = height;
+}
+
+/// `xdg_toplevel.wm_capabilities` (version 5): the requests the compositor honours.
+fn toplevel_wm_capabilities(
+    data: ?*anyopaque,
+    toplevel: ?*xdg.XdgToplevel,
+    capabilities: ?*xdg.WlArray,
+) callconv(.c) void {
+    _ = toplevel;
+    const state = state_of(data);
+    state.window_pending = xdg.capabilities_of(state.window_pending, capabilities);
+}
+
+/// `zxdg_toplevel_decoration_v1.configure`: who draws the frame, as the compositor decided.
+fn decoration_configure(
+    data: ?*anyopaque,
+    decoration: ?*xdg_decoration.Decoration,
+    mode: u32,
+) callconv(.c) void {
+    _ = decoration;
+    const state = state_of(data);
+    state.window_pending.decorations = xdg_decoration.decorations_of(mode);
 }
 
 /// C ABI callback for `wl_seat.capabilities` (opcode 0). Creates or releases the pointer and
@@ -2380,6 +2559,7 @@ fn pointer_button(
         .time_ms = time,
         .button = which,
         .mods = state.keyboard.mods(),
+        .serial = serial,
     };
     if (button_state == wl_seat.button_state_pressed) {
         state.queue.push(.{ .pointer_down = sample });
@@ -2777,14 +2957,13 @@ fn feedback_discarded(
     assert(state.feedback_in_flight < feedback_in_flight_max);
 }
 
-/// Callback when the user clicks the window close button.
+/// The compositor asks the window to close (its close button, a key binding): the app sees
+/// `close_requested` and the loop ends when it does not keep the window open (section 5e).
 fn toplevel_close(data: ?*anyopaque, toplevel: ?*xdg.XdgToplevel) callconv(.c) void {
     _ = toplevel;
-    assert(data != null);
-    const state: *State = @ptrCast(@alignCast(data.?));
-    if (state.frame.running) {
-        state.frame.close();
-    }
+    const state = state_of(data);
+    state.queue.push(.close_requested);
+    assert(state.queue.count >= 1);
 }
 
 /// Opens `path` for writing, created or truncated, or logs and returns null.
