@@ -78,7 +78,9 @@
 //! 200 px; step 38): a line in each Noto face, which stays one line and is cut at the pane's
 //! edge, beside a panel of wrapped text: three bullets, each a bold lead and the rest as two
 //! runs wrapped with `text.place_runs_wrapped` beside a dot, and a `widgets.Paragraph` whose fit
-//! height is the height of its lines. Moving the divider reports "type split 0.31".
+//! height is the height of its lines. Under the caption they sit in a view, which measures
+//! those heights and scrolls (wheel or thumb) when the pane or the window is too small to show
+//! them; when they fit there is no thumb. Moving the divider reports "type split 0.31".
 //!
 //! ## 2c. Files
 //! The files page is `files.zig`: one area flagged `drop` (step 37) over a panel that highlights
@@ -146,6 +148,7 @@
 //! Enter). Type (section 2b): `type` (the type page, still); `wrap` (the
 //! type divider dragged 240 px left: the wrapped text widens); `wrap-narrow` (dragged right to
 //! the wrapped pane's 200 px minimum: "antidisestablishmentarianism" breaks between letters);
+//! `wrap-scroll` (that, then the wheel over the wrapped text: scrolled to its end);
 //! `transport` (click play: its icon
 //! is pause). Files (section 2c): `files` (the files page, empty); `drop-hover` (files dragged
 //! over the zone: its border lit); `drop` (three files dropped on the zone: `tone.wav`, 96,044
@@ -279,6 +282,7 @@ const tabs_id = ui.id("tabs", 0);
 const split_id = ui.id("split", 0);
 const side_id = ui.id("side", 0);
 const type_split_id = ui.id("type_split", 0);
+const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
@@ -469,8 +473,9 @@ pub const App = struct {
     transport: [transport_icons.len]IconButton,
     playing: bool,
     tools: [tool_icons.len]IconButton,
-    /// The face lines | the wrapped text (step 38).
+    /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
     type_split: widgets.Splitter,
+    wrap_view: ui.ViewState,
     /// The files page (section 2c): the drop zone, the dropped files, and a WAV's samples.
     drops: files_page.Page,
     view: ui.ViewState,
@@ -518,6 +523,7 @@ pub const App = struct {
         .{ .name = "transport", .setup = &transport_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "wrap", .setup = &wrap_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "wrap-narrow", .setup = &wrap_narrow_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "wrap-scroll", .setup = &wrap_scroll_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "files", .setup = &files_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop-hover", .setup = &drop_hover_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "drop", .setup = &drop_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
@@ -542,6 +548,7 @@ pub const App = struct {
         }
         app.playing = false;
         app.type_split = widgets.Splitter.init(type_split_id, .horizontal, type_split_ratio, type_split_min_a, type_split_min_b);
+        app.wrap_view = ui.ViewState.init();
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -706,6 +713,7 @@ pub const App = struct {
         app.splitter_events(cx, "split ", &app.split, event_value);
         app.splitter_events(cx, "side ", &app.side, event_value);
         app.splitter_events(cx, "type split ", &app.type_split, event_value);
+        _ = app.wrap_view.handle(cx, wrap_view_id, event_value);
         var name: [preset_name_cap]u8 = undefined;
         switch (app.presets.handle(cx, event_value)) {
             .selected => |row| app.note(cx, &.{ preset_name(&name, row), " selected" }),
@@ -1060,7 +1068,7 @@ pub const App = struct {
         }
         _ = cx.end();
         _ = app.type_split.next(cx);
-        draw_wrapped(cx);
+        draw_wrapped(cx, &app.wrap_view);
         app.type_split.end(cx);
     }
 
@@ -1281,12 +1289,15 @@ fn draw_preset(cx: *Context, row: widgets.ListRow) void {
     kit.label(cx, styled(cx, .sans, 14), preset_name(&bytes, row.index), inner, row.clip, start);
 }
 
-/// The type page's wrapped text (step 38): the bullets, each a bold lead and the rest wrapped
-/// with `text.place_runs_wrapped` beside a dot, then a `widgets.Paragraph` of `wrap_words`.
-fn draw_wrapped(cx: *Context) void {
+/// The type page's wrapped text (step 38): under the caption, a view of the bullets, each a
+/// bold lead and the rest wrapped with `text.place_runs_wrapped` beside a dot, then a
+/// `widgets.Paragraph` of `wrap_words`. The view measures their heights and scrolls them when
+/// the pane is too narrow or the window too short to show them all.
+fn draw_wrapped(cx: *Context, view: *ui.ViewState) void {
     const face: widgets.Panel = .{ .paint = panel_paint(cx) };
     _ = face.begin(cx, ui.sized(.fill, .fill), group_layout);
     caption(cx, "wrapped: drag the divider");
+    _ = cx.begin_view(wrap_view_id, ui.sized(.fill, .fill), .{ .flow = .down, .spacing = gap_px }, view);
     const bold = styled(cx, .sans_bold, wrap_size);
     const regular = styled(cx, .sans, wrap_size);
     for (bullets) |bullet| {
@@ -1308,6 +1319,7 @@ fn draw_wrapped(cx: *Context) void {
     }
     const paragraph: widgets.Paragraph = .{ .text = wrap_words, .style = regular };
     _ = paragraph.draw(cx, ui.sized(.fill, .fit));
+    cx.end_view();
     _ = cx.end();
 }
 
@@ -1512,6 +1524,15 @@ const wrap_steps = [_]bench.Step{
 const wrap_narrow_steps = [_]bench.Step{
     .{ .click = tab(page_type) },
     .{ .drag = .{ .target = type_divider(), .from_x = 3, .from_y = 100, .dx = 600, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `wrap-scroll`: `wrap-narrow`, then the wheel over the wrapped text far down: the view
+/// scrolls to its end, showing the paragraph's last line and the thumb at the bottom.
+const wrap_scroll_steps = [_]bench.Step{
+    .{ .click = tab(page_type) },
+    .{ .drag = .{ .target = type_divider(), .from_x = 3, .from_y = 100, .dx = 600, .dy = 0 } },
+    .{ .wheel = .{ .target = bench.area("wrap_view", 0), .dx = 0, .dy = 2000 } },
     .{ .wait = 12 },
 };
 
@@ -2149,6 +2170,26 @@ test "the wrap scenarios move the type divider" {
     try std.testing.expectEqualStrings("type split 0.84", narrow.status_text());
     try std.testing.expectEqual(@as(f32, 16 + 1042), area_rect(narrow.type_split.divider_id()).x);
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks the wrapped text's view (section 2b): at half the span everything fits (no scroll
+// range, so no thumb); at the 200 px minimum the content is taller than the view, and the
+// `wrap-scroll` wheel moves it to the end of its range, a frame-exact clamp.
+test "the wrapped text scrolls only when it does not fit" {
+    const wide = new_app();
+    _ = frame(wide);
+    try replay(wide, "type");
+    try std.testing.expectEqual(@as(f32, 0), wide.wrap_view.max_scroll());
+    const narrow = new_app();
+    _ = frame(narrow);
+    try replay(narrow, "wrap-narrow");
+    try std.testing.expect(narrow.wrap_view.max_scroll() > 0);
+    try std.testing.expectEqual(@as(f32, 0), narrow.wrap_view.scroll_y);
+    const scrolled = new_app();
+    _ = frame(scrolled);
+    try replay(scrolled, "wrap-scroll");
+    try std.testing.expect(scrolled.wrap_view.scroll_y > 0);
+    try std.testing.expectEqual(scrolled.wrap_view.max_scroll(), scrolled.wrap_view.scroll_y);
 }
 
 test "the transport scenario turns play into pause" {

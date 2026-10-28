@@ -966,7 +966,8 @@ blue.
   draws the default face and the icon with `kit.icon`; a ladder draws one icon at 12, 16, 24,
   32, and 48 px, the icon set every icon at 24 px, and (step 38, see Text) a `Splitter` of a
   line in each Noto face beside a panel of wrapped text: three bullets of a bold lead and the
-  rest (`text.place_runs_wrapped`) and a `widgets.Paragraph`.
+  rest (`text.place_runs_wrapped`) and a `widgets.Paragraph`, in a view that scrolls them when
+  they do not fit.
 - **files** (step 37, see File Drops): a drop zone that lights its border while files are
   dragged over it, the dropped files in a `ListBox` with sizes and statuses ("reading 42%",
   "done", "folder"), and the first WAV among them decoded chunk by chunk
@@ -984,7 +985,8 @@ left), `list` (row 3 clicked, then Down 20 times: preset 0024 scrolled into view
 (the frequency dragged up 40 px, the gain double-clicked, "-6.5" typed, Enter) for the
 containers; `type` (the type page), `transport` (play clicked: pause shows), `wrap` (the
 type divider dragged 240 px left), and `wrap-narrow` (dragged to the wrapped pane's 200 px
-minimum: a long word breaks between letters) for the type page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
+minimum: a long word breaks between letters), and `wrap-scroll` (that, then the wheel: the
+wrapped text, in a view, scrolled to its end) for the type page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
 tone, a text file, and a folder dropped: the tone's waveform) for the files page.
 
 ## File Drops
