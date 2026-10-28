@@ -28,17 +28,19 @@
 //!   (`Knob.Action.reset`), the others ignore it.
 //! - Keyboard and paste events answer `none` from `hit`; only the focused `TextField` reads
 //!   them.
-//! `Panel`, `Label`, and `Meter` are passive: they draw and record no area.
+//! `Panel`, `Label`, `Paragraph`, and `Meter` are passive: they draw and record no area.
 //!
 //! ## 3. Files
 //! One file per widget, each with its constants, geometry helpers, guide, and tests; this file
 //! re-exports every name, so `widgets.Knob` and `widgets.ring_size` are where they always were
 //! (test "widgets re-exports every public name of step 29").
 //! ```text
-//! widgets/kit.zig         append, face, arc, label, step, aim, weight, clicked, Interaction,
-//!                         Paint, the hover and press constants, the shared text styles
+//! widgets/kit.zig         append, face, arc, label, paragraph, step, aim, weight, clicked,
+//!                         Interaction, Paint, the hover and press constants, the shared text
+//!                         styles
 //! widgets/skin.zig        the look structs, Shape, skins.check, and skins.Default
 //! widgets/label.zig       Label
+//! widgets/paragraph.zig   Paragraph: text wrapped to its width, a fit height for that width
 //! widgets/panel.zig       Panel
 //! widgets/button.zig      Button
 //! widgets/slider.zig      Slider and its track geometry
@@ -112,6 +114,7 @@ pub const kit = @import("widgets/kit.zig");
 /// Skins: the look of each widget, apart from its behaviour (`widgets/skin.zig`).
 pub const skins = @import("widgets/skin.zig");
 const label = @import("widgets/label.zig");
+const paragraph = @import("widgets/paragraph.zig");
 const panel = @import("widgets/panel.zig");
 const button = @import("widgets/button.zig");
 const slider = @import("widgets/slider.zig");
@@ -163,6 +166,7 @@ pub const ListRowLook = skins.ListRowLook;
 pub const NumberLook = skins.NumberLook;
 
 pub const Label = label.Label;
+pub const Paragraph = paragraph.Paragraph;
 pub const Panel = panel.Panel;
 pub const Button = button.Button;
 pub const ButtonOf = button.ButtonOf;
@@ -278,6 +282,7 @@ test {
     _ = kit;
     _ = skins;
     _ = label;
+    _ = paragraph;
     _ = panel;
     _ = button;
     _ = slider;

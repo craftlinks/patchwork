@@ -66,7 +66,7 @@ buffer, an `area_cap` outside 1 to 65536, a `point_cap` outside 1 to 65536, and 
 exact problem (`App.config.theme.colors.panel: a component is outside [0, 1]`). `point_cap` (default 65,536) sizes the path
 point pool, which exists only when a registered type reads points (`draw.Path`).
 
-Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Button`,
+Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Paragraph`, `Button`,
 `Toggle`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`, `Dropdown`,
 `Tooltip`), and the containers and value boxes (`Tabs`, `Splitter`, `ListBox`, `NumberBox`);
 the code editor
@@ -127,6 +127,7 @@ patchwork/
 │   ├── widgets/meter.zig
 │   ├── widgets/toggle.zig
 │   ├── widgets/text_field.zig
+│   ├── widgets/paragraph.zig   # Paragraph: text wrapped to its width; a fit height for that width
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
 │   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
@@ -534,7 +535,7 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   it), and `Meter.track_h` one meter's track; the defaults are the shared constants.
 - **Widget kit.** The library widgets are built from `widgets.kit`, which an app's own widget
   uses the same way: `kit.face(cx, rect, clip, look)` appends a `draw.Box` (none for an empty
-  rect), `kit.arc` a `draw.Arc`, `kit.label` places text, `kit.append` appends any draw type
+  rect), `kit.arc` a `draw.Arc`, `kit.label` places text (`kit.paragraph` wrapped), `kit.append` appends any draw type
   and skips it when its pool is full (the context counts it), `kit.step` and `kit.aim` ease
   animators and owe redraws, `kit.weight` and `Paint.look(hover, down)` turn animator values
   into mix weights, `kit.clicked(cx, id, event)` makes a clickable row (true on a release
@@ -963,7 +964,9 @@ blue.
   A transport of icon buttons (skip back, play, which turns into pause, stop, record, loop) and
   a toolbar (open, save, settings, each with a tooltip) are `widgets.ButtonOf` a small skin that
   draws the default face and the icon with `kit.icon`; a ladder draws one icon at 12, 16, 24,
-  32, and 48 px, the icon set every icon at 24 px, and a line in each Noto face.
+  32, and 48 px, the icon set every icon at 24 px, and (step 38, see Text) a `Splitter` of a
+  line in each Noto face beside a panel of wrapped text: three bullets of a bold lead and the
+  rest (`text.place_runs_wrapped`) and a `widgets.Paragraph`.
 - **files** (step 37, see File Drops): a drop zone that lights its border while files are
   dragged over it, the dropped files in a `ListBox` with sizes and statuses ("reading 42%",
   "done", "folder"), and the first WAV among them decoded chunk by chunk
@@ -979,8 +982,9 @@ and Enter: "dropdown changed 2"), `menu-open`, `menu-flip`, `context` (right cli
 popups; `tabs` (each tab clicked: the containers page), `split` (the divider dragged 120 px
 left), `list` (row 3 clicked, then Down 20 times: preset 0024 scrolled into view), and `number`
 (the frequency dragged up 40 px, the gain double-clicked, "-6.5" typed, Enter) for the
-containers; `type` (the type page) and `transport` (play clicked: pause shows) for the type
-page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
+containers; `type` (the type page), `transport` (play clicked: pause shows), `wrap` (the
+type divider dragged 240 px left), and `wrap-narrow` (dragged to the wrapped pane's 200 px
+minimum: a long word breaks between letters) for the type page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
 tone, a text file, and a folder dropped: the tone's waveform) for the files page.
 
 ## File Drops
@@ -1506,6 +1510,25 @@ const width = text.measure(style, "0.50");                    // logical px, pur
 const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
 text.place(cx.drawing(), style, "0.50", rect, clip, options);  // during App.draw
 text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline for mixed styles
+```
+
+**Wrapped text.** `text.place_wrapped` and `text.place_runs_wrapped` break text into lines no
+wider than `rect.width`; `text.measure_wrapped` and `measure_runs_wrapped` give the height
+(lines times `text.line_height`, the face's line rounded up to a whole logical pixel), and
+`text.Lines` is the pure iterator both use. Lines break after spaces (which hang past the
+line's end), after a hyphen unless a digit follows ("-6.5" stays whole), and at `\n`; a word
+wider than the line breaks between letters, and a run boundary is never a break. Each line
+aligns by `WrapOptions.align_x`, the block by `align_y`, and each baseline snaps to the device
+grid; lines outside the clip cost no cache lookups. `widgets.Paragraph` (one style, passive
+like `Label`) takes a `.fit` height as the height of its lines at the width it gets:
+
+```zig
+const intro: widgets.Paragraph = .{ .text = words, .style = body };
+_ = intro.draw(cx, ui.sized(.fill, .fit));                    // as tall as its lines
+// Mixed styles (a bold word in a sentence): measure, walk, place.
+const height = text.measure_runs_wrapped(&runs, width);
+const rect = cx.walk(ui.sized(.fill, .{ .fixed = height }));
+text.place_runs_wrapped(cx.drawing(), &runs, rect, clip, .{}); // WrapOptions: start, start
 ```
 
 - **UTF-8** with U+FFFD for each invalid byte; at most `text.byte_cap` (4096) bytes per call.

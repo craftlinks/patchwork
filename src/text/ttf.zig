@@ -12,7 +12,8 @@
 //!
 //! ## 2. Tables
 //! - `head`: `unitsPerEm` and `indexToLocFormat` (short `loca` stores offsets / 2).
-//! - `hhea`: ascender, descender (stored as a positive `descent`), `numberOfHMetrics`.
+//! - `hhea`: ascender, descender (stored as a positive `descent`), line gap (a negative one
+//!   reads as 0), `numberOfHMetrics`.
 //! - `maxp`: `numGlyphs`, which must fit `glyph_cap` (the cache key holds 12 bits of id).
 //! - `hmtx`: advances; glyphs past `numberOfHMetrics` reuse the last advance.
 //! - `cmap`: format 12 (`(3, 10)` or `(0, 4)`) is preferred, format 4 (`(3, 1)` or `(0, 3)`)
@@ -66,6 +67,9 @@ pub const Font = struct {
     ascent: u32,
     /// Font units below the baseline, positive (`-hhea.descender`).
     descent: u32,
+    /// Font units between one line's descent and the next line's ascent (`hhea.lineGap`, at
+    /// least 0).
+    line_gap: u32,
     glyph_count: u32,
     metric_count: u32,
     hmtx: u32,
@@ -119,6 +123,7 @@ pub fn read(bytes: []const u8) Font {
         .units_per_em = read_u16(bytes, head + 18),
         .ascent = @intCast(read_i16(bytes, hhea + 4)),
         .descent = @intCast(-@as(i32, read_i16(bytes, hhea + 6))),
+        .line_gap = @intCast(@max(0, read_i16(bytes, hhea + 8))),
         .glyph_count = read_u16(bytes, maxp + 4),
         .metric_count = read_u16(bytes, hhea + 34),
         .hmtx = table(bytes, "hmtx"),

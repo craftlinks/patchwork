@@ -217,6 +217,22 @@ pub fn label(
     text.place(cx.drawing(), style, bytes, rect, clip, options);
 }
 
+/// `bytes` in `style`, wrapped to `rect.width` and placed by `options` under `clip`
+/// (`text.place_wrapped`): `label`'s twin for text longer than a line. `bytes` points at
+/// app-owned text of at most `text.byte_cap` bytes; lines outside `clip` append nothing.
+pub fn paragraph(
+    cx: anytype,
+    style: text.Style,
+    bytes: []const u8,
+    rect: Rect,
+    clip: Clip,
+    options: text.WrapOptions,
+) void {
+    assert(bytes.len <= text.byte_cap);
+    assert(clip.x1 > clip.x0);
+    text.place_wrapped(cx.drawing(), style, bytes, rect, clip, options);
+}
+
 /// `codepoint` of `face` at `size`, its ink centred on `rect` under `clip` (`text.icon`): an
 /// icon from an app's icon face. A codepoint the face does not map appends nothing.
 pub fn icon(
