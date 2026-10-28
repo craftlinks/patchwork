@@ -12,7 +12,10 @@
 //! append(cx, T, texture, record)   append; skip on a full pool or batch list (counted)
 //! face(cx, rect, clip, BoxLook)    a draw.Box, skipped when rect has a non-positive edge
 //! arc(cx, ring, clip, ArcLook)     a draw.Arc
+//! surface(cx, rect, clip, SurfaceLook)  a draw.Surface: gradient, rim, shadow; empty skipped
+//! lit(look, scheme, hover, down)   a SurfaceLook's colours mixed as a Box's are on the GPU
 //! label(cx, style, bytes, rect, clip, options)   text.place with the kit's asserts
+//! paragraph(cx, style, bytes, rect, clip, wrap)  text.place_wrapped, label's wrapped twin
 //! icon(cx, face, codepoint, size, rect, clip, color)  text.icon: one glyph centred by its ink
 //! step(cx, *Animator, dt_ms)       a moved value redraws, a live one keeps animating
 //! aim(cx, *Animator, target)       a new target redraws
@@ -49,6 +52,14 @@
 //! up outside   0       0
 //! drag, wheel, secondary, none: no change
 //! ```
+//! A `draw.Surface` has no hover or press weights (its record is full), so `lit(look, scheme,
+//! hover, down)` applies the same two mixes to its colours on the CPU before `surface`:
+//! ```text
+//! rgb = mix(mix(rgb, lighten.rgb, hover * scheme.hover_lighten), darken.rgb,
+//!           down * scheme.down_darken)        for fill, fill_to, and border; alpha kept
+//! ```
+//! so a surface lights and darkens exactly as a `Box` face does.
+//!
 //! A widget without a press channel passes no `down`. A widget that lightens on the wheel or
 //! a right press aims `hover` itself. Test "respond follows the table row by row".
 //!
@@ -73,6 +84,7 @@ pub const Id = ui.Id;
 pub const Animator = animator.Animator;
 pub const BoxLook = draw.BoxLook;
 pub const ArcLook = draw.ArcLook;
+pub const SurfaceLook = draw.SurfaceLook;
 
 /// The dark scheme's shader mix toward white at animator value 1. Widgets read the app's
 /// (`cx.theme().hover_lighten`).
@@ -193,6 +205,45 @@ pub fn face(cx: anytype, rect: Rect, clip: Clip, look: BoxLook) void {
     if (!(rect.width > 0)) return;
     if (!(rect.height > 0)) return;
     append(cx, draw.Box, null, draw.Box.of(rect, clip, look));
+}
+
+/// A `draw.Surface` whose shape is `rect`, under `clip` (`draw/types.zig`, section 6). Its
+/// shadow reaches past `rect` and is cut by `clip`, so pass the parent's clip, not one of
+/// `rect` itself. A rect with a non-positive edge appends nothing.
+pub fn surface(cx: anytype, rect: Rect, clip: Clip, look: SurfaceLook) void {
+    assert(look.radius >= 0);
+    assert(clip.x1 > clip.x0);
+    if (!(rect.width > 0)) return;
+    if (!(rect.height > 0)) return;
+    append(cx, draw.Surface, null, draw.Surface.of(rect, clip, look));
+}
+
+/// `look` at the animator values `hover` and `down`: its fill, end stop, and border mixed
+/// toward `scheme.colors.lighten` and then `darken` by the scheme's weights, as `Box`'s shader
+/// mixes (section 3). Alphas, the gradient, and the shadow are unchanged; 0 and 0 return `look`.
+pub fn lit(look: SurfaceLook, scheme: *const theme.Scheme, hover: f32, down: f32) SurfaceLook {
+    const lighten = weight(hover, scheme.hover_lighten);
+    const darken = weight(down, scheme.down_darken);
+    var out = look;
+    out.fill = mix_toward(look.fill, scheme.colors.lighten, scheme.colors.darken, lighten, darken);
+    if (look.fill_to) |end| {
+        out.fill_to = mix_toward(end, scheme.colors.lighten, scheme.colors.darken, lighten, darken);
+    }
+    out.border = mix_toward(look.border, scheme.colors.lighten, scheme.colors.darken, lighten, darken);
+    assert(out.fill[3] == look.fill[3]);
+    return out;
+}
+
+/// `color`'s rgb mixed toward `light` by `toward_light`, then toward `dark` by `toward_dark`.
+fn mix_toward(color: [4]f32, light: [4]f32, dark: [4]f32, toward_light: f32, toward_dark: f32) [4]f32 {
+    assert(toward_light >= 0 and toward_light <= 1);
+    assert(toward_dark >= 0 and toward_dark <= 1);
+    var out = color;
+    for (0..3) |i| {
+        const lifted = color[i] + (light[i] - color[i]) * toward_light;
+        out[i] = lifted + (dark[i] - lifted) * toward_dark;
+    }
+    return out;
 }
 
 /// A `draw.Arc` inscribed in the square `ring` under `clip`.
@@ -471,9 +522,9 @@ test "paint look scales hover and down" {
     try testing.expectEqual(hover_lighten, look.hover);
     try testing.expectEqual(@as(f32, 0.5) * down_darken, look.down);
     try testing.expectEqual(draw.transparent, look.border_color);
-    const lit = paint.look(&theme.light, 1, 0.5);
-    try testing.expectEqual(@as(f32, 0.10), lit.hover);
-    try testing.expectEqual(@as(f32, 0.5) * 0.15, lit.down);
+    const light = paint.look(&theme.light, 1, 0.5);
+    try testing.expectEqual(@as(f32, 0.10), light.hover);
+    try testing.expectEqual(@as(f32, 0.5) * 0.15, light.down);
 }
 
 // Locks `accent`: the app scheme's accents cycled by index with the knob stroke as radius,
@@ -491,4 +542,30 @@ test "accent reads the scheme's accents" {
     cx.event_begin(.{ .frame = 0 });
     cx.set_theme(theme.dark);
     cx.event_end();
+}
+
+// Locks `lit` (section 3) on the dark scheme: at rest the look is returned unchanged; full
+// hover moves each channel hover_lighten (0.18) of the way to `lighten`, then a full press
+// down_darken (0.30) of the rest of the way to `darken`, on the fill, the end stop, and the
+// border, keeping every alpha and the shadow.
+test "lit mixes a surface's colours as a box's shader does" {
+    const scheme = &theme.dark;
+    const look: SurfaceLook = .{
+        .fill = .{ 0.2, 0.4, 0.6, 0.9 },
+        .fill_to = .{ 1, 0, 0, 0 },
+        .border = .{ 0.5, 0.5, 0.5, 0.3 },
+        .shadow = .{ .offset = .{ 0, 6 }, .blur = 16, .alpha = 0.35 },
+    };
+    try testing.expect(std.meta.eql(look, lit(look, scheme, 0, 0)));
+    const hovered = lit(look, scheme, 1, 0);
+    const light = scheme.colors.lighten;
+    try testing.expectApproxEqAbs(0.2 + (light[0] - 0.2) * 0.18, hovered.fill[0], 1e-6);
+    try testing.expectEqual(@as(f32, 0.9), hovered.fill[3]);
+    try testing.expectEqual(@as(f32, 0), hovered.fill_to.?[3]);
+    try testing.expectEqual(@as(f32, 0.3), hovered.border[3]);
+    const pressed = lit(look, scheme, 1, 1);
+    const dark = scheme.colors.darken;
+    const lifted = 0.5 + (light[1] - 0.5) * 0.18;
+    try testing.expectApproxEqAbs(lifted + (dark[1] - lifted) * 0.30, pressed.border[1], 1e-6);
+    try testing.expect(std.meta.eql(look.shadow, pressed.shadow));
 }

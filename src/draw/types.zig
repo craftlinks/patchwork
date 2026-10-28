@@ -1,4 +1,5 @@
-//! The library draw types (`Box`, `Arc`, `Glyph`, `Image`, `Path`) and their CPU twins.
+//! The library draw types (`Box`, `Arc`, `Surface`, `Glyph`, `Image`, `Path`) and their CPU
+//! twins.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -18,6 +19,8 @@
 //!   `down` are mix weights toward the theme's `lighten` and then `darken`.
 //! - `Arc` (64 bytes): `color`, then `thickness`, `sweep` (a fraction of `theme.arc_sweep`),
 //!   `hover`, and a zero pad. An arc lightens on hover and never darkens.
+//! - `Surface` (128 bytes, the registry's maximum): a rounded rectangle with one gradient, a
+//!   border lit from the top, and a soft shadow; section 6.
 //! - `Glyph` (64 bytes): `uv` (u0, v0, u1, v1) and `color`; samples the `r8` glyph atlas, and
 //!   coverage scales `color.a`. The UVs sit on the exact texel edges of the glyph's bitmap,
 //!   with no half-texel inset: `text.place` snaps every quad edge to a device pixel edge and
@@ -52,6 +55,26 @@
 //! byte-identical to it (test "constructors match the literals byte for byte"). They append
 //! nothing: `widgets.kit` appends, and `ui` and `draw` append them with their own skip. Glyphs,
 //! images, and paths have appenders instead (`text.place`, `draw.path`).
+//!
+//! ## 6. Surfaces
+//! `Surface.of(rect, clip, SurfaceLook)` draws the shape over `rect`; its shadow lives inside
+//! the record's own `rect`, which `of` grows by the shadow's reach, so the pixel cache's bounds
+//! (`rect` and `clip`), alignment shifts, and clips cover it with no vertex function:
+//! ```text
+//! reach  = 1.5 * blur + max(|offset.x|, |offset.y|)     record rect = rect grown by reach
+//! p      = local - reach, size = rect.zw - 2 reach, uv = p / size     (the shape's own space)
+//! t      = linear: clamp(dot(uv - from, to - from) / |to - from|^2, 0, 1)
+//!          radial: clamp(length((uv - center) / radius), 0, 1)
+//! fill   = premultiplied mix of fill_a and fill_b at t, back to straight alpha
+//! border = mix(border, theme.lighten, rim * (1 - uv.y)), then face = mix(border, fill, inner)
+//! shadow = alpha * (1 - erf(sdf_box(p - offset) / (blur / 2 * sqrt 2))) / 2 * (1 - outer)
+//!          (alpha * coverage(sdf_box(p - offset)) when blur is 0), black, under the face
+//! ```
+//! The shadow is exact for a straight edge, at 1.5 blur (three sigma) under 0.0014 of its
+//! alpha, and never shows under the shape, so a translucent face stays clear. `erf` is
+//! Abramowitz and Stegun 7.1.26 in both the shader and its twin. A skin that animates a surface
+//! mixes its colours on the CPU: the record has no hover or press weights. The shadow is cut by
+//! `clip` like any pixel, so a surface takes its parent's clip, not its own rect's.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -182,6 +205,146 @@ pub const Arc = extern struct {
         \\    let dist = sdf_arc(px.local, px.size, px.thickness, px.sweep);
         \\    let rgb = mix(px.color.rgb, frame.theme.lighten.rgb, px.hover);
         \\    return vec4<f32>(rgb, px.color.a * coverage(dist));
+        \\}
+        \\
+    ;
+};
+
+/// A surface's gradient, in the shape's own uv (0 to 1 across it): a line `from` to `to`, or
+/// an ellipse of `radius` about `center` (module guide, section 6).
+pub const Gradient = union(enum) {
+    linear: struct { from: [2]f32 = .{ 0, 0 }, to: [2]f32 = .{ 0, 1 } },
+    radial: struct { center: [2]f32 = .{ 0.5, 0.5 }, radius: [2]f32 = .{ 0.5, 0.5 } },
+};
+
+/// A surface's black shadow: moved by `offset`, blurred by `blur` (a Gaussian of sigma
+/// `blur / 2`, 0 for a hard edge), at most `alpha` dark. The default is none.
+pub const Shadow = struct {
+    offset: [2]f32 = .{ 0, 0 },
+    blur: f32 = 0,
+    alpha: f32 = 0,
+};
+
+/// How a `Surface` looks (`Surface.of`). The defaults are a flat face with no border, rim, or
+/// shadow.
+pub const SurfaceLook = struct {
+    /// The gradient's start, straight RGBA; alone, a flat fill.
+    fill: [4]f32,
+    /// The gradient's end; null is `fill`.
+    fill_to: ?[4]f32 = null,
+    gradient: Gradient = .{ .linear = .{} },
+    radius: f32 = 0,
+    border: [4]f32 = transparent,
+    border_width: f32 = 0,
+    /// Mix weight of the border toward `theme.lighten` along the top edge, fading to 0 at the
+    /// bottom, `[0, 1]`.
+    rim: f32 = 0,
+    shadow: Shadow = .{},
+};
+
+/// A rounded rectangle with one gradient, a rim-lit border, and a soft shadow. See the module
+/// guide, section 6.
+pub const Surface = extern struct {
+    /// The shape grown by `reach(shadow)` on every side.
+    rect: [4]f32,
+    clip: [4]f32,
+    fill_a: [4]f32,
+    fill_b: [4]f32,
+    /// Linear: from.xy, to.xy; radial: center.xy, radius.xy; in the shape's uv.
+    gradient: [4]f32,
+    border: [4]f32,
+    /// Offset x, offset y, blur, alpha.
+    shadow: [4]f32,
+    radius: f32,
+    border_width: f32,
+    rim: f32,
+    /// 0 linear, 1 radial.
+    kind: f32,
+
+    pub const texture: ?textures.Format = null;
+
+    /// How far a shadow reaches past its shape on every side, in logical pixels.
+    pub fn reach(shadow: Shadow) f32 {
+        assert(shadow.blur >= 0);
+        assert(shadow.alpha >= 0 and shadow.alpha <= 1);
+        if (shadow.alpha == 0) return 0;
+        return 1.5 * shadow.blur + @max(@abs(shadow.offset[0]), @abs(shadow.offset[1]));
+    }
+
+    /// The surface whose shape is `rect`, clipped to `clip`, looking like `look` (module
+    /// guide, section 6). The record's `rect` is `rect` grown by the shadow's reach.
+    pub fn of(rect: Rect, clip: Clip, look: SurfaceLook) Surface {
+        assert(look.radius >= 0);
+        assert(look.border_width >= 0);
+        assert(look.rim >= 0 and look.rim <= 1);
+        const grow = reach(look.shadow);
+        const shadow = if (look.shadow.alpha == 0) Shadow{} else look.shadow;
+        var gradient: [4]f32 = undefined;
+        var kind: f32 = 0;
+        switch (look.gradient) {
+            .linear => |line| {
+                assert(line.from[0] != line.to[0] or line.from[1] != line.to[1]);
+                gradient = .{ line.from[0], line.from[1], line.to[0], line.to[1] };
+            },
+            .radial => |ellipse| {
+                assert(ellipse.radius[0] > 0 and ellipse.radius[1] > 0);
+                gradient = .{ ellipse.center[0], ellipse.center[1], ellipse.radius[0], ellipse.radius[1] };
+                kind = 1;
+            },
+        }
+        return .{
+            .rect = .{ rect.x - grow, rect.y - grow, rect.width + 2 * grow, rect.height + 2 * grow },
+            .clip = clip.array(),
+            .fill_a = look.fill,
+            .fill_b = look.fill_to orelse look.fill,
+            .gradient = gradient,
+            .border = look.border,
+            .shadow = .{ shadow.offset[0], shadow.offset[1], shadow.blur, shadow.alpha },
+            .radius = look.radius,
+            .border_width = look.border_width,
+            .rim = look.rim,
+            .kind = kind,
+        };
+    }
+
+    // Both shadows and both edges call `coverage` unconditionally and are chosen with
+    // `select`, so the derivatives stay in uniform control flow (prelude guide, section 3).
+    pub const pixel: []const u8 =
+        \\fn surface_erf(x: f32) -> f32 {
+        \\    let t = 1.0 / (1.0 + 0.3275911 * abs(x));
+        \\    let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
+        \\        - 0.284496736) * t + 0.254829592) * t;
+        \\    let y = 1.0 - poly * exp(-x * x);
+        \\    return select(-y, y, x >= 0.0);
+        \\}
+        \\
+        \\fn pixel(px: Pixel) -> vec4<f32> {
+        \\    // `Surface.of` zeroes a shadow without alpha, so this is `Surface.reach`.
+        \\    let reach = 1.5 * px.shadow.z + max(abs(px.shadow.x), abs(px.shadow.y));
+        \\    let shape = max(px.size - vec2<f32>(2.0 * reach), vec2<f32>(1.0e-3));
+        \\    let p = px.local - vec2<f32>(reach);
+        \\    let dist = sdf_box(p, shape, px.radius);
+        \\    let outer = coverage(dist);
+        \\    let inner = select(1.0, coverage(dist + px.border_width), px.border_width > 0.0);
+        \\    let uv = p / shape;
+        \\    let line = px.gradient.zw - px.gradient.xy;
+        \\    let linear_t = dot(uv - px.gradient.xy, line) / max(dot(line, line), 1.0e-6);
+        \\    let radial_t = length((uv - px.gradient.xy) / max(px.gradient.zw, vec2<f32>(1.0e-6)));
+        \\    let t = clamp(select(linear_t, radial_t, px.kind > 0.5), 0.0, 1.0);
+        \\    let alpha = mix(px.fill_a.a, px.fill_b.a, t);
+        \\    let premultiplied = mix(px.fill_a.rgb * px.fill_a.a, px.fill_b.rgb * px.fill_b.a, t);
+        \\    let fill = vec4<f32>(premultiplied / max(alpha, 1.0e-6), alpha);
+        \\    let rim = px.rim * clamp(1.0 - uv.y, 0.0, 1.0);
+        \\    let border = vec4<f32>(mix(px.border.rgb, frame.theme.lighten.rgb, rim), px.border.a);
+        \\    let face = mix(border, fill, inner);
+        \\    let face_a = face.a * outer;
+        \\    let shadow_dist = sdf_box(p - px.shadow.xy, shape, px.radius);
+        \\    let sigma = max(px.shadow.z * 0.5, 1.0e-3);
+        \\    let soft = 0.5 * (1.0 - surface_erf(shadow_dist / (sigma * 1.41421356)));
+        \\    let hard = coverage(shadow_dist);
+        \\    let shadow_a = px.shadow.w * select(hard, soft, px.shadow.z > 0.0) * (1.0 - outer);
+        \\    let out_a = face_a + shadow_a * (1.0 - face_a);
+        \\    return vec4<f32>(face.rgb * face_a / max(out_a, 1.0e-6), out_a);
         \\}
         \\
     ;
@@ -365,6 +528,65 @@ pub fn sdf_box(px: f32, py: f32, width: f32, height: f32, radius: f32) f32 {
     return inside + outside - k;
 }
 
+/// The error function, Abramowitz and Stegun 7.1.26 (error below 1.5e-7). CPU twin of
+/// `surface_erf` in `Surface.pixel`.
+pub fn erf(x: f32) f32 {
+    assert(x == x);
+    const t = 1.0 / (1.0 + 0.3275911 * @abs(x));
+    const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t +
+        0.254829592) * t;
+    const y = 1.0 - poly * @exp(-x * x);
+    assert(y >= -1e-6 and y <= 1);
+    return if (x >= 0) y else -y;
+}
+
+/// Where `(u, v)` of a shape falls on `gradient`, in `[0, 1]`. CPU twin of `Surface.pixel`'s
+/// `t` (module guide, section 6).
+pub fn gradient_t(gradient: Gradient, u: f32, v: f32) f32 {
+    assert(u == u and v == v);
+    const t = switch (gradient) {
+        .linear => |line| linear: {
+            const dx = line.to[0] - line.from[0];
+            const dy = line.to[1] - line.from[1];
+            const length2 = dx * dx + dy * dy;
+            assert(length2 > 0);
+            break :linear ((u - line.from[0]) * dx + (v - line.from[1]) * dy) / length2;
+        },
+        .radial => |ellipse| radial: {
+            assert(ellipse.radius[0] > 0 and ellipse.radius[1] > 0);
+            const x = (u - ellipse.center[0]) / ellipse.radius[0];
+            const y = (v - ellipse.center[1]) / ellipse.radius[1];
+            break :radial @sqrt(x * x + y * y);
+        },
+    };
+    return std.math.clamp(t, 0, 1);
+}
+
+/// `a` to `b` at `t`, mixed premultiplied and returned straight, so a fade to a transparent
+/// stop keeps its colour. CPU twin of `Surface.pixel`'s fill.
+pub fn mix_premultiplied(a: [4]f32, b: [4]f32, t: f32) [4]f32 {
+    assert(t >= 0 and t <= 1);
+    const alpha = a[3] + (b[3] - a[3]) * t;
+    assert(alpha >= 0);
+    var out: [4]f32 = .{ 0, 0, 0, alpha };
+    if (alpha <= 1e-6) return out;
+    for (0..3) |i| {
+        const pa = a[i] * a[3];
+        const pb = b[i] * b[3];
+        out[i] = (pa + (pb - pa) * t) / alpha;
+    }
+    return out;
+}
+
+/// A soft shadow's alpha at signed distance `dist` from its (offset) shape, before the shape
+/// masks it. CPU twin of `Surface.pixel`'s `soft` (blur > 0).
+pub fn shadow_alpha(dist: f32, blur: f32, alpha: f32) f32 {
+    assert(blur > 0);
+    assert(alpha >= 0 and alpha <= 1);
+    const sigma = blur * 0.5;
+    return alpha * 0.5 * (1 - erf(dist / (sigma * std.math.sqrt2)));
+}
+
 /// Signed distance of an open ring. CPU twin of `sdf_arc` in `prelude.wgsl`.
 ///
 /// `(px, py)` is in local logical pixels, origin at the face top-left, Y down. `thickness` is
@@ -477,6 +699,10 @@ comptime {
     assert(@offsetOf(Box, "radius") == 64);
     assert(@offsetOf(Box, "down") == 76);
     assert(@sizeOf(Arc) == 64);
+    assert(@sizeOf(Surface) == 128);
+    assert(@offsetOf(Surface, "shadow") == 96);
+    assert(@offsetOf(Surface, "radius") == 112);
+    assert(@offsetOf(Surface, "kind") == 124);
     assert(@offsetOf(Arc, "thickness") == 48);
     assert(@sizeOf(Glyph) == 64);
     assert(@offsetOf(Glyph, "uv") == 32);
@@ -640,4 +866,88 @@ test "constructors match the literals byte for byte" {
     });
     const swept_bytes = std.mem.asBytes(&built_swept);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_arc), swept_bytes);
+}
+
+// Locks the error function twin (section 6): erf(0.5) = 0.5204999, erf(1) = 0.8427008,
+// erf(2) = 0.9953223 within 1e-6, erf(0) = 0, and erf is odd.
+test "erf matches its table" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5204999), erf(0.5), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8427008), erf(1), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9953223), erf(2), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), erf(0), 1e-7);
+    try std.testing.expectEqual(-erf(0.7), erf(-0.7));
+}
+
+// Locks the gradient twin (section 6): linear (0, 0) to (0, 1) at (0.3, 0.25) is 0.25; the
+// diagonal at (1, 0) is 0.5; the ellipse of radius (0.5, 0.25) about the centre is 0.5 at
+// (0.75, 0.5) and at (0.5, 0.625), and clamps to 1 at a corner and to 0 before a line starts.
+test "gradient t along a line and an ellipse" {
+    try std.testing.expectEqual(@as(f32, 0.25), gradient_t(.{ .linear = .{} }, 0.3, 0.25));
+    const diagonal: Gradient = .{ .linear = .{ .from = .{ 0, 0 }, .to = .{ 1, 1 } } };
+    try std.testing.expectEqual(@as(f32, 0.5), gradient_t(diagonal, 1, 0));
+    try std.testing.expectEqual(@as(f32, 0), gradient_t(diagonal, -1, -1));
+    const ellipse: Gradient = .{ .radial = .{ .center = .{ 0.5, 0.5 }, .radius = .{ 0.5, 0.25 } } };
+    try std.testing.expectEqual(@as(f32, 0.5), gradient_t(ellipse, 0.75, 0.5));
+    try std.testing.expectEqual(@as(f32, 0.5), gradient_t(ellipse, 0.5, 0.625));
+    try std.testing.expectEqual(@as(f32, 1), gradient_t(ellipse, 1, 1));
+}
+
+// Locks the premultiplied mix (section 6): halfway from opaque red to transparent black is red
+// at alpha 0.5, not dark red; two opaque stops mix their channels evenly.
+test "a fade to a transparent stop keeps its colour" {
+    const red: [4]f32 = .{ 1, 0, 0, 1 };
+    try std.testing.expectEqual([4]f32{ 1, 0, 0, 0.5 }, mix_premultiplied(red, transparent, 0.5));
+    try std.testing.expectEqual([4]f32{ 0.5, 0, 0.5, 1 }, mix_premultiplied(red, .{ 0, 0, 1, 1 }, 0.5));
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, mix_premultiplied(red, transparent, 1));
+}
+
+// Locks the soft shadow (section 6) at blur 16 (sigma 8) and alpha 0.4: half its alpha at the
+// shape's edge, 0.0786 of it at sigma * sqrt 2 (erf(1) = 0.8427), under 0.0014 of it at the
+// reach (three sigma), and nearly all of it deep under the shape.
+test "the shadow falls off as a blurred edge" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), shadow_alpha(0, 16, 0.4), 1e-6);
+    const at_sigma = shadow_alpha(8 * std.math.sqrt2, 16, 0.4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4 * 0.0786496), at_sigma, 1e-6);
+    try std.testing.expect(shadow_alpha(24, 16, 0.4) < 0.4 * 0.0014);
+    try std.testing.expect(shadow_alpha(-24, 16, 0.4) > 0.4 * 0.998);
+}
+
+// Locks `Surface.of` (section 6): a shadow of offset (0, 6) and blur 16 reaches 1.5 * 16 + 6
+// = 30, so the shape (100, 50, 200, 120) becomes the record rect (70, 20, 260, 180); a flat look
+// keeps its rect, has equal stops, a linear kind, and an all-zero shadow, even with a blur but
+// no alpha; a radial look writes its centre and radius and kind 1.
+test "a surface's record grows its rect by the shadow's reach" {
+    const shape: Rect = .{ .x = 100, .y = 50, .width = 200, .height = 120 };
+    const window: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+    const shadow: Shadow = .{ .offset = .{ 0, 6 }, .blur = 16, .alpha = 0.35 };
+    try std.testing.expectEqual(@as(f32, 30), Surface.reach(shadow));
+    const card = Surface.of(shape, window, .{ .fill = .{ 1, 0.5, 0, 1 }, .radius = 16, .shadow = shadow });
+    try std.testing.expectEqual([4]f32{ 70, 20, 260, 180 }, card.rect);
+    try std.testing.expectEqual([4]f32{ 0, 6, 16, 0.35 }, card.shadow);
+    const flat = Surface.of(shape, window, .{
+        .fill = .{ 0.2, 0.2, 0.2, 1 },
+        .shadow = .{ .blur = 8 },
+    });
+    try std.testing.expectEqual(shape.array(), flat.rect);
+    try std.testing.expectEqual(flat.fill_a, flat.fill_b);
+    try std.testing.expectEqual(@as(f32, 0), flat.kind);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, flat.shadow);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 1 }, flat.gradient);
+    const glow = Surface.of(shape, window, .{
+        .fill = .{ 1, 1, 1, 0.6 },
+        .fill_to = transparent,
+        .gradient = .{ .radial = .{ .center = .{ 0.7, 0.2 }, .radius = .{ 0.6, 0.8 } } },
+    });
+    try std.testing.expectEqual([4]f32{ 0.7, 0.2, 0.6, 0.8 }, glow.gradient);
+    try std.testing.expectEqual(@as(f32, 1), glow.kind);
+}
+
+// Locks the registry's view of `Surface`: it satisfies the instance convention at the maximum
+// of eight groups, and its assembled module carries both its functions.
+test "the surface type passes the instance convention" {
+    const registry = @import("registry.zig");
+    try std.testing.expect(comptime registry.check(Surface) == null);
+    const source = comptime registry.source(Surface);
+    try std.testing.expect(std.mem.indexOf(u8, source, "fn surface_erf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "fn pixel(px: Pixel)") != null);
 }

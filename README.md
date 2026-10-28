@@ -143,7 +143,7 @@ patchwork/
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
 │   ├── draw/prelude.wgsl       # Shared vs_main, fs_main, coverage, clip mask, distance fields
-│   ├── draw/types.zig          # Library draw types (Box, Arc, Glyph, Image, Path) and CPU twins
+│   ├── draw/types.zig          # Library draw types (Box, Arc, Surface, Glyph, Image, Path), twins
 │   ├── draw/pools.zig          # Context: per-type pools, point pool, layers, sort, batches
 │   ├── draw/path.zig           # Stroked paths: flattening, chunking, twins, appenders
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId, write revisions
@@ -535,7 +535,8 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   it), and `Meter.track_h` one meter's track; the defaults are the shared constants.
 - **Widget kit.** The library widgets are built from `widgets.kit`, which an app's own widget
   uses the same way: `kit.face(cx, rect, clip, look)` appends a `draw.Box` (none for an empty
-  rect), `kit.arc` a `draw.Arc`, `kit.label` places text (`kit.paragraph` wrapped), `kit.append` appends any draw type
+  rect), `kit.surface` a `draw.Surface` (see Surfaces), `kit.arc` a `draw.Arc`, `kit.label`
+  places text (`kit.paragraph` wrapped), `kit.append` appends any draw type
   and skips it when its pool is full (the context counts it), `kit.step` and `kit.aim` ease
   animators and owe redraws, `kit.weight` and `Paint.look(hover, down)` turn animator values
   into mix weights, `kit.clicked(cx, id, event)` makes a clickable row (true on a release
@@ -973,6 +974,13 @@ blue.
   "done", "folder"), and the first WAV among them decoded chunk by chunk
   (`examples/gallery/wav.zig`) and drawn as a waveform. A WAV longer than 21.8 s cancels itself
   at the sample cap ("cut at 21.8 s"); other files are counted, not stored.
+- **surfaces** (step 39, see Surfaces): a music-player-like page of surfaces alone
+  (`examples/gallery/surfaces.zig`): a faint gradient backdrop, a glass-like panel and pill bar
+  (translucent, rim-lit, shadowed, not blurred), and six cards of a muted gradient, a radial
+  highlight, and a label pill, every colour derived from the theme so the light toggle restyles
+  it. The pills, rows, and cards are clickable: hover lights them and a
+  press darkens them through `kit.lit`, a pill or row becomes the selection, and a card is named
+  on the status line.
 
 Scenarios: `still`, `interact` (a click, two drags, a toggle, typing, a wheel, and a row click,
 then settled), `hover` (the pointer rests on button 1), `light` (the toggle, then the focused
@@ -987,7 +995,9 @@ containers; `type` (the type page), `transport` (play clicked: pause shows), `wr
 type divider dragged 240 px left), and `wrap-narrow` (dragged to the wrapped pane's 200 px
 minimum: a long word breaks between letters), and `wrap-scroll` (that, then the wheel: the
 wrapped text, in a view, scrolled to its end) for the type page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
-tone, a text file, and a folder dropped: the tone's waveform) for the files page.
+tone, a text file, and a folder dropped: the tone's waveform) for the files page; and
+`surfaces` (the surfaces page), `surfaces-click` (the Radio pill, the Browse row, and the
+Slate card clicked, then Moss hovered), and `surfaces-light` (the page in the light theme).
 
 ## File Drops
 
@@ -1293,10 +1303,39 @@ on and off are identical on both GPUs.
 
 A draw type is an `extern struct` plus a WGSL `fn pixel(px: Pixel) -> vec4<f32>`. The app
 lists its types and pool capacities in `config.draw`; the library provides `draw.Box` (fill,
-border, radius, hover, down), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
-`text.place`), and
-`draw.Image` (an `rgba8` texture), and `draw.Path` (a stroked polyline, see Paths), and an app
-adds its own (the rack's `Led`).
+border, radius, hover, down), `draw.Surface` (a gradient, a rim-lit border, and a soft shadow;
+see Surfaces below), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
+`text.place`), `draw.Image` (an `rgba8` texture), and `draw.Path` (a stroked polyline, see
+Paths), and an app adds its own (the rack's `Led`).
+
+**Surfaces.** `kit.surface(cx, rect, clip, look)` appends a `draw.Surface` whose shape is
+`rect`:
+
+```zig
+kit.surface(cx, card, page_clip, .{
+    .fill = .{ 1, 0.55, 0.25, 1 },                  // the gradient's start; alone a flat fill
+    .fill_to = .{ 1, 0.25, 0.5, 1 },
+    .gradient = .{ .linear = .{ .from = .{ 0, 0 }, .to = .{ 1, 1 } } }, // or .radial
+    .radius = 18,
+    .border = .{ 1, 1, 1, 0.45 }, .border_width = 1, .rim = 0.6,       // lit from the top
+    .shadow = .{ .offset = .{ 0, 6 }, .blur = 16, .alpha = 0.35 },      // black, soft
+});
+```
+
+- **One gradient per record**, linear or radial in the shape's own 0 to 1 space, mixed
+  premultiplied so a fade to a transparent stop keeps its colour. A highlight is a second
+  surface: a radial one from a light colour to `draw.transparent`.
+- **The shadow lives inside the record's rect.** `Surface.of` grows the rect by the reach,
+  `1.5 * blur + max(|offset|)`, and the shader insets the shape by it, so the pixel cache,
+  alignment shifts, and clips need nothing special. The shadow is a Gaussian of sigma `blur / 2`
+  (an `erf` of the box's distance), never shows under the shape, and is cut by `clip`: pass the
+  parent's clip. A surface with a blur of 16 rasterizes 1.5 blur past its shape on every side.
+- **128 bytes**, the registry's maximum, and no hover or press weights. `kit.lit(look, scheme,
+  hover, down)` mixes a look's fill, end stop, and border toward the theme's `lighten` and
+  `darken` by the scheme's weights, exactly as `Box`'s shader does, so a clickable surface
+  lights and darkens like a box face: `kit.surface(cx, rect, clip, kit.lit(look, cx.theme(),
+  item.hover.value, item.down_value()))`. A surface only draws; a widget records its area and
+  answers `cx.hit` as any other. `Box` is unchanged.
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
   pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
