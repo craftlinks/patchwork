@@ -4,7 +4,8 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Shape
-//! `Editor` is a plain widget struct like `TextField`: the app owns it (about 300 KiB, so
+//! `EditorOf(L)` is the editor of language `L` (section 8), and `Editor` is the patch
+//! language's. It is a plain widget struct like `TextField`: the app owns it (about 300 KiB, so
 //! `init` takes an out-pointer and the app lives in static memory), routes every event to
 //! `handle`, and calls `draw` (or the row iterator, section 6) while drawing. It records one
 //! area, `id`, over the viewport: focusable, the I-beam, and `tab`, so a focused editor
@@ -41,12 +42,21 @@
 //! ## 4. Drawing (per frame, visible lines only)
 //! ```text
 //! base layer   text and gutter faces, current line, selection, box and error decorations
-//!              gutter numbers and glyphs coloured per token (the tokenizer runs from each
-//!              visible line's cached start state; columns outside the clip are skipped)
+//!              gutter numbers and glyphs coloured per token (the language's `next` runs
+//!              from each visible line's cached start state; columns outside the clip are
+//!              skipped)
 //! layer 1      strike decorations and the caret
 //! ```
 //! At most `lines_max` lines and `columns_max` columns per line are drawn, so one draw
-//! appends at most `glyph_max` glyphs, which an app asserts against its glyph pool. Boxes
+//! appends at most `glyph_max` glyphs. A viewport `w` by `h` at text size `s` bounds it
+//! tighter, and `draw` asserts the bound:
+//! ```text
+//! lines_bound(h, s)     = min(lines_max, floor(h / lh) + 2)    tops inside, and the cut one
+//! glyph_bound(w, h, s)  = lines_bound(h, s) * (min(columns_max, floor(w / adv) + 3)
+//!                         + digits_max)                        x in (clip.x0 - 2 adv, x1)
+//! ```
+//! Both are callable at compile time, so an app sizes its glyph pool by its editors'
+//! largest viewports (`glyph_max` is the bound for a viewport of any size). Boxes
 //! appended before the first glyph put the base layer's box batch under its glyph batch.
 //! The caret is steady and nothing animates, so an idle editor never wakes the host.
 //!
@@ -83,6 +93,17 @@
 //! - Fixed storage; per-frame work is bounded by `lines_max`, `columns_max`,
 //!   `decoration_cap`, and `row_cap`, never by the text.
 //! - `caret` and `anchor` are codepoint boundaries in `0 ..= len` after every event.
+//!
+//! ## 8. Languages
+//! `EditorOf(L)` checks `L` against the contract in `language.zig` at compile time (a named
+//! compile error, like a skin) and keeps `L.State` per line in its `BufferOf(L)`. The
+//! language decides the states, the classes, their default colours (`L.palette`, which
+//! `default_palette` puts over the chrome colours), and the tokens. It cannot change the
+//! grid: one column per codepoint, and a gap between tokens is spaces, one column per byte
+//! (asserted in safe builds). Colours are per instance: an app may set `style.palette` at
+//! any time. `default_palette` suits a dark scheme and `light_palette` a light one (the
+//! language's optional `palette_light` over a light chrome); an app sets one when its scheme
+//! changes. The editor never reads the theme itself.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -95,12 +116,12 @@ const ui = @import("../ui.zig");
 const edit = @import("../ui/edit.zig");
 const view = @import("../ui/view.zig");
 const buffer_module = @import("buffer.zig");
+const language = @import("language.zig");
 const tokenizer = @import("tokenizer.zig");
 
 const Rect = draw.Rect;
 const Clip = draw.Clip;
 const Id = ui.Id;
-const Buffer = buffer_module.Buffer;
 const Range = buffer_module.Range;
 const Selection = buffer_module.Selection;
 
@@ -117,6 +138,29 @@ pub const columns_max: u32 = 200;
 pub const digits_max: u32 = 4;
 /// Glyphs one draw appends at most: the text cells and the gutter numbers.
 pub const glyph_max: u32 = lines_max * (columns_max + digits_max);
+/// Lines one draw shows at most in a viewport `height` logical pixels tall at text `size`:
+/// those whose tops fall inside it, plus the one the top edge cuts. At most `lines_max`.
+pub fn lines_bound(height: f32, size: f32) u32 {
+    assert(height >= 0);
+    assert(size > 0);
+    const fit = @min(height / mono_grid.line_height_of(size), @as(f32, lines_max));
+    return @min(lines_max, @as(u32, @intFromFloat(@floor(fit))) + 2);
+}
+
+/// Glyphs one draw appends at most in a viewport `width` by `height` logical pixels at text
+/// `size` (section 4): per drawn line, its gutter digits and the columns from two left of
+/// the clip to its right edge. At most `glyph_max`; callable at compile time, so an app
+/// sizes its glyph pool by its editors' largest viewports.
+pub fn glyph_bound(width: f32, height: f32, size: f32) u32 {
+    assert(width >= 0);
+    assert(size > 0);
+    const fit = @min(width / mono_grid.advance_of(size), @as(f32, columns_max));
+    const columns = @min(columns_max, @as(u32, @intFromFloat(@floor(fit))) + 3);
+    const bound = lines_bound(height, size) * (columns + digits_max);
+    assert(bound <= glyph_max);
+    return bound;
+}
+
 /// Space above the first line and below the last.
 pub const padding_px: f32 = 4;
 /// Tallest inline row.
@@ -131,51 +175,32 @@ pub const caret_px: f32 = 2;
 /// The editor's area flags (section 1).
 pub const flags: ui.Flags = .{ .wheel = false, .focusable = true, .tab = true, .cursor = .text };
 
-/// Colours, straight RGBA. `classes` is indexed by `tokenizer.Class`.
-pub const Palette = struct {
-    classes: [tokenizer.class_count][4]f32,
-    background: [4]f32,
-    gutter: [4]f32,
-    gutter_text: [4]f32,
-    gutter_current: [4]f32,
-    current_line: [4]f32,
-    selection: [4]f32,
-    caret: [4]f32,
-    box: [4]f32,
-    strike: [4]f32,
-    error_line: [4]f32,
-    error_fill: [4]f32,
-};
+/// Colours, straight RGBA, of an editor of language `L`: `classes` is indexed by `L.Class`
+/// (section 8).
+pub fn PaletteOf(comptime L: type) type {
+    return struct {
+        classes: [language.class_count(L)][4]f32,
+        background: [4]f32,
+        gutter: [4]f32,
+        gutter_text: [4]f32,
+        gutter_current: [4]f32,
+        current_line: [4]f32,
+        selection: [4]f32,
+        caret: [4]f32,
+        box: [4]f32,
+        strike: [4]f32,
+        error_line: [4]f32,
+        error_fill: [4]f32,
+    };
+}
 
-pub const default_palette: Palette = .{
-    .classes = .{
-        .{ 0.47, 0.53, 0.58, 1 },
-        .{ 0.95, 0.68, 0.40, 1 },
-        .{ 0.62, 0.82, 0.52, 1 },
-        .{ 0.80, 0.55, 0.92, 1 },
-        .{ 0.86, 0.87, 0.84, 1 },
-        .{ 0.45, 0.78, 0.92, 1 },
-        .{ 0.62, 0.64, 0.68, 1 },
-    },
-    .background = .{ 0.11, 0.12, 0.15, 1 },
-    .gutter = .{ 0.09, 0.10, 0.12, 1 },
-    .gutter_text = .{ 0.40, 0.43, 0.48, 1 },
-    .gutter_current = .{ 0.80, 0.82, 0.85, 1 },
-    .current_line = .{ 1, 1, 1, 0.04 },
-    .selection = .{ 0.26, 0.42, 0.70, 0.45 },
-    .caret = .{ 0.95, 0.95, 0.90, 1 },
-    .box = .{ 0.95, 0.68, 0.40, 0.65 },
-    .strike = .{ 0.90, 0.40, 0.40, 0.90 },
-    .error_line = .{ 0.95, 0.33, 0.33, 1 },
-    .error_fill = .{ 0.95, 0.33, 0.33, 0.12 },
-};
-
-pub const Style = struct {
-    size: f32,
-    palette: Palette,
-};
-
-pub const default_style: Style = .{ .size = 15, .palette = default_palette };
+/// The text size and colours of an editor of language `L`.
+pub fn StyleOf(comptime L: type) type {
+    return struct {
+        size: f32,
+        palette: PaletteOf(L),
+    };
+}
 
 /// A drawn mark over bytes `start .. end` (section 6).
 pub const Decoration = struct {
@@ -244,983 +269,1060 @@ const Visible = struct {
     tops: [lines_max]f32,
 };
 
-pub const Editor = struct {
-    id: Id,
-    style: Style,
-    buffer: Buffer,
-    caret: u32,
-    anchor: u32,
-    /// The column Up and Down aim for, kept across vertical moves.
-    goal: ?u32,
-    view: ui.ViewState,
-    scroll_x: f32,
-    decorations: [decoration_cap]Decoration,
-    decoration_count: u32,
-    rows: [row_cap]InlineRow,
-    row_count: u32,
-    refusal: buffer_module.Refusal,
-    refused_source: Source,
-    /// Paste sanitizing and load staging.
-    scratch: [buffer_module.buffer_cap]u8,
-    mono: mono_grid.Mono,
-    geometry: Geometry,
-    pass: Pass,
+/// The editor of language `L` (`language.zig`; section 8). `L` is checked at compile time.
+pub fn EditorOf(comptime L: type) type {
+    if (comptime language.check(L)) |problem| @compileError(problem);
+    return struct {
+        const Self = @This();
+        const Buffer = buffer_module.BufferOf(L);
 
-    /// An empty editor. Out-pointer init (section 1).
-    pub fn init(self: *Editor, id: Id, style: Style) void {
-        assert(id != .none);
-        assert(style.size > 0);
-        self.id = id;
-        self.style = style;
-        self.buffer.init();
-        self.caret = 0;
-        self.anchor = 0;
-        self.goal = null;
-        self.view = ui.ViewState.init();
-        self.scroll_x = 0;
-        self.decoration_count = 0;
-        self.row_count = 0;
-        self.refusal = .none;
-        self.refused_source = .call;
-        self.geometry = .{
-            .viewport = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-            .text_left = 0,
-            .text_width = 0,
-            .gutter_width = 0,
-            .drawn = false,
+        /// The language this editor colours.
+        pub const Language = L;
+        pub const Palette = PaletteOf(L);
+        pub const Style = StyleOf(L);
+
+        /// The language's class colours over the default chrome.
+        pub const default_palette: Palette = .{
+            .classes = L.palette,
+            .background = .{ 0.11, 0.12, 0.15, 1 },
+            .gutter = .{ 0.09, 0.10, 0.12, 1 },
+            .gutter_text = .{ 0.40, 0.43, 0.48, 1 },
+            .gutter_current = .{ 0.80, 0.82, 0.85, 1 },
+            .current_line = .{ 1, 1, 1, 0.04 },
+            .selection = .{ 0.26, 0.42, 0.70, 0.45 },
+            .caret = .{ 0.95, 0.95, 0.90, 1 },
+            .box = .{ 0.95, 0.68, 0.40, 0.65 },
+            .strike = .{ 0.90, 0.40, 0.40, 0.90 },
+            .error_line = .{ 0.95, 0.33, 0.33, 1 },
+            .error_fill = .{ 0.95, 0.33, 0.33, 0.12 },
         };
-        self.pass = .{ .open = false, .empty = true, .next_row = 0 };
-        assert(self.buffer.len == 0);
-    }
 
-    /// Replaces the text with `utf8`, sanitized (`edit.sanitize_text`), clears the history,
-    /// and puts the caret at the start, scrolled home. False when it does not fit.
-    pub fn load(self: *Editor, utf8: []const u8) bool {
-        assert(!self.pass.open);
-        const sanitized = edit.sanitize_text(utf8, 0, &self.scratch);
-        if (!sanitized.complete) {
-            self.refusal = .bytes;
-            self.refused_source = .call;
-            return false;
-        }
-        if (!self.buffer.load(self.scratch[0..sanitized.len])) {
-            self.refusal = self.buffer.refusal;
-            self.refused_source = .call;
-            return false;
-        }
-        self.caret = 0;
-        self.anchor = 0;
-        self.goal = null;
-        self.view.scroll_y = 0;
-        self.scroll_x = 0;
-        self.refusal = .none;
-        assert(self.buffer.line_count >= 1);
-        return true;
-    }
+        pub const default_style: Style = .{ .size = 15, .palette = default_palette };
 
-    pub fn text(self: *const Editor) []const u8 {
-        return self.buffer.text();
-    }
-
-    /// Moves on every change of the text, undo and redo included.
-    pub fn revision(self: *const Editor) u64 {
-        return self.buffer.revision;
-    }
-
-    /// The selected byte range, ordered.
-    pub fn selection(self: *const Editor) Range {
-        assert(self.caret <= self.buffer.len);
-        assert(self.anchor <= self.buffer.len);
-        return .{ .start = @min(self.caret, self.anchor), .end = @max(self.caret, self.anchor) };
-    }
-
-    /// The caret's line and codepoint column, both from 0.
-    pub fn caret_position(self: *const Editor) [2]u32 {
-        const line = self.buffer.line_of(self.caret);
-        return .{ line, self.column_of(self.caret) };
-    }
-
-    /// The first line the current scroll shows. A draw shows at most `lines_max` lines from
-    /// it, so an app that decorates only what is visible scans those.
-    /// The offset is clamped as the next draw will clamp it, so an edit that shortened the
-    /// text names the line that draw shows.
-    pub fn first_visible_line(self: *const Editor) u32 {
-        assert(self.view.scroll_y >= 0);
-        const room = self.content_height() - self.geometry.viewport.height;
-        return self.line_at(std.math.clamp(self.view.scroll_y, 0, @max(0, room)));
-    }
-
-    /// The viewport of the last draw.
-    pub fn viewport(self: *const Editor) Rect {
-        assert(self.geometry.viewport.width >= 0);
-        return self.geometry.viewport;
-    }
-
-    /// The logical rect of the character at `byte` (section 2).
-    pub fn rect_of(self: *const Editor, byte: u32) Rect {
-        assert(byte <= self.buffer.len);
-        const g = self.geometry;
-        const line = self.buffer.line_of(byte);
-        const column: f32 = @floatFromInt(self.column_of(byte));
-        const rect: Rect = .{
-            .x = g.text_left - self.scroll_x + column * self.advance(),
-            .y = g.viewport.y - self.view.scroll_y + self.line_top(line),
-            .width = self.advance(),
-            .height = self.line_height(),
+        /// The language's light class colours (`L.palette_light`, else `L.palette`) over a
+        /// light chrome, for an app to set on a light scheme (section 8).
+        pub const light_palette: Palette = .{
+            .classes = if (@hasDecl(L, "palette_light")) L.palette_light else L.palette,
+            .background = .{ 0.98, 0.98, 0.99, 1 },
+            .gutter = .{ 0.94, 0.95, 0.96, 1 },
+            .gutter_text = .{ 0.60, 0.62, 0.66, 1 },
+            .gutter_current = .{ 0.20, 0.22, 0.25, 1 },
+            .current_line = .{ 0, 0, 0, 0.04 },
+            .selection = .{ 0.72, 0.81, 0.97, 0.70 },
+            .caret = .{ 0.12, 0.13, 0.15, 1 },
+            .box = .{ 0.79, 0.47, 0.20, 0.70 },
+            .strike = .{ 0.80, 0.25, 0.25, 0.90 },
+            .error_line = .{ 0.85, 0.20, 0.20, 1 },
+            .error_fill = .{ 0.85, 0.20, 0.20, 0.10 },
         };
-        assert(rect.width > 0);
-        return rect;
-    }
 
-    /// Replaces `range` with `utf8` as one undo entry, or as part of an open gesture; the
-    /// caret and anchor follow the text. The caller owes a redraw. False when refused.
-    pub fn replace(self: *Editor, range: Range, utf8: []const u8) bool {
-        assert(range.end <= self.buffer.len);
-        const delta_end = range.start + @as(u32, @intCast(utf8.len));
-        const before = self.selection_now();
-        const after: Selection = .{
-            .caret = map_through(self.caret, range, delta_end),
-            .anchor = map_through(self.anchor, range, delta_end),
-        };
-        const change: buffer_module.Change = .{ .kind = .other, .before = before, .after = after };
-        if (!self.buffer.replace(range, utf8, change)) {
-            self.refusal = self.buffer.refusal;
+        pub const light_style: Style = .{ .size = 15, .palette = light_palette };
+
+        id: Id,
+        style: Style,
+        buffer: Buffer,
+        caret: u32,
+        anchor: u32,
+        /// The column Up and Down aim for, kept across vertical moves.
+        goal: ?u32,
+        view: ui.ViewState,
+        scroll_x: f32,
+        decorations: [decoration_cap]Decoration,
+        decoration_count: u32,
+        rows: [row_cap]InlineRow,
+        row_count: u32,
+        refusal: buffer_module.Refusal,
+        refused_source: Source,
+        /// Paste sanitizing and load staging.
+        scratch: [buffer_module.buffer_cap]u8,
+        mono: mono_grid.Mono,
+        geometry: Geometry,
+        pass: Pass,
+
+        /// An empty editor. Out-pointer init (section 1).
+        pub fn init(self: *Self, id: Id, style: Style) void {
+            assert(id != .none);
+            assert(style.size > 0);
+            self.id = id;
+            self.style = style;
+            self.buffer.init();
+            self.caret = 0;
+            self.anchor = 0;
+            self.goal = null;
+            self.view = ui.ViewState.init();
+            self.scroll_x = 0;
+            self.decoration_count = 0;
+            self.row_count = 0;
+            self.refusal = .none;
             self.refused_source = .call;
-            return false;
+            self.geometry = .{
+                .viewport = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                .text_left = 0,
+                .text_width = 0,
+                .gutter_width = 0,
+                .drawn = false,
+            };
+            self.pass = .{ .open = false, .empty = true, .next_row = 0 };
+            assert(self.buffer.len == 0);
         }
-        self.caret = after.caret;
-        self.anchor = after.anchor;
-        assert(self.caret <= self.buffer.len);
-        return true;
-    }
 
-    pub fn gesture_begin(self: *Editor) void {
-        self.buffer.gesture_begin();
-    }
-
-    pub fn gesture_end(self: *Editor) void {
-        self.buffer.gesture_end();
-    }
-
-    /// The history mark for a dirty marker (`editor/buffer.zig`, section 4).
-    pub fn history_mark(self: *const Editor) u64 {
-        return self.buffer.history_mark();
-    }
-
-    pub fn view_id(self: *const Editor) Id {
-        return self.id.derive(view_salt);
-    }
-
-    // ------------------------------------------------------------------- events
-
-    /// Applies one event; see the module guide, sections 3 and 5.
-    pub fn handle(self: *Editor, cx: anytype, event: input.Event) Action {
-        assert(self.id != .none);
-        assert(!self.pass.open);
-        if (event == .frame) return .none;
-        if (cx.focus_lost(self.id)) {
-            self.buffer.seal();
-            cx.redraw();
+        /// Replaces the text with `utf8`, sanitized (`edit.sanitize_text`), clears the history,
+        /// and puts the caret at the start, scrolled home. False when it does not fit.
+        pub fn load(self: *Self, utf8: []const u8) bool {
+            assert(!self.pass.open);
+            const sanitized = edit.sanitize_text(utf8, 0, &self.scratch);
+            if (!sanitized.complete) {
+                self.refusal = .bytes;
+                self.refused_source = .call;
+                return false;
+            }
+            if (!self.buffer.load(self.scratch[0..sanitized.len])) {
+                self.refusal = self.buffer.refusal;
+                self.refused_source = .call;
+                return false;
+            }
+            self.caret = 0;
+            self.anchor = 0;
+            self.goal = null;
+            self.view.scroll_y = 0;
+            self.scroll_x = 0;
+            self.refusal = .none;
+            assert(self.buffer.line_count >= 1);
+            return true;
         }
-        // Tab can bring focus without a press; the caret and line band must appear.
-        if (cx.focus_gained(self.id)) cx.redraw();
-        switch (event) {
-            .key_down => |press| {
-                if (!cx.focused(self.id)) return .none;
-                return self.key(cx, press);
-            },
-            .paste => |pasted| {
-                if (!cx.focused(self.id)) return .none;
-                return self.paste(cx, pasted);
-            },
-            .wheel => {
-                switch (cx.hit(self.view_id(), event)) {
-                    .wheel => |wheel| self.scroll_by(cx, wheel),
-                    else => {},
-                }
-                return .none;
-            },
-            else => {},
-        }
-        _ = self.view.handle(cx, self.view_id(), event);
-        self.pointer(cx, cx.hit(self.id, event));
-        return .none;
-    }
 
-    fn scroll_by(self: *Editor, cx: anytype, wheel: input.Wheel) void {
-        var dx = wheel.dx;
-        var dy = wheel.dy;
-        if (cx.mods.shift) {
-            dx += dy;
-            dy = 0;
+        pub fn text(self: *const Self) []const u8 {
+            return self.buffer.text();
         }
-        if (dy != 0) _ = self.view.scroll_to(cx, self.view.scroll_y + dy);
-        if (dx != 0) {
-            const next = std.math.clamp(self.scroll_x + dx, 0, self.scroll_x_max());
-            if (next != self.scroll_x) {
-                self.scroll_x = next;
+
+        /// Moves on every change of the text, undo and redo included.
+        pub fn revision(self: *const Self) u64 {
+            return self.buffer.revision;
+        }
+
+        /// The selected byte range, ordered.
+        pub fn selection(self: *const Self) Range {
+            assert(self.caret <= self.buffer.len);
+            assert(self.anchor <= self.buffer.len);
+            const start = @min(self.caret, self.anchor);
+            return .{ .start = start, .end = @max(self.caret, self.anchor) };
+        }
+
+        /// The caret's line and codepoint column, both from 0.
+        pub fn caret_position(self: *const Self) [2]u32 {
+            const line = self.buffer.line_of(self.caret);
+            return .{ line, self.column_of(self.caret) };
+        }
+
+        /// The first line the current scroll shows. A draw shows at most `lines_max` lines from
+        /// it, so an app that decorates only what is visible scans those.
+        /// The offset is clamped as the next draw will clamp it, so an edit that shortened the
+        /// text names the line that draw shows.
+        pub fn first_visible_line(self: *const Self) u32 {
+            assert(self.view.scroll_y >= 0);
+            const room = self.content_height() - self.geometry.viewport.height;
+            return self.line_at(std.math.clamp(self.view.scroll_y, 0, @max(0, room)));
+        }
+
+        /// The viewport of the last draw.
+        pub fn viewport(self: *const Self) Rect {
+            assert(self.geometry.viewport.width >= 0);
+            return self.geometry.viewport;
+        }
+
+        /// The logical rect of the character at `byte` (section 2).
+        pub fn rect_of(self: *const Self, byte: u32) Rect {
+            assert(byte <= self.buffer.len);
+            const g = self.geometry;
+            const line = self.buffer.line_of(byte);
+            const column: f32 = @floatFromInt(self.column_of(byte));
+            const rect: Rect = .{
+                .x = g.text_left - self.scroll_x + column * self.advance(),
+                .y = g.viewport.y - self.view.scroll_y + self.line_top(line),
+                .width = self.advance(),
+                .height = self.line_height(),
+            };
+            assert(rect.width > 0);
+            return rect;
+        }
+
+        /// Replaces `range` with `utf8` as one undo entry, or as part of an open gesture; the
+        /// caret and anchor follow the text. The caller owes a redraw. False when refused.
+        pub fn replace(self: *Self, range: Range, utf8: []const u8) bool {
+            assert(range.end <= self.buffer.len);
+            const delta_end = range.start + @as(u32, @intCast(utf8.len));
+            const before = self.selection_now();
+            const after: Selection = .{
+                .caret = map_through(self.caret, range, delta_end),
+                .anchor = map_through(self.anchor, range, delta_end),
+            };
+            const change: buffer_module.Change = .{
+                .kind = .other,
+                .before = before,
+                .after = after,
+            };
+            if (!self.buffer.replace(range, utf8, change)) {
+                self.refusal = self.buffer.refusal;
+                self.refused_source = .call;
+                return false;
+            }
+            self.caret = after.caret;
+            self.anchor = after.anchor;
+            assert(self.caret <= self.buffer.len);
+            return true;
+        }
+
+        pub fn gesture_begin(self: *Self) void {
+            self.buffer.gesture_begin();
+        }
+
+        pub fn gesture_end(self: *Self) void {
+            self.buffer.gesture_end();
+        }
+
+        /// The history mark for a dirty marker (`editor/buffer.zig`, section 4).
+        pub fn history_mark(self: *const Self) u64 {
+            return self.buffer.history_mark();
+        }
+
+        pub fn view_id(self: *const Self) Id {
+            return self.id.derive(view_salt);
+        }
+
+        // ------------------------------------------------------------------- events
+
+        /// Applies one event; see the module guide, sections 3 and 5.
+        pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
+            assert(self.id != .none);
+            assert(!self.pass.open);
+            if (event == .frame) return .none;
+            if (cx.focus_lost(self.id)) {
+                self.buffer.seal();
                 cx.redraw();
             }
+            // Tab can bring focus without a press; the caret and line band must appear.
+            if (cx.focus_gained(self.id)) cx.redraw();
+            switch (event) {
+                .key_down => |press| {
+                    if (!cx.focused(self.id)) return .none;
+                    return self.key(cx, press);
+                },
+                .paste => |pasted| {
+                    if (!cx.focused(self.id)) return .none;
+                    return self.paste(cx, pasted);
+                },
+                .wheel => {
+                    switch (cx.hit(self.view_id(), event)) {
+                        .wheel => |wheel| self.scroll_by(cx, wheel),
+                        else => {},
+                    }
+                    return .none;
+                },
+                else => {},
+            }
+            _ = self.view.handle(cx, self.view_id(), event);
+            self.pointer(cx, cx.hit(self.id, event));
+            return .none;
         }
-        assert(self.scroll_x >= 0);
-    }
 
-    fn pointer(self: *Editor, cx: anytype, hit: ui.Hit) void {
-        switch (hit) {
-            .down => |press| {
-                self.buffer.seal();
-                const byte = self.byte_at(press.x, press.y);
-                if (press.clicks >= 3) {
-                    const line = self.buffer.line_of(byte);
-                    const range = self.buffer.line_range(line);
-                    self.anchor = range.start;
-                    self.caret = @min(range.end + 1, self.buffer.len);
-                } else if (press.clicks == 2) {
-                    const range = edit.word_around(self.text(), byte);
-                    self.anchor = range.start;
-                    self.caret = range.end;
-                } else {
-                    self.caret = byte;
-                    if (!press.mods.shift) self.anchor = byte;
-                }
-                self.goal = null;
-                self.follow();
-                cx.redraw();
-            },
-            .drag => |press| {
-                const byte = self.byte_at(press.x, press.y);
-                if (byte != self.caret) {
-                    self.caret = byte;
-                    self.goal = null;
+        fn scroll_by(self: *Self, cx: anytype, wheel: input.Wheel) void {
+            var dx = wheel.dx;
+            var dy = wheel.dy;
+            if (cx.mods.shift) {
+                dx += dy;
+                dy = 0;
+            }
+            if (dy != 0) _ = self.view.scroll_to(cx, self.view.scroll_y + dy);
+            if (dx != 0) {
+                const next = std.math.clamp(self.scroll_x + dx, 0, self.scroll_x_max());
+                if (next != self.scroll_x) {
+                    self.scroll_x = next;
                     cx.redraw();
                 }
-            },
-            else => {},
+            }
+            assert(self.scroll_x >= 0);
         }
-        assert(self.caret <= self.buffer.len);
-    }
 
-    fn key(self: *Editor, cx: anytype, press: input.KeyPress) Action {
-        assert(cx.focused(self.id));
-        if (press.mods.shortcut()) return self.shortcut(cx, press);
-        switch (press.key) {
-            .left, .right, .up, .down, .home, .end, .page_up, .page_down => {
-                self.move(cx, press.key, press.mods.shift, false);
-                return .none;
-            },
-            .backspace => return self.erase(cx, .backward, false),
-            .delete => return self.erase(cx, .forward, false),
-            .enter => return self.enter(cx),
-            .tab => return self.tab(cx, press.mods.shift),
-            .escape => return .none,
-            else => {
-                if (press.len == 0) return .none;
-                return self.type_text(cx, press.typed());
-            },
+        fn pointer(self: *Self, cx: anytype, hit: ui.Hit) void {
+            switch (hit) {
+                .down => |press| {
+                    self.buffer.seal();
+                    const byte = self.byte_at(press.x, press.y);
+                    if (press.clicks >= 3) {
+                        const line = self.buffer.line_of(byte);
+                        const range = self.buffer.line_range(line);
+                        self.anchor = range.start;
+                        self.caret = @min(range.end + 1, self.buffer.len);
+                    } else if (press.clicks == 2) {
+                        const range = edit.word_around(self.text(), byte);
+                        self.anchor = range.start;
+                        self.caret = range.end;
+                    } else {
+                        self.caret = byte;
+                        if (!press.mods.shift) self.anchor = byte;
+                    }
+                    self.goal = null;
+                    self.follow();
+                    cx.redraw();
+                },
+                .drag => |press| {
+                    const byte = self.byte_at(press.x, press.y);
+                    if (byte != self.caret) {
+                        self.caret = byte;
+                        self.goal = null;
+                        cx.redraw();
+                    }
+                },
+                else => {},
+            }
+            assert(self.caret <= self.buffer.len);
         }
-    }
 
-    fn shortcut(self: *Editor, cx: anytype, press: input.KeyPress) Action {
-        assert(press.mods.shortcut());
-        const shift = press.mods.shift;
-        switch (press.key) {
-            .a => {
-                self.buffer.seal();
-                self.anchor = 0;
-                self.caret = self.buffer.len;
-                cx.redraw();
-            },
-            .c => {
-                const range = self.selection();
-                if (range.end > range.start) cx.copy(self.text()[range.start..range.end]);
-            },
-            .x => {
-                const range = self.selection();
-                if (range.end == range.start) return .none;
-                cx.copy(self.text()[range.start..range.end]);
-                return self.commit(cx, range, "", .other, .key);
-            },
-            .v => cx.request_paste(),
-            .z => return self.history(cx, if (shift) .redo else .undo),
-            .y => return self.history(cx, .redo),
-            .left, .right, .home, .end => self.move(cx, press.key, shift, true),
-            .backspace => return self.erase(cx, .backward, true),
-            .delete => return self.erase(cx, .forward, true),
-            else => {},
+        fn key(self: *Self, cx: anytype, press: input.KeyPress) Action {
+            assert(cx.focused(self.id));
+            if (press.mods.shortcut()) return self.shortcut(cx, press);
+            switch (press.key) {
+                .left, .right, .up, .down, .home, .end, .page_up, .page_down => {
+                    self.move(cx, press.key, press.mods.shift, false);
+                    return .none;
+                },
+                .backspace => return self.erase(cx, .backward, false),
+                .delete => return self.erase(cx, .forward, false),
+                .enter => return self.enter(cx),
+                .tab => return self.tab(cx, press.mods.shift),
+                .escape => return .none,
+                else => {
+                    if (press.len == 0) return .none;
+                    return self.type_text(cx, press.typed());
+                },
+            }
         }
-        return .none;
-    }
 
-    fn history(self: *Editor, cx: anytype, way: enum { undo, redo }) Action {
-        const restored = switch (way) {
-            .undo => self.buffer.undo(),
-            .redo => self.buffer.redo(),
-        } orelse return .none;
-        self.caret = @min(restored.caret, self.buffer.len);
-        self.anchor = @min(restored.anchor, self.buffer.len);
-        self.goal = null;
-        self.follow();
-        cx.redraw();
-        assert(edit.is_boundary(self.text(), self.caret));
-        return .changed;
-    }
-
-    /// Moves the caret for a navigation key; `word` is Ctrl or Meta (section 5).
-    fn move(self: *Editor, cx: anytype, key_name: input.Key, extend: bool, word: bool) void {
-        self.buffer.seal();
-        const bytes = self.text();
-        const range = self.selection();
-        const collapse = range.end > range.start and !extend;
-        const vertical = switch (key_name) {
-            .up, .down, .page_up, .page_down => true,
-            else => false,
-        };
-        if (!vertical) self.goal = null;
-        const target: u32 = switch (key_name) {
-            .left => if (collapse) range.start else if (word)
-                edit.word_left(bytes, self.caret)
-            else
-                edit.prev_boundary(bytes, self.caret),
-            .right => if (collapse) range.end else if (word)
-                edit.word_right(bytes, self.caret)
-            else
-                edit.next_boundary(bytes, self.caret),
-            .home => if (word) 0 else self.buffer.line_range(self.caret_line()).start,
-            .end => if (word) self.buffer.len else self.buffer.line_range(self.caret_line()).end,
-            .up => self.vertical_target(-1),
-            .down => self.vertical_target(1),
-            .page_up => self.vertical_target(-@as(i32, @intCast(self.page_lines()))),
-            .page_down => self.vertical_target(@intCast(self.page_lines())),
-            else => unreachable,
-        };
-        self.caret = target;
-        if (!extend) self.anchor = target;
-        self.follow();
-        cx.redraw();
-        assert(edit.is_boundary(self.text(), self.caret));
-    }
-
-    /// The byte `lines` lines away at the goal column, which the first vertical move sets.
-    fn vertical_target(self: *Editor, lines: i32) u32 {
-        const goal = self.goal orelse self.column_of(self.caret);
-        self.goal = goal;
-        const line: i64 = @as(i64, self.caret_line()) + lines;
-        if (line < 0) return 0;
-        if (line >= self.buffer.line_count) return self.buffer.len;
-        return self.byte_of_column(@intCast(line), goal);
-    }
-
-    fn type_text(self: *Editor, cx: anytype, typed: []const u8) Action {
-        assert(typed.len >= 1);
-        const range = self.selection();
-        if (range.end > range.start) self.buffer.seal();
-        if (edit.is_word(typed[0]) and self.caret > 0) {
-            const previous = edit.prev_boundary(self.text(), self.caret);
-            if (!edit.is_word(self.text()[previous])) self.buffer.seal();
+        fn shortcut(self: *Self, cx: anytype, press: input.KeyPress) Action {
+            assert(press.mods.shortcut());
+            const shift = press.mods.shift;
+            switch (press.key) {
+                .a => {
+                    self.buffer.seal();
+                    self.anchor = 0;
+                    self.caret = self.buffer.len;
+                    cx.redraw();
+                },
+                .c => {
+                    const range = self.selection();
+                    if (range.end > range.start) cx.copy(self.text()[range.start..range.end]);
+                },
+                .x => {
+                    const range = self.selection();
+                    if (range.end == range.start) return .none;
+                    cx.copy(self.text()[range.start..range.end]);
+                    return self.commit(cx, range, "", .other, .key);
+                },
+                .v => cx.request_paste(),
+                .z => return self.history(cx, if (shift) .redo else .undo),
+                .y => return self.history(cx, .redo),
+                .left, .right, .home, .end => self.move(cx, press.key, shift, true),
+                .backspace => return self.erase(cx, .backward, true),
+                .delete => return self.erase(cx, .forward, true),
+                else => {},
+            }
+            return .none;
         }
-        return self.commit(cx, range, typed, .typing, .key);
-    }
 
-    fn erase(self: *Editor, cx: anytype, direction: edit.Direction, word: bool) Action {
-        const range = self.selection();
-        if (range.end > range.start) return self.commit(cx, range, "", .other, .key);
-        const bytes = self.text();
-        const target = switch (direction) {
-            .backward => if (word)
-                edit.word_left(bytes, self.caret)
-            else
-                edit.prev_boundary(bytes, self.caret),
-            .forward => if (word)
-                edit.word_right(bytes, self.caret)
-            else
-                edit.next_boundary(bytes, self.caret),
-        };
-        if (target == self.caret) return .none;
-        const span: Range = .{ .start = @min(target, self.caret), .end = @max(target, self.caret) };
-        return self.commit(cx, span, "", if (word) .other else .erasing, .key);
-    }
-
-    /// Enter: a line break plus the current line's leading spaces before the caret.
-    fn enter(self: *Editor, cx: anytype) Action {
-        const range = self.selection();
-        const line = self.buffer.line_range(self.buffer.line_of(range.start));
-        var indent: u32 = 0;
-        while (line.start + indent < range.start and self.text()[line.start + indent] == ' ') {
-            indent += 1;
-        }
-        const room: u32 = @intCast(self.scratch.len - 1);
-        indent = @min(indent, room);
-        self.scratch[0] = '\n';
-        @memset(self.scratch[1..][0..indent], ' ');
-        return self.commit(cx, range, self.scratch[0 .. indent + 1], .other, .key);
-    }
-
-    /// Tab: spaces to the next stop, or with several lines selected (or Shift) an indent or
-    /// outdent of every selected line as one gesture.
-    fn tab(self: *Editor, cx: anytype, outdent: bool) Action {
-        const range = self.selection();
-        const first = self.buffer.line_of(range.start);
-        const last = self.buffer.line_of(range.end);
-        if (!outdent and first == last) {
-            const column = self.column_of(range.start);
-            const spaces = edit.tab_width - column % edit.tab_width;
-            @memset(self.scratch[0..spaces], ' ');
-            return self.commit(cx, range, self.scratch[0..spaces], .other, .key);
-        }
-        const before = self.selection_now();
-        self.buffer.gesture_begin();
-        var refused = false;
-        var line = last + 1;
-        while (line > first) {
-            line -= 1;
-            if (!self.indent_line(line, outdent, before)) refused = true;
-        }
-        self.anchor = self.buffer.line_range(first).start;
-        self.caret = self.buffer.line_range(last).end;
-        self.buffer.amend_after(self.selection_now());
-        self.buffer.gesture_end();
-        self.goal = null;
-        self.follow();
-        cx.redraw();
-        if (refused) {
-            self.refusal = self.buffer.refusal;
-            self.refused_source = .key;
-            return .refused;
-        }
-        return .changed;
-    }
-
-    /// Adds `tab_width` leading spaces to `line`, or removes up to that many.
-    /// `before` is the selection when the indent began; the gesture's entry restores it.
-    fn indent_line(self: *Editor, line: u32, outdent: bool, before: Selection) bool {
-        const range = self.buffer.line_range(line);
-        const change: buffer_module.Change = .{ .kind = .other, .before = before, .after = before };
-        if (!outdent) {
-            const at: Range = .{ .start = range.start, .end = range.start };
-            return self.buffer.replace(at, "    ", change);
-        }
-        var spaces: u32 = 0;
-        while (spaces < edit.tab_width and range.start + spaces < range.end and
-            self.text()[range.start + spaces] == ' ') spaces += 1;
-        if (spaces == 0) return true;
-        const cut: Range = .{ .start = range.start, .end = range.start + spaces };
-        return self.buffer.replace(cut, "", change);
-    }
-
-    fn paste(self: *Editor, cx: anytype, pasted: []const u8) Action {
-        const range = self.selection();
-        const sanitized = edit.sanitize_text(pasted, self.column_of(range.start), &self.scratch);
-        if (!sanitized.complete) {
-            self.refusal = .bytes;
-            self.refused_source = .paste;
+        fn history(self: *Self, cx: anytype, way: enum { undo, redo }) Action {
+            const restored = switch (way) {
+                .undo => self.buffer.undo(),
+                .redo => self.buffer.redo(),
+            } orelse return .none;
+            self.caret = @min(restored.caret, self.buffer.len);
+            self.anchor = @min(restored.anchor, self.buffer.len);
+            self.goal = null;
+            self.follow();
             cx.redraw();
-            return .refused;
+            assert(edit.is_boundary(self.text(), self.caret));
+            return .changed;
         }
-        self.buffer.seal();
-        return self.commit(cx, range, self.scratch[0..sanitized.len], .other, .paste);
-    }
 
-    /// Replaces `range` with `utf8`, puts the caret after it, and keeps it visible.
-    fn commit(
-        self: *Editor,
-        cx: anytype,
-        range: Range,
-        utf8: []const u8,
-        kind: buffer_module.Kind,
-        source: Source,
-    ) Action {
-        const end = range.start + @as(u32, @intCast(utf8.len));
-        const change: buffer_module.Change = .{
-            .kind = kind,
-            .before = self.selection_now(),
-            .after = .{ .caret = end, .anchor = end },
-        };
-        cx.redraw();
-        if (!self.buffer.replace(range, utf8, change)) {
-            self.refusal = self.buffer.refusal;
-            self.refused_source = source;
-            return .refused;
+        /// Moves the caret for a navigation key; `word` is Ctrl or Meta (section 5).
+        fn move(self: *Self, cx: anytype, key_name: input.Key, extend: bool, word: bool) void {
+            self.buffer.seal();
+            const bytes = self.text();
+            const range = self.selection();
+            const collapse = range.end > range.start and !extend;
+            const vertical = switch (key_name) {
+                .up, .down, .page_up, .page_down => true,
+                else => false,
+            };
+            if (!vertical) self.goal = null;
+            const target: u32 = switch (key_name) {
+                .left => if (collapse) range.start else if (word)
+                    edit.word_left(bytes, self.caret)
+                else
+                    edit.prev_boundary(bytes, self.caret),
+                .right => if (collapse) range.end else if (word)
+                    edit.word_right(bytes, self.caret)
+                else
+                    edit.next_boundary(bytes, self.caret),
+                .home => if (word) 0 else self.buffer.line_range(self.caret_line()).start,
+                .end => if (word)
+                    self.buffer.len
+                else
+                    self.buffer.line_range(self.caret_line()).end,
+                .up => self.vertical_target(-1),
+                .down => self.vertical_target(1),
+                .page_up => self.vertical_target(-@as(i32, @intCast(self.page_lines()))),
+                .page_down => self.vertical_target(@intCast(self.page_lines())),
+                else => unreachable,
+            };
+            self.caret = target;
+            if (!extend) self.anchor = target;
+            self.follow();
+            cx.redraw();
+            assert(edit.is_boundary(self.text(), self.caret));
         }
-        self.refusal = .none;
-        self.caret = end;
-        self.anchor = end;
-        self.goal = null;
-        self.follow();
-        assert(self.caret <= self.buffer.len);
-        return .changed;
-    }
 
-    /// Scrolls so the caret is inside the viewport both ways (section 3). Before the first
-    /// draw there is no viewport and nothing scrolls.
-    fn follow(self: *Editor) void {
-        const g = self.geometry;
-        if (!g.drawn) return;
-        self.view.content_h = self.content_height();
-        const top = self.line_top(self.caret_line());
-        const bottom = top + self.line_height() + padding_px;
-        var scroll_y = self.view.scroll_y;
-        if (top - padding_px < scroll_y) scroll_y = top - padding_px;
-        if (bottom > scroll_y + g.viewport.height) scroll_y = bottom - g.viewport.height;
-        self.view.scroll_y = std.math.clamp(scroll_y, 0, self.view.max_scroll());
-        const x = @as(f32, @floatFromInt(self.column_of(self.caret))) * self.advance();
-        if (x < self.scroll_x) self.scroll_x = x;
-        if (x + self.advance() > self.scroll_x + g.text_width) {
-            self.scroll_x = x + self.advance() - g.text_width;
+        /// The byte `lines` lines away at the goal column, which the first vertical move sets.
+        fn vertical_target(self: *Self, lines: i32) u32 {
+            const goal = self.goal orelse self.column_of(self.caret);
+            self.goal = goal;
+            const line: i64 = @as(i64, self.caret_line()) + lines;
+            if (line < 0) return 0;
+            if (line >= self.buffer.line_count) return self.buffer.len;
+            return self.byte_of_column(@intCast(line), goal);
         }
-        self.scroll_x = std.math.clamp(self.scroll_x, 0, self.scroll_x_max());
-        assert(self.view.scroll_y >= 0);
-        assert(self.scroll_x >= 0);
-    }
 
-    // ----------------------------------------------------------------- geometry
-
-    fn advance(self: *const Editor) f32 {
-        return mono_grid.advance_of(self.style.size);
-    }
-
-    fn line_height(self: *const Editor) f32 {
-        return mono_grid.line_height_of(self.style.size);
-    }
-
-    fn caret_line(self: *const Editor) u32 {
-        return self.buffer.line_of(self.caret);
-    }
-
-    fn selection_now(self: *const Editor) Selection {
-        assert(self.caret <= self.buffer.len);
-        return .{ .caret = self.caret, .anchor = self.anchor };
-    }
-
-    fn page_lines(self: *const Editor) u32 {
-        const lines = self.geometry.viewport.height / self.line_height();
-        return @max(1, @as(u32, @intFromFloat(@max(0, @floor(lines)))));
-    }
-
-    /// The codepoint column of `byte` in its line.
-    fn column_of(self: *const Editor, byte: u32) u32 {
-        const start = self.buffer.line_range(self.buffer.line_of(byte)).start;
-        return codepoints(self.text()[start..byte]);
-    }
-
-    /// The byte at codepoint column `column` of `line`, or the line's end.
-    fn byte_of_column(self: *const Editor, line: u32, column: u32) u32 {
-        const range = self.buffer.line_range(line);
-        var byte = range.start;
-        var at: u32 = 0;
-        while (at < column and byte < range.end) : (at += 1) {
-            byte = edit.next_boundary(self.text()[0..range.end], byte);
+        fn type_text(self: *Self, cx: anytype, typed: []const u8) Action {
+            assert(typed.len >= 1);
+            const range = self.selection();
+            if (range.end > range.start) self.buffer.seal();
+            if (edit.is_word(typed[0]) and self.caret > 0) {
+                const previous = edit.prev_boundary(self.text(), self.caret);
+                if (!edit.is_word(self.text()[previous])) self.buffer.seal();
+            }
+            return self.commit(cx, range, typed, .typing, .key);
         }
-        assert(byte <= range.end);
-        return byte;
-    }
 
-    /// The caret position under the window point `(x, y)` of the last draw.
-    fn byte_at(self: *const Editor, x: f32, y: f32) u32 {
-        const g = self.geometry;
-        const line = self.line_at(y - g.viewport.y + self.view.scroll_y);
-        const column = @round((x - g.text_left + self.scroll_x) / self.advance());
-        return self.byte_of_column(line, @intFromFloat(@max(0, column)));
-    }
-
-    /// The row's line, clamped to the text: a row left behind by a shrink sits at the end.
-    fn row_line(self: *const Editor, index: u32) u32 {
-        assert(index < self.row_count);
-        return @min(self.rows[index].after_line, self.buffer.line_count - 1);
-    }
-
-    /// The content y of the top of `line` (section 2).
-    fn line_top(self: *const Editor, line: u32) f32 {
-        assert(line < self.buffer.line_count);
-        var above: f32 = 0;
-        for (0..self.row_count) |index| {
-            if (self.row_line(@intCast(index)) >= line) break;
-            above += self.rows[index].height;
+        fn erase(self: *Self, cx: anytype, direction: edit.Direction, word: bool) Action {
+            const range = self.selection();
+            if (range.end > range.start) return self.commit(cx, range, "", .other, .key);
+            const bytes = self.text();
+            const target = switch (direction) {
+                .backward => if (word)
+                    edit.word_left(bytes, self.caret)
+                else
+                    edit.prev_boundary(bytes, self.caret),
+                .forward => if (word)
+                    edit.word_right(bytes, self.caret)
+                else
+                    edit.next_boundary(bytes, self.caret),
+            };
+            if (target == self.caret) return .none;
+            const low = @min(target, self.caret);
+            const span: Range = .{ .start = low, .end = @max(target, self.caret) };
+            return self.commit(cx, span, "", if (word) .other else .erasing, .key);
         }
-        return padding_px + @as(f32, @floatFromInt(line)) * self.line_height() + above;
-    }
 
-    /// The content y of the top of row `index`.
-    fn row_top(self: *const Editor, index: u32) f32 {
-        const line = self.row_line(index);
-        var above: f32 = 0;
-        for (self.rows[0..index]) |row| above += row.height;
-        return padding_px + @as(f32, @floatFromInt(line + 1)) * self.line_height() + above;
-    }
-
-    /// The line at content y `y`; a row maps to the line above it.
-    fn line_at(self: *const Editor, y: f32) u32 {
-        const height = self.line_height();
-        var above: f32 = 0;
-        for (0..self.row_count) |index| {
-            const row_y = self.row_top(@intCast(index));
-            if (y < row_y) break;
-            if (y < row_y + self.rows[index].height) return self.row_line(@intCast(index));
-            above += self.rows[index].height;
+        /// Enter: a line break plus the current line's leading spaces before the caret.
+        fn enter(self: *Self, cx: anytype) Action {
+            const range = self.selection();
+            const line = self.buffer.line_range(self.buffer.line_of(range.start));
+            var indent: u32 = 0;
+            while (line.start + indent < range.start and self.text()[line.start + indent] == ' ') {
+                indent += 1;
+            }
+            const room: u32 = @intCast(self.scratch.len - 1);
+            indent = @min(indent, room);
+            self.scratch[0] = '\n';
+            @memset(self.scratch[1..][0..indent], ' ');
+            return self.commit(cx, range, self.scratch[0 .. indent + 1], .other, .key);
         }
-        const lines = @floor((y - padding_px - above) / height);
-        const last: f32 = @floatFromInt(self.buffer.line_count - 1);
-        return @intFromFloat(std.math.clamp(lines, 0, last));
-    }
 
-    fn content_height(self: *const Editor) f32 {
-        var rows: f32 = 0;
-        for (self.rows[0..self.row_count]) |row| rows += row.height;
-        const lines: f32 = @floatFromInt(self.buffer.line_count);
-        return 2 * padding_px + lines * self.line_height() + rows;
-    }
+        /// Tab: spaces to the next stop, or with several lines selected (or Shift) an indent or
+        /// outdent of every selected line as one gesture.
+        fn tab(self: *Self, cx: anytype, outdent: bool) Action {
+            const range = self.selection();
+            const first = self.buffer.line_of(range.start);
+            const last = self.buffer.line_of(range.end);
+            if (!outdent and first == last) {
+                const column = self.column_of(range.start);
+                const spaces = edit.tab_width - column % edit.tab_width;
+                @memset(self.scratch[0..spaces], ' ');
+                return self.commit(cx, range, self.scratch[0..spaces], .other, .key);
+            }
+            const before = self.selection_now();
+            self.buffer.gesture_begin();
+            var refused = false;
+            var line = last + 1;
+            while (line > first) {
+                line -= 1;
+                if (!self.indent_line(line, outdent, before)) refused = true;
+            }
+            self.anchor = self.buffer.line_range(first).start;
+            self.caret = self.buffer.line_range(last).end;
+            self.buffer.amend_after(self.selection_now());
+            self.buffer.gesture_end();
+            self.goal = null;
+            self.follow();
+            cx.redraw();
+            if (refused) {
+                self.refusal = self.buffer.refusal;
+                self.refused_source = .key;
+                return .refused;
+            }
+            return .changed;
+        }
 
-    fn scroll_x_max(self: *const Editor) f32 {
-        const wide = @as(f32, @floatFromInt(self.buffer.longest + 1)) * self.advance();
-        return @max(0, wide - self.geometry.text_width);
-    }
+        /// Adds `tab_width` leading spaces to `line`, or removes up to that many.
+        /// `before` is the selection when the indent began; the gesture's entry restores it.
+        fn indent_line(self: *Self, line: u32, outdent: bool, before: Selection) bool {
+            const range = self.buffer.line_range(line);
+            const change: buffer_module.Change = .{
+                .kind = .other,
+                .before = before,
+                .after = before,
+            };
+            if (!outdent) {
+                const at: Range = .{ .start = range.start, .end = range.start };
+                return self.buffer.replace(at, "    ", change);
+            }
+            var spaces: u32 = 0;
+            while (spaces < edit.tab_width and range.start + spaces < range.end and
+                self.text()[range.start + spaces] == ' ') spaces += 1;
+            if (spaces == 0) return true;
+            const cut: Range = .{ .start = range.start, .end = range.start + spaces };
+            return self.buffer.replace(cut, "", change);
+        }
 
-    // --------------------------------------------------------------------- draw
+        fn paste(self: *Self, cx: anytype, pasted: []const u8) Action {
+            const range = self.selection();
+            const column = self.column_of(range.start);
+            const sanitized = edit.sanitize_text(pasted, column, &self.scratch);
+            if (!sanitized.complete) {
+                self.refusal = .bytes;
+                self.refused_source = .paste;
+                cx.redraw();
+                return .refused;
+            }
+            self.buffer.seal();
+            return self.commit(cx, range, self.scratch[0..sanitized.len], .other, .paste);
+        }
 
-    /// Draws the editor in the view `walk` places, all of it except inline rows (section 6).
-    pub fn draw(self: *Editor, cx: anytype, walk: ui.Walk) void {
-        self.draw_begin(cx, walk);
-        while (self.next_row(cx)) |slot| _ = cx.walk(slot.walk);
-        self.draw_end(cx);
-    }
+        /// Replaces `range` with `utf8`, puts the caret after it, and keeps it visible.
+        fn commit(
+            self: *Self,
+            cx: anytype,
+            range: Range,
+            utf8: []const u8,
+            kind: buffer_module.Kind,
+            source: Source,
+        ) Action {
+            const end = range.start + @as(u32, @intCast(utf8.len));
+            const change: buffer_module.Change = .{
+                .kind = kind,
+                .before = self.selection_now(),
+                .after = .{ .caret = end, .anchor = end },
+            };
+            cx.redraw();
+            if (!self.buffer.replace(range, utf8, change)) {
+                self.refusal = self.buffer.refusal;
+                self.refused_source = source;
+                return .refused;
+            }
+            self.refusal = .none;
+            self.caret = end;
+            self.anchor = end;
+            self.goal = null;
+            self.follow();
+            assert(self.caret <= self.buffer.len);
+            return .changed;
+        }
 
-    /// Opens the view and draws the lines, selection, decorations, and caret.
-    pub fn draw_begin(self: *Editor, cx: anytype, walk: ui.Walk) void {
-        assert(!self.pass.open);
-        self.check_rows();
-        // The view clamps the offset with the content height before it draws, so it gets
-        // this frame's height, not the one measured before an edit or a load.
-        self.view.content_h = self.content_height();
-        const port = cx.begin_view(self.view_id(), walk, ui.flow_of(.down), &self.view);
-        self.pass = .{ .open = true, .empty = true, .next_row = 0 };
-        self.mono.prepare(cx.drawing(), self.style.size);
-        const digits = @max(3, digit_count(self.buffer.line_count));
-        const gutter = @as(f32, @floatFromInt(digits + 2)) * self.advance();
-        self.geometry = .{
-            .viewport = port,
-            .text_left = port.x + gutter + self.advance() * 0.5,
-            .text_width = @max(0, port.width - gutter - self.advance() * 0.5 - view.gutter_px),
-            .gutter_width = gutter,
-            .drawn = true,
-        };
-        self.view.content_h = self.content_height();
-        self.view.scroll_y = std.math.clamp(self.view.scroll_y, 0, self.view.max_scroll());
-        self.scroll_x = std.math.clamp(self.scroll_x, 0, self.scroll_x_max());
-        const clip = cx.clip() orelse return;
-        if (!(port.width > 0) or !(port.height > 0)) return;
-        self.pass.empty = false;
-        cx.area(self.id, port, 0, flags);
-        var visible: Visible = undefined;
-        self.visible_lines(&visible);
-        self.draw_faces(cx, clip, &visible, cx.focused(self.id));
-        self.draw_decorations(cx, clip, &visible, false);
-        self.draw_text(cx, clip, &visible);
-        const previous = cx.drawing().layer(over_layer);
-        self.draw_decorations(cx, clip, &visible, true);
-        if (cx.focused(self.id)) self.draw_caret(cx, clip, &visible);
-        _ = cx.drawing().layer(previous);
-        assert(self.pass.open);
-    }
+        /// Scrolls so the caret is inside the viewport both ways (section 3). Before the first
+        /// draw there is no viewport and nothing scrolls.
+        fn follow(self: *Self) void {
+            const g = self.geometry;
+            if (!g.drawn) return;
+            self.view.content_h = self.content_height();
+            const top = self.line_top(self.caret_line());
+            const bottom = top + self.line_height() + padding_px;
+            var scroll_y = self.view.scroll_y;
+            if (top - padding_px < scroll_y) scroll_y = top - padding_px;
+            if (bottom > scroll_y + g.viewport.height) scroll_y = bottom - g.viewport.height;
+            self.view.scroll_y = std.math.clamp(scroll_y, 0, self.view.max_scroll());
+            const x = @as(f32, @floatFromInt(self.column_of(self.caret))) * self.advance();
+            if (x < self.scroll_x) self.scroll_x = x;
+            if (x + self.advance() > self.scroll_x + g.text_width) {
+                self.scroll_x = x + self.advance() - g.text_width;
+            }
+            self.scroll_x = std.math.clamp(self.scroll_x, 0, self.scroll_x_max());
+            assert(self.view.scroll_y >= 0);
+            assert(self.scroll_x >= 0);
+        }
 
-    /// The next visible inline row, with the view's turtle skipped to its top, or null.
-    pub fn next_row(self: *Editor, cx: anytype) ?RowSlot {
-        assert(self.pass.open);
-        const g = self.geometry;
-        while (self.pass.next_row < self.row_count) {
-            const index = self.pass.next_row;
-            self.pass.next_row += 1;
-            if (self.pass.empty) continue;
-            const top = g.viewport.y - self.view.scroll_y + self.row_top(index);
-            const height = self.rows[index].height;
-            if (top + height <= g.viewport.y) continue;
-            if (top >= g.viewport.y + g.viewport.height) continue;
-            const span = top - cx.remaining().y;
+        // ----------------------------------------------------------------- geometry
+
+        fn advance(self: *const Self) f32 {
+            return mono_grid.advance_of(self.style.size);
+        }
+
+        fn line_height(self: *const Self) f32 {
+            return mono_grid.line_height_of(self.style.size);
+        }
+
+        fn caret_line(self: *const Self) u32 {
+            return self.buffer.line_of(self.caret);
+        }
+
+        fn selection_now(self: *const Self) Selection {
+            assert(self.caret <= self.buffer.len);
+            return .{ .caret = self.caret, .anchor = self.anchor };
+        }
+
+        fn page_lines(self: *const Self) u32 {
+            const lines = self.geometry.viewport.height / self.line_height();
+            return @max(1, @as(u32, @intFromFloat(@max(0, @floor(lines)))));
+        }
+
+        /// The codepoint column of `byte` in its line.
+        fn column_of(self: *const Self, byte: u32) u32 {
+            const start = self.buffer.line_range(self.buffer.line_of(byte)).start;
+            return codepoints(self.text()[start..byte]);
+        }
+
+        /// The byte at codepoint column `column` of `line`, or the line's end.
+        fn byte_of_column(self: *const Self, line: u32, column: u32) u32 {
+            const range = self.buffer.line_range(line);
+            var byte = range.start;
+            var at: u32 = 0;
+            while (at < column and byte < range.end) : (at += 1) {
+                byte = edit.next_boundary(self.text()[0..range.end], byte);
+            }
+            assert(byte <= range.end);
+            return byte;
+        }
+
+        /// The caret position under the window point `(x, y)` of the last draw.
+        fn byte_at(self: *const Self, x: f32, y: f32) u32 {
+            const g = self.geometry;
+            const line = self.line_at(y - g.viewport.y + self.view.scroll_y);
+            const column = @round((x - g.text_left + self.scroll_x) / self.advance());
+            return self.byte_of_column(line, @intFromFloat(@max(0, column)));
+        }
+
+        /// The row's line, clamped to the text: a row left behind by a shrink sits at the end.
+        fn row_line(self: *const Self, index: u32) u32 {
+            assert(index < self.row_count);
+            return @min(self.rows[index].after_line, self.buffer.line_count - 1);
+        }
+
+        /// The content y of the top of `line` (section 2).
+        fn line_top(self: *const Self, line: u32) f32 {
+            assert(line < self.buffer.line_count);
+            var above: f32 = 0;
+            for (0..self.row_count) |index| {
+                if (self.row_line(@intCast(index)) >= line) break;
+                above += self.rows[index].height;
+            }
+            return padding_px + @as(f32, @floatFromInt(line)) * self.line_height() + above;
+        }
+
+        /// The content y of the top of row `index`.
+        fn row_top(self: *const Self, index: u32) f32 {
+            const line = self.row_line(index);
+            var above: f32 = 0;
+            for (self.rows[0..index]) |row| above += row.height;
+            return padding_px + @as(f32, @floatFromInt(line + 1)) * self.line_height() + above;
+        }
+
+        /// The line at content y `y`; a row maps to the line above it.
+        fn line_at(self: *const Self, y: f32) u32 {
+            const height = self.line_height();
+            var above: f32 = 0;
+            for (0..self.row_count) |index| {
+                const row_y = self.row_top(@intCast(index));
+                if (y < row_y) break;
+                if (y < row_y + self.rows[index].height) return self.row_line(@intCast(index));
+                above += self.rows[index].height;
+            }
+            const lines = @floor((y - padding_px - above) / height);
+            const last: f32 = @floatFromInt(self.buffer.line_count - 1);
+            return @intFromFloat(std.math.clamp(lines, 0, last));
+        }
+
+        fn content_height(self: *const Self) f32 {
+            var rows: f32 = 0;
+            for (self.rows[0..self.row_count]) |row| rows += row.height;
+            const lines: f32 = @floatFromInt(self.buffer.line_count);
+            return 2 * padding_px + lines * self.line_height() + rows;
+        }
+
+        fn scroll_x_max(self: *const Self) f32 {
+            const wide = @as(f32, @floatFromInt(self.buffer.longest + 1)) * self.advance();
+            return @max(0, wide - self.geometry.text_width);
+        }
+
+        // --------------------------------------------------------------------- draw
+
+        /// Draws the editor in the view `walk` places, all of it except inline rows (section 6).
+        pub fn draw(self: *Self, cx: anytype, walk: ui.Walk) void {
+            self.draw_begin(cx, walk);
+            while (self.next_row(cx)) |slot| _ = cx.walk(slot.walk);
+            self.draw_end(cx);
+        }
+
+        /// Opens the view and draws the lines, selection, decorations, and caret.
+        pub fn draw_begin(self: *Self, cx: anytype, walk: ui.Walk) void {
+            assert(!self.pass.open);
+            self.check_rows();
+            // The view clamps the offset with the content height before it draws, so it gets
+            // this frame's height, not the one measured before an edit or a load.
+            self.view.content_h = self.content_height();
+            const port = cx.begin_view(self.view_id(), walk, ui.flow_of(.down), &self.view);
+            self.pass = .{ .open = true, .empty = true, .next_row = 0 };
+            self.mono.prepare(cx.drawing(), self.style.size);
+            const digits = @max(3, digit_count(self.buffer.line_count));
+            const gutter = @as(f32, @floatFromInt(digits + 2)) * self.advance();
+            self.geometry = .{
+                .viewport = port,
+                .text_left = port.x + gutter + self.advance() * 0.5,
+                .text_width = @max(0, port.width - gutter - self.advance() * 0.5 - view.gutter_px),
+                .gutter_width = gutter,
+                .drawn = true,
+            };
+            self.view.content_h = self.content_height();
+            self.view.scroll_y = std.math.clamp(self.view.scroll_y, 0, self.view.max_scroll());
+            self.scroll_x = std.math.clamp(self.scroll_x, 0, self.scroll_x_max());
+            const clip = cx.clip() orelse return;
+            if (!(port.width > 0) or !(port.height > 0)) return;
+            self.pass.empty = false;
+            cx.area(self.id, port, 0, flags);
+            var visible: Visible = undefined;
+            self.visible_lines(&visible);
+            self.draw_faces(cx, clip, &visible, cx.focused(self.id));
+            self.draw_decorations(cx, clip, &visible, false);
+            const glyphs = self.draw_text(cx, clip, &visible);
+            assert(glyphs <= glyph_bound(port.width, port.height, self.style.size));
+            const previous = cx.drawing().layer(over_layer);
+            self.draw_decorations(cx, clip, &visible, true);
+            if (cx.focused(self.id)) self.draw_caret(cx, clip, &visible);
+            _ = cx.drawing().layer(previous);
+            assert(self.pass.open);
+        }
+
+        /// The next visible inline row, with the view's turtle skipped to its top, or null.
+        pub fn next_row(self: *Self, cx: anytype) ?RowSlot {
+            assert(self.pass.open);
+            const g = self.geometry;
+            while (self.pass.next_row < self.row_count) {
+                const index = self.pass.next_row;
+                self.pass.next_row += 1;
+                if (self.pass.empty) continue;
+                const top = g.viewport.y - self.view.scroll_y + self.row_top(index);
+                const height = self.rows[index].height;
+                if (top + height <= g.viewport.y) continue;
+                if (top >= g.viewport.y + g.viewport.height) continue;
+                const span = top - cx.remaining().y;
+                assert(span > -0.01);
+                cx.skip(@max(0, span));
+                // From the gutter's right edge to the thumb's gutter, like the text clip.
+                const width = g.text_width + self.advance() * 0.5;
+                var walk = ui.sized(.{ .fixed = width }, .{ .fixed = height });
+                walk.margin.left = g.gutter_width;
+                return .{ .index = index, .walk = walk, .rect = cx.peek(walk) };
+            }
+            return null;
+        }
+
+        /// Skips the turtle to the end of the content and closes the view.
+        pub fn draw_end(self: *Self, cx: anytype) void {
+            assert(self.pass.open);
+            const g = self.geometry;
+            const end = g.viewport.y - self.view.scroll_y + self.content_height();
+            const span = end - cx.remaining().y;
             assert(span > -0.01);
             cx.skip(@max(0, span));
-            // From the gutter's right edge to the thumb's gutter, like the text clip.
-            const width = g.text_width + self.advance() * 0.5;
-            var walk = ui.sized(.{ .fixed = width }, .{ .fixed = height });
-            walk.margin.left = g.gutter_width;
-            return .{ .index = index, .walk = walk, .rect = cx.peek(walk) };
+            cx.end_view();
+            self.pass.open = false;
+            assert(!self.pass.open);
         }
-        return null;
-    }
 
-    /// Skips the turtle to the end of the content and closes the view.
-    pub fn draw_end(self: *Editor, cx: anytype) void {
-        assert(self.pass.open);
-        const g = self.geometry;
-        const end = g.viewport.y - self.view.scroll_y + self.content_height();
-        const span = end - cx.remaining().y;
-        assert(span > -0.01);
-        cx.skip(@max(0, span));
-        cx.end_view();
-        self.pass.open = false;
-        assert(!self.pass.open);
-    }
-
-    fn check_rows(self: *const Editor) void {
-        assert(self.row_count <= row_cap);
-        assert(self.decoration_count <= decoration_cap);
-        for (self.rows[0..self.row_count], 0..) |row, index| {
-            assert(row.height > 0);
-            assert(row.height <= row_height_max);
-            if (index > 0) assert(self.rows[index - 1].after_line <= row.after_line);
-        }
-    }
-
-    /// The lines that overlap the viewport, at most `lines_max`, with their window tops.
-    fn visible_lines(self: *const Editor, visible: *Visible) void {
-        const g = self.geometry;
-        const height = self.line_height();
-        const first = self.line_at(self.view.scroll_y);
-        var top = g.viewport.y - self.view.scroll_y + self.line_top(first);
-        var row: u32 = 0;
-        while (row < self.row_count and self.row_line(row) < first) row += 1;
-        visible.first = first;
-        visible.count = 0;
-        var line = first;
-        while (line < self.buffer.line_count and visible.count < lines_max) : (line += 1) {
-            if (top >= g.viewport.y + g.viewport.height) break;
-            visible.tops[visible.count] = top;
-            visible.count += 1;
-            top += height;
-            while (row < self.row_count and self.row_line(row) == line) : (row += 1) {
-                top += self.rows[row].height;
+        fn check_rows(self: *const Self) void {
+            assert(self.row_count <= row_cap);
+            assert(self.decoration_count <= decoration_cap);
+            for (self.rows[0..self.row_count], 0..) |row, index| {
+                assert(row.height > 0);
+                assert(row.height <= row_height_max);
+                if (index > 0) assert(self.rows[index - 1].after_line <= row.after_line);
             }
         }
-        assert(visible.count <= lines_max);
-    }
 
-    /// Faces, the current line, and the selection bands, on the base layer.
-    fn draw_faces(
-        self: *Editor,
-        cx: anytype,
+        /// The lines that overlap the viewport, at most `lines_max`, with their window tops.
+        fn visible_lines(self: *const Self, visible: *Visible) void {
+            const g = self.geometry;
+            const height = self.line_height();
+            const first = self.line_at(self.view.scroll_y);
+            var top = g.viewport.y - self.view.scroll_y + self.line_top(first);
+            var row: u32 = 0;
+            while (row < self.row_count and self.row_line(row) < first) row += 1;
+            visible.first = first;
+            visible.count = 0;
+            var line = first;
+            while (line < self.buffer.line_count and visible.count < lines_max) : (line += 1) {
+                if (top >= g.viewport.y + g.viewport.height) break;
+                visible.tops[visible.count] = top;
+                visible.count += 1;
+                top += height;
+                while (row < self.row_count and self.row_line(row) == line) : (row += 1) {
+                    top += self.rows[row].height;
+                }
+            }
+            assert(visible.count <= lines_max);
+        }
+
+        /// Faces, the current line, and the selection bands, on the base layer.
+        fn draw_faces(
+            self: *Self,
+            cx: anytype,
+            clip: Clip,
+            visible: *const Visible,
+            focused: bool,
+        ) void {
+            const g = self.geometry;
+            const palette = &self.style.palette;
+            const gutter: Rect = .{
+                .x = g.viewport.x,
+                .y = g.viewport.y,
+                .width = g.gutter_width,
+                .height = g.viewport.height,
+            };
+            push_box(cx, g.viewport, clip, palette.background);
+            push_box(cx, gutter, clip, palette.gutter);
+            const text_clip = self.clip_text(clip) orelse return;
+            const range = self.selection();
+            const current = self.caret_line();
+            for (0..visible.count) |offset| {
+                const line = visible.first + @as(u32, @intCast(offset));
+                const top = visible.tops[offset];
+                if (focused and line == current and range.start == range.end) {
+                    const band: Rect = .{
+                        .x = g.text_left,
+                        .y = top,
+                        .width = g.text_width,
+                        .height = self.line_height(),
+                    };
+                    push_box(cx, band, text_clip, palette.current_line);
+                }
+                const span = self.line_span(line, range.start, range.end, true) orelse continue;
+                push_box(cx, self.span_rect(span, top), text_clip, palette.selection);
+            }
+        }
+
+        /// The columns `[0]` to `[1]` of the part of bytes `start .. end` on `line`; with
+        /// `newline`, a selection that continues past the line end covers one more column.
+        fn line_span(self: *const Self, line: u32, start: u32, end: u32, newline: bool) ?[2]u32 {
+            const range = self.buffer.line_range(line);
+            if (end <= start) return null;
+            if (end < range.start) return null;
+            if (start > range.end) return null;
+            const bytes = self.text();
+            const first = if (start > range.start) codepoints(bytes[range.start..start]) else 0;
+            var last = codepoints(bytes[range.start..@min(end, range.end)]);
+            if (newline and end > range.end) last += 1;
+            if (last <= first) return null;
+            return .{ first, last };
+        }
+
+        fn span_rect(self: *const Self, columns: [2]u32, top: f32) Rect {
+            assert(columns[1] > columns[0]);
+            const x0 = self.geometry.text_left - self.scroll_x;
+            const first: f32 = @floatFromInt(columns[0]);
+            const count: f32 = @floatFromInt(columns[1] - columns[0]);
+            return .{
+                .x = x0 + first * self.advance(),
+                .y = top,
+                .width = count * self.advance(),
+                .height = self.line_height(),
+            };
+        }
+
+        fn clip_text(self: *const Self, clip: Clip) ?Clip {
+            const g = self.geometry;
+            if (!(g.text_width > 0)) return null;
+            const area: Rect = .{
+                .x = g.viewport.x + g.gutter_width,
+                .y = g.viewport.y,
+                .width = g.text_width + self.advance() * 0.5,
+                .height = g.viewport.height,
+            };
+            return ui.cx.intersect(clip, area);
+        }
+
+        /// The decorations of one layer: box and error under the text, strike over it.
+        fn draw_decorations(
+            self: *Self,
+            cx: anytype,
+            clip: Clip,
+            visible: *const Visible,
+            over: bool,
+        ) void {
+            if (visible.count == 0) return;
+            const text_clip = self.clip_text(clip) orelse return;
+            const first_byte = self.buffer.line_range(visible.first).start;
+            const last_line = visible.first + visible.count - 1;
+            const last_byte = self.buffer.line_range(last_line).end;
+            for (self.decorations[0..self.decoration_count]) |decoration| {
+                assert(decoration.start <= decoration.end);
+                if ((decoration.kind == .strike) != over) continue;
+                if (decoration.end < first_byte or decoration.start > last_byte) continue;
+                if (decoration.end > self.buffer.len) continue;
+                const from = @max(visible.first, self.buffer.line_of(decoration.start));
+                const to = @min(last_line, self.buffer.line_of(decoration.end));
+                var line = from;
+                while (line <= to) : (line += 1) {
+                    const found = self.line_span(line, decoration.start, decoration.end, false);
+                    const span = found orelse continue;
+                    const rect = self.span_rect(span, visible.tops[line - visible.first]);
+                    self.draw_decoration(cx, decoration.kind, rect, text_clip);
+                }
+            }
+        }
+
+        fn draw_decoration(
+            self: *const Self,
+            cx: anytype,
+            kind: Decoration.Kind,
+            rect: Rect,
+            clip: Clip,
+        ) void {
+            const palette = &self.style.palette;
+            switch (kind) {
+                .box => {
+                    const framed: Rect = .{
+                        .x = rect.x - 1,
+                        .y = rect.y + 1,
+                        .width = rect.width + 2,
+                        .height = rect.height - 2,
+                    };
+                    append_box(cx, framed, clip, .{ 0, 0, 0, 0 }, palette.box, 1, 3);
+                },
+                .strike => {
+                    const bar: Rect = .{
+                        .x = rect.x,
+                        .y = rect.y + rect.height * 0.5 - 1,
+                        .width = rect.width,
+                        .height = 2,
+                    };
+                    push_box(cx, bar, clip, palette.strike);
+                },
+                .@"error" => {
+                    push_box(cx, rect, clip, palette.error_fill);
+                    const line: Rect = .{
+                        .x = rect.x,
+                        .y = rect.y + rect.height - 2,
+                        .width = rect.width,
+                        .height = 2,
+                    };
+                    push_box(cx, line, clip, palette.error_line);
+                },
+            }
+        }
+
+        /// Gutter numbers and the coloured glyphs of every visible line. Returns the glyphs
+        /// emitted, which `glyph_bound` bounds.
+        fn draw_text(self: *Self, cx: anytype, clip: Clip, visible: *const Visible) u32 {
+            const g = self.geometry;
+            const gutter_area: Rect = .{
+                .x = g.viewport.x,
+                .y = g.viewport.y,
+                .width = g.gutter_width,
+                .height = g.viewport.height,
+            };
+            const gutter_clip = ui.cx.intersect(clip, gutter_area);
+            const text_clip = self.clip_text(clip);
+            const current = self.caret_line();
+            const palette = &self.style.palette;
+            var emitted: u32 = 0;
+            for (0..visible.count) |offset| {
+                const line = visible.first + @as(u32, @intCast(offset));
+                const baseline = self.mono.baseline_of(visible.tops[offset]);
+                if (gutter_clip) |numbers| {
+                    const now = line == current;
+                    const color = if (now) palette.gutter_current else palette.gutter_text;
+                    const paint: mono_grid.Paint = .{ .clip = numbers, .color = color };
+                    emitted += self.draw_number(cx, line + 1, baseline, paint);
+                }
+                if (text_clip) |cells| {
+                    emitted += emit_line(L, &self.mono, cx.drawing(), .{
+                        .bytes = self.buffer.line_bytes(line),
+                        .state = self.buffer.states[line],
+                        .left = g.text_left - self.scroll_x,
+                        .baseline_px = baseline,
+                        .clip = cells,
+                        .palette = &palette.classes,
+                    });
+                }
+            }
+            return emitted;
+        }
+
+        fn draw_number(
+            self: *const Self,
+            cx: anytype,
+            number: u32,
+            baseline: f32,
+            paint: mono_grid.Paint,
+        ) u32 {
+            assert(number >= 1);
+            var digits: [digits_max]u8 = undefined;
+            const printed = std.fmt.bufPrint(&digits, "{d}", .{number}) catch unreachable;
+            const right = self.geometry.viewport.x + self.geometry.gutter_width - self.advance();
+            var x = right - @as(f32, @floatFromInt(printed.len)) * self.advance();
+            for (printed) |digit| {
+                self.mono.emit(cx.drawing(), digit, x, baseline, paint);
+                x += self.advance();
+            }
+            assert(printed.len <= digits_max);
+            return @intCast(printed.len);
+        }
+
+        fn draw_caret(self: *const Self, cx: anytype, clip: Clip, visible: *const Visible) void {
+            const line = self.caret_line();
+            if (line < visible.first or line >= visible.first + visible.count) return;
+            const text_clip = self.clip_text(clip) orelse return;
+            const scale = self.mono.scale;
+            const column: f32 = @floatFromInt(self.column_of(self.caret));
+            const x = self.geometry.text_left - self.scroll_x + column * self.advance();
+            const caret: Rect = .{
+                .x = @round(x * scale) / scale - 1 / scale,
+                .y = visible.tops[line - visible.first],
+                .width = caret_px / scale,
+                .height = self.line_height(),
+            };
+            push_box(cx, caret, text_clip, self.style.palette.caret);
+        }
+    };
+}
+
+/// The patch language's editor, the default.
+pub const Editor = EditorOf(tokenizer);
+
+/// One line of glyphs for `emit_line`, in language `L`.
+fn LineJob(comptime L: type) type {
+    return struct {
+        bytes: []const u8,
+        state: L.State,
+        /// Window x of column 0.
+        left: f32,
+        baseline_px: f32,
         clip: Clip,
-        visible: *const Visible,
-        focused: bool,
-    ) void {
-        const g = self.geometry;
-        const palette = &self.style.palette;
-        const gutter: Rect = .{
-            .x = g.viewport.x,
-            .y = g.viewport.y,
-            .width = g.gutter_width,
-            .height = g.viewport.height,
-        };
-        push_box(cx, g.viewport, clip, palette.background);
-        push_box(cx, gutter, clip, palette.gutter);
-        const text_clip = self.clip_text(clip) orelse return;
-        const range = self.selection();
-        const current = self.caret_line();
-        for (0..visible.count) |offset| {
-            const line = visible.first + @as(u32, @intCast(offset));
-            const top = visible.tops[offset];
-            if (focused and line == current and range.start == range.end) {
-                const band: Rect = .{
-                    .x = g.text_left,
-                    .y = top,
-                    .width = g.text_width,
-                    .height = self.line_height(),
-                };
-                push_box(cx, band, text_clip, palette.current_line);
-            }
-            const span = self.line_span(line, range.start, range.end, true) orelse continue;
-            push_box(cx, self.span_rect(span, top), text_clip, palette.selection);
-        }
-    }
-
-    /// The columns `[0]` to `[1]` of the part of bytes `start .. end` on `line`; with
-    /// `newline`, a selection that continues past the line end covers one more column.
-    fn line_span(self: *const Editor, line: u32, start: u32, end: u32, newline: bool) ?[2]u32 {
-        const range = self.buffer.line_range(line);
-        if (end <= start) return null;
-        if (end < range.start) return null;
-        if (start > range.end) return null;
-        const bytes = self.text();
-        const first = if (start > range.start) codepoints(bytes[range.start..start]) else 0;
-        var last = codepoints(bytes[range.start..@min(end, range.end)]);
-        if (newline and end > range.end) last += 1;
-        if (last <= first) return null;
-        return .{ first, last };
-    }
-
-    fn span_rect(self: *const Editor, columns: [2]u32, top: f32) Rect {
-        assert(columns[1] > columns[0]);
-        const x0 = self.geometry.text_left - self.scroll_x;
-        const first: f32 = @floatFromInt(columns[0]);
-        const count: f32 = @floatFromInt(columns[1] - columns[0]);
-        return .{
-            .x = x0 + first * self.advance(),
-            .y = top,
-            .width = count * self.advance(),
-            .height = self.line_height(),
-        };
-    }
-
-    fn clip_text(self: *const Editor, clip: Clip) ?Clip {
-        const g = self.geometry;
-        if (!(g.text_width > 0)) return null;
-        const area: Rect = .{
-            .x = g.viewport.x + g.gutter_width,
-            .y = g.viewport.y,
-            .width = g.text_width + self.advance() * 0.5,
-            .height = g.viewport.height,
-        };
-        return ui.cx.intersect(clip, area);
-    }
-
-    /// The decorations of one layer: box and error under the text, strike over it.
-    fn draw_decorations(
-        self: *Editor,
-        cx: anytype,
-        clip: Clip,
-        visible: *const Visible,
-        over: bool,
-    ) void {
-        if (visible.count == 0) return;
-        const text_clip = self.clip_text(clip) orelse return;
-        const first_byte = self.buffer.line_range(visible.first).start;
-        const last_line = visible.first + visible.count - 1;
-        const last_byte = self.buffer.line_range(last_line).end;
-        for (self.decorations[0..self.decoration_count]) |decoration| {
-            assert(decoration.start <= decoration.end);
-            if ((decoration.kind == .strike) != over) continue;
-            if (decoration.end < first_byte or decoration.start > last_byte) continue;
-            if (decoration.end > self.buffer.len) continue;
-            const from = @max(visible.first, self.buffer.line_of(decoration.start));
-            const to = @min(last_line, self.buffer.line_of(decoration.end));
-            var line = from;
-            while (line <= to) : (line += 1) {
-                const found = self.line_span(line, decoration.start, decoration.end, false);
-                const span = found orelse continue;
-                const rect = self.span_rect(span, visible.tops[line - visible.first]);
-                self.draw_decoration(cx, decoration.kind, rect, text_clip);
-            }
-        }
-    }
-
-    fn draw_decoration(
-        self: *const Editor,
-        cx: anytype,
-        kind: Decoration.Kind,
-        rect: Rect,
-        clip: Clip,
-    ) void {
-        const palette = &self.style.palette;
-        switch (kind) {
-            .box => {
-                const framed: Rect = .{
-                    .x = rect.x - 1,
-                    .y = rect.y + 1,
-                    .width = rect.width + 2,
-                    .height = rect.height - 2,
-                };
-                append_box(cx, framed, clip, .{ 0, 0, 0, 0 }, palette.box, 1, 3);
-            },
-            .strike => {
-                const bar: Rect = .{
-                    .x = rect.x,
-                    .y = rect.y + rect.height * 0.5 - 1,
-                    .width = rect.width,
-                    .height = 2,
-                };
-                push_box(cx, bar, clip, palette.strike);
-            },
-            .@"error" => {
-                push_box(cx, rect, clip, palette.error_fill);
-                const line: Rect = .{
-                    .x = rect.x,
-                    .y = rect.y + rect.height - 2,
-                    .width = rect.width,
-                    .height = 2,
-                };
-                push_box(cx, line, clip, palette.error_line);
-            },
-        }
-    }
-
-    /// Gutter numbers and the coloured glyphs of every visible line.
-    fn draw_text(self: *Editor, cx: anytype, clip: Clip, visible: *const Visible) void {
-        const g = self.geometry;
-        const gutter_area: Rect = .{
-            .x = g.viewport.x,
-            .y = g.viewport.y,
-            .width = g.gutter_width,
-            .height = g.viewport.height,
-        };
-        const gutter_clip = ui.cx.intersect(clip, gutter_area);
-        const text_clip = self.clip_text(clip);
-        const current = self.caret_line();
-        const palette = &self.style.palette;
-        for (0..visible.count) |offset| {
-            const line = visible.first + @as(u32, @intCast(offset));
-            const baseline = self.mono.baseline_of(visible.tops[offset]);
-            if (gutter_clip) |numbers| {
-                const color = if (line == current) palette.gutter_current else palette.gutter_text;
-                self.draw_number(cx, line + 1, baseline, .{ .clip = numbers, .color = color });
-            }
-            if (text_clip) |cells| {
-                emit_line(&self.mono, cx.drawing(), .{
-                    .bytes = self.buffer.line_bytes(line),
-                    .state = self.buffer.states[line],
-                    .left = g.text_left - self.scroll_x,
-                    .baseline_px = baseline,
-                    .clip = cells,
-                    .palette = &palette.classes,
-                });
-            }
-        }
-    }
-
-    fn draw_number(
-        self: *const Editor,
-        cx: anytype,
-        number: u32,
-        baseline: f32,
-        paint: mono_grid.Paint,
-    ) void {
-        assert(number >= 1);
-        var digits: [digits_max]u8 = undefined;
-        const printed = std.fmt.bufPrint(&digits, "{d}", .{number}) catch unreachable;
-        const right = self.geometry.viewport.x + self.geometry.gutter_width - self.advance();
-        var x = right - @as(f32, @floatFromInt(printed.len)) * self.advance();
-        for (printed) |digit| {
-            self.mono.emit(cx.drawing(), digit, x, baseline, paint);
-            x += self.advance();
-        }
-    }
-
-    fn draw_caret(self: *const Editor, cx: anytype, clip: Clip, visible: *const Visible) void {
-        const line = self.caret_line();
-        if (line < visible.first or line >= visible.first + visible.count) return;
-        const text_clip = self.clip_text(clip) orelse return;
-        const scale = self.mono.scale;
-        const column: f32 = @floatFromInt(self.column_of(self.caret));
-        const x = self.geometry.text_left - self.scroll_x + column * self.advance();
-        const caret: Rect = .{
-            .x = @round(x * scale) / scale - 1 / scale,
-            .y = visible.tops[line - visible.first],
-            .width = caret_px / scale,
-            .height = self.line_height(),
-        };
-        push_box(cx, caret, text_clip, self.style.palette.caret);
-    }
-};
-
-/// One line of glyphs for `emit_line`.
-const LineJob = struct {
-    bytes: []const u8,
-    state: tokenizer.State,
-    /// Window x of column 0.
-    left: f32,
-    baseline_px: f32,
-    clip: Clip,
-    palette: *const [tokenizer.class_count][4]f32,
-};
+        palette: *const [language.class_count(L)][4]f32,
+    };
+}
 
 /// The hot loop: tokenize one line and emit each codepoint of each token in its class
 /// colour, skipping columns left of the clip and stopping right of it or at `columns_max`.
-fn emit_line(grid: *const mono_grid.Mono, cx: anytype, job: LineJob) void {
+/// Returns the glyphs emitted.
+fn emit_line(comptime L: type, grid: *const mono_grid.Mono, cx: anytype, job: LineJob(L)) u32 {
     assert(job.clip.x1 > job.clip.x0);
     const advance = grid.advance;
     var state = job.state;
@@ -1228,8 +1330,12 @@ fn emit_line(grid: *const mono_grid.Mono, cx: anytype, job: LineJob) void {
     var column: u32 = 0;
     var position: u32 = 0;
     var emitted: u32 = 0;
-    while (tokenizer.next(job.bytes, &at, &state)) |token| {
-        // Separators are ASCII spaces: one column per byte.
+    while (L.next(job.bytes, &at, &state)) |token| {
+        // Separators are ASCII spaces: one column per byte (`language.zig`, section 2).
+        assert(token.start >= position);
+        if (std.debug.runtime_safety) {
+            for (job.bytes[position..token.start]) |byte| assert(byte == ' ');
+        }
         column += token.start - position;
         position = token.end;
         const paint: mono_grid.Paint = .{
@@ -1240,13 +1346,14 @@ fn emit_line(grid: *const mono_grid.Mono, cx: anytype, job: LineJob) void {
         while (index < token.end) : (column += 1) {
             const codepoint = layout.decode(job.bytes, &index);
             const x = job.left + @as(f32, @floatFromInt(column)) * advance;
-            if (x >= job.clip.x1) return;
+            if (x >= job.clip.x1) return emitted;
             if (x + 2 * advance <= job.clip.x0) continue;
             grid.emit(cx, codepoint, x, job.baseline_px, paint);
             emitted += 1;
-            if (emitted == columns_max) return;
+            if (emitted == columns_max) return emitted;
         }
     }
+    return emitted;
 }
 
 /// Maps `byte` through replacing `range` with bytes ending at `end`: after the range it
@@ -1327,7 +1434,7 @@ const test_id = ui.id("editor", 0);
 
 fn test_fresh(utf8: []const u8) *Editor {
     fixture.context.init();
-    fixture.editor.init(test_id, default_style);
+    fixture.editor.init(test_id, Editor.default_style);
     const loaded = fixture.editor.load(utf8);
     assert(loaded);
     return &fixture.editor;
@@ -1373,6 +1480,102 @@ fn test_focus_at(x: f32, y: f32) void {
 const mods_ctrl: input.Mods = .{ .shift = false, .ctrl = true, .alt = false, .meta = false };
 const mods_shift: input.Mods = .{ .shift = true, .ctrl = false, .alt = false, .meta = false };
 const mods_ctrl_shift: input.Mods = .{ .shift = true, .ctrl = true, .alt = false, .meta = false };
+
+/// A two-class test language: a run starting with a digit is a number, any other a word.
+const Duo = struct {
+    pub const State = enum(u8) { normal };
+    pub const Class = enum(u8) { word, number };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 0, 0, 1 } };
+
+    pub fn next(line: []const u8, at: *u32, state: *State) ?language.Token(Class) {
+        assert(state.* == .normal);
+        var index = at.*;
+        while (index < line.len and line[index] == ' ') index += 1;
+        at.* = index;
+        if (index == line.len) return null;
+        const start = index;
+        const digit = std.ascii.isDigit(line[start]);
+        while (index < line.len and line[index] != ' ') index += 1;
+        at.* = index;
+        return .{ .start = start, .end = index, .class = if (digit) .number else .word };
+    }
+};
+
+const duo_fixture = struct {
+    var editor: EditorOf(Duo) = undefined;
+};
+
+// Locks the seam: an editor of a test language draws "ab 12 c3" with its own palette: the
+// gutter's "1" first (the caret's line), then a and b in the word colour, 1 and 2 in the
+// number colour, and c and 3 in the word colour; its buffer keeps the language's states.
+test "an editor of another language colours tokens with its palette" {
+    fixture.context.init();
+    const editor = &duo_fixture.editor;
+    editor.init(test_id, EditorOf(Duo).default_style);
+    try testing.expect(editor.load("ab 12 c3"));
+    const context = &fixture.context;
+    context.begin_frame(400, 100, 120);
+    editor.draw(context, ui.sized(.fill, .fill));
+    _ = context.end_frame();
+    const glyphs = context.draw.items(draw.Glyph);
+    try testing.expectEqual(@as(usize, 7), glyphs.len);
+    try testing.expectEqual(EditorOf(Duo).default_palette.gutter_current, glyphs[0].color);
+    const colours = [_]Duo.Class{ .word, .word, .number, .number, .word, .word };
+    for (colours, glyphs[1..]) |class, glyph| {
+        try testing.expectEqual(Duo.palette[@backingInt(class)], glyph.color);
+    }
+    try testing.expectEqual(Duo.State.normal, editor.buffer.states[0]);
+    try testing.expectEqual(@as(usize, 2), editor.style.palette.classes.len);
+}
+
+// Locks the light palette: a language without `palette_light` keeps its class colours over
+// the light chrome, the patch language takes its own light colours, and both share the
+// light background, which is lighter than the dark one.
+test "light palettes take palette_light or fall back to palette" {
+    const duo = EditorOf(Duo).light_palette;
+    try testing.expectEqual(Duo.palette, duo.classes);
+    try testing.expectEqual(tokenizer.palette_light, Editor.light_palette.classes);
+    try testing.expectEqual(duo.background, Editor.light_palette.background);
+    try testing.expect(duo.background[0] > Editor.default_palette.background[0]);
+    try testing.expectEqual(Editor.light_palette, Editor.light_style.palette);
+}
+
+// Locks the viewport bounds at 15 px (a 9 px column, a 21 px line): 800 x 600 is 30 lines of
+// 91 columns and 4 digits, an empty viewport 2 lines of 3, and a huge one `glyph_max`; all
+// at compile time. Then draws over a grid of viewports and scroll offsets of a dense text
+// with long lines, where `draw` asserts its glyphs against the bound.
+test "glyph_bound bounds every draw" {
+    try testing.expectEqual(@as(u32, 30), comptime lines_bound(600, 15));
+    try testing.expectEqual(@as(u32, 30 * 95), comptime glyph_bound(800, 600, 15));
+    try testing.expectEqual(@as(u32, 2 * 7), comptime glyph_bound(0, 0, 15));
+    try testing.expectEqual(glyph_max, comptime glyph_bound(1e6, 1e6, 15));
+    try testing.expectEqual(lines_max, comptime lines_bound(1e9, 15));
+    const long: [300]u8 = @splat('x');
+    var source: [buffer_module.buffer_cap]u8 = undefined;
+    var length: u32 = 0;
+    var line: u32 = 0;
+    while (line < 150) : (line += 1) {
+        const written = std.fmt.bufPrint(source[length..], "{d} {s}\n", .{
+            line,
+            &long,
+        }) catch unreachable;
+        length += @intCast(written.len);
+    }
+    const editor = test_fresh(source[0..length]);
+    var width: u32 = 40;
+    while (width <= 1240) : (width += 75) {
+        var height: u32 = 30;
+        while (height <= 900) : (height += 87) {
+            editor.view.scroll_y = @floatFromInt(height * 7 % 4000);
+            editor.scroll_x = @floatFromInt(width * 3 % 1700);
+            const context = test_frame(width, height);
+            const glyphs: u32 = @intCast(context.draw.items(draw.Glyph).len);
+            const bound = glyph_bound(@floatFromInt(width), @floatFromInt(height), 15);
+            try testing.expect(glyphs <= bound);
+            try testing.expect(glyphs > 0);
+        }
+    }
+}
 
 // Locks the geometry of section 2 at 15 px: the gutter is five 9 px columns, column 0 sits
 // half a column further, line `i` starts at 4 + 21 i, a 30 px row after line 0 pushes later

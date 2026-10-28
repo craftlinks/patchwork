@@ -1,0 +1,32 @@
+<?xml version="1.0"
+      encoding="UTF-8"?>
+<!DOCTYPE window
+  SYSTEM "window.dtd">
+<!--
+  A mixer strip for the designer (step 47).
+  A sample for the gallery's code page (xml.zig).
+-->
+<window title="Mixer" width="640" height="360">
+  <row spacing="8" padding="12">
+    <knob id="gain" min="-60" max="12" value="-6.5"/>
+    <knob id='q' min="0.1" max="18" value="0.71"/>
+    <knob
+      id="drive"
+      tip="Drive in dB,
+           before the filter"
+      value="0.25"/>
+    <toggle id="bypass" hint='skip
+      the strip'/>
+  </row>
+  <label text="Tom &amp; Jerry"/>
+  <list id="presets" rows="6">
+    <item>Warm &lt;tape&gt; &#x2192; out</item>
+    <item>Bright</item>
+  </list>
+  <script><![CDATA[
+    if (gain < -24 && !bypass) {
+      label.text = "quiet";
+    }
+  ]]></script>
+  <!-- end of strip --> <spacer/>
+</window>

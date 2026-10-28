@@ -75,8 +75,9 @@
 //!   (`src/native_tests.zig`, linked with libxkbcommon and libwayland-client).
 //!   `zig build test-contract` compiles an app with no `draw`, an app whose draw type is not a
 //!   multiple of 16 bytes, an app whose draw type reads time without declaring `animated`, an
-//!   app that declares `Audio` without `audio`, a theme color out of range, and a knob whose
-//!   skin lacks `knob`, and passes only if the compiler rejects each with its expected
+//!   app that declares `Audio` without `audio`, a theme color out of range, a knob whose
+//!   skin lacks `knob`, overlays on a type without an overlay field, and an editor whose
+//!   language lacks `next`, and passes only if the compiler rejects each with its expected
 //!   message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
@@ -788,6 +789,11 @@ fn add_test_steps(
         .{
             .path = "test/contract_overlays_none.zig",
             .expected = "ui.overlays: contract_overlays_none.Bare has no overlay field",
+        },
+        .{
+            .path = "test/contract_language_missing.zig",
+            .expected = "contract_language_missing.Bare: missing `pub fn next(line: []const u8, " ++
+                "at: *u32, state: *State) ?editor.Token(Class)`",
         },
     };
     for (contracts) |case| {
