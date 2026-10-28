@@ -7,8 +7,9 @@
 //! written with `widgets.kit` and the layout defaults only (one-statement containers, no Box
 //! literal, no private append helper), so it is also the template for an app's own screens.
 //! Every widget reports its last action on the status line, for example "knob 1 changed 0.75".
-//! A "light" toggle in the title bar switches the app between `theme.dark` and `theme.light`
-//! with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
+//! The title bar is the window's chrome (step 43, section 2h): a menu bar, a Run button, and
+//! the window buttons over a drag area. A "light" toggle in the title bar switches the app
+//! between `theme.dark` and `theme.light` with `cx.set_theme` (section 3a). A hardware row shows the same knob, button, and toggle
 //! behaviour in the gallery's own skin (section 3b). A `widgets.Tabs` bar under the title holds
 //! one page per phase-6/7 section (section 2a): "basics" (steps 30 to 32, and step 41's form
 //! group, section 2f), "popups" (step 33:
@@ -26,7 +27,9 @@
 //! browser viewport and a native dump and a browser screenshot compare region for region:
 //! ```text
 //! screen   1280 x 704 at (0, 0), flow down, padding 16, spacing 8
-//!   title  fill x 40        "gallery", the "light" toggle (160 x 40 at x 156), the status
+//!   title  fill x 40        "gallery", the menu bar (x 104), Run (56 x 28 at x 260), the
+//!                           "light" toggle (160 x 40 at x 324), the status, and the window
+//!                           buttons (3 x 46, flush right)
 //!   tabs   fill x fill      the bar (32), then the selected page from y 104, 1248 x 584
 //! basics
 //!   band   fill x 152       buttons (176) | sliders (288) | knobs (fill: 4 cells of 140)
@@ -138,8 +141,22 @@
 //! "node widgets expanded", "open kit.zig", "sort size descending", "column name 280", "file
 //! kit.zig", and "group layout open".
 //!
+//! ## 2h. Window Chrome
+//! The title bar (step 43) is the window's own: a `widgets.window_drag` area over the whole
+//! bar, recorded first so everything on it takes the pointer over it (a press moves the
+//! window, a double press maximizes or restores, a right press opens the window manager's
+//! menu); a `widgets.MenuBar` of File (New, Open, Save, Quit), Edit (Undo and Redo disabled,
+//! Cut, Copy, Paste), and View (Light, Dark, Maximize); a Run button; the light toggle; the
+//! status; and `widgets.WindowButtons` flush right, which draw nothing while the window
+//! manager decorates the window (`config.decorations` is the default `server`; run with
+//! `--decorations client` for the gallery's own buttons and edges). `draw` ends with
+//! `widgets.window_edges`, after the overlays. The status line reports "menu view", "edit
+//! Copy", "view Dark" (which also sets the toggle), "run", "window maximize", and, from the
+//! window's state, "window maximized" or "window normal". Quit calls `cx.close()`.
+//!
 //! ## 3. Events
-//! `event` hands every event to each widget itself, because the status line needs each
+//! `event` hands every event first to the window chrome (`chrome_events`: the menu bar before
+//! anything its open menu's backdrop covers), then to each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
 //! to the rows it drew last through `kit.clicked`, which also repaints a row on hover, then to
 //! the form group (`form_events`), the popups (`popup_events`) and to the tabs and the containers page (`container_events`; the
@@ -211,7 +228,10 @@
 //! hint gone, the text after the icon). Data (section 2g): `data` (the page, still); `tree`
 //! (click src, then Right, Down, Down, Right, Right, Down, Left: widgets expanded and selected,
 //! its nine files in the table); `sort` (src's children by size, descending, the name column
-//! 60 px wider); `groups` (transform closed, layout open). The
+//! 60 px wider); `groups` (transform closed, layout open). Chrome (section 2h): `menubar`
+//! (click File, hover Edit, Right to View, Down: Dark highlighted); `chrome` (a double click on
+//! the bar's bare middle, which the replay's window manager answers by maximizing, so maximize
+//! shows restore; click Run; rest on close: its red band). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -472,9 +492,35 @@ const popup_notes = [_][]const u8{
     "Hover a knob on the basics page for its tooltip.",
 };
 
-/// The "light" toggle's box in the title bar: right of "gallery", one toggle row high.
-const theme_toggle_x: f32 = 156;
+/// The title bar's window chrome (section 2h): the menu bar's and Run's boxes, then the "light"
+/// toggle's, one bar high, from the screen's left.
+const menubar_x: f32 = 104;
+const run_x: f32 = 260;
+const run_w: f32 = 56;
+const run_h: f32 = 28;
+const theme_toggle_x: f32 = 324;
 const theme_toggle_w: f32 = 160;
+
+const chrome_id = ui.id("chrome", 0);
+const menubar_id = ui.id("menubar", 0);
+const run_id = ui.id("run", 0);
+const window_buttons_id = ui.id("window_buttons", 0);
+const edges_id = ui.id("edges", 0);
+
+/// The menu bar (section 2h): File, Edit, and View; Edit's Undo and Redo are disabled.
+const bar_titles = [_][]const u8{ "File", "Edit", "View" };
+const bar_names = [_][]const u8{ "file", "edit", "view" };
+const bar_file_items = [_][]const u8{ "New", "Open", "Save", "Quit" };
+const bar_edit_items = [_][]const u8{ "Undo", "Redo", "Cut", "Copy", "Paste" };
+const bar_view_items = [_][]const u8{ "Light", "Dark", "Maximize" };
+const bar_items = [_][]const []const u8{ &bar_file_items, &bar_edit_items, &bar_view_items };
+const bar_file: u32 = 0;
+const bar_edit: u32 = 1;
+const bar_view: u32 = 2;
+const bar_quit: u32 = 3;
+const bar_light: u32 = 0;
+const bar_dark: u32 = 1;
+const bar_maximize: u32 = 2;
 
 const panel_radius: f32 = 8;
 const button_paint: widgets.Paint = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = 8 };
@@ -523,6 +569,13 @@ const group_layout: ui.Layout = .{
 
 /// The gallery. `timer_period_ms` is 0: nothing wakes the host while the pointer rests.
 pub const App = struct {
+    /// The title bar's window chrome (section 2h): the menu bar first, so its open menu sees
+    /// events before anything under its backdrop; Run; the window buttons.
+    menubar: widgets.MenuBar,
+    run: widgets.Button,
+    window_buttons: widgets.WindowButtons,
+    /// The last `window_state` said maximized: the status line reports a change.
+    maximized: bool,
     /// The title bar's "light" toggle: on is `theme.light`.
     light: widgets.Toggle,
     /// The pages (section 2a); the app draws the selected one.
@@ -637,12 +690,29 @@ pub const App = struct {
         .{ .name = "tree", .setup = &tree_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "sort", .setup = &sort_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "groups", .setup = &groups_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "menubar", .setup = &menubar_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "chrome", .setup = &chrome_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
     /// no textures.
     pub fn init(app: *App, textures: *quads.Textures) void {
         assert(textures.count >= 1);
+        app.menubar = widgets.MenuBar.init(menubar_id, &bar_titles, &bar_items);
+        app.menubar.menu(bar_edit).set_enabled(0, false);
+        app.menubar.menu(bar_edit).set_enabled(1, false);
+        for (app.menubar.menus[0..app.menubar.count]) |*menu| menu.bounds = frame_rect;
+        app.run = .{
+            .id = run_id,
+            .label = "Run",
+            .style = button_style,
+            .padding = .xy(8, 0),
+            .paint = button_paint,
+            .hover = .init(widgets.hover_rate_per_ms),
+            .down = .init(widgets.down_rate_per_ms),
+        };
+        app.window_buttons = widgets.WindowButtons.init(window_buttons_id);
+        app.maximized = false;
         app.light = widgets.Toggle.init(theme_id, "light", false);
         app.tabs = widgets.Tabs.init(tabs_id, &page_labels, page_basics);
         app.split = widgets.Splitter.init(split_id, .horizontal, split_ratio, split_min_a, split_min_b);
@@ -761,12 +831,9 @@ pub const App = struct {
 
     /// Every widget, the view, then the rows drawn last (module guide, section 3).
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        app.chrome_events(cx, event_value);
         switch (app.light.handle(cx, event_value)) {
-            .toggled => |on| {
-                cx.set_theme(if (on) theme.light else theme.dark);
-                app.restyle(cx.theme());
-                app.note(cx, &.{ "theme ", if (on) "light" else "dark" });
-            },
+            .toggled => |on| app.apply_theme(cx, on),
             .none => {},
         }
         app.button_events(cx, "", &app.buttons, event_value);
@@ -818,6 +885,54 @@ pub const App = struct {
             },
         };
         assert(app.status_len <= status_cap);
+    }
+
+    /// The window chrome (section 2h): the menu bar, Run, the window buttons, and the window's
+    /// state.
+    fn chrome_events(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.menubar.handle(cx, event_value)) {
+            .opened => |index| app.note(cx, &.{ "menu ", bar_names[index] }),
+            .chosen => |choice| app.bar_chosen(cx, choice),
+            .closed, .none => {},
+        }
+        if (app.run.handle(cx, event_value) == .clicked) app.note(cx, &.{"run"});
+        switch (app.window_buttons.handle(cx, event_value)) {
+            .pressed => |button| app.note(cx, &.{ "window ", @tagName(button) }),
+            .none => {},
+        }
+        if (event_value == .window_state) {
+            const maximized = event_value.window_state.maximized;
+            if (maximized != app.maximized) {
+                app.maximized = maximized;
+                app.note(cx, &.{ "window ", if (maximized) "maximized" else "normal" });
+            }
+        }
+    }
+
+    /// A menu bar choice: Quit closes, Light and Dark set the theme (and the toggle), and
+    /// Maximize maximizes or restores; every choice reports "file New" and so on.
+    fn bar_chosen(app: *App, cx: *Context, choice: widgets.MenuChoice) void {
+        const items = bar_items[choice.menu];
+        app.note(cx, &.{ bar_names[choice.menu], " ", items[choice.item] });
+        if (choice.menu == bar_file and choice.item == bar_quit) cx.close();
+        if (choice.menu != bar_view) return;
+        switch (choice.item) {
+            bar_light, bar_dark => {
+                const on = choice.item == bar_light;
+                app.light.on = on;
+                kit.aim(cx, &app.light.thumb, if (on) 1 else 0);
+                app.apply_theme(cx, on);
+            },
+            bar_maximize => cx.toggle_maximize(),
+            else => unreachable,
+        }
+    }
+
+    /// The light theme when `on`, else the dark one, restyled and reported.
+    fn apply_theme(app: *App, cx: *Context, on: bool) void {
+        cx.set_theme(if (on) theme.light else theme.dark);
+        app.restyle(cx.theme());
+        app.note(cx, &.{ "theme ", if (on) "light" else "dark" });
     }
 
     /// The data page's report (section 2g) on the status line.
@@ -1038,6 +1153,7 @@ pub const App = struct {
         _ = cx.end();
         _ = cx.end();
         ui.overlays(cx, app);
+        widgets.window_edges(cx, edges_id);
         assert(cx.draw.overflow_count == 0);
         assert(cx.area_overflow == 0);
     }
@@ -1071,16 +1187,31 @@ pub const App = struct {
         return app.status[0..app.status_len];
     }
 
+    /// The title bar as window chrome (section 2h): a drag area under everything on it, the
+    /// name, the menu bar, Run, the light toggle, the status, and the window buttons.
     fn draw_title(app: *const App, cx: *Context) void {
         const bar = cx.walk(ui.sized(.fill, .{ .fixed = title_px }));
         const clip = cx.visible(bar) orelse return;
         kit.face(cx, bar, clip, panel_paint(cx).look(cx.theme(), 0, 0));
-        const inner = ui.cx.inset(bar, .xy(title_inset_px, 0));
+        widgets.window_drag(cx, chrome_id, bar);
+        const buttons_w = app.window_buttons.width(cx);
+        var inner = ui.cx.inset(bar, .xy(title_inset_px, 0));
+        inner.width -= buttons_w;
         kit.label(cx, styled(cx, .sans_bold, 18), "gallery", inner, clip, start);
         kit.label(cx, styled(cx, .sans, 14), app.status_text(), inner, clip, end);
-        const cell: Rect = .{ .x = bar.x + theme_toggle_x - screen_padding, .y = bar.y, .width = theme_toggle_w, .height = title_px };
-        _ = cx.begin_at(cell, .{ .flow = .down });
+        _ = cx.begin_at(title_cell(bar, menubar_x, run_x - menubar_x), .{ .flow = .right });
+        app.menubar.draw(cx, ui.sized(.fit, .fill));
+        _ = cx.end();
+        const inset_y = (title_px - run_h) / 2;
+        _ = cx.begin_at(title_cell(bar, run_x, run_w), .{ .flow = .down, .padding = .xy(0, inset_y) });
+        app.run.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
+        _ = cx.begin_at(title_cell(bar, theme_toggle_x, theme_toggle_w), .{ .flow = .down });
         app.light.draw(cx, ui.sized(.fill, .fill));
+        _ = cx.end();
+        const buttons: Rect = .{ .x = bar.x + bar.width - buttons_w, .y = bar.y, .width = buttons_w, .height = title_px };
+        _ = cx.begin_at(buttons, .{ .flow = .right });
+        app.window_buttons.draw(cx);
         _ = cx.end();
     }
 
@@ -1547,6 +1678,12 @@ fn panel_paint(cx: *Context) widgets.Paint {
     return widgets.paint_of(cx.theme().colors.panel, panel_radius);
 }
 
+/// The title bar's box from the screen's `x`, `width` wide and the bar high.
+fn title_cell(bar: Rect, x: f32, width: f32) Rect {
+    assert(width > 0);
+    return .{ .x = bar.x + x - screen_padding, .y = bar.y, .width = width, .height = title_px };
+}
+
 /// Text in `face` at `size` in the scheme's text color: the title, status, captions, and rows.
 fn styled(cx: *Context, face: text.Face, size: f32) text.Style {
     assert(size > 0);
@@ -1851,6 +1988,35 @@ const data_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// Menu bar title `index` (section 2h), a target.
+fn bar_title(index: u32) bench.Target {
+    return .{ .id = menubar_id.derive(index), .name = "menubar title", .index = index };
+}
+
+/// `menubar` (section 2h): click File, hover Edit (the bar switches to it), Right to View (Light
+/// highlighted), and Down to Dark.
+const menubar_steps = [_]bench.Step{
+    .{ .click = bar_title(bar_file) },
+    .{ .hover = .{ .target = bar_title(bar_edit), .x = 20, .y = 14 } },
+    .{ .key = .{ .key = .right, .text = "" } },
+    .{ .key = .{ .key = .down, .text = "" } },
+    .{ .wait = 2 },
+};
+
+const chrome_target: bench.Target = .{ .id = chrome_id, .name = "chrome", .index = 0 };
+const close_target: bench.Target = .{ .id = window_buttons_id.derive(@backingInt(widgets.WindowButton.close)), .name = "window close", .index = 0 };
+
+/// `chrome` (section 2h): two clicks on the bar's bare middle, a frame apart (a double press:
+/// the replay's window manager maximizes, and maximize shows restore), click Run, and rest on
+/// close (its red band).
+const chrome_steps = [_]bench.Step{
+    .{ .click_at = .{ .target = chrome_target, .x = 700, .y = 20 } },
+    .{ .click_at = .{ .target = chrome_target, .x = 700, .y = 20 } },
+    .{ .click = .{ .id = run_id, .name = "run", .index = 0 } },
+    .{ .hover = .{ .target = close_target, .x = 23, .y = 20 } },
+    .{ .wait = 12 },
+};
+
 /// Visible row `row` of the data page's tree, a click target.
 fn tree_row(row: u32) bench.Target {
     return .{ .id = data_page.tree_id.derive(widgets.list_row_salt + row), .name = "tree row", .index = row };
@@ -1957,9 +2123,12 @@ comptime {
     // column 40 px above the frame's bottom.
     assert(page_y + group_padding + 3 * gap_px + caption_px + dropdown_h + button_px + scratch_px < frame_rect.height - flip_margin_px - dropdown_h);
     assert(frame_rect.height - flip_margin_px <= page_y + page_h);
-    // The title: the toggle sits right of "gallery" and inside the bar.
-    assert(theme_toggle_x + theme_toggle_w < screen_w - screen_padding);
+    // The title (section 2h): the menu bar, Run, and the toggle sit in order right of
+    // "gallery", and the window buttons fit after them; Run is centred in the bar.
+    assert(menubar_x < run_x and run_x + run_w < theme_toggle_x);
+    assert(theme_toggle_x + theme_toggle_w + 3 * widgets.window_button_w < screen_w - screen_padding);
     assert(widgets.toggle_height == title_px);
+    assert(run_h < title_px and bar_titles.len == bar_items.len);
     // The bands' widths: the knob group holds four cells.
     const inner_w = screen_w - 2 * screen_padding;
     assert(inner_w - narrow_px - sliders_px - 2 * gap_px >= 4 * knob_cell_px + 2 * group_padding);
@@ -1981,12 +2150,13 @@ comptime {
     assert(split_min_a + split_min_b + widgets.splitter_px <= inner_w);
     assert(params_h + side_min_b + widgets.splitter_px <= page_h);
     assert(params.len == param_names.len and params.len == 6);
-    // Faces, on the busiest page (basics): the title and its toggle (2), the tab bar's line,
+    // Faces, on the busiest page (basics): the title and its toggle (2), Run, a title's band,
+    // and a window button's band (3), the tab bar's line,
     // four tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
     // 3 for the focused field and 1 for each other field, the segments' track, selected, and
     // hovered segment, a box per checkbox and the mixed bar, 2 highlighted rows, the thumb; a
     // popup's dim, face, and band; the tooltip.
-    assert(1 + 2 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 3 + checkbox_names.len + 1 + 2 + 1 + 3 + 1 <= box_cap);
+    assert(1 + 2 + 3 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 3 + checkbox_names.len + 1 + 2 + 1 + 3 + 1 <= box_cap);
     // The containers page: the title (3), the tabs (6), the list's panel, two bands, and thumb,
     // two dividers, the grid's panel, six faces (one an editing field: face, band, caret), and
     // the preset panel.
@@ -1999,20 +2169,26 @@ comptime {
     assert(hard_knob_names.len <= dial_cap);
     assert(hard_button_labels.len + hard_toggle_names.len <= bevel_cap);
     assert(hard_toggle_names.len <= led_cap);
-    // Areas: the title's toggle, the bar and its tabs, and per page: basics (every widget, the
+    // Areas: the title's (section 2h: the drag area, three menu titles, Run, the toggle, three
+    // window buttons, and the eight edges), the bar and its tabs, and per page: basics (every
+    // widget, the
     // form's three fields, segments bar and segments, and checkboxes, the view and its thumb,
     // the rows drawn, the hardware row); popups (two dropdowns, the button,
     // the panel, and one popup: its backdrop and at most six rows); containers (the list box's
     // view, thumb, and rows, two dividers, six number boxes).
-    const chrome = 1 + 1 + page_labels.len;
+    const title_areas = 1 + bar_titles.len + 1 + 1 + 3 + 8;
+    const chrome = title_areas + 1 + page_labels.len;
     assert(chrome + 3 + 2 + 4 + 3 + 3 + 1 + segment_labels.len + checkbox_names.len + 2 + rows_drawn_max + 8 <= area_cap);
     assert(chrome + 4 + 1 + file_items.len <= area_cap);
     assert(chrome + 2 + preset_rows_max + 2 + param_names.len <= area_cap);
     assert(wave_items.len >= file_items.len and file_items.len >= context_items.len);
-    // Paths: one chevron per dropdown (popups) or one mark per checkbox (basics), three points
-    // each.
-    assert(2 <= path_cap and 2 * 3 <= point_cap);
-    assert(checkbox_names.len <= path_cap and 3 * checkbox_names.len <= point_cap);
+    // Paths: the window buttons' icons (at most four strokes, eleven points), and one chevron
+    // per dropdown (popups) or one mark per checkbox (basics), three points each.
+    const icon_paths = 4;
+    const icon_points = 11;
+    assert(icon_paths + 2 <= path_cap and icon_points + 2 * 3 <= point_cap);
+    assert(icon_paths + checkbox_names.len <= path_cap);
+    assert(icon_points + 3 * checkbox_names.len <= point_cap);
     // The data page (section 2g): its tree shows at most ceil(540 / 24) + 1 = 24 rows, each
     // with a row area and a chevron (area and Path), beside the header's 3 cells and 2
     // dividers, the table's rows, two views with thumbs, three group headers and their
@@ -2021,7 +2197,8 @@ comptime {
     const tree_rows_max: u32 = 24;
     const data_areas = chrome + 2 * 2 + 2 * tree_rows_max + 3 + 2 + data_page.children_max + 3 + 1;
     assert(data_areas <= area_cap);
-    assert(tree_rows_max + 3 + 1 <= path_cap and 3 * (tree_rows_max + 4) <= point_cap);
+    assert(icon_paths + tree_rows_max + 3 + 1 <= path_cap);
+    assert(icon_points + 3 * (tree_rows_max + 4) <= point_cap);
     // The form group: two field columns and the checkboxes' column fit its inner width; two
     // captioned fields fit its inner height, as do the caption and the checkboxes.
     const form_w = inner_w - 2 * narrow_px - 2 * gap_px - 2 * group_padding;
@@ -2092,6 +2269,98 @@ fn expect_rect(rect: Rect, x: f32, y: f32, width: f32, height: f32) !void {
 // Locks the layout of section 2: the title face, the tab bar and its first tab, the first
 // button and slider, the knob rings centered in the knob band (56, 40, 56, 72 px), the first
 // toggle's pill, the field, the list's viewport, and that the first frame leaves nothing owed.
+// Locks section 2h: the drag area is the whole bar and under everything on it; the menu bar's
+// titles from x 104 side by side, their bands 28 high centred in the bar, ending before Run at
+// 260 (56 x 28); the window buttons flush right, 46 each; eight edge areas over the window;
+// and the status ends before the buttons.
+test "the title bar is the window chrome" {
+    const app = new_app();
+    const cx = frame(app);
+    try expect_rect(area_rect(chrome_id), 16, 16, 1248, 40);
+    try std.testing.expectEqual(ui.WindowPart.drag, cx.find(chrome_id).?.flags.window);
+    const file = area_rect(app.menubar.title_id(bar_file));
+    const view = area_rect(app.menubar.title_id(bar_view));
+    try std.testing.expectEqual(@as(f32, 104), file.x);
+    try std.testing.expectEqual(@as(f32, 22), file.y);
+    try std.testing.expectEqual(@as(f32, 28), file.height);
+    try std.testing.expect(view.x + view.width <= run_x);
+    try expect_rect(area_rect(run_id), 260, 22, 56, 28);
+    const close = area_rect(window_buttons_id.derive(@backingInt(widgets.WindowButton.close)));
+    try expect_rect(close, 1218, 16, 46, 40);
+    try expect_rect(area_rect(window_buttons_id.derive(0)), 1126, 16, 46, 40);
+    var edges: u32 = 0;
+    for (cx.area_list()) |area| {
+        if (area.flags.window != .none and area.flags.window != .drag) edges += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 8), edges);
+    // The drag area comes before every other title-bar area, so they take the pointer over it.
+    try std.testing.expect(chrome_index(cx) < area_index(cx, run_id));
+}
+
+fn area_index(cx: *Context, id: ui.Id) usize {
+    for (cx.area_list(), 0..) |area, index| {
+        if (area.id == id) return index;
+    }
+    unreachable;
+}
+
+fn chrome_index(cx: *Context) usize {
+    return area_index(cx, chrome_id);
+}
+
+// Locks the menubar scenario (section 2h): File opened, the hover switched to Edit, Right went
+// to View with Light highlighted, and Down moved to Dark; the status names the last menu.
+test "the menubar scenario switches menus by hover and keys" {
+    const app = new_app();
+    try replay(app, "menubar");
+    try std.testing.expectEqual(@as(?u32, bar_view), app.menubar.open);
+    try std.testing.expectEqual(@as(?u32, bar_dark), app.menubar.menus[bar_view].highlight);
+    try std.testing.expect(!app.menubar.menus[bar_file].open and !app.menubar.menus[bar_edit].open);
+    try std.testing.expectEqualStrings("menu view", app.status_text());
+}
+
+// Locks the chrome scenario (section 2h): the double press maximized the replay's window (the
+// app saw it), Run reported, and close is hovered.
+test "the chrome scenario maximizes, runs, and rests on close" {
+    const app = new_app();
+    const scenario = bench.find(App.scenarios, "chrome").?;
+    const steps: u32 = @intCast(scenario.setup.len + 1);
+    _ = try bench.replay_headless_paced(App, app, &test_context, scenario, .{ 1280, 720 }, steps, 16);
+    _ = frame(app);
+    try std.testing.expect(test_context.window_state().maximized);
+    try std.testing.expect(app.maximized);
+    try std.testing.expectEqualStrings("run", app.status_text());
+    try std.testing.expectEqual(@as(f32, 1), app.window_buttons.hover[2].target);
+}
+
+// Locks the menu bar's choices (section 2h): Quit asks to close, Maximize to toggle, Dark sets
+// the dark theme and the toggle off after Light set them on, and each reports.
+test "the menu bar's choices close, maximize, and switch the theme" {
+    const app = new_app();
+    _ = frame(app);
+    const ctx = &test_context;
+    const key: input.Event = .{ .key_down = input.key_press(.a, .none, false, "a") };
+    ctx.event_begin(key);
+    app.bar_chosen(ctx, .{ .menu = bar_file, .item = bar_quit });
+    ctx.event_end();
+    try std.testing.expectEqual(@as(?ui.WindowRequest, .close), ctx.take_window_request());
+    try std.testing.expectEqualStrings("file Quit", app.status_text());
+    ctx.event_begin(key);
+    app.bar_chosen(ctx, .{ .menu = bar_view, .item = bar_maximize });
+    ctx.event_end();
+    try std.testing.expectEqual(@as(?ui.WindowRequest, .toggle_maximize), ctx.take_window_request());
+    ctx.event_begin(key);
+    app.bar_chosen(ctx, .{ .menu = bar_view, .item = bar_light });
+    ctx.event_end();
+    try std.testing.expect(app.light.on);
+    try std.testing.expectEqual(theme.light.colors.panel, ctx.theme().colors.panel);
+    ctx.event_begin(key);
+    app.bar_chosen(ctx, .{ .menu = bar_view, .item = bar_dark });
+    ctx.event_end();
+    try std.testing.expect(!app.light.on);
+    try std.testing.expectEqualStrings("theme dark", app.status_text());
+}
+
 test "gallery layout at 1280 by 720" {
     const app = new_app();
     const cx = frame(app);
@@ -2101,8 +2370,8 @@ test "gallery layout at 1280 by 720" {
     try std.testing.expectEqual(@as(f32, 31), area_rect(app.tabs.tab_id(0)).height);
     // The basics page starts at y 104: its first band's panel padding puts button 0 at 112.
     try expect_rect(area_rect(app.buttons[0].id), 24, 112, 160, 40);
-    // The title's toggle: its pill 8 px into its 160 px cell at x 156, centered in the bar.
-    try expect_rect(area_rect(theme_id), 164, 24, 44, 24);
+    // The title's toggle: its pill 8 px into its 160 px cell at x 324, centered in the bar.
+    try expect_rect(area_rect(theme_id), 332, 24, 44, 24);
     try expect_rect(area_rect(app.sliders[0].id), 208, 140, 272, 24);
     // Knob cells start at 16 + 176 + 8 + 288 + 8 + 8 = 504; the 72 px rows sit at
     // 104 + 8 + (136 - 72) / 2 = 144, and each ring is centered in its row.

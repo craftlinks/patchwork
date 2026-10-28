@@ -48,6 +48,9 @@
 //!                 tree_chevron(cx, ChevronLook)        void     a parent's chevron
 //! DisclosureOf(S) disclosure(cx, DisclosureLook)       ?Shape   the header
 //! ColumnHeaderOf(S) header_cell(cx, HeaderCellLook)    ?Shape   one column's cell
+//! WindowButtonsOf(S) window_button(cx, WindowButtonLook) ?Shape  one window button
+//! MenuBarOf(S)    menu_title(cx, MenuTitleLook)        ?Shape   one title; its menus are
+//!                                                               MenuOf(S)
 //! ```
 //! `check` reads the table of each widget's functions (`functions_of`), in this order.
 //! - A look carries values, never the widget, so a skin cannot change state. Animator values
@@ -109,6 +112,8 @@ const list_box_file = @import("list_box.zig");
 const number_box_file = @import("number_box.zig");
 const disclosure_file = @import("disclosure.zig");
 const column_header_file = @import("column_header.zig");
+const window_chrome_file = @import("window_chrome.zig");
+const menu_bar_file = @import("menu_bar.zig");
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -297,6 +302,34 @@ pub const HeaderCellLook = struct {
     hovered: bool,
 };
 
+/// A menu bar's title: its label, whether its menu is open, and whether the pointer is on it.
+pub const MenuTitleLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    open: bool,
+    hovered: bool,
+};
+
+/// What a window button shows: maximize turns into restore while the window is maximized.
+pub const WindowButtonKind = enum(u2) {
+    minimize,
+    maximize,
+    restore,
+    close,
+};
+
+/// A window button: which one, the raw hover and press values, and whether the window is
+/// activated (a skin may dim an inactive window's buttons).
+pub const WindowButtonLook = struct {
+    rect: Rect,
+    clip: Clip,
+    kind: WindowButtonKind,
+    hover: f32,
+    down: f32,
+    active: bool,
+};
+
 /// A number box's face: the formatted value, its unit, and the raw hover value.
 pub const NumberLook = struct {
     rect: Rect,
@@ -325,6 +358,8 @@ pub const Kind = enum {
     tree,
     disclosure,
     column_header,
+    window_buttons,
+    menu_bar,
 };
 
 /// One skin function: its name, its look's type and name, and whether it returns the hit
@@ -397,6 +432,22 @@ fn functions_of(comptime widget: Kind) []const Function {
             .Look = HeaderCellLook,
             .shape = true,
         }},
+        .window_buttons => &.{.{
+            .name = "window_button",
+            .look = "WindowButtonLook",
+            .Look = WindowButtonLook,
+            .shape = true,
+        }},
+        .menu_bar => &.{
+            .{ .name = "menu_face", .look = "MenuFaceLook", .Look = MenuFaceLook, .shape = false },
+            .{ .name = "menu_row", .look = "MenuRowLook", .Look = MenuRowLook, .shape = false },
+            .{
+                .name = "menu_title",
+                .look = "MenuTitleLook",
+                .Look = MenuTitleLook,
+                .shape = true,
+            },
+        },
     };
 }
 
@@ -492,6 +543,55 @@ fn chevron_in(cx: anytype, rect: Rect, clip: Clip, turn: f32, lit: bool) void {
     var style = scheme.name;
     style.color = color;
     kit.label(cx, style, sign, rect, clip, kit.centered);
+}
+
+/// The close button's hover band: a fixed red, as window managers draw it, whatever the scheme.
+pub const close_red: [4]f32 = .{ 0.77, 0.17, 0.17, 1 };
+
+/// A window button's hover band: its inset from the button on every side, and its radius, so it
+/// sits inside a rounded title bar.
+const window_band_inset: f32 = 4;
+const window_band_radius: f32 = 6;
+
+/// A window button's icon: half its side, and its stroke width.
+const window_icon_half: f32 = 5;
+const window_icon_stroke: f32 = 1;
+
+/// The icon of `kind` centred in `rect` (section 4): a line, a square, two offset squares, or
+/// an X, stroked one pixel wide on pixel centres; without `draw.Path`, a glyph.
+fn window_icon(cx: anytype, rect: Rect, clip: Clip, kind: WindowButtonKind, color: [4]f32) void {
+    assert(rect.width > 0);
+    assert(color[3] >= 0);
+    const x = @floor(rect.x + rect.width * 0.5) + 0.5;
+    const y = @floor(rect.y + rect.height * 0.5) + 0.5;
+    const h = window_icon_half - 0.5;
+    const w = window_icon_stroke;
+    const drawn = switch (kind) {
+        .minimize => kit.stroke(cx, &.{ .{ x - h, y }, .{ x + h, y } }, clip, color, w),
+        .maximize => kit.stroke(cx, &.{
+            .{ x - h, y - h }, .{ x + h, y - h }, .{ x + h, y + h },
+            .{ x - h, y + h }, .{ x - h, y - h },
+        }, clip, color, w),
+        .restore => kit.stroke(cx, &.{
+            .{ x - h, y - h + 2 }, .{ x + h - 2, y - h + 2 }, .{ x + h - 2, y + h },
+            .{ x - h, y + h },     .{ x - h, y - h + 2 },
+        }, clip, color, w) and kit.stroke(cx, &.{
+            .{ x - h + 2, y - h + 2 }, .{ x - h + 2, y - h },     .{ x + h, y - h },
+            .{ x + h, y + h - 2 },     .{ x + h - 2, y + h - 2 },
+        }, clip, color, w),
+        .close => kit.stroke(cx, &.{ .{ x - h, y - h }, .{ x + h, y + h } }, clip, color, w) and
+            kit.stroke(cx, &.{ .{ x + h, y - h }, .{ x - h, y + h } }, clip, color, w),
+    };
+    if (drawn) return;
+    const glyph = switch (kind) {
+        .minimize => "\u{2212}",
+        .maximize => "+",
+        .restore => "\u{00B1}",
+        .close => "\u{00D7}",
+    };
+    var style = cx.theme().name;
+    style.color = color;
+    kit.label(cx, style, glyph, rect, clip, kit.centered);
 }
 
 /// A checkbox label starts at its box's left and is centred vertically, never cut.
@@ -910,6 +1010,59 @@ pub const Default = struct {
             kit.label(cx, style, look.label, label, look.clip, checkbox_text_options);
         }
         return .{ .rect = look.rect, .radius = radius };
+    }
+
+    /// A `colors.track` band `menubar_band_h` high centred in the title while its menu is open
+    /// (lightened) or the pointer is on it, then the label centred in the name style. The band
+    /// is the hit shape.
+    pub fn menu_title(cx: anytype, look: MenuTitleLook) ?Shape {
+        assert(look.rect.width > 0);
+        assert(look.label.len <= text.byte_cap);
+        const scheme = cx.theme();
+        const height = @min(look.rect.height, menu_bar_file.menubar_band_h);
+        const band: Rect = .{
+            .x = look.rect.x,
+            .y = look.rect.y + @round((look.rect.height - height) * 0.5),
+            .width = look.rect.width,
+            .height = height,
+        };
+        const radius = menu_bar_file.menubar_band_radius;
+        if (look.open or look.hovered) {
+            kit.face(cx, band, look.clip, .{
+                .fill = scheme.colors.track,
+                .radius = radius,
+                .hover = if (look.open) scheme.hover_lighten else 0,
+            });
+        }
+        kit.label(cx, scheme.name, look.label, look.rect, look.clip, kit.centered);
+        return .{ .rect = band, .radius = radius };
+    }
+
+    /// A band inset `window_band_inset` while hovered or pressed (`colors.track`, or `close_red`
+    /// for close) at the hover value's alpha, darkened by the press, then the icon
+    /// (`window_icon`) in `colors.text`, white over the red band, at half alpha while the window
+    /// is not activated. The button is the hit shape.
+    pub fn window_button(cx: anytype, look: WindowButtonLook) ?Shape {
+        assert(look.hover >= 0 and look.hover <= 1);
+        assert(look.rect.width > 0);
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        const close = look.kind == .close;
+        if (look.hover > 0 or look.down > 0) {
+            var fill = if (close) close_red else colors.track;
+            fill[3] *= @max(look.hover, look.down);
+            const band = ui.cx.inset(look.rect, .all(window_band_inset));
+            kit.face(cx, band, look.clip, .{
+                .fill = fill,
+                .radius = window_band_radius,
+                .down = kit.weight(look.down, scheme.down_darken),
+            });
+        }
+        var color = colors.text;
+        if (close) color = mix(color, .{ 1, 1, 1, 1 }, look.hover);
+        if (!look.active) color[3] *= 0.5;
+        window_icon(cx, look.rect, look.clip, look.kind, color);
+        return .{ .rect = look.rect, .radius = 0 };
     }
 
     /// The cell in `colors.track` (lightened while hovered), a one-pixel `colors.control` line

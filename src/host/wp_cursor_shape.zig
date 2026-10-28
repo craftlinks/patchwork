@@ -98,6 +98,8 @@ pub fn shape_of(cursor: areas.Cursor) u32 {
         .grabbing => 17,
         .ew_resize => 26,
         .ns_resize => 27,
+        .nesw_resize => 28,
+        .nwse_resize => 29,
     };
     assert(shape >= 1);
     assert(shape <= 34);
@@ -157,4 +159,6 @@ test "every cursor maps to its protocol shape" {
     try std.testing.expectEqual(@as(u32, 17), shape_of(.grabbing));
     try std.testing.expectEqual(@as(u32, 26), shape_of(.ew_resize));
     try std.testing.expectEqual(@as(u32, 27), shape_of(.ns_resize));
+    try std.testing.expectEqual(@as(u32, 28), shape_of(.nesw_resize));
+    try std.testing.expectEqual(@as(u32, 29), shape_of(.nwse_resize));
 }

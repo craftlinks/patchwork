@@ -47,7 +47,9 @@
 //!   another). Returning 0 ends the rAF chain, and `clock.reset` makes the next sample after
 //!   idle report a zero delta.
 //! - Pointer exports dispatch through `ui.dispatch`, and `timer` calls `App.timer`; each
-//!   requests a frame when the UI context is dirty afterwards.
+//!   requests a frame when the UI context is dirty afterwards. A window request (a window
+//!   button, a press on a drag area) is taken and dropped: the page has no window to move,
+//!   resize, or close.
 //! - `present_frame` runs `ui.draw_frame`, which calls `App.draw` when the context is dirty
 //!   or the glyph cache owes a draw (`Cache.owes_draw`: the scale changed since the last
 //!   draw, or glyphs are pending). A changed canvas size only marks the context dirty,
@@ -838,6 +840,7 @@ fn WebApp(comptime App: type) type {
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| replay_dispatch(event);
             if (step == .drop) bench.replay_drop(App, &app, &context, step.drop, rect.?);
+            bench.serve_window(App, &app, &context);
             return true;
         }
 
@@ -890,6 +893,8 @@ fn WebApp(comptime App: type) type {
             ui.dispatch(App, &app, &context, event);
             // The page's own paste event delivers the text, so a request needs no action.
             _ = context.take_paste_request();
+            // The page has no window to move, resize, or close (`ui/cx.zig`, section 5a).
+            _ = context.take_window_request();
             serve_files();
             if (context.dirty) {
                 state.frame.request_redraw();
@@ -978,9 +983,8 @@ fn WebApp(comptime App: type) type {
 
 // Locks the cursor name export: the CSS names in `ui.Cursor` order.
 test "the cursor names are the CSS names by value" {
-    const expected =
-        \\["default","pointer","text","grab","grabbing","ew-resize","ns-resize"]
-    ;
+    const expected = "[\"default\",\"pointer\",\"text\",\"grab\",\"grabbing\"," ++
+        "\"ew-resize\",\"ns-resize\",\"nwse-resize\",\"nesw-resize\"]";
     try std.testing.expectEqualStrings(expected, cursor_names_json);
     try std.testing.expectEqual(@as(u8, 0x0B), @as(u8, @bitCast(mods_of(0xFB))));
     try std.testing.expectEqual(input.MouseButton.right, button_of(2));

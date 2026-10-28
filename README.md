@@ -69,8 +69,8 @@ point pool, which exists only when a registered type reads points (`draw.Path`).
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Paragraph`, `Button`,
 `Toggle`, `Checkbox`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`,
 `Dropdown`, `Tooltip`), the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
-`ListBox`, `NumberBox`), and trees and tables (`TreeView`, `Disclosure`, `ColumnHeader`);
-the code editor
+`ListBox`, `NumberBox`), trees and tables (`TreeView`, `Disclosure`, `ColumnHeader`), and
+window chrome (`MenuBar`, `WindowButtons`, `window_drag`, `window_edges`); the code editor
 (`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
 when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
 Events resolve once per event against the areas of the last frame, so `handle` is O(1) per
@@ -83,7 +83,7 @@ widget; the app routes every event to every widget it owns.
 | Event | Payload |
 |---|---|
 | `pointer_move` | `Point{x, y}` in logical pixels |
-| `pointer_down`, `pointer_up` | `Button{x, y, time_ms, button: .left/.right/.middle, mods}` |
+| `pointer_down`, `pointer_up` | `Button{x, y, time_ms, button: .left/.right/.middle, mods, serial}` |
 | `pointer_leave` | none |
 | `wheel` | `Wheel{x, y, dx, dy}` |
 | `key_down`, `key_up` | `KeyPress{key, mods, repeat, len, text: [4]u8}`: the typed text rides on `key_down` |
@@ -94,6 +94,8 @@ widget; the app routes every event to every widget it owns.
 | `drop` | `*const Drop{x, y, count, skipped, files}`, valid only while it is dispatched |
 | `file` | `*const Chunk{file, offset, bytes, end}`: bytes of an accepted file, valid only while it is dispatched |
 | `frame` | the animator step in milliseconds |
+| `close_requested` | none: the window manager asks to close; the app closes unless it calls `cx.keep_open()` |
+| `window_state` | `WindowState{maximized, fullscreen, activated, tiled sides, decorations, capabilities}` |
 
 `Key` names arrows, Home, End, Page Up and Down, Backspace, Delete, Enter, Tab, Escape, `a`
 to `z`, `0` to `9`, and F1 to F12 after the user's layout; anything else is `other`. `Mods` is
@@ -141,6 +143,8 @@ patchwork/
 │   ├── widgets/tree_view.zig   # TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
 │   ├── widgets/disclosure.zig  # Disclosure: a header with a chevron over a section drawn while open
 │   ├── widgets/column_header.zig # ColumnHeader: resizable, sortable columns and a row's spans
+│   ├── widgets/window_chrome.zig # WindowButtons, the drag area, and the resize edges
+│   ├── widgets/menu_bar.zig    # MenuBar: menus side by side; hover and Left / Right switch them
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: Editor, Style, Decoration, InlineRow
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
@@ -634,8 +638,9 @@ where it takes presses belong to a skin, a struct of draw functions passed at co
 `widgets.Knob` is `widgets.KnobOf(widgets.skins.Default)`; `ButtonOf`, `SliderOf`, `ToggleOf`,
 `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`,
 `DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TreeViewOf` (its bands are
-the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, and `ColumnHeaderOf` work
-the same way. A
+the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, `ColumnHeaderOf`,
+`WindowButtonsOf` (`window_button`), and `MenuBarOf` (`menu_title`, and its menus' `menu_face`
+and `menu_row`) work the same way. A
 `TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
@@ -804,6 +809,40 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
   other columns leave (`Action.resized`; a double press restores it), and `cell(row_rect, i)`
   is the span a table's row draws column `i` into. The header sorts nothing: the app sorts
   its rows by `sort`.
+
+### Window Chrome
+
+An app can draw its own title bar. The window manager still moves, resizes, maximizes, and
+closes the window; the app's areas only ask it to.
+
+- **Decorations.** `config.decorations` (`.server` by default) is who should draw the frame;
+  `--decorations client|server` overrides it natively. For `.server` the host asks through
+  `zxdg_decoration_manager_v1` and `cx.window_state().decorations` reports the answer
+  (`.client` where the compositor has no manager); `.client` asks nothing. Headless and the
+  browser report `.client`.
+- **The window's state.** `cx.window_state()`: maximized, fullscreen, activated, the tiled
+  sides, the decorations, and which requests the window manager honours (`wm_capabilities`).
+  A change arrives as a `window_state` event and owes a draw.
+- **Areas.** `widgets.window_drag(cx, id, rect)` records a drag area (record it before what
+  sits on the bar): a press moves the window, a double press maximizes or restores, and a
+  right press opens the window manager's menu. `widgets.window_edges(cx, id)`, the last call
+  of `draw`, records 4 px resize strips and 12 px corners over the window with resize cursors,
+  none while maximized, fullscreen, or server-decorated, and none on a tiled side. A press on
+  either never reaches a widget and captures nothing.
+- **Requests.** `cx.minimize()`, `cx.toggle_maximize()`, and `cx.close()`; the compositor's
+  close arrives as `close_requested`, which closes unless the app calls `cx.keep_open()`.
+  Natively each becomes an `xdg_toplevel` request with the press's serial. The browser drops
+  them, and a bench replay simulates them (`bench.serve_window`: maximize flips the state).
+- **WindowButtons.** Minimize (where the window manager offers it), maximize or restore, and
+  close, 46 px each in a row; nothing under server decorations (`width(cx)` says how wide).
+- **MenuBar.** `widgets.MenuBar.init(id, titles, items)`: titles side by side, each opening its
+  `Menu` below it on a press. While one is open, moving onto another title switches to it, and
+  Left and Right move between the menus. `Action` is `opened`, `chosen{menu, item}`, or
+  `closed`; `draw_overlay` draws the open menu (through `ui.overlays`).
+
+On Hyprland (0.56) the compositor answers `server_side`, so the gallery shows its window
+buttons only with `--decorations client`, and it reports even a floating window as maximized
+and tiled on every side, so no resize edges are recorded there.
 
 ## Example Applications
 
@@ -1001,7 +1040,9 @@ Every library widget on a fixed 1280 by 704 screen from the top-left, built only
 `widgets.kit` and the one-statement layouts. It is the regression app of phases 6 and 7: a
 `widgets.Tabs` bar under the title holds one page per section, and the title bar's status line
 shows the last action ("knob 1 changed 0.75"), so the app handles each widget itself rather
-than through `ui.route`. A "light" toggle in the title bar switches the whole app between
+than through `ui.route`. The title bar is the window's chrome (step 43, see Window Chrome): a
+drag area under a File / Edit / View `MenuBar`, a Run button, and `WindowButtons` (shown with
+`--decorations client`). A "light" toggle in the title bar switches the whole app between
 `theme.dark` and `theme.light` (`cx.set_theme`); the widgets' stored colors (slider paints,
 knob accents, the field's text) are restyled from the scheme, while the buttons keep their own
 blue.
@@ -1074,7 +1115,9 @@ output list over the sidebar), `glass-clear`, and `glass-light` for the glass pa
 `form-search` (the mixed box turned on, "saw" typed into the search field) for the form group;
 and `data` (the page), `tree` (keys from src into widgets, expanded), `sort` (src's children by
 size, descending, and the name column dragged wider), and `groups` (transform closed, layout
-opened) for the data page.
+opened) for the data page; `menubar` (File clicked, Edit hovered, Right to View, Down: Dark
+highlighted) and `chrome` (a double click on the bar, which the replay maximizes: restore
+shows; Run clicked; close hovered) for the title bar.
 
 ## File Drops
 
@@ -1181,8 +1224,8 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
 it runs, no GPU feature is requested, and the frame path is unchanged.
 
 ```text
-<app> [--adapter low|high] [--no-cache] [--check] [--bench [scenario] [--frames N]
-      [--dump out.ppm] [--csv out.csv]]
+<app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
+      [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
 zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 ```
 
@@ -1802,6 +1845,11 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   a paste reads at most 64 KiB, and `SIGPIPE` is ignored. A stalled peer costs no wakes and
   is closed when the next copy or paste replaces it.
 - File drops: the same data device's drag-and-drop events (see File Drops).
+- Window chrome: `xdg_wm_base` is bound at `min(advertised, 5)`, so configure carries the
+  tiled states and `wm_capabilities` the honoured requests; `zxdg_decoration_manager_v1` is
+  bound when offered. The compositor's close is queued as `close_requested`, and after each
+  dispatch the host sends the app's window request (see Window Chrome). The startup log names
+  the decoration mode asked for and answered, and the window's capabilities.
 - GPU setup: after `gpu.create` makes the device, the host submits the renderer's setup
   stream. The device's uncaptured-error callback is installed, so a validation error fails the
   frame with the op index, the op name (with the draw type's label for a shader), and the

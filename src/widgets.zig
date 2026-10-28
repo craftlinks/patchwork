@@ -60,6 +60,8 @@
 //! widgets/tree_view.zig   TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
 //! widgets/disclosure.zig  Disclosure: a header with a chevron over a section drawn while open
 //! widgets/column_header.zig  ColumnHeader: resizable, sortable columns and a row's spans
+//! widgets/window_chrome.zig  WindowButtons, the drag area, and the resize edges
+//! widgets/menu_bar.zig    MenuBar: menus side by side; hover and Left / Right switch them
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
 //! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
@@ -138,6 +140,8 @@ const number_box = @import("widgets/number_box.zig");
 const tree_view = @import("widgets/tree_view.zig");
 const disclosure = @import("widgets/disclosure.zig");
 const column_header = @import("widgets/column_header.zig");
+const window_chrome = @import("widgets/window_chrome.zig");
+const menu_bar = @import("widgets/menu_bar.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -177,6 +181,9 @@ pub const NumberLook = skins.NumberLook;
 pub const ChevronLook = skins.ChevronLook;
 pub const DisclosureLook = skins.DisclosureLook;
 pub const HeaderCellLook = skins.HeaderCellLook;
+pub const WindowButtonLook = skins.WindowButtonLook;
+pub const WindowButtonKind = skins.WindowButtonKind;
+pub const MenuTitleLook = skins.MenuTitleLook;
 
 pub const Label = label.Label;
 pub const Paragraph = paragraph.Paragraph;
@@ -316,6 +323,21 @@ pub const columns_max = column_header.columns_max;
 pub const header_h = column_header.header_h;
 pub const column_divider_salt = column_header.divider_salt;
 
+pub const WindowButtons = window_chrome.WindowButtons;
+pub const WindowButtonsOf = window_chrome.WindowButtonsOf;
+pub const WindowButton = window_chrome.WindowButton;
+pub const window_button_w = window_chrome.window_button_w;
+pub const window_drag = window_chrome.window_drag;
+pub const window_drag_flags = window_chrome.window_drag_flags;
+pub const window_edges = window_chrome.window_edges;
+pub const window_edge_px = window_chrome.window_edge_px;
+pub const window_corner_px = window_chrome.window_corner_px;
+
+pub const MenuBar = menu_bar.MenuBar;
+pub const MenuBarOf = menu_bar.MenuBarOf;
+pub const MenuChoice = menu_bar.MenuChoice;
+pub const menubar_menus_max = menu_bar.menubar_menus_max;
+
 pub const NumberBox = number_box.NumberBox;
 pub const NumberBoxOf = number_box.NumberBoxOf;
 pub const NumberFormat = number_box.Format;
@@ -347,6 +369,8 @@ test {
     _ = tree_view;
     _ = disclosure;
     _ = column_header;
+    _ = window_chrome;
+    _ = menu_bar;
 }
 
 /// Every public name of `widgets.zig` at step 29, before the split.
