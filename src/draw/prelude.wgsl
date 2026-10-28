@@ -17,7 +17,8 @@
 // height in logical pixels) and `g1` is `clip` (exclusive-max x0, y0, x1, y1). The parameter
 // groups `g2` to `g7` follow. `Varyings` carries every group flat to the fragment stage, plus
 // the interpolated `local` position, and `unpack` exposes each Zig field by its own name in
-// `Pixel`, beside `local`, `size`, and `pos` (= rect.xy + local).
+// `Pixel`, beside `local`, `size`, `pos` (= rect.xy + local), and `frag` (the fragment's
+// position in device pixels of the pass's target, read by backdrop types).
 //
 // ## 2a. Vertex
 // `vs_main` places each corner at `rect.xy + vertex_local(instance, unit)`. The registry

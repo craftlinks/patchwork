@@ -83,6 +83,7 @@ const quads = @import("../draw.zig");
 const text = @import("../text.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const theme = @import("../theme.zig");
 const slider_file = @import("slider.zig");
 const knob_file = @import("knob.zig");
 const toggle_file = @import("toggle.zig");
@@ -163,6 +164,8 @@ pub const PanelLook = struct {
     rect: Rect,
     clip: Clip,
     paint: Paint,
+    /// The panel's own material, or the scheme's (`theme.zig`, section 7).
+    material: theme.Material = .solid,
 };
 
 /// A text field's face and border; `focused` selects the focus border.
@@ -176,6 +179,8 @@ pub const FieldLook = struct {
 pub const MenuFaceLook = struct {
     rect: Rect,
     clip: Clip,
+    /// The menu's own material, or the scheme's (`theme.zig`, section 7).
+    material: theme.Material = .solid,
 };
 
 /// One menu row: its rect, its label in `style`, whether it is enabled, and whether it is the
@@ -197,6 +202,8 @@ pub const DropdownLook = struct {
     label: []const u8,
     hover: f32,
     open: bool,
+    /// The list's material, or the scheme's (`theme.zig`, section 7).
+    material: theme.Material = .solid,
 };
 
 /// A tab bar's strip under its tabs; `focused` while the bar has keyboard focus.
@@ -475,11 +482,17 @@ pub const Default = struct {
         kit.label(cx, scheme.name, look.name, side_box, look.clip, kit.centered);
     }
 
-    /// The face in the panel's paint.
+    /// The face in the panel's paint, or glass of its material over the backdrop under it
+    /// (`kit.glass`); without one, the solid face.
     pub fn panel(cx: anytype, look: PanelLook) void {
         assert(look.paint.radius >= 0);
         assert(look.rect.width > 0);
-        kit.face(cx, look.rect, look.clip, look.paint.look(cx.theme(), 0, 0));
+        const scheme = cx.theme();
+        if (look.material.glass()) {
+            const glass = kit.glass_look(scheme, look.material, look.paint.radius);
+            if (kit.glass(cx, look.rect, look.clip, glass)) return;
+        }
+        kit.face(cx, look.rect, look.clip, look.paint.look(scheme, 0, 0));
     }
 
     /// The face in `colors.track` with a one-pixel border, `colors.focus` while focused and
@@ -497,11 +510,32 @@ pub const Default = struct {
         }));
     }
 
-    /// The popup face in `colors.panel` with a one-pixel `colors.control` border.
+    /// The popup face in `colors.panel` with a one-pixel `colors.control` border, or glass of
+    /// its material over the popup layer's backdrop, which the menu marked, with a hairline in
+    /// `colors.lighten` at its edge. Either way a Box comes first, so the bands draw under the
+    /// labels.
     pub fn menu_face(cx: anytype, look: MenuFaceLook) void {
         assert(look.rect.width > 0);
         assert(look.rect.height > 0);
-        const colors = &cx.theme().colors;
+        const scheme = cx.theme();
+        const colors = &scheme.colors;
+        if (look.material.glass()) {
+            const glass = kit.glass_look(scheme, look.material, menu_file.menu_radius);
+            if (kit.glass(cx, look.rect, look.clip, glass)) {
+                // A hairline over the glass's edge. It is also the popup layer's first Box, as
+                // the solid face is, so the rows' bands draw under their labels (a Box batch
+                // that opened after a Glyph would draw over every glyph of the layer).
+                var edge = colors.lighten;
+                edge[3] = look.material.rim * 0.35;
+                kit.face(cx, look.rect, look.clip, .{
+                    .fill = quads.transparent,
+                    .border_color = edge,
+                    .border_width = menu_file.menu_border_px,
+                    .radius = menu_file.menu_radius,
+                });
+                return;
+            }
+        }
         kit.face(cx, look.rect, look.clip, .{
             .fill = colors.panel,
             .border_color = colors.control,
@@ -528,19 +562,26 @@ pub const Default = struct {
 
     /// A button-like face in `colors.track` with a `colors.control` border (`colors.focus`
     /// while the list is open), lightened by hover, the label at the left, and a chevron
-    /// (two `draw.Path` segments) at the right. The face is the hit shape.
+    /// (two `draw.Path` segments) at the right; with a glass material, `kit.glass_face`. The
+    /// face is the hit shape.
     pub fn dropdown(cx: anytype, look: DropdownLook) ?Shape {
         assert(look.rect.width > 0);
         assert(look.label.len <= text.byte_cap);
         const scheme = cx.theme();
         const colors = &scheme.colors;
-        kit.face(cx, look.rect, look.clip, .{
-            .fill = colors.track,
-            .border_color = if (look.open) colors.focus else colors.control,
-            .border_width = menu_file.menu_border_px,
-            .radius = menu_file.menu_radius,
-            .hover = kit.weight(look.hover, scheme.hover_lighten),
-        });
+        if (look.material.glass()) {
+            var face = kit.glass_face(scheme, look.material, menu_file.menu_radius, look.hover);
+            if (look.open) face.border_color = colors.focus;
+            kit.face(cx, look.rect, look.clip, face);
+        } else {
+            kit.face(cx, look.rect, look.clip, .{
+                .fill = colors.track,
+                .border_color = if (look.open) colors.focus else colors.control,
+                .border_width = menu_file.menu_border_px,
+                .radius = menu_file.menu_radius,
+                .hover = kit.weight(look.hover, scheme.hover_lighten),
+            });
+        }
         const chevron = dropdown_file.chevron_points(look.rect);
         const stroke: quads.path.Stroke = .{
             .color = colors.text,

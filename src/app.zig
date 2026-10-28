@@ -116,6 +116,7 @@ const commands = @import("gpu/commands.zig");
 const input = @import("input.zig");
 const registry = @import("draw/registry.zig");
 const renderer = @import("draw/renderer.zig");
+const backdrop = @import("draw/backdrop.zig");
 const ui = @import("ui.zig");
 const areas = @import("ui/areas.zig");
 const pools = @import("draw/pools.zig");
@@ -201,7 +202,10 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     if (App.config.batch_cap == 0) {
         return "App.config.batch_cap must be at least 1";
     }
-    const frame_bytes = renderer.frame_bytes_max(App.config.draw.len, App.config.batch_cap);
+    const any_backdrop = registry.Registry(App.config.draw).any_backdrop;
+    const backdrops: u32 = if (any_backdrop) backdrop.backdrop_cap else 0;
+    const draw_count = App.config.draw.len;
+    const frame_bytes = renderer.frame_bytes_max(draw_count, App.config.batch_cap, backdrops);
     if (frame_bytes > commands.capacity) {
         return "App.config.batch_cap is too large: its worst frame exceeds the command buffer";
     }

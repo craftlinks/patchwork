@@ -14,6 +14,10 @@
 //! arc(cx, ring, clip, ArcLook)     a draw.Arc
 //! surface(cx, rect, clip, SurfaceLook)  a draw.Surface: gradient, rim, shadow; empty skipped
 //! lit(look, scheme, hover, down)   a SurfaceLook's colours mixed as a Box's are on the GPU
+//! backdrop(cx, layer, material)    marks a backdrop for a material's blur (section 4)
+//! glass(cx, rect, clip, GlassLook) a draw.Glass over the backdrop under the layer, or false
+//! glass_look(scheme, material, r)  the GlassLook a material gives a face of radius r
+//! glass_face(scheme, material, r, hover)  a translucent BoxLook for a control inside glass
 //! label(cx, style, bytes, rect, clip, options)   text.place with the kit's asserts
 //! paragraph(cx, style, bytes, rect, clip, wrap)  text.place_wrapped, label's wrapped twin
 //! icon(cx, face, codepoint, size, rect, clip, color)  text.icon: one glyph centred by its ink
@@ -24,6 +28,22 @@
 //! respond / Interaction            the hover and press table (section 3)
 //! accent(cx, index)                the app scheme's accent `index` as a `Paint`
 //! ```
+//! ## 4. Glass
+//! A glass face needs a registered `draw.Glass` and a backdrop at or below its layer
+//! (`draw/backdrop.zig`). `backdrop(cx, layer, material)` marks one with the material's blur
+//! and returns its id, or null for an app without `draw.Glass` or a solid material.
+//! `glass(cx, rect, clip, look)` appends a `draw.Glass` over the highest backdrop at or below
+//! the current layer and returns true; it returns false and appends nothing when there is none,
+//! so a skin draws its solid face instead:
+//! ```text
+//! if (!(material.glass() and kit.glass(cx, rect, clip, kit.glass_look(scheme, material, r))))
+//!     kit.face(cx, rect, clip, solid_look);
+//! ```
+//! `glass_look` takes the tint colour from the scheme (`colors.panel`, or `colors.focus` for
+//! `tinted`) at the material's `tint`, and the bevel from the radius (`bevel_of`). A control
+//! inside glass (a dropdown's face) samples nothing: `glass_face` is a translucent box, the
+//! track colour at `0.25 + 0.5 tint` alpha with a lighten border at `rim / 2` alpha.
+//!
 //! It sits under `widgets` because it carries the widgets' look (`Paint`, the dark defaults);
 //! `ui` and `draw` never import it and use `draw.Box.of` with their own skip.
 //!
@@ -85,6 +105,8 @@ pub const Animator = animator.Animator;
 pub const BoxLook = draw.BoxLook;
 pub const ArcLook = draw.ArcLook;
 pub const SurfaceLook = draw.SurfaceLook;
+pub const GlassLook = draw.GlassLook;
+pub const Material = theme.Material;
 
 /// The dark scheme's shader mix toward white at animator value 1. Widgets read the app's
 /// (`cx.theme().hover_lighten`).
@@ -232,6 +254,86 @@ pub fn lit(look: SurfaceLook, scheme: *const theme.Scheme, hover: f32, down: f32
     out.border = mix_toward(look.border, scheme.colors.lighten, scheme.colors.darken, lighten, darken);
     assert(out.fill[3] == look.fill[3]);
     return out;
+}
+
+/// Marks `layer` as a backdrop with `material`'s blur (section 4) and returns the id glass on
+/// it samples; null when the app registers no `draw.Glass` or `material` is solid.
+pub fn backdrop(cx: anytype, layer: draw.Layer, material: Material) ?draw.TextureId {
+    assert(material.problem() == null);
+    assert(@backingInt(layer) != 0);
+    if (comptime !has_glass(@TypeOf(cx))) return null;
+    if (!material.glass()) return null;
+    return cx.drawing().backdrop(layer, material.blur);
+}
+
+/// A `draw.Glass` over `rect` under `clip`, sampling the highest backdrop at or below the
+/// current layer (section 4). False, with nothing appended, when the app registers no
+/// `draw.Glass` or no backdrop lies there; an empty rect appends nothing and returns true.
+pub fn glass(cx: anytype, rect: Rect, clip: Clip, look: GlassLook) bool {
+    assert(look.radius >= 0);
+    assert(clip.x1 > clip.x0);
+    if (comptime !has_glass(@TypeOf(cx))) return false;
+    const drawing = cx.drawing();
+    const under = drawing.backdrop_under(drawing.layer_now) orelse return false;
+    if (!(rect.width > 0) or !(rect.height > 0)) return true;
+    append(cx, draw.Glass, under.id, draw.Glass.of(rect, clip, look));
+    return true;
+}
+
+/// True when the UI context type `Cx` (a pointer to it) draws through a registry that has
+/// `draw.Glass`.
+fn has_glass(comptime Cx: type) bool {
+    const Ui = @typeInfo(Cx).pointer.child;
+    return Ui.DrawContext.Registry.has(draw.Glass);
+}
+
+/// The bevel of a glass face of `radius`: the radius, between 6 and 16 logical pixels.
+pub fn bevel_of(radius: f32) f32 {
+    assert(radius >= 0);
+    return std.math.clamp(radius, 6, 16);
+}
+
+/// The glass look `material` gives a face of `radius` in `scheme` (section 4).
+pub fn glass_look(scheme: *const theme.Scheme, material: Material, radius: f32) GlassLook {
+    assert(material.glass());
+    assert(material.problem() == null);
+    const colors = &scheme.colors;
+    var tint = if (material.kind == .tinted) colors.focus else colors.panel;
+    tint[3] = material.tint;
+    return .{
+        .radius = radius,
+        .tint = tint,
+        .frost = material.frost,
+        .saturation = material.saturation,
+        .rim = material.rim,
+        .refraction = material.refraction,
+        .bevel = bevel_of(radius),
+    };
+}
+
+/// A translucent face for a control inside glass (section 4): `colors.track` at
+/// `0.25 + 0.5 tint` alpha, a one-pixel `colors.lighten` border at `rim / 2` alpha, and the
+/// hover weight.
+pub fn glass_face(
+    scheme: *const theme.Scheme,
+    material: Material,
+    radius: f32,
+    hover: f32,
+) BoxLook {
+    assert(material.glass());
+    assert(hover >= 0 and hover <= 1);
+    const colors = &scheme.colors;
+    var fill = colors.track;
+    fill[3] = 0.25 + 0.5 * material.tint;
+    var border = colors.lighten;
+    border[3] = material.rim * 0.5;
+    return .{
+        .fill = fill,
+        .border_color = border,
+        .border_width = 1,
+        .radius = radius,
+        .hover = weight(hover, scheme.hover_lighten),
+    };
 }
 
 /// `color`'s rgb mixed toward `light` by `toward_light`, then toward `dark` by `toward_dark`.

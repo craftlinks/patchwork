@@ -19,6 +19,7 @@
 //! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
 //! draw/wave.zig       Waveform and Ring types, the waveform appender, the zoom pyramid
 //! draw/fx.zig         offscreen targets: device rects, projection, Composite and Blur
+//! draw/backdrop.zig   backdrops: the blur chain's sizes and passes, Glass, and the twins
 //! draw/textures.zig   Textures: queued creates and writes, TextureId, Format
 //! draw/renderer.zig   Renderer: records setup and frames from a Context
 //! ```
@@ -107,6 +108,9 @@ pub const path = @import("draw/path.zig");
 
 /// Offscreen effects: target device rects, `fx.composite`, `fx.blur`, and their types.
 pub const fx = @import("draw/fx.zig");
+
+/// Backdrops and glass: the blur chain's math and passes, `Glass`, and their CPU twins.
+pub const backdrop = @import("draw/backdrop.zig");
 
 /// Waveforms and rings: `wave.append`, `wave.Pyramid`, and the `Waveform` and `Ring` types.
 pub const wave = @import("draw/wave.zig");
@@ -206,6 +210,9 @@ pub const Path = types.Path;
 pub const Waveform = wave.Waveform;
 pub const Ring = wave.Ring;
 pub const Composite = fx.Composite;
+pub const Glass = backdrop.Glass;
+pub const GlassLook = backdrop.GlassLook;
+pub const Backdrop = backdrop.Backdrop;
 pub const Blur = fx.Blur;
 pub const TargetKind = textures_module.TargetKind;
 pub const Point = pools.Point;
@@ -392,6 +399,7 @@ test {
     _ = path;
     _ = wave;
     _ = fx;
+    _ = backdrop;
     _ = @import("draw/tiles.zig");
 }
 

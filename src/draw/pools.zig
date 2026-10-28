@@ -76,6 +76,18 @@
 //! of `mask`, and outside it no append may go to a viewed layer, one mask test per append.
 //! `view_zoom` is the open canvas's zoom (1 otherwise), which `draw/path.zig` flattens by.
 //!
+//! ## 5d. Backdrops
+//! `backdrop(layer, blur)` marks a layer for one frame: the renderer draws every layer below it
+//! (but bound ones) into a scene, blurs it into a pack, and draws the marked layer and those
+//! above over a copy of the scene (`draw/backdrop.zig`, `draw/renderer.zig` section 4e). It
+//! returns the pack's id, which a backdrop type (`draw.Glass`) is appended with; such an
+//! instance must sit on the marked layer or above (asserted). The context owns the ids: the
+//! first call of a frame gets the first id, created the first time it is needed, so an app that
+//! marks its backdrops in the same order every frame keeps them. `backdrop_under(layer)` is the
+//! highest marked layer at or below `layer`, which skins ask before drawing glass. A context
+//! whose registry has no backdrop type has no backdrops (`backdrop_capacity == 0`), and calling
+//! `backdrop` fails the build.
+//!
 //! ## 6. TigerStyle Invariants
 //! - All storage is fixed arrays sized at compile time from `App.config.draw` and
 //!   `batch_cap`; the hosts keep the context in static memory (BSS on wasm).
@@ -91,6 +103,7 @@ const registry = @import("registry.zig");
 const theme = @import("../theme.zig");
 const textures = @import("textures.zig");
 const types = @import("types.zig");
+const backdrop_module = @import("backdrop.zig");
 
 /// One path point in logical pixels, relative to its path's origin (`draw/path.zig`).
 pub const Point = [2]f32;
@@ -120,6 +133,9 @@ pub const Binding = struct {
     target: textures.TextureId,
     rect: [4]f32,
 };
+
+/// A layer marked as a backdrop this frame (section 5d), `draw/backdrop.zig`.
+pub const Backdrop = backdrop_module.Backdrop;
 
 /// A pan/zoom view of a layer (section 5c): world `(wx, wy)` lands on the logical screen point
 /// `(x + zoom * wx, y + zoom * wy)`. 16 bytes, so it folds into a tile key whole.
@@ -247,6 +263,11 @@ pub fn Context(
         open_mask: u8,
         /// The open canvas's zoom, 1 when none is open.
         view_zoom: f32,
+        /// This frame's backdrops (section 5d), in call order, and the ids each call order
+        /// owns: the first call of a frame always gets `backdrop_ids[0]`.
+        backdrops: [backdrop_capacity]Backdrop,
+        backdrop_count: u32,
+        backdrop_ids: [backdrop_capacity]textures.TextureId,
         /// The theme record the renderer uploads (`theme.zig`): `theme.dark`'s from `init`,
         /// then the app's scheme's (`ui.Context.set_theme`). `reset` keeps it.
         theme: theme.Theme,
@@ -254,6 +275,9 @@ pub fn Context(
         pub const Registry = R;
         pub const batch_capacity: u32 = batch_cap;
         pub const point_capacity: u32 = point_total;
+        /// Backdrops a frame may mark: `backdrop.backdrop_cap` when a registered type samples
+        /// one (`registry.zig`, section 2d), else 0.
+        pub const backdrop_capacity: u32 = if (R.any_backdrop) backdrop_module.backdrop_cap else 0;
 
         /// Empties every pool and the glyph cache and creates the glyph atlas as texture 0.
         /// The atlas starts empty (WebGPU zero-fills it); the cache uploads what it draws.
@@ -267,6 +291,8 @@ pub fn Context(
                 self.pools[index].revision = 0;
             }
             self.point_revision = 0;
+            self.backdrop_count = 0;
+            for (&self.backdrop_ids) |*id| id.* = .atlas;
             self.theme = theme.dark.record();
             self.reset();
             assert(self.textures.count == 1);
@@ -295,6 +321,7 @@ pub fn Context(
             self.batch_count = 0;
             self.finalized = false;
             self.binding_count = 0;
+            self.backdrop_count = 0;
             self.view_mask = 0;
             self.open_mask = 0;
             self.view_zoom = 1;
@@ -320,6 +347,62 @@ pub fn Context(
             }
             self.bindings[self.binding_count] = .{ .layer = layer_index, .target = target, .rect = rect };
             self.binding_count += 1;
+        }
+
+        /// Marks `layer_value` as a backdrop this frame (section 5d) with a blur of sigma `blur`
+        /// logical pixels, and returns the id its glass samples. Every layer below it draws
+        /// into a scene the renderer blurs (`draw/backdrop.zig`). Not the base layer and not a
+        /// layer bound to a target; at most `backdrop_capacity` layers. Marking a layer again
+        /// keeps the wider blur and returns the same id. `reset` clears every backdrop.
+        pub fn backdrop(self: *Self, layer_value: Layer, blur: f32) textures.TextureId {
+            comptime {
+                if (backdrop_capacity == 0) {
+                    @compileError("a backdrop needs a registered type that samples one " ++
+                        "(draw.Glass)");
+                }
+            }
+            const layer_index: u8 = @backingInt(layer_value);
+            assert(layer_index != @backingInt(Layer.base));
+            assert(layer_index < layer_count);
+            assert(blur >= 0 and !std.math.isInf(blur));
+            assert(self.binding_of(layer_index) == null);
+            for (self.backdrops[0..self.backdrop_count]) |*marked| {
+                if (marked.layer == layer_index) {
+                    marked.blur = @max(marked.blur, blur);
+                    return marked.id;
+                }
+            }
+            assert(self.backdrop_count < backdrop_capacity);
+            const slot = self.backdrop_count;
+            if (slot == self.textures.backdrop_count) {
+                self.backdrop_ids[slot] = self.textures.create_backdrop();
+            }
+            assert(self.textures.is_backdrop(self.backdrop_ids[slot]));
+            self.backdrops[slot] = .{
+                .layer = layer_index,
+                .blur = blur,
+                .id = self.backdrop_ids[slot],
+            };
+            self.backdrop_count += 1;
+            return self.backdrops[slot].id;
+        }
+
+        /// The backdrop a glass on `layer_value` samples: the highest one marked at or below
+        /// it this frame, or null (section 5d).
+        pub fn backdrop_under(self: *const Self, layer_value: Layer) ?Backdrop {
+            const layer_index: u8 = @backingInt(layer_value);
+            assert(layer_index < layer_count);
+            var best: ?Backdrop = null;
+            for (self.backdrops[0..self.backdrop_count]) |marked| {
+                if (marked.layer > layer_index) continue;
+                if (best == null or marked.layer > best.?.layer) best = marked;
+            }
+            return best;
+        }
+
+        /// This frame's backdrops, in call order.
+        pub fn backdrop_list(self: *const Self) []const Backdrop {
+            return self.backdrops[0..self.backdrop_count];
         }
 
         /// The binding of `layer_index` this frame, or null when it draws to the main pass.
@@ -411,6 +494,11 @@ pub fn Context(
             } else {
                 assert(self.view_mask & bit_of(layer_index) == 0);
             }
+            // A backdrop's glass draws on its layer or above (section 5d).
+            if (comptime R.any_backdrop and T.texture != null) {
+                const id = texture.?;
+                if (self.textures.is_backdrop(id)) self.assert_over_backdrop(id, layer_index);
+            }
             const key: u16 = @intCast(layer_index * P.texture_slots + slot);
             if (pool.histogram[key] == 0) {
                 if (self.appearance_count == batch_cap) {
@@ -437,6 +525,16 @@ pub fn Context(
             self.finalized = false;
             assert(pool.count <= P.capacity);
             assert(pool.histogram[key] >= 1);
+        }
+
+        fn assert_over_backdrop(self: *const Self, id: textures.TextureId, layer_index: u8) void {
+            for (self.backdrops[0..self.backdrop_count]) |marked| {
+                if (marked.id == id) {
+                    assert(layer_index >= marked.layer);
+                    return;
+                }
+            }
+            unreachable; // The backdrop was not marked this frame.
         }
 
         fn texture_slot(self: *const Self, comptime T: type, texture: ?textures.TextureId) u32 {
@@ -696,6 +794,7 @@ comptime {
     // One bit per layer in the view masks.
     assert(layer_count <= 8);
     assert(@sizeOf(View) == 16);
+    assert(backdrop_module.backdrop_cap == textures.backdrop_cap);
 }
 
 const testing = std.testing;
@@ -903,4 +1002,48 @@ test "64 textures batch on the top layer with keys past 255" {
     try testing.expectEqual(@as(u16, 511), batches[1].key);
     try testing.expectEqual(last, batches[1].texture);
     try testing.expectEqual(@as(u8, 7), batches[1].layer);
+}
+
+const glass_draw = [_]registry.DrawType{
+    .{ .type = types.Box, .cap = 4 },
+    .{ .type = backdrop_module.Glass, .cap = 4 },
+};
+
+const GlassContext = Context(&glass_draw, 6, 0);
+
+// Locks the backdrop ids (section 5d): the first mark of a frame creates the first id and the
+// second the second; marking a layer again keeps the wider blur and returns its id; a glass
+// on layer 5 samples the backdrop at 4, one on layer 3 the one at 2, and the base layer none;
+// the next frame marking the same layers in the same order gets the same ids and creates
+// none; a context without a backdrop type has no capacity.
+test "backdrops keep their ids by call order and glass finds the one under it" {
+    var cx: GlassContext = undefined;
+    cx.init();
+    cx.text.scale_120 = 120;
+    try std.testing.expectEqual(@as(u32, 2), GlassContext.backdrop_capacity);
+    try std.testing.expectEqual(@as(u32, 0), TestContext.backdrop_capacity);
+    const upper = cx.backdrop(@fromBackingInt(4), 8);
+    const lower = cx.backdrop(@fromBackingInt(2), 16);
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(upper));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(lower));
+    try std.testing.expectEqual(upper, cx.backdrop(@fromBackingInt(4), 12));
+    try std.testing.expectEqual(@as(f32, 12), cx.backdrop_under(@fromBackingInt(7)).?.blur);
+    try std.testing.expectEqual(upper, cx.backdrop_under(@fromBackingInt(5)).?.id);
+    try std.testing.expectEqual(lower, cx.backdrop_under(@fromBackingInt(3)).?.id);
+    try std.testing.expect(cx.backdrop_under(.base) == null);
+    _ = cx.layer(@fromBackingInt(5));
+    const rect: [4]f32 = .{ 0, 0, 10, 10 };
+    const glass: backdrop_module.Glass = .{
+        .rect = rect,
+        .clip = rect,
+        .tint = @splat(0),
+        .look = @splat(0),
+        .lens = .{ 0, 1, 0, 0 },
+    };
+    try cx.append(backdrop_module.Glass, upper, glass);
+    cx.reset();
+    try std.testing.expectEqual(@as(usize, 0), cx.backdrop_list().len);
+    try std.testing.expectEqual(upper, cx.backdrop(@fromBackingInt(4), 8));
+    try std.testing.expectEqual(lower, cx.backdrop(@fromBackingInt(2), 8));
+    try std.testing.expectEqual(@as(u32, 3), cx.textures.count);
 }

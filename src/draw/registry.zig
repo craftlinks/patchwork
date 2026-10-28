@@ -21,7 +21,7 @@
 //! `float32x2`, or `float32x3`, and its WGSL type is `f32` or `vec2`/`vec3` (`last_width`).
 //! The type declares `pub const pixel: []const u8` (its WGSL
 //! function) and `pub const texture: ?textures.Format` (null for an untextured type). Field
-//! names must not shadow the prelude's `local`, `size`, or `pos`. `check` returns the first
+//! names must not shadow the prelude's `local`, `size`, `pos`, or `frag`. `check` returns the first
 //! violation as a message that starts with the type's name, so `app.check` can fail the build
 //! naming it (`zig build test-contract` locks one case).
 //!
@@ -60,6 +60,13 @@
 //! so a clipped-out pixel leaves the target unchanged in every mode. The factors are in
 //! `commands.Blend`.
 //!
+//! ## 2d. Backdrop Types
+//! A type may declare `pub const backdrop: bool`. Such a type samples a backdrop's pack
+//! (`draw/backdrop.zig`), so its `texture` must be `.target`, and a registry that holds one
+//! (`any_backdrop`) gives its context backdrops and its renderer the chain's pipelines;
+//! without one, neither exists. `draw.Glass` declares it. `Pixel.frag` is the fragment's
+//! position in device pixels of the pass's target, which a backdrop type reads its pack by.
+//!
 //! ## 2a. The Vertex Contract
 //! By default a type's quad is its `rect`: the shared `vs_main` places the unit quad's corner
 //! `unit` (in [0, 1]^2) at `rect.xy + unit * rect.zw`. A type may instead declare
@@ -81,7 +88,7 @@
 //! points                               @group(0) @binding(1), `reads_points` types only
 //! struct Instance { g0 .. gN-1 }       @location(1 .. N) vec4<f32>
 //! struct Varyings                      position, local, and every group @interpolate(flat)
-//! struct Pixel                         local, size, pos, and every Zig field by name
+//! struct Pixel                         local, size, pos, frag, and every Zig field by name
 //! fn carry, fn unpack                  copy the groups through and name the fields
 //! T.pixel                              the type's own fn pixel(px: Pixel) -> vec4<f32>
 //! [T.vertex]                           the type's own fn vertex, when it declares one
@@ -121,7 +128,7 @@ pub const group_cap: u32 = 8;
 pub const instance_cap_max: u32 = 65536;
 
 /// Names the prelude adds to `Pixel`.
-const reserved = [_][]const u8{ "local", "size", "pos" };
+const reserved = [_][]const u8{ "local", "size", "pos", "frag" };
 
 /// Null when `T` satisfies the instance convention, otherwise a message naming `T` and the
 /// first violation. See the module guide, section 2.
@@ -167,6 +174,12 @@ pub fn check(comptime T: type) ?[]const u8 {
         }
         if (@hasDecl(T, "animated")) {
             if (@TypeOf(T.animated) != bool) return name ++ ": `animated` must be bool";
+        }
+        if (@hasDecl(T, "backdrop")) {
+            if (@TypeOf(T.backdrop) != bool) return name ++ ": `backdrop` must be bool";
+            if (T.backdrop and T.texture != .target) {
+                return name ++ ": a `backdrop` type must sample `.target`";
+            }
         }
         if (@hasDecl(T, "blend")) {
             if (@TypeOf(T.blend) != commands.Blend) {
@@ -225,6 +238,13 @@ fn group_wgsl(comptime T: type, comptime group: u32) []const u8 {
 pub fn reads_points(comptime T: type) bool {
     if (comptime !@hasDecl(T, "reads_points")) return false;
     return comptime T.reads_points;
+}
+
+/// True when `T` declares `backdrop = true`: it samples a backdrop's pack (module guide,
+/// section 2d).
+pub fn samples_backdrop(comptime T: type) bool {
+    if (comptime !@hasDecl(T, "backdrop")) return false;
+    return comptime T.backdrop;
 }
 
 /// True when `T` declares `animated = true` (module guide, section 2b).
@@ -334,6 +354,31 @@ pub fn Registry(comptime entries: []const DrawType) type {
             }
             break :blk out;
         };
+
+        /// True for a type that samples a backdrop, by id (module guide, section 2d).
+        pub const samples: [count]bool = blk: {
+            var out: [count]bool = undefined;
+            for (entries, 0..) |entry, index| out[index] = samples_backdrop(entry.type);
+            break :blk out;
+        };
+
+        /// True when some registered type samples a backdrop (module guide, section 2d):
+        /// only then does the draw context take backdrops.
+        pub const any_backdrop: bool = blk: {
+            var out = false;
+            for (entries) |entry| out = out or samples_backdrop(entry.type);
+            break :blk out;
+        };
+
+        /// True when `T` is registered, so a skin can draw it only for apps that have it.
+        pub fn has(comptime T: type) bool {
+            comptime {
+                for (entries) |entry| {
+                    if (entry.type == T) return true;
+                }
+                return false;
+            }
+        }
 
         /// True when some registered type is animated.
         pub const any_animated: bool = blk: {
@@ -508,10 +553,11 @@ fn io_wgsl(comptime T: type) []const u8 {
             carry = carry ++ "    out." ++ g ++ " = i." ++ g ++ ";\n";
         }
         var pixel: []const u8 = "struct Pixel {\n" ++
-            "    local: vec2<f32>,\n    size: vec2<f32>,\n    pos: vec2<f32>,\n";
+            "    local: vec2<f32>,\n    size: vec2<f32>,\n    pos: vec2<f32>,\n" ++
+            "    frag: vec2<f32>,\n";
         var unpack: []const u8 = "fn unpack(v: Varyings) -> Pixel {\n" ++
             "    var px: Pixel;\n    px.local = v.local;\n    px.size = v.g0.zw;\n" ++
-            "    px.pos = v.g0.xy + v.local;\n";
+            "    px.pos = v.g0.xy + v.local;\n    px.frag = v.position.xy;\n";
         const info = @typeInfo(T).@"struct";
         for (info.field_names, info.field_types) |field_name, field_type| {
             const offset = @offsetOf(T, field_name);

@@ -66,6 +66,17 @@
 //! scale, or `draw.Context.theme` changed it records one `buffer_write` of the whole record,
 //! which both hosts replay, and repaints every tile; view and target uniforms are rebuilt from
 //! it. Nothing is allocated: a scheme is a value.
+//!
+//! ## 7. Materials
+//! `Scheme.material` says what the default skins make panels and popups of: `solid` (the
+//! faces of steps 1 to 39, and the default of `dark` and `light`), or glass, `clear`,
+//! `frosted`, or `tinted`, over a backdrop (`draw/backdrop.zig`). A `Panel` or `Menu` (and so a
+//! `Dropdown`'s list) may set its own. Glass needs the app to register `draw.Glass` and to mark
+//! a backdrop at or below the face's layer (`kit.backdrop`); a menu marks the popup layer
+//! itself. Without either the skin draws the solid face, so a glass material never hides a
+//! panel. The material is CPU state only: it is not part of the GPU record, and switching it is
+//! a redraw. `blur` is the backdrop's sigma; the rest become the `draw.GlassLook` that
+//! `kit.glass_look` derives with the scheme's colours.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -131,6 +142,86 @@ pub const Colors = struct {
     darken: [4]f32,
 };
 
+/// The widest backdrop blur a material may ask for, sigma in logical pixels.
+pub const blur_max: f32 = 48;
+
+/// The most refraction a material may ask for, logical pixels.
+pub const refraction_max: f32 = 64;
+
+/// What panels and popups are made of (module guide, section 7): solid faces, or glass over a
+/// backdrop (`draw/backdrop.zig`). Colours stay the scheme's: the tint is `colors.panel`, or
+/// `colors.focus` for `tinted`, at `tint` alpha, and the rim mixes toward `colors.lighten`.
+pub const Material = struct {
+    kind: Kind = .solid,
+    /// The backdrop's blur, sigma in logical pixels, `[0, blur_max]`.
+    blur: f32 = 0,
+    /// `[0, 1]`: 0 shows the lightly filtered backdrop, 1 the blurred one.
+    frost: f32 = 0,
+    /// `[0, 1]`: how far the backdrop moves toward the tint colour.
+    tint: f32 = 0,
+    /// `[0, 2]`: 1 keeps the backdrop's colours, more makes them vivid.
+    saturation: f32 = 1,
+    /// `[0, 1]`: the lit edge.
+    rim: f32 = 0,
+    /// How far the edge bends what is under it, logical pixels, `[0, refraction_max]`.
+    refraction: f32 = 0,
+
+    /// `solid` is the faces of steps 1 to 39 (`opaque` is a Zig keyword).
+    pub const Kind = enum(u8) { solid, clear, frosted, tinted };
+
+    pub const solid: Material = .{};
+    /// Barely blurred and barely tinted, with a strong lens at the edge.
+    pub const clear: Material = .{
+        .kind = .clear,
+        .blur = 4,
+        .frost = 0.35,
+        .tint = 0.1,
+        .saturation = 1.2,
+        .rim = 0.7,
+        .refraction = 10,
+    };
+    /// Blurred and tinted toward the panel colour.
+    pub const frosted: Material = .{
+        .kind = .frosted,
+        .blur = 16,
+        .frost = 1,
+        .tint = 0.45,
+        .saturation = 1.5,
+        .rim = 0.5,
+        .refraction = 6,
+    };
+    /// Blurred and tinted toward the focus colour.
+    pub const tinted: Material = .{
+        .kind = .tinted,
+        .blur = 16,
+        .frost = 1,
+        .tint = 0.4,
+        .saturation = 1.3,
+        .rim = 0.5,
+        .refraction = 6,
+    };
+
+    /// True for every kind but `solid`.
+    pub fn glass(self: Material) bool {
+        return self.kind != .solid;
+    }
+
+    /// Null when every field is in its range, otherwise the first that is not.
+    pub fn problem(self: Material) ?[]const u8 {
+        if (!(self.blur >= 0 and self.blur <= blur_max)) return "blur: must be in [0, 48]";
+        if (!(self.frost >= 0 and self.frost <= 1)) return "frost: must be in [0, 1]";
+        if (!(self.tint >= 0 and self.tint <= 1)) return "tint: must be in [0, 1]";
+        if (!(self.saturation >= 0 and self.saturation <= 2)) {
+            return "saturation: must be in [0, 2]";
+        }
+        if (!(self.rim >= 0 and self.rim <= 1)) return "rim: must be in [0, 1]";
+        if (!(self.refraction >= 0 and self.refraction <= refraction_max)) {
+            return "refraction: must be in [0, 64]";
+        }
+        return null;
+    }
+};
+
 /// The app-level theme (module guide, section 1). `App.config.theme` sets it at start and
 /// `cx.set_theme` switches it at run time.
 pub const Scheme = struct {
@@ -145,6 +236,8 @@ pub const Scheme = struct {
     hover_lighten: f32,
     /// Shader mix toward `colors.darken` at press animator value 1, `[0, 1]`.
     down_darken: f32,
+    /// What panels and popups are made of (section 7); a panel or menu may override it.
+    material: Material = .solid,
 
     /// The GPU record: the colors the shaders and the passes read, and the constant arc.
     pub fn record(self: *const Scheme) Theme {
@@ -266,6 +359,7 @@ pub fn problem(comptime scheme: Scheme) ?[]const u8 {
         if (!(scheme.down_darken >= 0 and scheme.down_darken <= 1)) {
             return "down_darken: must be in [0, 1]";
         }
+        if (scheme.material.problem()) |message| return "material." ++ message;
         return null;
     }
 }
@@ -293,6 +387,11 @@ comptime {
     assert(chrome.darken[0] == 0);
     assert(problem(dark) == null);
     assert(problem(light) == null);
+    assert(Material.clear.problem() == null);
+    assert(Material.frosted.problem() == null);
+    assert(Material.tinted.problem() == null);
+    assert(!dark.material.glass());
+    assert(!light.material.glass());
     assert(@typeInfo(Colors).@"struct".field_names.len == 11);
 }
 
@@ -409,4 +508,25 @@ test "open ring gap is a quarter turn that closes at the start angle" {
     const end: f32 = arc_start + arc_sweep - std.math.tau;
     try std.testing.expectApproxEqAbs(std.math.pi / 6.0, end, 0.00001);
     try std.testing.expectApproxEqAbs(arc_start, end + gap, 0.00001);
+}
+
+// Locks the materials (section 7): the presets are glass and valid, `solid` is the default of
+// both schemes, and `problem` names the first field out of range.
+test "materials are glass but solid and name their first bad field" {
+    try std.testing.expect(Material.frosted.glass());
+    try std.testing.expect(!Material.solid.glass());
+    try std.testing.expectEqual(Material.Kind.solid, dark.material.kind);
+    var bad = Material.frosted;
+    bad.blur = 60;
+    try std.testing.expectEqualStrings("blur: must be in [0, 48]", bad.problem().?);
+    bad = Material.clear;
+    bad.saturation = 2.5;
+    try std.testing.expectEqualStrings("saturation: must be in [0, 2]", bad.problem().?);
+    const scheme = comptime blk: {
+        var out = dark;
+        out.material.rim = 2;
+        break :blk out;
+    };
+    const message = comptime problem(scheme).?;
+    try std.testing.expectEqualStrings("material.rim: must be in [0, 1]", message);
 }

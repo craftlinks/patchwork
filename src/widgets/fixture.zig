@@ -21,6 +21,7 @@ const draw_types = [_]draw.DrawType{
     .{ .type = draw.Arc, .cap = 16 },
     .{ .type = draw.Glyph, .cap = 128 },
     .{ .type = draw.Path, .cap = 8 },
+    .{ .type = draw.Glass, .cap = 4 },
 };
 
 pub const Context = ui.Context(draw.Context(&draw_types, 16, 64), 16);

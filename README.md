@@ -117,7 +117,8 @@ patchwork/
 │   ├── ui/popup.zig            # Popup placement: place (side, flip, clamp, cut), Anchor
 │   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
 │   ├── widgets/kit.zig         # The widget kit: append, face, arc, label, step, aim, weight,
-│   │                           #   clicked, Interaction, Paint, the hover and press constants
+│   │                           #   clicked, Interaction, Paint, the hover and press constants,
+│   │                           #   surface, lit, backdrop, glass, glass_look, glass_face
 │   ├── widgets/skin.zig        # Skins: the look structs, Shape, skins.check, skins.Default
 │   ├── widgets/label.zig       # One file per widget, with its constants, geometry, and tests:
 │   ├── widgets/panel.zig       #   Label, Panel, Button, Slider, Knob (and the shared ring and
@@ -146,6 +147,7 @@ patchwork/
 │   ├── draw/types.zig          # Library draw types (Box, Arc, Surface, Glyph, Image, Path), twins
 │   ├── draw/pools.zig          # Context: per-type pools, point pool, layers, sort, batches
 │   ├── draw/path.zig           # Stroked paths: flattening, chunking, twins, appenders
+│   ├── draw/backdrop.zig       # Backdrops: the blur chain's levels, passes, reach; Glass; twins
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId, write revisions
 │   ├── draw/tiles.zig          # Pixel cache tiles: hashes, dirty bits, scissor rects, record keys
 │   ├── draw/renderer.zig       # Records setup and frame command streams; frame kinds, kept target
@@ -223,6 +225,8 @@ patchwork/
 │       ├── icons.zig           # Named Lucide codepoints and the icon face's ranges
 │       ├── files.zig           # The files page: a drop zone, the dropped files, a waveform
 │       ├── wav.zig             # A streaming 16-bit PCM WAV decoder fed chunk by chunk
+│       ├── surfaces.zig        # The surfaces page: gradient cards, rims, and shadows
+│       ├── glass.zig           # The glass page: cards under glass, materials, a lens slider
 │       └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
@@ -601,6 +605,13 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 - **Making one.** Copy a preset and change fields: `var s = theme.dark; s.colors.panel =
   .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, and text
   sizes are at most `text.size_max`; `app.check` refuses anything else and names the field.
+- **Material.** `scheme.material` (`theme.Material`) is what the default skins make panels and
+  popups of: `.solid` (the default of both presets, the faces of steps 1 to 39), or glass,
+  `.clear`, `.frosted`, or `.tinted`: a backdrop blur (sigma, logical pixels), how far glass
+  reads its blurred level (`frost`), a tint toward `colors.panel` (`colors.focus` for tinted),
+  `saturation`, a lit `rim`, and `refraction` at the edge. A `Panel` or `Menu` (so a
+  `Dropdown`'s list) may set its own `material`. Glass needs `draw.Glass` registered and a
+  backdrop under the face (see Backdrops and Glass); without one the skin draws the solid face.
 
 ## Make a Skin
 
@@ -974,6 +985,11 @@ blue.
   "done", "folder"), and the first WAV among them decoded chunk by chunk
   (`examples/gallery/wav.zig`) and drawn as a waveform. A WAV longer than 21.8 s cancels itself
   at the sample cap ("cut at 21.8 s"); other files are counted, not stored.
+- **glass** (step 40, see Backdrops and Glass): sixteen album cards (gradients between the
+  scheme's accents) scroll in a view under a glass sidebar (`widgets.Panel` with the page's
+  material), a segmented bar that picks it (Clear, Frosted, Tinted, Solid), and a transport
+  bar whose position slider is `widgets.SliderOf(glass.LensSkin)`, its knob a clear glass lens
+  on the popup level. The sidebar's output dropdown opens a glass list that blurs the sidebar.
 - **surfaces** (step 39, see Surfaces): a music-player-like page of surfaces alone
   (`examples/gallery/surfaces.zig`): a faint gradient backdrop, a glass-like panel and pill bar
   (translucent, rim-lit, shadowed, not blurred), and six cards of a muted gradient, a radial
@@ -997,7 +1013,9 @@ minimum: a long word breaks between letters), and `wrap-scroll` (that, then the 
 wrapped text, in a view, scrolled to its end) for the type page; `files` (the empty page), `drop-hover` (files dragged over the zone), and `drop` (a 1 s
 tone, a text file, and a folder dropped: the tone's waveform) for the files page; and
 `surfaces` (the surfaces page), `surfaces-click` (the Radio pill, the Browse row, and the
-Slate card clicked, then Moss hovered), and `surfaces-light` (the page in the light theme).
+Slate card clicked, then Moss hovered), and `surfaces-light` (the page in the light theme);
+`glass` (frosted), `glass-scroll` (the wheel every frame, for benches), `glass-popup` (the
+output list over the sidebar), `glass-clear`, and `glass-light` for the glass page.
 
 ## File Drops
 
@@ -1304,7 +1322,8 @@ on and off are identical on both GPUs.
 A draw type is an `extern struct` plus a WGSL `fn pixel(px: Pixel) -> vec4<f32>`. The app
 lists its types and pool capacities in `config.draw`; the library provides `draw.Box` (fill,
 border, radius, hover, down), `draw.Surface` (a gradient, a rim-lit border, and a soft shadow;
-see Surfaces below), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
+see Surfaces below), `draw.Glass` (a blurred, tinted, refracting view of a backdrop; see
+Backdrops and Glass below), `draw.Arc` (open ring), `draw.Glyph` (glyph-atlas text written by
 `text.place`), `draw.Image` (an `rgba8` texture), and `draw.Path` (a stroked polyline, see
 Paths), and an app adds its own (the rack's `Led`).
 
@@ -1336,6 +1355,44 @@ kit.surface(cx, card, page_clip, .{
   lights and darkens like a box face: `kit.surface(cx, rect, clip, kit.lit(look, cx.theme(),
   item.hover.value, item.down_value()))`. A surface only draws; a widget records its area and
   answers `cx.hit` as any other. `Box` is unchanged.
+
+**Backdrops and Glass.** `cx.drawing().backdrop(layer, blur)` (or `kit.backdrop(cx, layer,
+material)`) marks a layer for one frame and returns the id its glass samples. The renderer
+draws every layer below it into a window-sized scene, blurs that into a pack with a dual-filter
+chain (`src/draw/backdrop.zig`), copies the scene into the main pass with exact bytes, and
+continues with the marked layer:
+
+```zig
+_ = kit.backdrop(cx, glass_layer, theme.Material.frosted);   // blur sigma 16, logical px
+_ = cx.drawing().layer(glass_layer);
+if (!kit.glass(cx, sidebar, clip, kit.glass_look(cx.theme(), .frosted, 22)))
+    kit.face(cx, sidebar, clip, .{ .fill = cx.theme().colors.panel, .radius = 22 });
+```
+
+- **At most two** per frame, one per layer, taking no layer of their own: one under panels and
+  one under popups (a `Menu` with a glass material marks `.popup` itself), so a popup's glass
+  blurs the glass panel under it. Glass on the same level does not see other glass.
+- **The chain** downsamples to half, a quarter, ... (2 to 6 levels) and back up to half, so a
+  wide blur costs about what a narrow one does; `backdrop.chain_for(sigma)` picks the levels
+  and the tap offset from a variance formula calibrated against a CPU twin of the passes, for
+  sigma 2 to 96 device pixels. The pack holds two half-size images: the first down pass (light)
+  and the last up pass (heavy).
+- **`draw.Glass`** (80 bytes) is a rounded rect over the pack: `frost` mixes light and heavy,
+  then `saturation`, a `tint`, a rim toward `theme.lighten` lit from the top left, and
+  `refraction`: the edge band (`bevel`) reads the backdrop nearer the centre, so a small disc
+  is a lens (the gallery's slider knob). It reads its position from `Pixel.frag`, so it draws
+  only in window-sized passes, never on a layer bound to an offscreen target.
+- **Only where glass is.** Each chain pass is scissored to the union of the rects of the glass
+  that samples it, grown by the chain's reach, which keeps it exact; a backdrop nothing samples
+  renders no chain. On the gallery's glass page scrolling at 1901 by 2114, the two chains cost
+  0.47 and 0.06 ms of GPU on the UHD 770 (1.71 and 1.45 ms unscissored), and the whole frame
+  0.26 ms on the RTX 3060.
+- **Cache and idle.** A chain re-renders only when the content below its layer, its region, or
+  the size changes; that moves the pack's revision and dirties the glass tiles. Scenes repaint
+  only the frame's dirty rects, so a cached frame equals a direct one, and an unchanged frame
+  is skipped. A type that declares `pub const backdrop = true` samples a pack (`texture =
+  .target`); only a registry with one gives its context backdrops and its renderer the copy,
+  down, and up pipelines.
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
   pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
