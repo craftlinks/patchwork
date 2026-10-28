@@ -1,6 +1,7 @@
-//! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, a text field, menus, a
-//! dropdown, a tooltip, tabs, a splitter, a list box, and a number box as plain structs, and the
-//! kit they are built from.
+//! Widgets: panels, labels, buttons, sliders, knobs, meters, toggles, checkboxes, a text field
+//! (with a hint, a secret mode, and a leading icon), menus, a dropdown, a tooltip, tabs (and a
+//! segmented control), a splitter, a list box, and a number box as plain structs, and the kit
+//! they are built from.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -47,11 +48,12 @@
 //! widgets/knob.zig        Knob, the ring and label-column geometry, accents
 //! widgets/meter.zig       Meter
 //! widgets/toggle.zig      Toggle and its pill geometry
+//! widgets/checkbox.zig    Checkbox: a box, a check mark or a mixed bar, and its label
 //! widgets/text_field.zig  TextField
 //! widgets/menu.zig        Menu and ContextMenu: a list in a popup (`ui/popup.zig`)
 //! widgets/dropdown.zig    Dropdown: a face and its Menu
 //! widgets/tooltip.zig     Tooltip: one line after a hover dwell, on the tooltip layer
-//! widgets/tabs.zig        Tabs: a bar of tabs over a page the app draws
+//! widgets/tabs.zig        Tabs: a bar of tabs over a page the app draws, or alone (Segmented)
 //! widgets/splitter.zig    Splitter: two panes and a draggable divider, begin/next/end
 //! widgets/list_box.zig    ListBox: a virtual list with selection, keys, scroll-into-view
 //! widgets/number_box.zig  NumberBox: drag, wheel, or type a value with a unit; format, parse
@@ -78,8 +80,8 @@
 //! ## 6. Skins
 //! Every widget but `Label` is generic over a skin, a struct of draw functions passed at
 //! compile time (`widgets/skin.zig`): `KnobOf(Skin)`, `ButtonOf`, `SliderOf`, `ToggleOf`,
-//! `MeterOf`, `PanelOf`, `TextFieldOf` (its face only), `MenuOf`, `DropdownOf`, `TabsOf`,
-//! `SplitterOf`, `ListBoxOf`, and `NumberBoxOf`. The plain names are the default
+//! `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face only), `MenuOf`, `DropdownOf`,
+//! `TabsOf`, `SplitterOf`, `ListBoxOf`, and `NumberBoxOf`. The plain names are the default
 //! skin, `Knob = KnobOf(skins.Default)`, and draw exactly what they drew before skins. A skin
 //! gets a look struct of values and returns the hit shape; a missing or mistyped function is
 //! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
@@ -121,6 +123,7 @@ const slider = @import("widgets/slider.zig");
 const knob = @import("widgets/knob.zig");
 const meter = @import("widgets/meter.zig");
 const toggle = @import("widgets/toggle.zig");
+const checkbox = @import("widgets/checkbox.zig");
 const text_field = @import("widgets/text_field.zig");
 const menu = @import("widgets/menu.zig");
 const dropdown = @import("widgets/dropdown.zig");
@@ -153,6 +156,7 @@ pub const ButtonLook = skins.ButtonLook;
 pub const SliderLook = skins.SliderLook;
 pub const KnobLook = skins.KnobLook;
 pub const ToggleLook = skins.ToggleLook;
+pub const CheckboxLook = skins.CheckboxLook;
 pub const MeterLook = skins.MeterLook;
 pub const PanelLook = skins.PanelLook;
 pub const FieldLook = skins.FieldLook;
@@ -221,6 +225,12 @@ pub const thumb_inset = toggle.thumb_inset;
 pub const pill_of = toggle.pill_of;
 pub const toggle_thumb = toggle.toggle_thumb;
 
+pub const Checkbox = checkbox.Checkbox;
+pub const CheckboxOf = checkbox.CheckboxOf;
+pub const checkbox_height = checkbox.checkbox_height;
+pub const checkbox_flags = checkbox.checkbox_flags;
+pub const checkbox_label_max = checkbox.checkbox_label_max;
+
 pub const TextField = text_field.TextField;
 pub const TextFieldOf = text_field.TextFieldOf;
 pub const field_flags = text_field.field_flags;
@@ -261,6 +271,11 @@ pub const divider_salt = splitter.divider_salt;
 
 pub const Tabs = tabs.Tabs;
 pub const TabsOf = tabs.TabsOf;
+/// A segmented control: tabs arranged `even` in a track, drawn with `bar` (no page).
+pub const Segmented = TabsOf(skins.Segmented);
+pub const TabArrange = tabs.TabArrange;
+pub const even_widths = tabs.even_widths;
+pub const segment_inset = tabs.segment_inset;
 pub const tabs_max = tabs.tabs_max;
 pub const tab_bar_h = tabs.tab_bar_h;
 pub const tab_widths = tabs.tab_widths;
@@ -289,6 +304,7 @@ test {
     _ = knob;
     _ = meter;
     _ = toggle;
+    _ = checkbox;
     _ = text_field;
     _ = menu;
     _ = dropdown;

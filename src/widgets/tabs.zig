@@ -22,6 +22,16 @@
 //! the bar and are clipped by it. Each tab is `tab_bar_h - tab_line_px` high, so the bar's
 //! bottom line shows under them. Test "tab widths shrink evenly to their floors" locks it.
 //!
+//! ## 2a. Arrangements and the Bar Alone
+//! The skin picks the arrangement: an optional `pub const tab_arrange: widgets.TabArrange`,
+//! read at compile time (`natural` without it), as a slider's skin owns its travel. `natural`
+//! is section 2. `even` is a segmented control: the tabs fill the bar inset by
+//! `segment_inset` on every side, `tab_gap` apart, in equal whole-pixel widths with the
+//! remainder given one pixel at a time from the first (`even_widths`). `bar(cx, walk)` draws
+//! the bar in the whole box `walk` gets and opens no page, so the caller draws nothing under
+//! it and calls no `cx.end()`; `widgets.Segmented` is `TabsOf(skins.Segmented)`, which
+//! arranges `even` and draws a track with the selected segment raised.
+//!
 //! ## 3. Events
 //! The bar is a focusable area (`id`) under the tabs (`id.derive(index)`).
 //! ```text
@@ -72,6 +82,13 @@ pub const tab_gap: f32 = 2;
 pub const tab_radius: f32 = 4;
 pub const tab_line_px: f32 = 1;
 pub const tab_underline_px: f32 = 2;
+
+/// How a bar lays out its tabs (section 2a); a skin picks one with `tab_arrange`.
+pub const TabArrange = enum { natural, even };
+
+/// An `even` bar's inset around its tabs, and the space left and right of their labels.
+pub const segment_inset: f32 = 3;
+pub const segment_pad_x: f32 = 6;
 
 /// Labels are centered and cut with an ellipsis when the tab shrank.
 pub const tab_text_options: text.Options = .{
@@ -134,11 +151,34 @@ pub fn tab_widths(natural: []const f32, room: f32, out: []f32) void {
     }
 }
 
+/// Writes `out.len` equal whole-pixel widths that fill `room` with `tab_gap` between them,
+/// the remainder one pixel each from the first (section 2a).
+pub fn even_widths(room: f32, out: []f32) void {
+    assert(out.len >= 1 and out.len <= tabs_max);
+    assert(room >= 0);
+    const count: f32 = @floatFromInt(out.len);
+    const free = @max(0, @floor(room - (count - 1) * tab_gap));
+    const base = @floor(free / count);
+    var extra = free - base * count;
+    for (out) |*width| {
+        width.* = base + @as(f32, if (extra > 0) 1 else 0);
+        extra -= 1;
+    }
+    assert(out[0] - out[out.len - 1] <= 1);
+    assert(out[0] >= base);
+}
+
 /// A bar of tabs drawn by `Skin` (`Skin.tab_bar`, `Skin.tab`; `widgets/skin.zig`).
 pub fn TabsOf(comptime Skin: type) type {
     if (comptime skin.check(Skin, .tabs)) |problem| @compileError(problem);
     return struct {
         const Self = @This();
+
+        /// The skin's arrangement (section 2a).
+        pub const arrange: TabArrange = if (@hasDecl(Skin, "tab_arrange"))
+            Skin.tab_arrange
+        else
+            .natural;
 
         id: Id,
         labels: []const []const u8,
@@ -173,47 +213,67 @@ pub fn TabsOf(comptime Skin: type) type {
             assert(walk.width != .fit and walk.height != .fit);
             assert(self.selected < self.labels.len);
             const rect = cx.peek(walk);
-            const bar: Rect = .{
+            const strip: Rect = .{
                 .x = rect.x,
                 .y = rect.y,
                 .width = rect.width,
                 .height = @min(tab_bar_h, rect.height),
             };
-            if (cx.visible(bar)) |clip| self.draw_bar(cx, bar, clip);
+            if (cx.visible(strip)) |clip| self.draw_bar(cx, strip, clip);
             var page_layout = layout;
-            page_layout.padding.top += bar.height;
+            page_layout.padding.top += strip.height;
             const opened = cx.begin(walk, page_layout);
             assert(opened.x == rect.x and opened.y == rect.y);
             return .{
                 .x = rect.x,
-                .y = rect.y + bar.height,
+                .y = rect.y + strip.height,
                 .width = rect.width,
-                .height = rect.height - bar.height,
+                .height = rect.height - strip.height,
             };
         }
 
-        fn draw_bar(self: *const Self, cx: anytype, bar: Rect, clip: kit.Clip) void {
-            assert(bar.width > 0 and bar.height > 0);
-            cx.area(self.id, bar, 0, tabs_flags);
-            Skin.tab_bar(cx, .{ .rect = bar, .clip = clip, .focused = cx.focused(self.id) });
+        /// Draws the bar alone in the whole box `walk` gets, with no page under it (section
+        /// 2a): a segmented control. Draw phase.
+        pub fn bar(self: *const Self, cx: anytype, walk: Walk) void {
+            assert(walk.width != .fit and walk.height != .fit);
+            assert(self.selected < self.labels.len);
+            const rect = cx.walk(walk);
+            const clip = cx.visible(rect) orelse return;
+            self.draw_bar(cx, rect, clip);
+        }
+
+        fn draw_bar(self: *const Self, cx: anytype, strip: Rect, clip: kit.Clip) void {
+            assert(strip.width > 0 and strip.height > 0);
+            cx.area(self.id, strip, 0, tabs_flags);
+            Skin.tab_bar(cx, .{ .rect = strip, .clip = clip, .focused = cx.focused(self.id) });
             const style = cx.theme().name;
             var natural: [tabs_max]f32 = undefined;
             var widths: [tabs_max]f32 = undefined;
             const count = self.labels.len;
-            for (self.labels, natural[0..count]) |label, *width| {
-                width.* = natural_width(style, label);
+            const inset: f32 = if (arrange == .even) segment_inset else 0;
+            if (arrange == .even) {
+                even_widths(@max(0, strip.width - 2 * inset), widths[0..count]);
+            } else {
+                for (self.labels, natural[0..count]) |label, *width| {
+                    width.* = natural_width(style, label);
+                }
+                tab_widths(natural[0..count], strip.width, widths[0..count]);
             }
-            tab_widths(natural[0..count], bar.width, widths[0..count]);
-            var x = bar.x;
+            const height = if (arrange == .even)
+                strip.height - 2 * inset
+            else
+                strip.height - tab_line_px;
+            var x = strip.x + inset;
             for (self.labels, widths[0..count], 0..) |label, width, index| {
                 const at: u32 = @intCast(index);
                 const tab: Rect = .{
                     .x = x,
-                    .y = bar.y,
+                    .y = strip.y + inset,
                     .width = width,
-                    .height = @max(0, bar.height - tab_line_px),
+                    .height = @max(0, height),
                 };
                 x += width + tab_gap;
+                if (!(tab.width > 0) or !(tab.height > 0)) continue;
                 const inside = cx.visible(tab) orelse continue;
                 const shape = Skin.tab(cx, .{
                     .rect = tab,
@@ -326,7 +386,7 @@ fn draw_tabs(cx: *fixture.Context, tabs: *const Tabs) Rect {
     return page;
 }
 
-fn tab_center(cx: *fixture.Context, tabs: *const Tabs, index: u32) input.Point {
+fn tab_center(cx: *fixture.Context, tabs: anytype, index: u32) input.Point {
     const area = cx.find(tabs.tab_id(index)).?;
     return .{ .x = area.rect[0] + area.rect[2] * 0.5, .y = area.rect[1] + area.rect[3] * 0.5 };
 }
@@ -406,4 +466,45 @@ test "tabs route" {
     try testing.expectEqual(@as(u32, 1), ui.route(cx, down, &holder));
     cx.event_end();
     try testing.expectEqual(@as(u32, 1), holder.tabs.selected);
+}
+
+// Locks `even_widths` (section 2a): 234 px for three tabs leaves 230 after two 2 px gaps,
+// 76 each and 2 over, so 77, 77, 76; a room too small for the gaps gives zero widths.
+test "even widths fill the room with the remainder first" {
+    var out: [3]f32 = undefined;
+    even_widths(234, &out);
+    try testing.expectEqual([3]f32{ 77, 77, 76 }, out);
+    even_widths(10, &out);
+    try testing.expectEqual([3]f32{ 2, 2, 2 }, out);
+    even_widths(3, &out);
+    try testing.expectEqual([3]f32{ 0, 0, 0 }, out);
+}
+
+// Locks the segmented control (section 2a): `bar` draws in the whole 240 x 32 box with no
+// page; the segments sit 3 px in, 77, 77, and 76 wide and 26 high, 2 px apart, each a capsule
+// hit shape; the track and the selected segment are the two boxes; Right selects the next.
+test "a segmented bar draws alone with even segments" {
+    const Segmented = TabsOf(skin.Segmented);
+    try testing.expectEqual(TabArrange.even, Segmented.arrange);
+    try testing.expectEqual(TabArrange.natural, Tabs.arrange);
+    const cx = fixture.context();
+    var segmented = Segmented.init(ui.id("segments", 0), &tab_labels, 1);
+    cx.begin_frame(1280, 720, 120);
+    segmented.bar(cx, fixture.at(0, 0, 240, 32));
+    _ = cx.end_frame();
+    const xs = [_]f32{ 3, 82, 161 };
+    const ws = [_]f32{ 77, 77, 76 };
+    for (xs, ws, 0..) |x, width, index| {
+        const area = cx.find(segmented.tab_id(@intCast(index))).?;
+        try testing.expectEqualSlices(f32, &.{ x, 3, width, 26 }, &area.rect);
+        try testing.expectEqual(@as(f32, 13), area.radius);
+    }
+    try testing.expectEqual(@as(usize, 2), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(theme.dark.colors.panel, cx.draw.items(draw.Box)[1].fill);
+    const two = tab_center(cx, &segmented, 2);
+    _ = fixture.send(cx, &segmented, .{ .pointer_down = input.left_at(two) });
+    try testing.expectEqual(@as(u32, 2), segmented.selected);
+    const right = input.key_press(.right, .none, false, "");
+    const wrapped = fixture.send(cx, &segmented, .{ .key_down = right });
+    try testing.expectEqual(Segmented.Action{ .changed = 0 }, wrapped);
 }

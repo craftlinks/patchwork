@@ -18,6 +18,9 @@
 //! glass(cx, rect, clip, GlassLook) a draw.Glass over the backdrop under the layer, or false
 //! glass_look(scheme, material, r)  the GlassLook a material gives a face of radius r
 //! glass_face(scheme, material, r, hover)  a translucent BoxLook for a control inside glass
+//! has(Cx, T)                       whether the app registers draw type T (comptime)
+//! stroke(cx, points, clip, color, width)  a draw.Path polyline, or false without draw.Path
+//! is_space(press)                  Space without modifiers (`other` typing " ")
 //! label(cx, style, bytes, rect, clip, options)   text.place with the kit's asserts
 //! paragraph(cx, style, bytes, rect, clip, wrap)  text.place_wrapped, label's wrapped twin
 //! icon(cx, face, codepoint, size, rect, clip, color)  text.icon: one glyph centred by its ink
@@ -261,7 +264,7 @@ pub fn lit(look: SurfaceLook, scheme: *const theme.Scheme, hover: f32, down: f32
 pub fn backdrop(cx: anytype, layer: draw.Layer, material: Material) ?draw.TextureId {
     assert(material.problem() == null);
     assert(@backingInt(layer) != 0);
-    if (comptime !has_glass(@TypeOf(cx))) return null;
+    if (comptime !has(@TypeOf(cx), draw.Glass)) return null;
     if (!material.glass()) return null;
     return cx.drawing().backdrop(layer, material.blur);
 }
@@ -272,7 +275,7 @@ pub fn backdrop(cx: anytype, layer: draw.Layer, material: Material) ?draw.Textur
 pub fn glass(cx: anytype, rect: Rect, clip: Clip, look: GlassLook) bool {
     assert(look.radius >= 0);
     assert(clip.x1 > clip.x0);
-    if (comptime !has_glass(@TypeOf(cx))) return false;
+    if (comptime !has(@TypeOf(cx), draw.Glass)) return false;
     const drawing = cx.drawing();
     const under = drawing.backdrop_under(drawing.layer_now) orelse return false;
     if (!(rect.width > 0) or !(rect.height > 0)) return true;
@@ -280,11 +283,38 @@ pub fn glass(cx: anytype, rect: Rect, clip: Clip, look: GlassLook) bool {
     return true;
 }
 
-/// True when the UI context type `Cx` (a pointer to it) draws through a registry that has
-/// `draw.Glass`.
-fn has_glass(comptime Cx: type) bool {
+/// True when the UI context type `Cx` (a pointer to it) draws through a registry that has the
+/// draw type `T`: a skin's optional parts (`glass`, `stroke`) ask it at compile time.
+pub fn has(comptime Cx: type, comptime T: type) bool {
     const Ui = @typeInfo(Cx).pointer.child;
-    return Ui.DrawContext.Registry.has(draw.Glass);
+    return Ui.DrawContext.Registry.has(T);
+}
+
+/// A stroke through `points` (absolute, at least two) in `color`, `width` wide with round caps,
+/// under `clip` (`draw.path.polyline`). False, with nothing appended, when the app registers no
+/// `draw.Path`, so a skin draws a fallback; a refused path is counted as `append` counts it.
+pub fn stroke(
+    cx: anytype,
+    points: []const draw.Point,
+    clip: Clip,
+    color: [4]f32,
+    width: f32,
+) bool {
+    assert(points.len >= 2);
+    assert(width > 0);
+    if (comptime !has(@TypeOf(cx), draw.Path)) return false;
+    const line: draw.path.Stroke = .{ .color = color, .width = width, .hover = 0 };
+    _ = draw.path.polyline(cx.drawing(), points, line, clip);
+    return true;
+}
+
+/// True when `press` is Space without modifiers: no host names the key, so it arrives as
+/// `other` typing one space.
+pub fn is_space(press: input.KeyPress) bool {
+    assert(press.len <= input.key_text_cap);
+    if (press.key != .other) return false;
+    if (press.mods.shortcut() or press.mods.alt) return false;
+    return std.mem.eql(u8, press.typed(), " ");
 }
 
 /// The bevel of a glass face of `radius`: the radius, between 6 and 16 logical pixels.

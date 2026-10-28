@@ -102,7 +102,7 @@ const drop = @import("drop.zig");
 pub const steps_max: u32 = 256;
 
 /// Most scenarios one app declares.
-pub const scenario_cap: u32 = 32;
+pub const scenario_cap: u32 = 48;
 
 /// Most frames one run measures; the host's sample storage.
 pub const sample_cap: u32 = 4096;
@@ -229,7 +229,9 @@ pub const Scenario = struct {
 /// Returns null when `scenarios` are well formed, otherwise a message naming the problem.
 /// Called by `app.conformance` at compile time.
 pub fn validate(comptime scenarios: []const Scenario) ?[]const u8 {
-    if (scenarios.len > scenario_cap) return "App.scenarios: at most 32 scenarios";
+    if (scenarios.len > scenario_cap) {
+        return std.fmt.comptimePrint("App.scenarios: at most {d} scenarios", .{scenario_cap});
+    }
     for (scenarios, 0..) |scenario, index| {
         const name = scenario.name;
         if (name.len == 0) return "App.scenarios: a scenario has an empty name";

@@ -67,8 +67,9 @@ exact problem (`App.config.theme.colors.panel: a component is outside [0, 1]`). 
 point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Paragraph`, `Button`,
-`Toggle`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`, `Dropdown`,
-`Tooltip`), and the containers and value boxes (`Tabs`, `Splitter`, `ListBox`, `NumberBox`);
+`Toggle`, `Checkbox`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`,
+`Dropdown`, `Tooltip`), and the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
+`ListBox`, `NumberBox`);
 the code editor
 (`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
 when interactive, answers `handle(cx, event)` with an action such as `Knob.Action.changed`.
@@ -127,12 +128,13 @@ patchwork/
 │   ├── widgets/knob.zig
 │   ├── widgets/meter.zig
 │   ├── widgets/toggle.zig
-│   ├── widgets/text_field.zig
+│   ├── widgets/checkbox.zig    # Checkbox: a box, a check mark or a mixed bar, and its label
+│   ├── widgets/text_field.zig  # TextField: hint, secret (bullets), and a leading icon too
 │   ├── widgets/paragraph.zig   # Paragraph: text wrapped to its width; a fit height for that width
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
 │   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
-│   ├── widgets/tabs.zig        # Tabs: a bar of tabs over a page the app draws
+│   ├── widgets/tabs.zig        # Tabs: a bar of tabs over a page the app draws; Segmented
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
 │   ├── widgets/list_box.zig    # ListBox: a virtual list with selection, keys, scroll-into-view
 │   ├── widgets/number_box.zig  # NumberBox: drag, wheel, or type a value with a unit
@@ -576,7 +578,16 @@ the device scale, and only the glyph records change (see Text below).
   for everything, drag selection, copy, cut, paste (one line, cut to the limit), and
   horizontal scroll that follows the caret. Actions are `changed`, `committed` (Enter or
   losing focus), and `cancelled` (Escape). The caret is steady, so a focused field does not
-  wake the host.
+  wake the host. Three optional fields: `hint`, drawn in the field's style at 0.45 alpha while
+  it is empty; `secret`, which shows U+2022 per codepoint (the caret, the selection, and
+  presses map through it), refuses copy and cut, and sends word moves to the ends; and
+  `icon` (`.{ .face, .codepoint }` of an app face), drawn in the field's left 28 px, where the
+  text then starts.
+- **Checkbox.** `widgets.Checkbox.init(id, label, on)`: a 16 px box, the label to its right,
+  and the box and label as the hit area. An inside release or Space while focused flips it
+  (`Action.toggled`). `mixed` (the app sets it, for a parent of differing children) draws a
+  bar; a flip clears it and turns the box on. The check mark is a `draw.Path`; an app without
+  `draw.Path` gets a small square instead (`kit.stroke` returns false).
 - **Clipboard.** `cx.copy(bytes)` hands up to 64 KiB to the host and `cx.request_paste()`
   asks for the clipboard, which arrives as one `paste` event for the focused widget.
 - **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
@@ -618,8 +629,10 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 A widget's behaviour (its fields, `handle`, and actions) is written once; how it looks and
 where it takes presses belong to a skin, a struct of draw functions passed at compile time.
 `widgets.Knob` is `widgets.KnobOf(widgets.skins.Default)`; `ButtonOf`, `SliderOf`, `ToggleOf`,
-`MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`, `DropdownOf`, `TabsOf`,
-`SplitterOf`, `ListBoxOf`, and `NumberBoxOf` work the same way. There
+`CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`,
+`DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, and `NumberBoxOf` work the same way. A
+`TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
+segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
 
 A knob skin declares one function. It gets a `widgets.KnobLook` of plain values (the row, the
@@ -704,6 +717,9 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
   page. Tabs are left-aligned at their labels' widths and shrink evenly to 48 px when the bar is
   narrow, cutting labels with an ellipsis. A press selects (`Action.changed` for a different
   tab); with the bar focused, Left and Right, Ctrl+Tab and Ctrl+Shift+Tab move, wrapping.
+- **Segmented.** `widgets.Segmented` is `TabsOf(skins.Segmented)`: the same behaviour, its
+  tabs in equal whole-pixel segments inside a capsule track, the selected one raised. Draw it
+  with `bar(cx, walk)`, which draws the bar in the whole box and opens no page.
 
   ```zig
   _ = app.tabs.begin(cx, ui.sized(.fill, .fill), .{ .flow = .down });
@@ -958,7 +974,9 @@ knob accents, the field's text) are restyled from the scheme, while the buttons 
 blue.
 
 - **basics** (steps 30 to 32): three buttons, two sliders, four knobs with rings of 56, 40, 56,
-  and 72, three toggles, a meter that follows slider 0, a 240 px text field, and a list of 40
+  and 72, three toggles, a meter that follows slider 0, a form group (step 41: a name field
+  with a hint, a secret password field and a search field with icons, a Sine / Saw / Square
+  `Segmented` bar, and checkboxes "loop", "sync", and the mixed "all voices"), and a list of 40
   clickable rows (`kit.clicked`) in a view. Under them a hardware row draws four knobs, two
   buttons, and two toggles with the same library behaviour in the gallery's own skin
   (`examples/gallery/hardware.zig`): a `Dial` draw type with a drop shadow and a pointer, a
@@ -1015,7 +1033,9 @@ tone, a text file, and a folder dropped: the tone's waveform) for the files page
 `surfaces` (the surfaces page), `surfaces-click` (the Radio pill, the Browse row, and the
 Slate card clicked, then Moss hovered), and `surfaces-light` (the page in the light theme);
 `glass` (frosted), `glass-scroll` (the wheel every frame, for benches), `glass-popup` (the
-output list over the sidebar), `glass-clear`, and `glass-light` for the glass page.
+output list over the sidebar), `glass-clear`, and `glass-light` for the glass page; `form`
+(Saw picked, "loop" ticked, "hunter2" typed into the password field: seven bullets) and
+`form-search` (the mixed box turned on, "saw" typed into the search field) for the form group.
 
 ## File Drops
 
