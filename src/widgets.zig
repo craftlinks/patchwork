@@ -55,6 +55,7 @@
 //! widgets/tooltip.zig     Tooltip: one line after a hover dwell, on the tooltip layer
 //! widgets/tabs.zig        Tabs: a bar of tabs over a page the app draws, or alone (Segmented)
 //! widgets/splitter.zig    Splitter: two panes and a draggable divider, begin/next/end
+//! widgets/dock.zig        Dock: panels in a tree of splits and tab sets; drop zones, save/load
 //! widgets/list_box.zig    ListBox: a virtual list with selection, keys, scroll-into-view
 //! widgets/number_box.zig  NumberBox: drag, wheel, or type a value with a unit; format, parse
 //! widgets/tree_view.zig   TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
@@ -136,6 +137,7 @@ const tooltip = @import("widgets/tooltip.zig");
 const splitter = @import("widgets/splitter.zig");
 const tabs = @import("widgets/tabs.zig");
 const list_box = @import("widgets/list_box.zig");
+const dock = @import("widgets/dock.zig");
 const number_box = @import("widgets/number_box.zig");
 const tree_view = @import("widgets/tree_view.zig");
 const disclosure = @import("widgets/disclosure.zig");
@@ -306,6 +308,19 @@ pub const tab_close_w = tabs.tab_close_w;
 pub const tab_detach_px = tabs.tab_detach_px;
 pub const close_salt = tabs.close_salt;
 
+pub const Dock = dock.Dock;
+pub const DockOf = dock.DockOf;
+pub const DockZone = dock.Zone;
+pub const DockPanel = dock.Panel;
+pub const dock_nodes_max = dock.dock_nodes_max;
+pub const dock_panels_max = dock.dock_panels_max;
+pub const dock_save_max = dock.dock_save_max;
+pub const dock_edge_px = dock.dock_edge_px;
+pub const dock_edge_salt = dock.edge_salt;
+pub const dock_page_salt = dock.page_salt;
+pub const dock_zone_of = dock.zone_of;
+pub const dock_zone_rect = dock.zone_rect;
+
 pub const ListBox = list_box.ListBox;
 pub const ListBoxOf = list_box.ListBoxOf;
 pub const ListRow = list_box.Row;
@@ -375,6 +390,7 @@ test {
     _ = splitter;
     _ = tabs;
     _ = list_box;
+    _ = dock;
     _ = number_box;
     _ = tree_view;
     _ = disclosure;
