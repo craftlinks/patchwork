@@ -245,10 +245,20 @@ patchwork/
 │   │   ├── sample.c            # The C page's sample
 │   │   ├── layout.xml          # The XML page's sample, every XML state across a line
 │   │   └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
-│   └── workspace/              # A docking workspace (step 46)
-│       ├── app.zig             # Workspace App: files, editor, log, appearance in a Dock
-│       ├── c.zig               # The C language recipe, copied from the gallery
-│       └── sample.c            # The editor's sample
+│   ├── workspace/              # A docking workspace (step 46)
+│   │   ├── app.zig             # Workspace App: files, editor, log, appearance in a Dock
+│   │   ├── c.zig               # The C language recipe, copied from the gallery
+│   │   └── sample.c            # The editor's sample
+│   └── session/                # A live-coding music screen rebuilt from photos (step 47)
+│       ├── app.zig             # Session App: the document's rows, mixer, sidebar, card
+│       ├── code.zig            # Read-only code set token by token in proportional serif
+│       ├── look.zig            # Palette, serif styles, Ring/Bipolar knob and Pill skins
+│       ├── fader.zig           # Fader: an upright level with a stereo meter in its track
+│       ├── keys.zig            # Keyboard: a piano played by pointer and tracker keys
+│       ├── plots.zig           # Transfer curve, envelope, response, bars, spectrum fills
+│       ├── signal.zig          # Four made-up channels as pure functions of time
+│       ├── faces.zig           # The serif faces' ranges (build.zig imports it)
+│       └── fonts/              # Noto Serif Regular, Italic, Bold, pre-subset (OFL)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
@@ -327,8 +337,13 @@ zig build run-workspace   # Build and run the docking workspace natively
 zig build wasm-workspace  # Compile it to zig-out/bin/workspace.wasm
 zig build serve-workspace # Serve it on localhost (prints the address)
 
+# Examples (Live-Coding Session)
+zig build run-session     # Build and run the live-coding session natively
+zig build wasm-session    # Compile it to zig-out/bin/session.wasm
+zig build serve-session   # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the ten examples
+zig build test            # Run unit tests across the library and the eleven examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
                           # `Audio` source without `audio`, a theme color of 1.5, a
@@ -1210,6 +1225,20 @@ editor), `dock-edge` (files held over the dock's right edge, then released: a qu
 right), `dock-close` (log's "×"), `dock-resize` (the files divider 80 px right), `dock-ghost`
 (files held over the editor's right zone: the overlay and the ghost), and `dock-save` (Save,
 close log, Load: the default again).
+
+### 11. Live-Coding Session (`examples/session/app.zig`)
+
+A live-coding music screen rebuilt from two photos of another tool, with the public API only:
+a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels)
+with widgets in its margins, a compander row of ring knobs over a transfer curve and a
+spectrum, upright toggles and knobs at their lines, a five-strip mixer (pan and send knobs,
+mute and solo, a scope, a fader with a stereo meter, a spectrum, readouts), and a card with a
+piano keyboard, the song's overview, and a transport. The patch's numbers are formatted from
+the widgets every frame, so a fader rewrites `level = ...`. The view and the card follow the
+window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps. Scenarios:
+`still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
+`mix` (bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
+and `keys` (E4 held, the mix section off).
 
 ## Drags Between Widgets
 

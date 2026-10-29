@@ -101,6 +101,7 @@
 const std = @import("std");
 const subset = @import("src/text/subset.zig");
 const gallery_icons = @import("examples/gallery/icons.zig");
+const session_faces = @import("examples/session/faces.zig");
 
 /// The codepoints an app's faces cover unless it passes `font_ranges` (`src/text/subset.zig`).
 pub const default_font_ranges: []const [2]u21 = &subset.default_ranges;
@@ -666,7 +667,21 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(workspace.install);
     add_example_steps(b, "-workspace", "the docking workspace", workspace);
-    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace };
+    const session = addApp(b, b, .{
+        .name = "session",
+        .root_source_file = b.path("examples/session/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+        .fonts = &.{
+            .{ .name = "serif", .source = b.path("examples/session/fonts/NotoSerif-Regular.ttf"), .ranges = &session_faces.ranges },
+            .{ .name = "serif_italic", .source = b.path("examples/session/fonts/NotoSerif-Italic.ttf"), .ranges = &session_faces.ranges },
+            .{ .name = "serif_bold", .source = b.path("examples/session/fonts/NotoSerif-Bold.ttf"), .ranges = &session_faces.ranges },
+        },
+    });
+    b.getInstallStep().dependOn(session.install);
+    add_example_steps(b, "-session", "the live-coding session", session);
+    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
@@ -737,7 +752,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [10]AppSteps,
+    examples: [11]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
