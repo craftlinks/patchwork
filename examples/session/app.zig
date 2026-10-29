@@ -69,9 +69,7 @@ const PanKnob = widgets.KnobOf(look.Bipolar);
 const compander_color = [4]f32{ 0.45, 0.88, 0.55, 1 };
 const eq_color = [4]f32{ 0.98, 0.62, 0.55, 1 };
 const shimmer_color = [4]f32{ 0.98, 0.62, 0.86, 1 };
-const CompanderToggle = widgets.ToggleOf(look.Pill(compander_color));
-const EqToggle = widgets.ToggleOf(look.Pill(eq_color));
-const ShimmerToggle = widgets.ToggleOf(look.Pill(shimmer_color));
+const SideToggle = widgets.ToggleOf(look.Pill);
 
 // ---------------------------------------------------------------------------- layout
 
@@ -351,9 +349,9 @@ pub const App = struct {
     comp: [comp_params.len]RingKnob,
     shimmer: RingKnob,
     wet: RingKnob,
-    comp_on: CompanderToggle,
-    eq_on: EqToggle,
-    shimmer_on: ShimmerToggle,
+    comp_on: SideToggle,
+    eq_on: SideToggle,
+    shimmer_on: SideToggle,
     strips: [strip_count]Strip,
     enabled: [4]bool,
     keyboard: keys.Keyboard,
@@ -396,9 +394,12 @@ pub const App = struct {
         }
         app.shimmer = RingKnob.init(shimmer_id, "shimmer", shimmer_param.position(shimmer_param.initial), paint(shimmer_color)).sized(side_ring);
         app.wet = RingKnob.init(wet_id, "wet", wet_param.position(wet_param.initial), paint(look.pastels[2])).sized(side_ring);
-        app.comp_on = CompanderToggle.init(comp_on_id, "", true);
-        app.eq_on = EqToggle.init(eq_on_id, "", true);
-        app.shimmer_on = ShimmerToggle.init(shimmer_on_id, "", true);
+        app.comp_on = SideToggle.init(comp_on_id, "compander", true);
+        app.comp_on.accent = compander_color;
+        app.eq_on = SideToggle.init(eq_on_id, "eq", true);
+        app.eq_on.accent = eq_color;
+        app.shimmer_on = SideToggle.init(shimmer_on_id, "shimmer", true);
+        app.shimmer_on.accent = shimmer_color;
         for (&app.strips, 0..) |*strip, index| {
             const at: u32 = @intCast(index);
             const color = strip_color(at);
@@ -765,21 +766,14 @@ pub const App = struct {
 
     /// The toggles and knobs of section 2, each at its line or pushed below the one above.
     fn draw_side(app: *App, cx: *Context, placed: *const Placed) void {
-        const toggle_h: f32 = 52;
+        const toggles = [_]*const SideToggle{ &app.comp_on, &app.eq_on, &app.shimmer_on };
         var bottom: f32 = -std.math.inf(f32);
-        const toggle_names = [_][]const u8{ "compander", "eq", "shimmer" };
-        for (placed.toggle_y, 0..) |centre, index| {
-            const top = @max(centre - toggle_h * 0.5 + 6, bottom + 4);
-            bottom = top + toggle_h;
-            const pill: Rect = .{ .x = toggle_x, .y = top, .width = toggle_w, .height = 38 };
-            _ = cx.begin_at(pill, .{ .flow = .overlay });
-            switch (index) {
-                0 => app.comp_on.draw(cx, ui.sized(.fill, .fill)),
-                1 => app.eq_on.draw(cx, ui.sized(.fill, .fill)),
-                else => app.shimmer_on.draw(cx, ui.sized(.fill, .fill)),
-            }
+        for (placed.toggle_y, toggles) |centre, toggle| {
+            const top = @max(centre - look.pill_row_h * 0.5 + 6, bottom + 4);
+            bottom = top + look.pill_row_h;
+            _ = cx.begin_at(.{ .x = toggle_x, .y = top, .width = toggle_w, .height = look.pill_row_h }, .{ .flow = .overlay });
+            toggle.draw(cx, ui.sized(.fill, .fill));
             _ = cx.end();
-            look.caption(cx, toggle_names[index], .{ .x = toggle_x - 10, .y = top + 38, .width = toggle_w + 20, .height = 12 }, look.dim);
         }
         bottom = -std.math.inf(f32);
         for (placed.knob_y, 0..) |centre, index| {
@@ -889,14 +883,12 @@ fn place_button(cx: *Context, button: *const widgets.Button, rect: Rect) void {
     _ = cx.end();
 }
 
-/// A ring knob in `box` (its ring fills the box) with its value text in `param`'s units.
+/// A ring knob in `box` with its value text in `param`'s units.
 fn knob_at(cx: *Context, knob: anytype, box: Rect, param: Param) void {
-    _ = cx.begin_at(box, .{ .flow = .overlay });
-    knob.draw(cx, ui.sized(.fill, .fill));
-    _ = cx.end();
-    const ring_box: Rect = .{ .x = box.x + (box.width - knob.ring) * 0.5, .y = box.y + (box.height - knob.ring) * 0.5, .width = knob.ring, .height = knob.ring };
     var out: [12]u8 = undefined;
-    look.ring_text(cx, ring_box, param.format(&out, knob.value));
+    _ = cx.begin_at(box, .{ .flow = .overlay });
+    knob.draw_text(cx, ui.sized(.fill, .fill), param.format(&out, knob.value));
+    _ = cx.end();
 }
 
 fn readout(cx: *Context, rect: Rect, clip: Clip, bytes: []const u8) void {
@@ -967,8 +959,10 @@ const play_steps = [_]bench.Step{
     .{ .click = .{ .id = play_id, .name = "play", .index = 0 } },
     .{ .wait = 30 },
 };
-/// The bass fader up 20 px, pads muted, line soloed, the eq off.
+/// The bass fader up 20 px, pads muted, line soloed, the eq off, and the pads panned right
+/// 18 px (0.15 of the knob: pan 0.3, an arc from the top).
 const mix_steps = [_]bench.Step{
+    .{ .drag = .{ .target = bench.area("pan", 1), .from_x = 20, .from_y = 20, .dx = 0, .dy = -18 } },
     .{ .drag = .{ .target = bench.area("fader", 0), .from_x = 20, .from_y = 30, .dx = 0, .dy = -20 } },
     .{ .click = bench.area("mute", 1) },
     .{ .click = bench.area("solo", 2) },
@@ -1064,7 +1058,7 @@ test "the first frame binds the patch to its widgets" {
 
 // Locks the scenarios' effects: the wheel scrolls 686 px (the whole range), play runs 30
 // ticks of 33 ms add 0.99 s, the mix scenario moves the bass fader 20 px (0.1 of the unit) and mutes,
-// solos, and gates, the knobs move by their drags over 120 px, and the key scenario holds E4
+// solos, gates, and pans the pads to 0.65, the knobs move by their drags over 120 px, and the key scenario holds E4
 // with the mix section off.
 test "scenarios scroll, play, mix, turn, and hold" {
     var app = try scenario_app("scroll");
@@ -1076,6 +1070,7 @@ test "scenarios scroll, play, mix, turn, and hold" {
     app = try scenario_app("mix");
     try std.testing.expectApproxEqAbs(fader_file.position(-2.68) + 0.1, app.strips[0].fader.value, 1e-4);
     try std.testing.expect(app.strips[1].muted and app.strips[2].soloed and !app.eq_on.on);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), app.strips[1].pan.value, 1e-4);
     try std.testing.expectEqualStrings("0", app.slots.get(0));
     try std.testing.expectEqualStrings("1", app.slots.get(13));
     app = try scenario_app("knobs");

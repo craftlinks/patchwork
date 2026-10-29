@@ -6,14 +6,11 @@
 //! ## 1. Skins
 //! - `Ring` (`KnobOf(Ring)`): a thin track arc, the value arc in the knob's accent, and a dot
 //!   at the value's end on `over_layer` (a box appended on the base layer would draw under
-//!   the arcs, whose batch comes later). The name sits in the ring's top in small italics.
-//!   The value text is the app's (`ring_text`): a `KnobLook` carries only hundredths.
-//! - `Bipolar`: `Ring` without the value arc, for pans. An arc sweeps from `theme.arc_start`
-//!   only, so a value arc from the top is not a record the library has.
-//! - `Pill(color)` (`ToggleOf(Pill(c))`): an upright capsule whose thumb rises when on and
-//!   takes `color`. A `ToggleLook` carries no colour, so the colour is the skin's type
-//!   parameter: three toggles are three types. The label is the app's (`caption`): the
-//!   toggle's name is at most eight bytes and "compander" is nine.
+//!   the arcs, whose batch comes later). The name sits in the ring's top in small italics and
+//!   the value text in its middle: the app's units through `Knob.draw_text`.
+//! - `Bipolar`: `Ring` whose value arc runs from the top (`ArcLook.start` 0.5), for pans.
+//! - `Pill` (`ToggleOf(Pill)`): an upright capsule whose thumb rises when on and takes the
+//!   toggle's `accent`, with the name under it.
 //!
 //! ## 2. Text
 //! Three Noto Serif faces (`build.zig`, `faces.zig`): `serif` for code and values,
@@ -119,12 +116,6 @@ pub const start: text.Options = .{ .align_x = .start, .align_y = .center, .ellip
 pub const end: text.Options = .{ .align_x = .end, .align_y = .center, .ellipsis = false };
 pub const centered: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
 
-/// `bytes` centred under (or in) `rect`: a control's caption in small italics.
-pub fn caption(cx: anytype, bytes: []const u8, rect: Rect, color: [4]f32) void {
-    const clip = cx.visible(rect) orelse return;
-    kit.label(cx, style(.serif_italic, 10, color), bytes, rect, clip, centered);
-}
-
 // ---------------------------------------------------------------------------- shapes
 
 /// A filled rect, skipped when empty.
@@ -177,14 +168,14 @@ pub const Ring = struct {
     }
 };
 
-/// The ring knob without a value arc (section 1).
+/// The ring knob whose value arc runs from the top (section 1).
 pub const Bipolar = struct {
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         return ring(cx, look, false);
     }
 };
 
-fn ring(cx: anytype, look: widgets.KnobLook, value_arc: bool) ?widgets.Shape {
+fn ring(cx: anytype, look: widgets.KnobLook, from_start: bool) ?widgets.Shape {
     assert(look.value >= 0 and look.value <= 1);
     if (look.row.height < look.ring or look.row.width < look.ring) return null;
     const side = look.ring;
@@ -197,47 +188,44 @@ fn ring(cx: anytype, look: widgets.KnobLook, value_arc: bool) ?widgets.Shape {
     const accent = [4]f32{ look.accent.r, look.accent.g, look.accent.b, look.accent.a };
     const hover = kit.weight(look.hover, cx.theme().hover_lighten);
     kit.arc(cx, ring_rect, look.clip, .{ .color = track, .thickness = ring_thickness, .hover = hover });
-    if (value_arc and look.value > 0) {
-        kit.arc(cx, ring_rect, look.clip, .{ .color = with_alpha(accent, 0.85), .thickness = ring_thickness, .sweep = look.value, .hover = hover });
+    const origin: f32 = if (from_start) 0 else 0.5;
+    const sweep = @abs(look.value - origin);
+    if (sweep > 0) {
+        const value_arc: quads.ArcLook = .{ .color = with_alpha(accent, 0.85), .thickness = ring_thickness, .start = @min(origin, look.value), .sweep = sweep, .hover = hover };
+        kit.arc(cx, ring_rect, look.clip, value_arc);
     }
     dot(cx, arc_point(ring_rect, look.value, ring_thickness * 0.5), 3, look.clip, accent);
     const name: Rect = .{ .x = ring_rect.x, .y = ring_rect.y + side * 0.16, .width = side, .height = side * 0.22 };
     kit.label(cx, style(.serif_italic, @max(9, side * 0.17), dim), look.name, name, look.clip, centered);
+    const value: Rect = .{ .x = ring_rect.x, .y = ring_rect.y + side * 0.36, .width = side, .height = side * 0.34 };
+    kit.label(cx, style(.serif, @max(10, side * 0.2), ink), look.value_text, value, look.clip, centered);
     return .{ .rect = ring_rect, .radius = side * 0.5 };
-}
-
-/// A ring knob's value text, centred in its ring: the app's formatted value.
-pub fn ring_text(cx: anytype, ring_box: Rect, bytes: []const u8) void {
-    const clip = cx.visible(ring_box) orelse return;
-    const value_box: Rect = .{ .x = ring_box.x, .y = ring_box.y + ring_box.height * 0.36, .width = ring_box.width, .height = ring_box.height * 0.34 };
-    kit.label(cx, style(.serif, @max(10, ring_box.width * 0.2), ink), bytes, value_box, clip, centered);
 }
 
 pub const pill_w: f32 = 20;
 pub const pill_h: f32 = 34;
 
-/// The upright toggle of `color` (section 1).
-pub fn Pill(comptime color: [4]f32) type {
-    return struct {
-        pub fn toggle(cx: anytype, look: widgets.ToggleLook) ?widgets.Shape {
-            assert(look.thumb >= 0 and look.thumb <= 1);
-            if (look.row.height < pill_h) return null;
-            const pill: Rect = .{
-                .x = look.row.x + (look.row.width - pill_w) * 0.5,
-                .y = look.row.y + (look.row.height - pill_h) * 0.5,
-                .width = pill_w,
-                .height = pill_h,
-            };
-            const hover = kit.weight(look.hover, cx.theme().hover_lighten);
-            kit.face(cx, pill, look.clip, .{ .fill = mix(track, with_alpha(color, 0.35), look.thumb), .radius = pill_w * 0.5, .hover = hover });
-            const thumb_side = pill_w - 4;
-            const travel = pill_h - thumb_side - 4;
-            const thumb: Rect = .{ .x = pill.x + 2, .y = pill.y + 2 + (1 - look.thumb) * travel, .width = thumb_side, .height = thumb_side };
-            kit.face(cx, thumb, look.clip, .{ .fill = mix(dim, color, look.thumb), .radius = thumb_side * 0.5, .hover = hover });
-            return .{ .rect = pill, .radius = pill_w * 0.5 };
-        }
-    };
-}
+/// A pill and its caption: the row a `Pill` toggle needs.
+pub const pill_row_h: f32 = pill_h + 16;
+
+/// The upright toggle (section 1): the pill at the top of its row, the name under it.
+pub const Pill = struct {
+    pub fn toggle(cx: anytype, look: widgets.ToggleLook) ?widgets.Shape {
+        assert(look.thumb >= 0 and look.thumb <= 1);
+        if (look.row.height < pill_h) return null;
+        const color = look.accent orelse white;
+        const pill: Rect = .{ .x = look.row.x + (look.row.width - pill_w) * 0.5, .y = look.row.y + 2, .width = pill_w, .height = pill_h };
+        const hover = kit.weight(look.hover, cx.theme().hover_lighten);
+        kit.face(cx, pill, look.clip, .{ .fill = mix(track, with_alpha(color, 0.35), look.thumb), .radius = pill_w * 0.5, .hover = hover });
+        const thumb_side = pill_w - 4;
+        const travel = pill_h - thumb_side - 4;
+        const thumb: Rect = .{ .x = pill.x + 2, .y = pill.y + 2 + (1 - look.thumb) * travel, .width = thumb_side, .height = thumb_side };
+        kit.face(cx, thumb, look.clip, .{ .fill = mix(dim, color, look.thumb), .radius = thumb_side * 0.5, .hover = hover });
+        const name: Rect = .{ .x = look.row.x - 12, .y = pill.y + pill_h + 2, .width = look.row.width + 24, .height = 12 };
+        kit.label(cx, style(.serif_italic, 10, dim), look.name, name, look.clip, centered);
+        return .{ .rect = pill, .radius = pill_w * 0.5 };
+    }
+};
 
 // Locks the arc geometry the dots follow: value 0 sits at arc_start (lower left, 120 degrees
 // clockwise from +x) and value 1 a three-quarter turn later (lower right, 30 degrees).

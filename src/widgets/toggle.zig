@@ -12,7 +12,8 @@
 //! The skin's shape is the hit area (`widgets/skin.zig`; the default skin's is the pill, and
 //! `Toggle` is `ToggleOf(skins.Default)`). Hover follows the kit's table without a press
 //! channel; a release inside flips `on` and aims the `thumb` animator, which eases on `.frame`
-//! beside the hover. Only the thumb disc lightens.
+//! beside the hover. Only the thumb disc lightens. `accent`, when set, is the thumb's colour
+//! when on: the default skin mixes `colors.control` toward it by the thumb's position.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -51,6 +52,8 @@ pub fn ToggleOf(comptime Skin: type) type {
         on: bool,
         hover: animator.Animator,
         thumb: animator.Animator,
+        /// The thumb's colour when on, straight RGBA; null is the skin's own.
+        accent: ?[4]f32 = null,
 
         pub const Action = union(enum) {
             none,
@@ -60,7 +63,7 @@ pub fn ToggleOf(comptime Skin: type) type {
         /// A toggle at rest, thumb on the side `on` selects.
         pub fn init(id: Id, name: []const u8, on: bool) Self {
             assert(id != .none);
-            assert(name.len <= 8);
+            assert(name.len <= knob_file.name_max);
             const toggle: Self = .{
                 .id = id,
                 .name = name,
@@ -101,6 +104,7 @@ pub fn ToggleOf(comptime Skin: type) type {
                 .thumb = self.thumb.value,
                 .hover = self.hover.value,
                 .name = self.name,
+                .accent = self.accent,
             }) orelse return;
             cx.area(self.id, shape.rect, shape.radius, ui.cx.plain);
         }
@@ -143,6 +147,7 @@ comptime {
 
 const testing = std.testing;
 const fixture = @import("fixture.zig");
+const quads = @import("../draw.zig");
 const test_context = fixture.context;
 const send = fixture.send;
 const draw_one = fixture.draw_one;
@@ -180,4 +185,20 @@ test "toggle thumb spans the pill and flips only on an inside release" {
     _ = send(cx, &toggle, .{ .frame = 50 });
     try testing.expectApproxEqAbs(@as(f32, 0.5), toggle.thumb.value, 0.0001);
     try testing.expect(cx.animating);
+}
+
+// Locks the accent: with none the thumb is `colors.control` either way; with one the default
+// skin mixes control toward it by the thumb, all the way when on. The pill is unchanged.
+test "a toggle's accent colours its thumb when on" {
+    const cx = test_context();
+    var toggle = Toggle.init(ui.id("toggle", 0), "compander", true);
+    draw_one(cx, &toggle, at(0, 0, 200, toggle_height));
+    const control = cx.theme().colors.control;
+    try testing.expectEqual(control, cx.draw.items(quads.Box)[1].fill);
+    const accent = [4]f32{ 0.2, 0.9, 0.4, 1 };
+    toggle.accent = accent;
+    draw_one(cx, &toggle, at(0, 0, 200, toggle_height));
+    const boxes = cx.draw.items(quads.Box);
+    try testing.expectEqual(cx.theme().colors.track, boxes[0].fill);
+    for (accent, boxes[1].fill) |want, got| try testing.expectApproxEqAbs(want, got, 1e-6);
 }

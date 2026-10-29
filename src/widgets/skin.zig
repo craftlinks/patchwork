@@ -160,13 +160,15 @@ pub const KnobLook = struct {
     value_text: []const u8,
 };
 
-/// A toggle row: the thumb's eased position in `[0, 1]`, the raw hover value, and the name.
+/// A toggle row: the thumb's eased position in `[0, 1]`, the raw hover value, the name, and
+/// the thumb's colour when on (null: the skin's own).
 pub const ToggleLook = struct {
     row: Rect,
     clip: Clip,
     thumb: f32,
     hover: f32,
     name: []const u8,
+    accent: ?[4]f32 = null,
 };
 
 /// A checkbox row: its label, the check's eased value in `[0, 1]`, whether it is mixed, the raw
@@ -685,8 +687,8 @@ pub const Default = struct {
         return .{ .rect = ring, .radius = look.ring * 0.5 };
     }
 
-    /// The pill, the thumb disc (lightened by hover), and the name in the label column. The
-    /// pill is the hit shape.
+    /// The pill, the thumb disc (lightened by hover, moving toward the accent with the thumb
+    /// when there is one), and the name in the label column. The pill is the hit shape.
     pub fn toggle(cx: anytype, look: ToggleLook) ?Shape {
         assert(look.thumb >= 0);
         assert(look.thumb <= 1);
@@ -695,7 +697,11 @@ pub const Default = struct {
         const pill_radius = toggle_file.pill_radius;
         kit.face(cx, pill, look.clip, .{ .fill = scheme.colors.track, .radius = pill_radius });
         const thumb = toggle_file.toggle_thumb(pill, look.thumb);
-        const disc = kit.paint_of(scheme.colors.control, toggle_file.thumb_side * 0.5);
+        var thumb_color = scheme.colors.control;
+        if (look.accent) |accent| {
+            for (thumb_color[0..4], accent) |*channel, target| channel.* += (target - channel.*) * look.thumb;
+        }
+        const disc = kit.paint_of(thumb_color, toggle_file.thumb_side * 0.5);
         kit.face(cx, thumb, look.clip, disc.look(scheme, look.hover, 0));
         const side_box = knob_file.side_box(look.row);
         kit.label(cx, scheme.name, look.name, side_box, look.clip, kit.centered);
