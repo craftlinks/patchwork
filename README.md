@@ -138,6 +138,7 @@ patchwork/
 │   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
 │   ├── widgets/tabs.zig        # Tabs: a bar over a page; close, reorder, drag out; Segmented
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
+│   ├── widgets/dock.zig        # Dock: a tree of splits and tab sets; drop zones, save and load
 │   ├── widgets/list_box.zig    # ListBox: a virtual list with selection, keys, scroll-into-view
 │   ├── widgets/number_box.zig  # NumberBox: drag, wheel, or type a value with a unit
 │   ├── widgets/tree_view.zig   # TreeView: pre-order nodes flattened into a ListBox, chevrons, keys
@@ -229,21 +230,25 @@ patchwork/
 │   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
 │   ├── canvas/                 # Pan and zoom
 │   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
-│   └── gallery/                # Every library widget on tabbed pages (phases 6 and 7)
-│       ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
-│       ├── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
-│       ├── icons.zig           # Named Lucide codepoints and the icon face's ranges
-│       ├── files.zig           # The files page: a drop zone, the dropped files, a waveform
-│       ├── wav.zig             # A streaming 16-bit PCM WAV decoder fed chunk by chunk
-│       ├── surfaces.zig        # The surfaces page: gradient cards, rims, and shadows
-│       ├── glass.zig           # The glass page: cards under glass, materials, a lens slider
-│       ├── code.zig            # The code page: the editor in C and XML side by side
-│       ├── tabs.zig            # The tabs page: two bars whose tabs close, reorder, and move
-│       ├── c.zig               # A C language for the editor (a recipe to copy)
-│       ├── xml.zig             # An XML language for the editor (a recipe to copy)
-│       ├── sample.c            # The C page's sample
-│       ├── layout.xml          # The XML page's sample, every XML state across a line
-│       └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
+│   ├── gallery/                # Every library widget on tabbed pages (phases 6 and 7)
+│   │   ├── app.zig             # Gallery App: built only from widgets.kit and layout defaults
+│   │   ├── hardware.zig        # A hardware skin: the Dial and Bevel draw types, an Led, Skin
+│   │   ├── icons.zig           # Named Lucide codepoints and the icon face's ranges
+│   │   ├── files.zig           # The files page: a drop zone, the dropped files, a waveform
+│   │   ├── wav.zig             # A streaming 16-bit PCM WAV decoder fed chunk by chunk
+│   │   ├── surfaces.zig        # The surfaces page: gradient cards, rims, and shadows
+│   │   ├── glass.zig           # The glass page: cards under glass, materials, a lens slider
+│   │   ├── code.zig            # The code page: the editor in C and XML side by side
+│   │   ├── tabs.zig            # The tabs page: two bars whose tabs close, reorder, and move
+│   │   ├── c.zig               # A C language for the editor (a recipe to copy)
+│   │   ├── xml.zig             # An XML language for the editor (a recipe to copy)
+│   │   ├── sample.c            # The C page's sample
+│   │   ├── layout.xml          # The XML page's sample, every XML state across a line
+│   │   └── fonts/              # lucide.ttf (lucide-static 1.55.0, ISC, LICENSE)
+│   └── workspace/              # A docking workspace (step 46)
+│       ├── app.zig             # Workspace App: files, editor, log, appearance in a Dock
+│       ├── c.zig               # The C language recipe, copied from the gallery
+│       └── sample.c            # The editor's sample
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
@@ -317,8 +322,13 @@ zig build run-gallery     # Build and run the widget gallery natively
 zig build wasm-gallery    # Compile it to zig-out/bin/gallery.wasm
 zig build serve-gallery   # Serve it on localhost (prints the address)
 
+# Examples (Docking Workspace)
+zig build run-workspace   # Build and run the docking workspace natively
+zig build wasm-workspace  # Compile it to zig-out/bin/workspace.wasm
+zig build serve-workspace # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the nine examples
+zig build test            # Run unit tests across the library and the ten examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
                           # `Audio` source without `audio`, a theme color of 1.5, a
@@ -864,6 +874,42 @@ On Hyprland (0.56) the compositor answers `server_side`, so the gallery shows it
 buttons only with `--decorations client`, and it reports even a floating window as maximized
 and tiled on every side, so no resize edges are recorded there.
 
+### Dock
+
+`widgets.Dock` arranges panels the app draws in a tree of splits and tab sets, which the user
+rearranges by dragging tabs (steps 45 and 46):
+
+```zig
+app.dock.init(ui.id("dock", 0), &labels);          // a panel's id is its index in `labels`
+app.dock.add(app.dock.root, editor);                // the root: an empty set at first
+_ = app.dock.split(app.dock.root, .left, files, 0.2).?;   // files on the left, a fifth
+
+app.dock.begin(cx, ui.sized(.fill, .fill));
+while (app.dock.next(cx)) |panel| switch (panel.id) {
+    files => app.draw_files(cx),                    // into the panel's page, a clipped column
+    editor => app.code.draw(cx, ui.sized(.fill, .fill)),
+    else => {},
+};
+app.dock.end(cx);
+
+switch (app.dock.handle(cx, event)) { .activated, .closed, .moved => |panel| ..., else => {} }
+```
+
+- **The tree** is `widgets.dock_nodes_max` (64) nodes: splits (a `Splitter` each, its ratio
+  pane a's share) and sets (up to 16 panels in closable, movable `Tabs`), walked with an
+  explicit stack. An empty set collapses, and its split's other child takes its place.
+- **Drops.** A tab dragged over a set's page shows one of five zones: the centre joins the set,
+  a side (the outer quarter) splits it in half with the panel on that side. Near the dock's
+  edges, strips that exist only while a drag is in flight split the whole layout, the new pane
+  a quarter. A tab dropped on a bar joins it at that place. A split needs two free nodes; a
+  full dock refuses it and the tab stays.
+- **Ownership.** The app draws panels and names them; the dock keeps where they are. `close`,
+  `show`, `set_of`, and `tab_id` are there for an app's own commands.
+- **Save and load.** `save` writes the layout as at most `widgets.dock_save_max` bytes;
+  `load` checks every rule (the header, the exact length, children used once and reached once
+  from the root, each panel once, only the root empty) before it replaces anything, and a
+  refused load changes nothing.
+
 ## Example Applications
 
 Worked coordinates, initial values, palettes, and budgets live in the examples' tests, not
@@ -1152,6 +1198,19 @@ closed), `tab-move` (main.zig dragged past ui.zig), `tab-drag` (app.zig dragged 
 bar between README.md and build.zig), and `tab-ghost` (ui.zig held over that gap: its ghost
 and the insertion marker) for the tabs page.
 
+### 10. Docking Workspace (`examples/workspace/app.zig`)
+
+Four panels in a `widgets.Dock` on a fixed 1280 by 704 screen: files (a `ListBox`), editor
+(`EditorOf(c)` on a C sample, the gallery's recipe copied), log (the dock's last eight
+actions), and appearance (a light toggle). Dragging a tab joins or splits panels, moves it to
+the dock's edge, or reorders it; Save keeps the layout as bytes, Load restores it, and Reset
+rebuilds the default. Scenarios: `still`; `dock-centre` (log into the editor's set),
+`dock-left`, `dock-right`, `dock-top`, and `dock-bottom` (appearance onto each side of the
+editor), `dock-edge` (files held over the dock's right edge, then released: a quarter on the
+right), `dock-close` (log's "×"), `dock-resize` (the files divider 80 px right), `dock-ghost`
+(files held over the editor's right zone: the overlay and the ghost), and `dock-save` (Save,
+close log, Load: the default again).
+
 ## Drags Between Widgets
 
 A widget that holds a press may turn it into a drag that another widget receives: a tab
@@ -1305,7 +1364,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   `key`, `click` and `click_at` (an area of the last frame, by `bench.area(name, index)`),
   `right_click` (a right press and release at a point, for a context menu), `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
   move by a delta, release; a zero delta is refused), `hold` (press, then move by a delta twice
-  and stay pressed, so a drag between widgets shows in flight), and `wait`. Each step runs when the host is idle and presents one frame; an empty
+  and stay pressed, so a drag between widgets shows in flight), `release` (move to a point and
+  release there, ending a hold a frame later), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
   a name lists the scenarios. `bench.replay_headless_paced` spaces the steps by a given

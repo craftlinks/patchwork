@@ -31,7 +31,8 @@
 //! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
 //! pointer stays at the end point; `hold` presses and moves by a delta twice without
 //! releasing, so a drag between widgets (`ui/cx.zig`, section 7b) stays in flight, and its
-//! second move resolves the target the first one's `drag_begin` left open.
+//! second move resolves the target the first one's `drag_begin` left open; `release` moves to
+//! a point and releases there, ending a hold a frame later.
 //!
 //! ## 2b. File Drops
 //! `drop_hover` drags files over the target's centre and stays (the drag is not ended), so a
@@ -217,6 +218,9 @@ pub const Step = union(enum) {
     /// Move to the start, press, move by the delta, and move there again; no release, so the
     /// press stays held and a drag between widgets stays in flight for the dump.
     hold: Drag,
+    /// Move to the point and release the left button there: ends a `hold` a frame later, so
+    /// what the hold's frame drew (a dock's edge strips) takes the drop.
+    release: At,
     /// Frames presented without input.
     wait: u32,
     /// A file drag moves over the target's centre and stays (section 2b).
@@ -277,7 +281,7 @@ fn steps_invalid(steps: []const Step) bool {
         switch (step) {
             .key => |press| if (press.text.len > input.key_text_cap) return true,
             .wait => |frames| if (frames == 0) return true,
-            .click, .click_at, .right_click, .wheel, .hover, .drag, .hold => {},
+            .click, .click_at, .right_click, .wheel, .hover, .drag, .hold, .release => {},
             .drop_hover, .drop => {},
         }
     }
@@ -469,6 +473,20 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[3] = .{ .pointer_up = release };
             return 4;
         },
+        .release => |at| {
+            const r = rect.?;
+            const point: input.Point = .{ .x = r[0] + at.x, .y = r[1] + at.y };
+            const up: input.Button = .{
+                .x = point.x,
+                .y = point.y,
+                .time_ms = time_ms,
+                .button = .left,
+                .mods = .none,
+            };
+            out[0] = .{ .pointer_move = point };
+            out[1] = .{ .pointer_up = up };
+            return 2;
+        },
         .hold => |hold| {
             assert(hold.dx != 0 or hold.dy != 0);
             const r = rect.?;
@@ -499,7 +517,7 @@ pub fn step_target(step: Step) ?Target {
         .click => |target| target,
         .click_at, .right_click => |at| at.target,
         .wheel => |turn| turn.target,
-        .hover => |at| at.target,
+        .hover, .release => |at| at.target,
         .drag, .hold => |drag| drag.target,
         .drop_hover => |target| target,
         .drop => |files| files.target,
@@ -1375,7 +1393,8 @@ test "steps become events" {
 
 // Locks the pointer steps: a hover is one move to the point from the target's top-left with no
 // leave; a drag is move, press, move by (dx, dy), and release there, with no leave; a hold is
-// the same press and move, then the same move again, with no release.
+// the same press and move, then the same move again, with no release; a release is a move to
+// the point and an up there.
 test "hover, drag, and hold steps dispatch exactly their events" {
     var out: [event_cap]input.Event = undefined;
     const rect: [4]f32 = .{ 10, 20, 40, 30 };
@@ -1406,6 +1425,11 @@ test "hover, drag, and hold steps dispatch exactly their events" {
     try testing.expectEqual(input.Point{ .x = 94, .y = 5 }, out[2].pointer_move);
     try testing.expectEqual(input.Point{ .x = 94, .y = 5 }, out[3].pointer_move);
     try testing.expectEqual(areas.id("a", 1), step_target(hold).?.id);
+    const release: Step = .{ .release = .{ .target = area("a", 2), .x = 5, .y = 6 } };
+    try testing.expectEqual(@as(u32, 2), step_events(release, rect, 9, &out));
+    try testing.expectEqual(input.Point{ .x = 15, .y = 26 }, out[0].pointer_move);
+    try testing.expectEqual(@as(f32, 15), out[1].pointer_up.x);
+    try testing.expectEqual(areas.id("a", 2), step_target(release).?.id);
 }
 
 // Locks the right click: move to the point from the target's top-left (10 + 5, 20 + 6), press
