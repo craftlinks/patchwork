@@ -136,7 +136,7 @@ patchwork/
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
 │   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
-│   ├── widgets/tabs.zig        # Tabs: a bar of tabs over a page the app draws; Segmented
+│   ├── widgets/tabs.zig        # Tabs: a bar over a page; close, reorder, drag out; Segmented
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
 │   ├── widgets/list_box.zig    # ListBox: a virtual list with selection, keys, scroll-into-view
 │   ├── widgets/number_box.zig  # NumberBox: drag, wheel, or type a value with a unit
@@ -238,6 +238,7 @@ patchwork/
 │       ├── surfaces.zig        # The surfaces page: gradient cards, rims, and shadows
 │       ├── glass.zig           # The glass page: cards under glass, materials, a lens slider
 │       ├── code.zig            # The code page: the editor in C and XML side by side
+│       ├── tabs.zig            # The tabs page: two bars whose tabs close, reorder, and move
 │       ├── c.zig               # A C language for the editor (a recipe to copy)
 │       ├── xml.zig             # An XML language for the editor (a recipe to copy)
 │       ├── sample.c            # The C page's sample
@@ -734,6 +735,18 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
   page. Tabs are left-aligned at their labels' widths and shrink evenly to 48 px when the bar is
   narrow, cutting labels with an ellipsis. A press selects (`Action.changed` for a different
   tab); with the bar focused, Left and Right, Ctrl+Tab and Ctrl+Shift+Tab move, wrapping.
+- **Tabs that close and move.** `Tabs.init_keyed(id, labels, keys, selected)` keys each tab
+  by an app `u64`, so a tab keeps its id (`id.derive(key)`) wherever it moves. `closable`
+  gives every tab a "×" (and a middle press closes); `movable` lets a tab be dragged within
+  its bar to reorder, or off it (24 px above or below, or past an end) as a drag between
+  widgets (see Drags Between Widgets) whose ghost follows the pointer on the tooltip layer, and
+  makes the bar a drop target that shows where a tab would land. The labels and keys stay the
+  app's arrays: the bar reports `closed i`, `moved { from, to }`, `dragged_out i` (dropped on
+  another target), or `received { payload, index }`, adjusts its own `selected` as if the app
+  applied it, and the app updates its arrays with `widgets.move_item`, `remove_item`, or
+  `insert_item` and calls `tabs.set(labels, keys)` before the next draw. A bar may be empty.
+  A tab dragged from one bar onto another is two actions in one event, the source's
+  `dragged_out` and the target's `received`; apply both.
 - **Segmented.** `widgets.Segmented` is `TabsOf(skins.Segmented)`: the same behaviour, its
   tabs in equal whole-pixel segments inside a capsule track, the selected one raised. Draw it
   with `bar(cx, walk)`, which draws the bar in the whole box and opens no page.
@@ -1091,6 +1104,10 @@ blue.
   `Splitter`: `EditorOf(c)` on a C sample and `EditorOf(xml)` on a designer-like XML layout
   (`examples/gallery/code.zig`). `c.zig` and `xml.zig` are recipes, languages an app copies
   rather than imports; the light toggle gives both editors their light palettes.
+- **tabs** (step 45, see Containers and Drags Between Widgets): two movable, closable tab bars
+  side by side over the page's own arrays (`examples/gallery/tabs.zig`): drag a tab to reorder
+  it, off its bar onto the other (its ghost follows the pointer), close it with its "×" or a
+  middle press, and Reset both.
 - **glass** (step 40, see Backdrops and Glass): sixteen album cards (gradients between the
   scheme's accents) scroll in a view under a glass sidebar (`widgets.Panel` with the page's
   material), a segmented bar that picks it (Clear, Frosted, Tinted, Solid), and a transport
@@ -1130,7 +1147,48 @@ opened) for the data page; `menubar` (File clicked, Edit hovered, Right to View,
 highlighted) and `chrome` (a double click on the bar, which the replay maximizes: restore
 shows; Run clicked; close hovered) for the title bar; `code` (the page) and `code-edit` (`/*`
 typed before `typedef struct {`: the lines below turn to comment down to the next `*/`), and
-`code-light` (both editors in their light palettes) for the code page.
+`code-light` (both editors in their light palettes) for the code page; `tab-close` (app.zig
+closed), `tab-move` (main.zig dragged past ui.zig), `tab-drag` (app.zig dragged onto the right
+bar between README.md and build.zig), and `tab-ghost` (ui.zig held over that gap: its ghost
+and the insertion marker) for the tabs page.
+
+## Drags Between Widgets
+
+A widget that holds a press may turn it into a drag that another widget receives: a tab
+dragged from one bar to another, later a dock panel. The payload is a `u64` the app interprets.
+
+```zig
+// source, on its drag hit (a threshold of its own choosing): start the drag.
+cx.drag_begin(tab_id, key);
+// source, draw: a ghost at the pointer while `cx.dragging()` names it.
+if (cx.dragging()) |drag| if (drag.source == tab_id) draw_ghost(drag.x, drag.y);
+
+// target, draw: one area flagged `drag_target`; a marker while a drag is over it.
+cx.area(bar, rect, 0, ui.cx.drag_target_flag);
+const lit = cx.drag_hovering(bar);
+// target, event:
+switch (cx.drag_hit(bar, event)) {
+    .dropped => |over| insert(over.payload, over.x),
+    .drag_in, .over, .drag_out, .ended, .none => {},
+}
+// source, event: `.ended = { target, cancelled }` once the drag is over.
+```
+
+- **One at a time,** riding on the source's capture: `cx.hit` is unchanged, so the source
+  still sees its `drag` and `up` and ignores them while a drag of its own is in flight.
+- **The target** is the topmost area flagged `drag_target` under the pointer, on a layer at
+  least the hot area's, so a popup blocks it, resolved at every pointer event from the one
+  after `drag_begin`. `drag_in`, `over`, and `drag_out` follow it; the left release gives the
+  target `dropped` and the source `ended { target }`.
+- **Cancel.** Escape or the pointer leaving the window gives the target `drag_out` and the
+  source `ended { .none, cancelled }`; the press stays held until its release.
+- **Drawing** needs no state: `dragging()` and `drag_hovering(id)` answer in any phase, every
+  pointer event of a drag owes a draw, and the cursor reads `grabbing`.
+- **Separate from file drops.** Their events, lifetimes, and flags differ (a file drop holds no
+  capture and streams chunks later), so a file zone never receives a tab and a tab bar never
+  files.
+- **Bench step** `hold` presses and moves without releasing, so a dump shows a drag in flight;
+  `drag` releases, which drops.
 
 ## File Drops
 
@@ -1246,7 +1304,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   list run once and a `cycle` list repeated while `frames` frames are measured. Steps are
   `key`, `click` and `click_at` (an area of the last frame, by `bench.area(name, index)`),
   `right_click` (a right press and release at a point, for a context menu), `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
-  move by a delta, release; a zero delta is refused), and `wait`. Each step runs when the host is idle and presents one frame; an empty
+  move by a delta, release; a zero delta is refused), `hold` (press, then move by a delta twice
+  and stay pressed, so a drag between widgets shows in flight), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
   a name lists the scenarios. `bench.replay_headless_paced` spaces the steps by a given

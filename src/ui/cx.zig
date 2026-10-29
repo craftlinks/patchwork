@@ -163,6 +163,33 @@
 //! those files of the running transfer (`take_files_cancel`); the host dispatches their
 //! `cancelled` chunks after the current dispatch (`input.zig`, section 6).
 //!
+//! ## 7b. Drags Between Widgets
+//! A widget that holds the capture may turn its press into a drag between widgets:
+//! `drag_begin(source, payload)` (event phase, one at a time) starts a session carrying a `u64`
+//! the app interprets. The session rides on the capture, so `hit` is unchanged and the source
+//! still gets `drag` and `up`; it ignores them while `dragging()` names it. Its target is the
+//! topmost area flagged `drag_target` under the pointer, on a layer at least the hot area's
+//! (`ui/areas.zig`, section 4), resolved like a file drop's from the first pointer event after
+//! `drag_begin`:
+//! ```text
+//! move, down, wheel   the target at the point; the event owes a draw
+//! left up             the target at the release point; the session is released
+//! leave, Escape down  the target is cleared; the session is cancelled
+//! event_end           a released or cancelled session is over
+//! ```
+//! `drag_hit(id, event)` answers them, a separate call like `drop_hit`:
+//! ```text
+//! target changed   the new target drag_in { over }, the old one drag_out
+//! same target      the target over { over }                       (pointer moves only)
+//! released         the target dropped { over }; the source ended { target, false }
+//! cancelled        the old target drag_out; the source ended { .none, true }
+//! ```
+//! A source is never its own target: on release the source's `ended` is answered first.
+//! `dragging()` and `drag_hovering(id)` report the session in any phase, so a source draws its
+//! ghost and a target its marker in `draw` with no state of their own, and `cursor()` reads
+//! `grabbing` while it lasts. File drops stay apart (section 7a): their events, lifetime, and
+//! flag differ, so a file zone never receives a widget's drag and a drag target never files.
+//!
 //! ## 8. Cursor and Clipboard
 //! The hot area's `Flags.cursor` is resolved with the hot area; `cursor()` reports it, the
 //! captured area's cursor while a press is held (a held `grab` reads `grabbing`), and
@@ -313,6 +340,57 @@ pub const DropHit = union(enum) {
     file: *const input.Chunk,
 };
 
+/// A drag between widgets in flight (section 7b): its source and payload, the pointer, and
+/// the target under it (`.none` when there is none).
+pub const Dragging = struct {
+    source: Id,
+    payload: u64,
+    x: f32,
+    y: f32,
+    target: Id,
+};
+
+/// A drag over a target or dropped on it: the pointer, the target's rect at the last draw,
+/// the payload, and the source.
+pub const DragOver = struct {
+    x: f32,
+    y: f32,
+    rect: Rect,
+    payload: u64,
+    source: Id,
+};
+
+/// How a drag ended, for its source: the target it was dropped on (`.none` when it was
+/// released over nothing or cancelled), and whether Escape or the pointer leaving the window
+/// cancelled it.
+pub const DragEnd = struct {
+    target: Id,
+    cancelled: bool,
+};
+
+/// What a pointer event (or Escape) means for one id during a drag between widgets. See the
+/// module guide, section 7b.
+pub const DragHit = union(enum) {
+    none,
+    /// The drag moved onto the target.
+    drag_in: DragOver,
+    /// The drag moved while over the target.
+    over: DragOver,
+    /// The drag moved off the target, was cancelled, or was released elsewhere.
+    drag_out,
+    /// The drag was released over the target.
+    dropped: DragOver,
+    /// To the source: the drag is over after this event.
+    ended: DragEnd,
+};
+
+/// How the current event ends a drag session (section 7b).
+const DragEnding = enum(u8) {
+    none,
+    released,
+    cancelled,
+};
+
 /// No hover, press, or wheel interest beyond the default.
 pub const plain: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default };
 /// Takes wheel input.
@@ -330,6 +408,15 @@ pub const drop_flag: Flags = .{
     .tab = false,
     .cursor = .default,
     .drop = true,
+};
+
+/// Takes drags between widgets (section 7b).
+pub const drag_target_flag: Flags = .{
+    .wheel = false,
+    .focusable = false,
+    .tab = false,
+    .cursor = .default,
+    .drag_target = true,
 };
 
 /// The layout of the root turtle: the window, flowing down, clipped to the window.
@@ -436,6 +523,15 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         drop_rect: Rect,
         /// Files listed by the `drop` being dispatched.
         drop_count: u8,
+        /// The drag between widgets (section 7b): its source (`.none` when no drag is in
+        /// flight) and payload, its target and the target when the current event began, the
+        /// target's rect at the last draw, and how the current event ends it.
+        drag_source: Id,
+        drag_payload: u64,
+        drag_target: Id,
+        drag_prev: Id,
+        drag_rect: Rect,
+        drag_ending: DragEnding,
         /// The id that accepted the running transfer, and the host's requests (section 7a).
         files_receiver: Id,
         files_accept: ?u16,
@@ -517,6 +613,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.drop_prev = .none;
             self.drop_rect = self.window;
             self.drop_count = 0;
+            self.drag_source = .none;
+            self.drag_payload = 0;
+            self.drag_target = .none;
+            self.drag_prev = .none;
+            self.drag_rect = self.window;
+            self.drag_ending = .none;
             self.files_receiver = .none;
             self.files_accept = null;
             self.files_cancel = 0;
@@ -1224,6 +1326,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.hover_prev = self.hover;
             self.focus_prev = self.focus;
             self.drop_prev = self.drop_target;
+            self.drag_prev = self.drag_target;
+            self.drag_ending = .none;
             self.pressed = false;
             self.ending_capture = false;
             self.escaping = false;
@@ -1274,7 +1378,33 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     self.dirty = true;
                 },
             }
+            if (self.drag_source != .none) self.drag_event(event);
             assert(self.phase == .event);
+        }
+
+        /// A session's part of `event_begin` (section 7b): pointer events owe a draw, a left
+        /// release ends the session over its target, and a leave or Escape cancels it.
+        fn drag_event(self: *Self, event: input.Event) void {
+            assert(self.drag_source != .none);
+            assert(self.capture != .none);
+            switch (event) {
+                .pointer_move, .pointer_down, .wheel => self.dirty = true,
+                .pointer_up => |up| {
+                    self.dirty = true;
+                    if (up.button == .left) self.drag_ending = .released;
+                },
+                .pointer_leave => {
+                    self.drag_target = .none;
+                    self.drag_ending = .cancelled;
+                    self.dirty = true;
+                },
+                .key_down => |press| if (press.key == .escape) {
+                    self.drag_target = .none;
+                    self.drag_ending = .cancelled;
+                    self.dirty = true;
+                },
+                else => {},
+            }
         }
 
         /// Finishes dispatching: a left release or a leave drops the capture, and an Escape
@@ -1290,6 +1420,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .drop => self.drop_target = .none,
                 else => {},
             }
+            if (self.drag_ending != .none) {
+                self.drag_source = .none;
+                self.drag_target = .none;
+                self.drag_ending = .none;
+            }
+            if (self.drag_source != .none) assert(self.capture != .none);
             if (self.escaping) self.focus = .none;
             self.phase = .idle;
             assert(self.phase == .idle);
@@ -1441,6 +1577,87 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             return cancelled;
         }
 
+        /// Starts a drag between widgets from `source`, which holds the capture, carrying
+        /// `payload` (section 7b). The target is resolved from the next pointer event on.
+        /// Event phase; one drag at a time.
+        pub fn drag_begin(self: *Self, source: Id, payload: u64) void {
+            assert(self.phase == .event);
+            assert(source != .none);
+            assert(source == self.capture);
+            assert(self.drag_source == .none);
+            self.drag_source = source;
+            self.drag_payload = payload;
+            self.drag_target = .none;
+            self.drag_prev = .none;
+            self.drag_ending = .none;
+            self.dirty = true;
+            assert(self.dragging() != null);
+        }
+
+        /// The drag between widgets in flight, or null (section 7b). Any phase.
+        pub fn dragging(self: *const Self) ?Dragging {
+            if (self.drag_source == .none) return null;
+            assert(self.capture != .none or self.phase == .event);
+            return .{
+                .source = self.drag_source,
+                .payload = self.drag_payload,
+                .x = self.pointer.x,
+                .y = self.pointer.y,
+                .target = self.drag_target,
+            };
+        }
+
+        /// True while a drag between widgets is over `id`'s area (section 7b). Any phase.
+        pub fn drag_hovering(self: *const Self, id: Id) bool {
+            assert(id != .none);
+            return self.drag_source != .none and id == self.drag_target;
+        }
+
+        /// What `event` means for `id` during a drag between widgets. O(1); see the module
+        /// guide, section 7b.
+        pub fn drag_hit(self: *const Self, id: Id, event: input.Event) DragHit {
+            assert(self.phase == .event);
+            assert(id != .none);
+            assert(@as(std.meta.Tag(input.Event), event) == self.event_tag);
+            if (self.drag_source == .none) return .none;
+            const over: DragOver = .{
+                .x = self.pointer.x,
+                .y = self.pointer.y,
+                .rect = self.drag_rect,
+                .payload = self.drag_payload,
+                .source = self.drag_source,
+            };
+            switch (self.drag_ending) {
+                .released => {
+                    if (id == self.drag_source) {
+                        return .{ .ended = .{ .target = self.drag_target, .cancelled = false } };
+                    }
+                    if (id == self.drag_target) return .{ .dropped = over };
+                    if (id == self.drag_prev) return .drag_out;
+                    return .none;
+                },
+                .cancelled => {
+                    if (id == self.drag_source) {
+                        return .{ .ended = .{ .target = .none, .cancelled = true } };
+                    }
+                    if (id == self.drag_prev) return .drag_out;
+                    return .none;
+                },
+                .none => {},
+            }
+            switch (event) {
+                .pointer_move, .pointer_down, .pointer_up, .wheel => {},
+                else => return .none,
+            }
+            if (self.drag_target != self.drag_prev) {
+                if (id == self.drag_target) return .{ .drag_in = over };
+                if (id == self.drag_prev) return .drag_out;
+                return .none;
+            }
+            if (id == self.drag_target and event == .pointer_move) return .{ .over = over };
+            return .none;
+        }
+
         /// Resolves the drop target at the drag's point (section 7a). The pointer stays.
         fn drop_at(self: *Self, x: f32, y: f32) void {
             assert(x == x);
@@ -1504,6 +1721,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 self.hot_window = hot_area.flags.window;
             }
             if (found.wheel) |index| self.wheel = self.areas[index].id;
+            if (self.drag_source != .none) {
+                self.drag_target = .none;
+                if (found.drag) |index| {
+                    self.drag_target = self.areas[index].id;
+                    self.drag_rect = rect_of(self.areas[index].rect);
+                }
+            }
             if (self.capture == .none or releasing) self.hover = self.hot;
             assert(self.pointer.inside);
         }
@@ -1683,6 +1907,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// The pointer shape to show (section 8).
         pub fn cursor(self: *const Self) Cursor {
             assert(self.phase != .draw);
+            if (self.drag_source != .none) return .grabbing;
             if (self.capture != .none) {
                 if (self.capture_cursor == .grab) return .grabbing;
                 return self.capture_cursor;
@@ -2863,4 +3088,143 @@ test "accept_files names the receiver and the host takes accept and cancel once"
     context.event_end();
     try testing.expectEqual(@as(u16, 0b101), context.take_files_cancel());
     try testing.expectEqual(@as(u16, 0), context.take_files_cancel());
+}
+
+const drag_source_id = areas.id("drag source", 0);
+const drag_a = areas.id("drag target", 0);
+const drag_b = areas.id("drag target", 1);
+
+/// Draws a plain source at (0, 0, 50, 30) and two drag targets, A at (100, 0, 100, 100) and B
+/// at (250, 0, 100, 100); with `cover`, a popup-layer area over A.
+fn drag_frame(context: *TestContext, cover: bool) void {
+    context.begin_frame(400, 300, 120);
+    context.area(drag_source_id, rect_at(0, 0, 50, 30), 0, plain);
+    context.area(drag_a, rect_at(100, 0, 100, 100), 0, drag_target_flag);
+    context.area(drag_b, rect_at(250, 0, 100, 100), 0, drag_target_flag);
+    if (cover) {
+        const previous = context.drawing().layer(.popup);
+        context.area(areas.id("drag cover", 0), rect_at(90, 0, 120, 120), 0, plain);
+        _ = context.drawing().layer(previous);
+    }
+    _ = context.end_frame();
+}
+
+/// Dispatches `event` and writes what it means for the source and A and B as drag hits, and
+/// for the source as a plain hit.
+fn send_drag(context: *TestContext, event: input.Event, out: *[3]DragHit) Hit {
+    context.event_begin(event);
+    const ids = [_]Id{ drag_source_id, drag_a, drag_b };
+    for (ids, out) |key, *result| result.* = context.drag_hit(key, event);
+    const source = context.hit(drag_source_id, event);
+    context.event_end();
+    return source;
+}
+
+/// Presses the source at (10, 10), then moves to (20, 10) and begins a drag of `payload`
+/// there, as a widget does on its `drag` hit.
+fn begin_drag(context: *TestContext, payload: u64) !void {
+    var out: [3]DragHit = undefined;
+    _ = send_drag(context, button_event(10, 10, .left, true), &out);
+    try testing.expectEqual(drag_source_id, context.capture);
+    const move: input.Event = .{ .pointer_move = .{ .x = 20, .y = 10 } };
+    context.event_begin(move);
+    try testing.expect(context.hit(drag_source_id, move) == .drag);
+    context.drag_begin(drag_source_id, payload);
+    try testing.expectEqual(DragHit.none, context.drag_hit(drag_a, move));
+    context.event_end();
+    try testing.expectEqual(drag_source_id, context.dragging().?.source);
+}
+
+fn move_to(x: f32, y: f32) input.Event {
+    return .{ .pointer_move = .{ .x = x, .y = y } };
+}
+
+// Locks a drag between widgets (section 7b): onto A is drag_in with the pointer, A's rect,
+// and the payload; a move on A is over; onto B is drag_out for A and drag_in for B; each
+// pointer event owes a draw; the release is dropped for B and ended { B } for the source,
+// whose plain hit is still its capture's up, and the session and the capture are over.
+test "a drag between widgets crosses two targets and drops on the second" {
+    const context = new_context();
+    drag_frame(context, false);
+    try begin_drag(context, 42);
+    var out: [3]DragHit = undefined;
+    context.dirty = false;
+    try testing.expect(send_drag(context, move_to(150, 50), &out) == .drag);
+    try testing.expect(context.dirty);
+    try testing.expectEqual(@as(f32, 150), out[1].drag_in.x);
+    try testing.expectEqual(@as(f32, 100), out[1].drag_in.rect.x);
+    try testing.expectEqual(@as(u64, 42), out[1].drag_in.payload);
+    try testing.expectEqual(drag_source_id, out[1].drag_in.source);
+    try testing.expectEqual(DragHit.none, out[0]);
+    try testing.expectEqual(DragHit.none, out[2]);
+    _ = send_drag(context, move_to(160, 50), &out);
+    try testing.expectEqual(@as(f32, 160), out[1].over.x);
+    _ = send_drag(context, move_to(300, 50), &out);
+    try testing.expectEqual(DragHit.drag_out, out[1]);
+    try testing.expectEqual(@as(f32, 250), out[2].drag_in.rect.x);
+    const released = send_drag(context, button_event(310, 60, .left, false), &out);
+    try testing.expect(!released.up.inside);
+    try testing.expectEqual(DragEnd{ .target = drag_b, .cancelled = false }, out[0].ended);
+    try testing.expectEqual(@as(f32, 310), out[2].dropped.x);
+    try testing.expectEqual(@as(u64, 42), out[2].dropped.payload);
+    try testing.expectEqual(DragHit.none, out[1]);
+    try testing.expectEqual(@as(?Dragging, null), context.dragging());
+    try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks the cancels (section 7b): Escape over A gives A drag_out and the source ended
+// { none, cancelled }, clears focus as always, and keeps the capture, so the release is a
+// plain up with no drop; a pointer leave cancels and ends the capture in the same event.
+test "Escape and a leave cancel a drag between widgets" {
+    const context = new_context();
+    drag_frame(context, false);
+    try begin_drag(context, 7);
+    var out: [3]DragHit = undefined;
+    _ = send_drag(context, move_to(150, 50), &out);
+    _ = send_drag(context, press_key(.escape, .none), &out);
+    try testing.expectEqual(DragHit.drag_out, out[1]);
+    try testing.expectEqual(DragEnd{ .target = .none, .cancelled = true }, out[0].ended);
+    try testing.expectEqual(@as(?Dragging, null), context.dragging());
+    try testing.expectEqual(drag_source_id, context.capture);
+    try testing.expectEqual(Id.none, context.focus);
+    const released = send_drag(context, button_event(150, 50, .left, false), &out);
+    try testing.expect(released == .up);
+    for (out) |result| try testing.expectEqual(DragHit.none, result);
+    drag_frame(context, false);
+    try begin_drag(context, 8);
+    _ = send_drag(context, move_to(150, 50), &out);
+    _ = send_drag(context, .pointer_leave, &out);
+    try testing.expectEqual(DragHit.drag_out, out[1]);
+    try testing.expect(out[0].ended.cancelled);
+    try testing.expectEqual(@as(?Dragging, null), context.dragging());
+    try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks the queries and the layer rule (section 7b): while a drag is in flight the cursor is
+// grabbing, `dragging()` follows the pointer and names the target, `drag_hovering` is true
+// for A only while over it; a popup-layer area over A hides it, so the release drops on
+// nothing and the source's ended names no target.
+test "a drag reads grabbing, reports its target, and a popup blocks it" {
+    const context = new_context();
+    drag_frame(context, false);
+    try begin_drag(context, 1);
+    var out: [3]DragHit = undefined;
+    try testing.expectEqual(Cursor.grabbing, context.cursor());
+    _ = send_drag(context, move_to(120, 40), &out);
+    const now = context.dragging().?;
+    try testing.expectEqual(@as(f32, 120), now.x);
+    try testing.expectEqual(drag_a, now.target);
+    try testing.expect(context.drag_hovering(drag_a));
+    try testing.expect(!context.drag_hovering(drag_b));
+    _ = send_drag(context, move_to(220, 40), &out);
+    try testing.expect(!context.drag_hovering(drag_a));
+    _ = send_drag(context, button_event(220, 40, .left, false), &out);
+    drag_frame(context, true);
+    try begin_drag(context, 2);
+    _ = send_drag(context, move_to(150, 50), &out);
+    try testing.expectEqual(DragHit.none, out[1]);
+    try testing.expect(!context.drag_hovering(drag_a));
+    _ = send_drag(context, button_event(150, 50, .left, false), &out);
+    try testing.expectEqual(DragEnd{ .target = .none, .cancelled = false }, out[0].ended);
+    try testing.expectEqual(DragHit.none, out[1]);
 }

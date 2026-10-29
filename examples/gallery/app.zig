@@ -1,4 +1,4 @@
-//! Gallery example: every library widget on nine tabbed pages, built only from the kit.
+//! Gallery example: every library widget on ten tabbed pages, built only from the kit.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -19,7 +19,8 @@
 //! dropped files, and a WAV's waveform; section 2c), "surfaces" (step 39: gradients, rims,
 //! and shadows; section 2d), and "glass" (step 40: backdrops, glass, and materials; section
 //! 2e), "data" (step 42: a tree, a sortable table, and folding groups; section 2g), and "code"
-//! (step 44: the code editor in C and XML from recipe tokenizers; section 2i). Tooltips
+//! (step 44: the code editor in C and XML from recipe tokenizers; section 2i), and "tabs"
+//! (step 45: tabs that close, reorder, and move between bars; section 2j). Tooltips
 //! show on every knob of the
 //! basics page and every button of the type page's toolbar.
 //!
@@ -165,6 +166,14 @@
 //! `editor.glyph_max` (`code.zig`, section 3). The status line reports "c changed", "xml
 //! changed", "c refused", and "code split 0.42".
 //!
+//! ## 2j. Tabs
+//! The tabs page is `tabs.zig` (step 45): two movable, closable `widgets.Tabs` side by side,
+//! keyed by file, over the page's own arrays. A tab drags within its bar to reorder, off it
+//! (as a drag between widgets, its ghost on the tooltip layer) onto the other bar, closes on
+//! its "×" or a middle press, and Reset restores both bars. The status line reports "select
+//! app.zig", "close app.zig", "move main.zig to 2", "drop app.zig on right 1", and "tabs
+//! reset".
+//!
 //! ## 3. Events
 //! `event` hands every event first to the window chrome (`chrome_events`: the menu bar before
 //! anything its open menu's backdrop covers), then to each widget itself, because the status line needs each
@@ -245,7 +254,11 @@
 //! shows restore; click Run; rest on close: its red band). Code (section 2i): `code` (the
 //! page, still); `code-edit` (click the start of `typedef struct {` and type `/*`: the lines
 //! below turn to comment down to the next `*/`, after which the colours return);
-//! `code-light` (the light toggle, then the page: both editors in their light palettes). The
+//! `code-light` (the light toggle, then the page: both editors in their light palettes). Tabs
+//! (section 2j): `tab-close` (app.zig's "×": main, ui, draw, text); `tab-move` (main.zig
+//! dragged past ui.zig: app, ui, main, draw, text); `tab-drag` (app.zig dragged onto the right
+//! bar between README.md and build.zig, selected there); `tab-ghost` (ui.zig held over that
+//! gap: its ghost under the pointer and the insertion marker above it). The
 //! app tests replay all but `still` and `hover` headless (`number` a 60 Hz frame
 //! apart, so its two clicks are a double click as in regress) and check every value they
 //! leave.
@@ -272,6 +285,7 @@ const surfaces_page = @import("surfaces.zig");
 const glass_page = @import("glass.zig");
 const data_page = @import("data.zig");
 const code_page = @import("code.zig");
+const tabs_page = @import("tabs.zig");
 const c_language = @import("c.zig");
 
 const Rect = quads.Rect;
@@ -396,7 +410,7 @@ const wrap_view_id = ui.id("wrap_view", 0);
 const presets_id = ui.id("presets", 0);
 
 /// The pages (section 2a), in tab order.
-const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass", "data", "code" };
+const page_labels = [_][]const u8{ "basics", "popups", "containers", "type", "files", "surfaces", "glass", "data", "code", "tabs" };
 const page_basics: u32 = 0;
 const page_popups: u32 = 1;
 const page_containers: u32 = 2;
@@ -406,6 +420,7 @@ const page_surfaces: u32 = 5;
 const page_glass: u32 = 6;
 const page_data: u32 = 7;
 const page_code: u32 = 8;
+const page_tabs: u32 = 9;
 
 /// The type page (section 2b): the icon buttons' icon size and boxes, the size ladder, the
 /// icon set, and the face lines.
@@ -640,6 +655,8 @@ pub const App = struct {
     data: data_page.Page,
     /// The code page (section 2i): the editor in C and XML, from recipe tokenizers.
     code: code_page.Page,
+    /// The tabs page (section 2j): two bars whose tabs close, reorder, and move between them.
+    tab_page: tabs_page.Page,
     /// The glass page (section 2e): its material, cards' view, output dropdown, and lens.
     glass: glass_page.Page,
     /// The face lines | the wrapped text (step 38), which scrolls when it does not fit.
@@ -717,6 +734,10 @@ pub const App = struct {
         .{ .name = "code", .setup = &code_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "code-edit", .setup = &code_edit_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "code-light", .setup = &code_light_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tab-close", .setup = &tab_close_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tab-move", .setup = &tab_move_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tab-drag", .setup = &tab_drag_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "tab-ghost", .setup = &tab_ghost_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -758,6 +779,7 @@ pub const App = struct {
         app.glass.init(frame_rect);
         app.data.init();
         app.code.init();
+        app.tab_page.init(button_paint, button_style);
         app.drops.init();
         for (&app.tools, &tool_labels, 0..) |*button, *label, index| {
             button.* = icon_button(ui.id("tool", @intCast(index)), label, tool_button_w, button_style.color);
@@ -903,6 +925,7 @@ pub const App = struct {
         if (app.data.handle(cx, event_value)) |report| app.data_note(cx, report);
         app.splitter_events(cx, "code split ", &app.code.split, event_value);
         if (app.code.handle(cx, event_value)) |report| app.note(cx, &.{ report.language, " ", @tagName(report.action) });
+        if (app.tab_page.handle(cx, event_value)) |report| app.tabs_note(cx, report);
         if (app.glass.handle(cx, event_value)) |report| switch (report) {
             .material => |index| app.note(cx, &.{ "material ", glass_page.material_names[index] }),
             .output => |index| app.note(cx, &.{ "output ", glass_page.output_names[index] }),
@@ -964,6 +987,24 @@ pub const App = struct {
     }
 
     /// The data page's report (section 2g) on the status line.
+    /// The tabs page's status (section 2j).
+    fn tabs_note(app: *App, cx: *Context, report: tabs_page.Report) void {
+        var digits: [8]u8 = undefined;
+        switch (report) {
+            .select => |key| app.note(cx, &.{ "select ", tabs_page.name_of(key) }),
+            .close => |key| app.note(cx, &.{ "close ", tabs_page.name_of(key) }),
+            .move => |move| {
+                const to = std.fmt.bufPrint(&digits, "{d}", .{move.to}) catch unreachable;
+                app.note(cx, &.{ "move ", tabs_page.name_of(move.key), " to ", to });
+            },
+            .drop => |drop| {
+                const at = std.fmt.bufPrint(&digits, "{d}", .{drop.index}) catch unreachable;
+                app.note(cx, &.{ "drop ", tabs_page.name_of(drop.key), if (drop.right) " on right " else " on left ", at });
+            },
+            .reset => app.note(cx, &.{"tabs reset"}),
+        }
+    }
+
     fn data_note(app: *App, cx: *Context, report: data_page.Report) void {
         const names = data_page.entries;
         switch (report) {
@@ -999,7 +1040,8 @@ pub const App = struct {
         }
         switch (app.segments.handle(cx, event_value)) {
             .changed => |index| app.note(cx, &.{ "wave ", segment_labels[index] }),
-            .none => {},
+            // Neither closable nor movable.
+            .none, .closed, .moved, .dragged_out, .received => {},
         }
         for (&app.checkboxes, 0..) |*checkbox, index| {
             switch (checkbox.handle(cx, event_value)) {
@@ -1039,7 +1081,8 @@ pub const App = struct {
     fn container_events(app: *App, cx: *Context, event_value: input.Event) void {
         switch (app.tabs.handle(cx, event_value)) {
             .changed => |page| app.note(cx, &.{ "page ", page_labels[page] }),
-            .none => {},
+            // Neither closable nor movable.
+            .none, .closed, .moved, .dragged_out, .received => {},
         }
         app.splitter_events(cx, "split ", &app.split, event_value);
         app.splitter_events(cx, "side ", &app.side, event_value);
@@ -1177,6 +1220,7 @@ pub const App = struct {
             page_glass => app.glass.draw(cx),
             page_data => app.data.draw(cx),
             page_code => app.code.draw(cx),
+            page_tabs => app.tab_page.draw(cx),
             else => unreachable,
         }
         _ = cx.end();
@@ -2023,6 +2067,46 @@ const code_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// Left tab `key` of the tabs page (section 2j), and its close button, as targets.
+fn left_tab(key: u64) bench.Target {
+    return .{ .id = tabs_page.left_id.derive(key), .name = "left tab", .index = @intCast(key) };
+}
+fn left_close(key: u64) bench.Target {
+    return .{ .id = tabs_page.left_id.derive(key).derive(widgets.close_salt), .name = "left close", .index = @intCast(key) };
+}
+
+/// `tab-close`: app.zig's close button.
+const tab_close_steps = [_]bench.Step{
+    .{ .click = tab(page_tabs) },
+    .{ .click = left_close(1) },
+    .{ .wait = 12 },
+};
+
+/// `tab-move`: main.zig (x 24 to 132) dragged from x 78 to 300, past ui.zig's centre (277)
+/// and short of draw.zig's (375): moved { 0, 2 }.
+const tab_move_steps = [_]bench.Step{
+    .{ .click = tab(page_tabs) },
+    .{ .drag = .{ .target = left_tab(0), .from_x = 54, .from_y = 15, .dx = 222, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `tab-drag`: app.zig dragged from x 184 off the left bar's end (x 628) and dropped at x 760
+/// on the right bar, past README.md's centre (721) and short of build.zig's (846): received
+/// at 1.
+const tab_drag_steps = [_]bench.Step{
+    .{ .click = tab(page_tabs) },
+    .{ .drag = .{ .target = left_tab(1), .from_x = 50, .from_y = 15, .dx = 576, .dy = 0 } },
+    .{ .wait = 12 },
+};
+
+/// `tab-ghost`: ui.zig grabbed 4 px below its top at (277, 164) and held at (791, 189) over
+/// the right bar's gap before build.zig, low in the bar so the marker shows above the ghost.
+const tab_ghost_steps = [_]bench.Step{
+    .{ .click = tab(page_tabs) },
+    .{ .hold = .{ .target = left_tab(2), .from_x = 42, .from_y = 4, .dx = 514, .dy = 25 } },
+    .{ .wait = 12 },
+};
+
 /// `code-light`: the light toggle, then the code page: both editors in their light palettes.
 const code_light_steps = [_]bench.Step{
     .{ .click = bench.area("theme", 0) },
@@ -2289,6 +2373,12 @@ comptime {
     assert(code_page.page_w == inner_w and code_page.page_h == page_h);
     assert(3 + 7 + code_page.box_max <= box_cap);
     assert(chrome + code_page.area_max <= area_cap);
+    // The tabs page (section 2j): the title (3) and the tabs (7), two panels, two bar lines,
+    // seven tab faces and two underlines, a close band, the marker, the ghost, and Reset;
+    // areas: Reset, two bars, seven tabs, and seven close buttons.
+    assert(3 + 7 + 2 + 2 + tabs_page.names.len + 2 + 1 + 1 + 1 + 1 <= box_cap);
+    assert(chrome + 1 + 2 + 2 * tabs_page.names.len <= area_cap);
+    assert(2 * tabs_page.panel_w + tabs_page.gap_px == inner_w and tabs_page.page_w == inner_w);
     // Points: the waveform's columns with RMS, then the dropdowns' chevrons.
     assert(2 * (inner_w - files_page.zone_w - gap_px - 2 * group_padding) + 2 * 3 <= point_cap);
 }
@@ -2705,6 +2795,98 @@ test "the code-light scenario restyles both editors" {
     app.restyle(&theme.dark);
     test_context.event_end();
     try std.testing.expectEqual(code_page.XmlEditor.default_palette, app.code.xml_editor.style.palette);
+}
+
+/// The labels of a tabs-page bar, for comparing.
+fn tab_bar_names(bar: *const tabs_page.Bar, out: *[widgets.tabs_max][]const u8) []const []const u8 {
+    for (bar.labels[0..bar.len], out[0..bar.len]) |label, *slot| slot.* = label;
+    return out[0..bar.len];
+}
+
+fn expect_bar(bar: *const tabs_page.Bar, expected: []const []const u8, selected: u32) !void {
+    var storage: [widgets.tabs_max][]const u8 = undefined;
+    const got = tab_bar_names(bar, &storage);
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |want, have| try std.testing.expectEqualStrings(want, have);
+    try std.testing.expectEqual(selected, bar.tabs.selected);
+}
+
+// Locks the tabs page's layout (section 2j): the bars at (24, 160) and (652, 160), 604 x 32;
+// main.zig 108 wide at the left bar's start and README.md 138 at the right's; app.zig's close
+// button 16 x 16 at (209, 167.5); Reset 96 x 32 at (1168, 108); nothing overflows.
+test "the tabs page lays out two bars of closable tabs" {
+    const app = new_app();
+    app.tabs.selected = page_tabs;
+    _ = frame(app);
+    try expect_rect(area_rect(tabs_page.left_id), 24, 160, 604, 32);
+    try expect_rect(area_rect(tabs_page.right_id), 652, 160, 604, 32);
+    try expect_rect(area_rect(tabs_page.left_id.derive(0)), 24, 160, 108, 31);
+    try expect_rect(area_rect(tabs_page.right_id.derive(5)), 652, 160, 138, 31);
+    try expect_rect(area_rect(left_close(1).id), 209, 167.5, 16, 16);
+    try expect_rect(area_rect(tabs_page.reset_id), 1168, 108, 96, 32);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+}
+
+// Locks `tab-close`, `tab-move`, and `tab-drag` (section 2j): the close leaves main, ui, draw,
+// text with main selected; the move leaves app, ui, main, draw, text with main selected at 2;
+// the drag leaves main, ui, draw, text (ui selected) and README.md, app.zig, build.zig with
+// app.zig selected, and no drag in flight; each reports on the status line.
+test "the tab scenarios close, move, and drag tabs between the bars" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tab-close");
+    try expect_bar(&app.tab_page.left, &.{ "main.zig", "ui.zig", "draw.zig", "text.zig" }, 0);
+    try std.testing.expectEqualStrings("close app.zig", app.status_text());
+    const moved = new_app();
+    _ = frame(moved);
+    try replay(moved, "tab-move");
+    try expect_bar(&moved.tab_page.left, &.{ "app.zig", "ui.zig", "main.zig", "draw.zig", "text.zig" }, 2);
+    try std.testing.expectEqualStrings("move main.zig to 2", moved.status_text());
+    const dragged = new_app();
+    _ = frame(dragged);
+    try replay(dragged, "tab-drag");
+    try expect_bar(&dragged.tab_page.left, &.{ "main.zig", "ui.zig", "draw.zig", "text.zig" }, 1);
+    try expect_bar(&dragged.tab_page.right, &.{ "README.md", "app.zig", "build.zig" }, 1);
+    try std.testing.expectEqualStrings("drop app.zig on right 1", dragged.status_text());
+    try std.testing.expectEqual(@as(?ui.Dragging, null), test_context.dragging());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks `tab-ghost` (section 2j): ui.zig's drag is in flight over the right bar; the frame
+// draws its ghost on the tooltip layer at (749, 185), 84 x 31 (the pointer at (791, 189) less
+// the grab's (42, 4)), and the 2 px marker at x 790 in the gap before build.zig; Reset then
+// restores both bars.
+test "the tab-ghost scenario holds a tab over the other bar" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "tab-ghost");
+    const dragging = test_context.dragging().?;
+    try std.testing.expectEqual(tabs_page.left_id.derive(2), dragging.source);
+    try std.testing.expectEqual(tabs_page.right_id, dragging.target);
+    var ghost = false;
+    var marker = false;
+    for (test_context.draw.items(quads.Box), 0..) |box, index| {
+        if (test_context.draw.layer_at(quads.Box, @intCast(index)) == .tooltip) {
+            try std.testing.expectEqualSlices(f32, &.{ 749, 185, 84, 31 }, &box.rect);
+            ghost = true;
+        }
+        if (box.rect[0] == 790 and box.rect[2] == 2) marker = true;
+    }
+    try std.testing.expect(ghost and marker);
+    test_context.event_begin(.{ .pointer_up = input.left_at(.{ .x = 791, .y = 189 }) });
+    _ = app.tab_page.handle(&test_context, .{ .pointer_up = input.left_at(.{ .x = 791, .y = 189 }) });
+    test_context.event_end();
+    _ = frame(app);
+    const reset = area_rect(tabs_page.reset_id);
+    const click: input.Point = .{ .x = reset.x + 10, .y = reset.y + 10 };
+    for ([_]input.Event{ .{ .pointer_move = click }, .{ .pointer_down = input.left_at(click) }, .{ .pointer_up = input.left_at(click) } }) |event| {
+        test_context.event_begin(event);
+        if (app.tab_page.handle(&test_context, event)) |report| try std.testing.expect(report == .reset or report == .select);
+        test_context.event_end();
+    }
+    try expect_bar(&app.tab_page.left, &.{ "main.zig", "app.zig", "ui.zig", "draw.zig", "text.zig" }, 0);
+    try expect_bar(&app.tab_page.right, &.{ "README.md", "build.zig" }, 0);
 }
 
 // Locks the `code-edit` scenario (section 2i): `/*` typed at the start of line 11 turns the

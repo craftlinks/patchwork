@@ -48,7 +48,8 @@
 //! takes the press and the wheel from the box areas under its stroke. The wheel target is the
 //! topmost wheel-flagged area under the point whose layer is at least the hot area's, so an
 //! overlay blocks wheel input to views beneath it. The drop target is found the same way among
-//! drop-flagged areas, so a popup blocks drops on what is beneath it too. All three come from
+//! drop-flagged areas, so a popup blocks drops on what is beneath it too, and the drag target
+//! among `drag_target` areas (a drag between widgets). All four come from
 //! the same pass: a candidate replaces the best only on a strictly higher layer, so the first
 //! one met on the winning layer stays.
 //!
@@ -126,7 +127,10 @@ pub const Flags = packed struct(u16) {
     drop: bool = false,
     /// The window part a press on the area moves or resizes; `none` for a widget's area.
     window: WindowPart = .none,
-    unused: u4 = 0,
+    /// The area takes drags between widgets: the topmost one under a drag session is its
+    /// target (`ui/cx.zig`, section 7b).
+    drag_target: bool = false,
+    unused: u3 = 0,
 };
 
 /// One hit area. See the module guide, section 3.
@@ -152,6 +156,7 @@ pub const Resolved = struct {
     hot: ?u32,
     wheel: ?u32,
     drop: ?u32,
+    drag: ?u32,
 };
 
 const fnv_offset: u64 = 0xcbf29ce484222325;
@@ -237,6 +242,7 @@ pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) 
     var hot: ?u32 = null;
     var wheel: ?u32 = null;
     var drop: ?u32 = null;
+    var drag: ?u32 = null;
     var index: u32 = @intCast(areas.len);
     while (index > 0) {
         index -= 1;
@@ -249,6 +255,9 @@ pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) 
         if (area.flags.drop) {
             if (drop == null or area.layer > areas[drop.?].layer) drop = index;
         }
+        if (area.flags.drag_target) {
+            if (drag == null or area.layer > areas[drag.?].layer) drag = index;
+        }
     }
     if (wheel) |target| {
         if (areas[target].layer < areas[hot.?].layer) wheel = null;
@@ -256,8 +265,11 @@ pub fn resolve(areas: []const Area, points: []const draw.Point, x: f32, y: f32) 
     if (drop) |target| {
         if (areas[target].layer < areas[hot.?].layer) drop = null;
     }
-    if (wheel != null or drop != null) assert(hot != null);
-    return .{ .hot = hot, .wheel = wheel, .drop = drop };
+    if (drag) |target| {
+        if (areas[target].layer < areas[hot.?].layer) drag = null;
+    }
+    if (wheel != null or drop != null or drag != null) assert(hot != null);
+    return .{ .hot = hot, .wheel = wheel, .drop = drop, .drag = drag };
 }
 
 /// The duplicate-id check for frames of at most `area_cap` areas; see the module guide,
@@ -401,6 +413,27 @@ test "a popup blocks the drop target beneath it" {
     try testing.expectEqual(@as(?u32, 2), covered.hot);
     try testing.expectEqual(@as(?u32, null), covered.drop);
     try testing.expectEqual(@as(?u32, null), resolve(&areas, &.{}, 500, 50).drop);
+}
+
+// Locks the drag rule (a drag between widgets): a `drag_target` bar under a later plain tab on
+// its layer is the target while the tab is hot, the drop flag does not make a drag target, and
+// a popup-layer area above blocks it.
+test "a popup blocks the drag target beneath it" {
+    var areas = [_]Area{
+        test_area(id("bar", 0), 0, 0, false),
+        test_area(id("zone", 0), 0, 0, false),
+        test_area(id("tab", 0), 0, 0, false),
+    };
+    areas[0].flags.drag_target = true;
+    areas[1].flags.drop = true;
+    const base = resolve(&areas, &.{}, 50, 50);
+    try testing.expectEqual(@as(?u32, 2), base.hot);
+    try testing.expectEqual(@as(?u32, 0), base.drag);
+    try testing.expectEqual(@as(?u32, 1), base.drop);
+    areas[2].layer = 6;
+    const covered = resolve(&areas, &.{}, 50, 50);
+    try testing.expectEqual(@as(?u32, null), covered.drag);
+    try testing.expectEqual(@as(?u32, null), resolve(&areas, &.{}, 500, 50).drag);
 }
 
 // Locks the duplicate check: a repeat in one frame is refused, the next frame starts empty.
