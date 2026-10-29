@@ -295,6 +295,16 @@ pub const segment_inset = tabs.segment_inset;
 pub const tabs_max = tabs.tabs_max;
 pub const tab_bar_h = tabs.tab_bar_h;
 pub const tab_widths = tabs.tab_widths;
+pub const closable_width = tabs.closable_width;
+pub const close_rect = tabs.close_rect;
+pub const insertion = tabs.insertion;
+pub const move_item = tabs.move_item;
+pub const remove_item = tabs.remove_item;
+pub const insert_item = tabs.insert_item;
+pub const TabGrab = tabs.Grab;
+pub const tab_close_w = tabs.tab_close_w;
+pub const tab_detach_px = tabs.tab_detach_px;
+pub const close_salt = tabs.close_salt;
 
 pub const ListBox = list_box.ListBox;
 pub const ListBoxOf = list_box.ListBoxOf;

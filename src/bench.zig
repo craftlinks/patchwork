@@ -29,7 +29,9 @@
 //! `right_click` does the same with the right button (a context menu);
 //! `wheel` turns at the centre, then leaves; `hover` moves to a point and stays, so hover
 //! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
-//! pointer stays at the end point.
+//! pointer stays at the end point; `hold` presses and moves by a delta twice without
+//! releasing, so a drag between widgets (`ui/cx.zig`, section 7b) stays in flight, and its
+//! second move resolves the target the first one's `drag_begin` left open.
 //!
 //! ## 2b. File Drops
 //! `drop_hover` drags files over the target's centre and stays (the drag is not ended), so a
@@ -212,6 +214,9 @@ pub const Step = union(enum) {
     hover: At,
     /// Move to the start, press, move by the delta, release; the pointer rests at the end.
     drag: Drag,
+    /// Move to the start, press, move by the delta, and move there again; no release, so the
+    /// press stays held and a drag between widgets stays in flight for the dump.
+    hold: Drag,
     /// Frames presented without input.
     wait: u32,
     /// A file drag moves over the target's centre and stays (section 2b).
@@ -272,7 +277,7 @@ fn steps_invalid(steps: []const Step) bool {
         switch (step) {
             .key => |press| if (press.text.len > input.key_text_cap) return true,
             .wait => |frames| if (frames == 0) return true,
-            .click, .click_at, .right_click, .wheel, .hover, .drag => {},
+            .click, .click_at, .right_click, .wheel, .hover, .drag, .hold => {},
             .drop_hover, .drop => {},
         }
     }
@@ -294,11 +299,14 @@ fn drop_invalid(steps: []const Step) bool {
     return false;
 }
 
-/// True when a drag of `steps` has `dx == 0` and `dy == 0`.
+/// True when a drag or hold of `steps` has `dx == 0` and `dy == 0`.
 fn drag_still(steps: []const Step) bool {
     for (steps) |step| {
-        if (step != .drag) continue;
-        if (step.drag.dx == 0 and step.drag.dy == 0) return true;
+        const drag = switch (step) {
+            .drag, .hold => |drag| drag,
+            else => continue,
+        };
+        if (drag.dx == 0 and drag.dy == 0) return true;
     }
     return false;
 }
@@ -461,6 +469,27 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[3] = .{ .pointer_up = release };
             return 4;
         },
+        .hold => |hold| {
+            assert(hold.dx != 0 or hold.dy != 0);
+            const r = rect.?;
+            const x = r[0] + hold.from_x;
+            const y = r[1] + hold.from_y;
+            const press: input.Button = .{
+                .x = x,
+                .y = y,
+                .time_ms = time_ms,
+                .button = .left,
+                .mods = .none,
+            };
+            const end: input.Point = .{ .x = x + hold.dx, .y = y + hold.dy };
+            // The second move resolves the target of a drag the first one began (`ui/cx.zig`,
+            // section 7b).
+            out[0] = .{ .pointer_move = .{ .x = x, .y = y } };
+            out[1] = .{ .pointer_down = press };
+            out[2] = .{ .pointer_move = end };
+            out[3] = .{ .pointer_move = end };
+            return 4;
+        },
     }
 }
 
@@ -471,7 +500,7 @@ pub fn step_target(step: Step) ?Target {
         .click_at, .right_click => |at| at.target,
         .wheel => |turn| turn.target,
         .hover => |at| at.target,
-        .drag => |drag| drag.target,
+        .drag, .hold => |drag| drag.target,
         .drop_hover => |target| target,
         .drop => |files| files.target,
         .key, .wait => null,
@@ -1345,8 +1374,9 @@ test "steps become events" {
 }
 
 // Locks the pointer steps: a hover is one move to the point from the target's top-left with no
-// leave; a drag is move, press, move by (dx, dy), and release there, with no leave.
-test "hover and drag steps dispatch exactly their events" {
+// leave; a drag is move, press, move by (dx, dy), and release there, with no leave; a hold is
+// the same press and move, then the same move again, with no release.
+test "hover, drag, and hold steps dispatch exactly their events" {
     var out: [event_cap]input.Event = undefined;
     const rect: [4]f32 = .{ 10, 20, 40, 30 };
     const hover: Step = .{ .hover = .{ .target = area("a", 0), .x = 5, .y = 6 } };
@@ -1370,6 +1400,12 @@ test "hover and drag steps dispatch exactly their events" {
     try testing.expectEqual(@as(f32, 5), out[3].pointer_up.y);
     try testing.expectEqual(input.MouseButton.left, out[3].pointer_up.button);
     try testing.expectEqual(areas.id("a", 1), step_target(drag).?.id);
+    const hold: Step = .{ .hold = drag.drag };
+    try testing.expectEqual(@as(u32, 4), step_events(hold, rect, 9, &out));
+    try testing.expectEqual(@as(f32, 14), out[1].pointer_down.x);
+    try testing.expectEqual(input.Point{ .x = 94, .y = 5 }, out[2].pointer_move);
+    try testing.expectEqual(input.Point{ .x = 94, .y = 5 }, out[3].pointer_move);
+    try testing.expectEqual(areas.id("a", 1), step_target(hold).?.id);
 }
 
 // Locks the right click: move to the point from the target's top-left (10 + 5, 20 + 6), press

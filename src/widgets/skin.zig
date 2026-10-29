@@ -242,6 +242,9 @@ pub const TabBarLook = struct {
     rect: Rect,
     clip: Clip,
     focused: bool,
+    /// While a drag between widgets is over a movable bar: the x of the gap a drop would
+    /// land in (`widgets/tabs.zig`, section 3b).
+    insert_x: ?f32 = null,
 };
 
 /// One tab: its rect, its label (cut with an ellipsis when the tab shrank), and whether it is
@@ -252,6 +255,13 @@ pub const TabLook = struct {
     label: []const u8,
     selected: bool,
     hovered: bool,
+    /// A closable tab's close button, inside `rect` at its right (`widgets/tabs.zig`,
+    /// section 2b), and whether the pointer is over it.
+    close: ?Rect = null,
+    close_hovered: bool = false,
+    /// The floating copy of a tab dragged out of its bar, on the tooltip layer; its shape is
+    /// not recorded.
+    ghost: bool = false,
 };
 
 /// A splitter's divider: its rect across the splitter, the axis the panes are laid along, and
@@ -544,6 +554,10 @@ fn chevron_in(cx: anytype, rect: Rect, clip: Clip, turn: f32, lit: bool) void {
     style.color = color;
     kit.label(cx, style, sign, rect, clip, kit.centered);
 }
+
+/// The insertion marker's width, and a dragged tab's ghost's opacity (`widgets/tabs.zig`).
+const tab_marker_px: f32 = 2;
+const tab_ghost_alpha: f32 = 0.95;
 
 /// The close button's hover band: a fixed red, as window managers draw it, whatever the scheme.
 pub const close_red: [4]f32 = .{ 0.77, 0.17, 0.17, 1 };
@@ -878,7 +892,8 @@ pub const Default = struct {
     }
 
     /// A one-pixel line along the bar's bottom: `colors.focus` while the bar has focus,
-    /// `colors.control` otherwise. The tabs draw over it.
+    /// `colors.control` otherwise, and a `tab_marker_px` insertion marker in `colors.focus`
+    /// at `insert_x`, as tall as the tabs, in the gap between two. The tabs draw over it.
     pub fn tab_bar(cx: anytype, look: TabBarLook) void {
         assert(look.rect.width > 0);
         assert(look.rect.height >= tabs_file.tab_line_px);
@@ -891,23 +906,51 @@ pub const Default = struct {
         };
         const fill = if (look.focused) colors.focus else colors.control;
         kit.face(cx, line, look.clip, .{ .fill = fill });
+        if (look.insert_x) |x| {
+            const marker: Rect = .{
+                .x = x - tab_marker_px * 0.5,
+                .y = look.rect.y,
+                .width = tab_marker_px,
+                .height = look.rect.height - tabs_file.tab_line_px,
+            };
+            kit.face(cx, marker, look.clip, .{ .fill = colors.focus });
+        }
     }
 
     /// The tab's face, `colors.panel` when selected and `colors.track` otherwise (lightened
     /// while hovered), the selected tab's accent underline, and the label centered inside
-    /// `tab_pad_x`, cut with an ellipsis. The face is the hit shape.
+    /// `tab_pad_x` (before the close button's gap when closable), cut with an ellipsis. A
+    /// close button is a "×" over a `colors.control` band while hovered; a ghost is the face
+    /// and label at `tab_ghost_alpha`, with no underline. The face is the hit shape.
     pub fn tab(cx: anytype, look: TabLook) ?Shape {
         assert(look.rect.width > 0);
         assert(look.label.len <= text.byte_cap);
         const scheme = cx.theme();
         const colors = &scheme.colors;
         const lit = look.hovered and !look.selected;
+        var fill = if (look.selected) colors.panel else colors.track;
+        var name = scheme.name;
+        if (look.ghost) {
+            fill[3] *= tab_ghost_alpha;
+            name.color[3] *= tab_ghost_alpha;
+        }
         kit.face(cx, look.rect, look.clip, .{
-            .fill = if (look.selected) colors.panel else colors.track,
+            .fill = fill,
             .radius = tabs_file.tab_radius,
             .hover = if (lit) scheme.hover_lighten else 0,
         });
-        if (look.selected) {
+        var inner = ui.cx.inset(look.rect, .xy(tabs_file.tab_pad_x, 0));
+        if (look.close) |close| {
+            inner.width = @max(0, close.x - tabs_file.tab_close_gap - inner.x);
+            if (look.close_hovered) {
+                kit.face(cx, close, look.clip, .{ .fill = colors.control, .radius = 4 });
+            }
+            kit.label(cx, name, "\u{d7}", close, look.clip, kit.centered);
+        }
+        if (inner.width > 0) {
+            kit.label(cx, name, look.label, inner, look.clip, tabs_file.tab_text_options);
+        }
+        if (look.selected and !look.ghost) {
             const underline: Rect = .{
                 .x = look.rect.x,
                 .y = look.rect.y + look.rect.height - tabs_file.tab_underline_px,
@@ -915,10 +958,6 @@ pub const Default = struct {
                 .height = tabs_file.tab_underline_px,
             };
             kit.face(cx, underline, look.clip, .{ .fill = scheme.accents[0] });
-        }
-        const inner = ui.cx.inset(look.rect, .xy(tabs_file.tab_pad_x, 0));
-        if (inner.width > 0) {
-            kit.label(cx, scheme.name, look.label, inner, look.clip, tabs_file.tab_text_options);
         }
         return .{ .rect = look.rect, .radius = tabs_file.tab_radius };
     }
