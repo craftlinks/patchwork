@@ -107,6 +107,9 @@ pub const ArcLook = struct {
     thickness: f32,
     /// The fraction of `theme.arc_sweep` drawn, `[0, 1]`.
     sweep: f32 = 1,
+    /// Where it begins, a fraction of `theme.arc_sweep`; `start + sweep` is at most 1. A
+    /// bipolar value (a pan) is an arc from 0.5.
+    start: f32 = 0,
     /// Mix weight toward `theme.lighten`, `[0, 1]`.
     hover: f32 = 0,
 };
@@ -178,16 +181,19 @@ pub const Arc = extern struct {
     thickness: f32,
     sweep: f32,
     hover: f32,
-    pad: f32,
+    /// Where the arc begins, a fraction of `theme.arc_sweep` from `theme.arc_start`; with
+    /// `sweep` it ends at `start + sweep`, at most 1.
+    start: f32,
 
     pub const texture: ?textures.Format = null;
 
     /// The ring inscribed in the square `ring`, clipped to `clip`, looking like `look`
-    /// (module guide, section 5). `pad` is written as 0.
+    /// (module guide, section 5).
     pub fn of(ring: Rect, clip: Clip, look: ArcLook) Arc {
         assert(ring.width == ring.height);
         assert(look.thickness >= 0);
         assert(look.sweep >= 0 and look.sweep <= 1);
+        assert(look.start >= 0 and look.start + look.sweep <= 1);
         assert(look.hover >= 0 and look.hover <= 1);
         return .{
             .rect = ring.array(),
@@ -196,13 +202,13 @@ pub const Arc = extern struct {
             .thickness = look.thickness,
             .sweep = look.sweep,
             .hover = look.hover,
-            .pad = 0,
+            .start = look.start,
         };
     }
 
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
-        \\    let dist = sdf_arc(px.local, px.size, px.thickness, px.sweep);
+        \\    let dist = sdf_arc(px.local, px.size, px.thickness, px.start, px.sweep);
         \\    let rgb = mix(px.color.rgb, frame.theme.lighten.rgb, px.hover);
         \\    return vec4<f32>(rgb, px.color.a * coverage(dist));
         \\}
@@ -590,7 +596,8 @@ pub fn shadow_alpha(dist: f32, blur: f32, alpha: f32) f32 {
 /// Signed distance of an open ring. CPU twin of `sdf_arc` in `prelude.wgsl`.
 ///
 /// `(px, py)` is in local logical pixels, origin at the face top-left, Y down. `thickness` is
-/// the stroke width and `sweep_fraction` in `[0, 1]` scales `theme.arc_sweep`. Angles follow
+/// the stroke width, `sweep_fraction` in `[0, 1]` scales `theme.arc_sweep`, and the arc
+/// begins `start_fraction` of that sweep past `arc_start` (`start + sweep <= 1`). Angles follow
 /// the convention in `theme.zig`. Round caps fall out of measuring the distance to the swept
 /// centerline, clamped to the nearer end, and subtracting half the thickness: a point in the
 /// gap's half next to the start measures against the start, so the field is continuous there
@@ -602,9 +609,10 @@ pub fn shadow_alpha(dist: f32, blur: f32, alpha: f32) f32 {
 /// p      = local - center
 /// mid    = min(center.x, center.y) - thickness * 0.5
 /// sweep  = sweep_fraction * arc_sweep
-/// rel    = wrap(atan2(p.y, p.x) - arc_start, 0, tau)
+/// origin = arc_start + start_fraction * arc_sweep
+/// rel    = wrap(atan2(p.y, p.x) - origin, 0, tau)
 /// ang    = rel > sweep + (tau - sweep) / 2 ? 0 : min(rel, sweep)
-/// dir    = (cos(arc_start + ang), sin(arc_start + ang))
+/// dir    = (cos(origin + ang), sin(origin + ang))
 /// dist   = length(p - dir * mid) - thickness * 0.5
 /// ```
 pub fn sdf_arc(
@@ -613,25 +621,27 @@ pub fn sdf_arc(
     width: f32,
     height: f32,
     thickness: f32,
+    start_fraction: f32,
     sweep_fraction: f32,
 ) f32 {
     assert(width > 0);
     assert(height > 0);
     assert(thickness >= 0);
     assert(sweep_fraction >= 0);
-    assert(sweep_fraction <= 1);
+    assert(start_fraction >= 0 and start_fraction + sweep_fraction <= 1);
     const center_x: f32 = width * 0.5;
     const center_y: f32 = height * 0.5;
     const local_x = px - center_x;
     const local_y = py - center_y;
     const mid = @min(center_x, center_y) - thickness * 0.5;
     const sweep = sweep_fraction * theme.arc_sweep;
-    const turned = std.math.atan2(local_y, local_x) - theme.arc_start;
+    const origin = theme.arc_start + start_fraction * theme.arc_sweep;
+    const turned = std.math.atan2(local_y, local_x) - origin;
     const rel = wrap_tau(turned);
     const gap_middle = sweep + (std.math.tau - sweep) * 0.5;
     const ang = if (rel > gap_middle) 0 else @min(rel, sweep);
-    const dir_x = @cos(theme.arc_start + ang);
-    const dir_y = @sin(theme.arc_start + ang);
+    const dir_x = @cos(origin + ang);
+    const dir_y = @sin(origin + ang);
     const dx = local_x - dir_x * mid;
     const dy = local_y - dir_y * mid;
     const dist = @sqrt(dx * dx + dy * dy) - thickness * 0.5;
@@ -775,15 +785,15 @@ test "sdf arc locks the open ring" {
     const start_y = size * 0.5 + @sin(theme.arc_start) * mid;
     try std.testing.expectApproxEqAbs(@as(f32, 15), start_x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 50.51666), start_y, 0.001);
-    const at_start = sdf_arc(start_x, start_y, size, size, thickness, 1);
-    const at_center = sdf_arc(28, 28, size, size, thickness, 1);
+    const at_start = sdf_arc(start_x, start_y, size, size, thickness, 0, 1);
+    const at_center = sdf_arc(28, 28, size, size, thickness, 0, 1);
     try std.testing.expectApproxEqAbs(@as(f32, -2), at_start, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 24), at_center, 0.0001);
-    const six = sdf_arc(28, 28 + mid, size, size, thickness, 1);
+    const six = sdf_arc(28, 28 + mid, size, size, thickness, 0, 1);
     try std.testing.expect(six > 0);
-    const cap = sdf_arc(start_x, start_y, size, size, thickness, 0);
+    const cap = sdf_arc(start_x, start_y, size, size, thickness, 0, 0);
     try std.testing.expectApproxEqAbs(@as(f32, -2), cap, 0.0001);
-    const away = sdf_arc(28, 28, size, size, thickness, 0);
+    const away = sdf_arc(28, 28, size, size, thickness, 0, 0);
     try std.testing.expect(away > 0);
     // 0.05 rad before the start on the centerline: inside the round start cap, at the chord
     // 2 * mid * sin(0.025) = 1.2999 from its center, so -0.7001; it used to measure the far end.
@@ -791,9 +801,26 @@ test "sdf arc locks the open ring" {
     const before_x = size * 0.5 + @cos(before) * mid;
     const before_y = size * 0.5 + @sin(before) * mid;
     for ([_]f32{ 1, 0.5, 0 }) |fraction| {
-        const near = sdf_arc(before_x, before_y, size, size, thickness, fraction);
+        const near = sdf_arc(before_x, before_y, size, size, thickness, 0, fraction);
         try std.testing.expectApproxEqAbs(@as(f32, -0.7001), near, 0.001);
     }
+}
+
+// Locks the start: an arc from 0.5 of the sweep (the top, 120 + 135 = 255 degrees) covers the
+// top of the ring and not its start, and a zero sweep there is a cap at the top. Start 0 is
+// the field of every arc before it (the goldens hold it bit for bit).
+test "sdf arc starts where it is told" {
+    const size: f32 = 56;
+    const thickness: f32 = 4;
+    const mid: f32 = size * 0.5 - thickness * 0.5;
+    const top = theme.arc_start + 0.5 * theme.arc_sweep;
+    const top_x = size * 0.5 + @cos(top) * mid;
+    const top_y = size * 0.5 + @sin(top) * mid;
+    try std.testing.expectApproxEqAbs(@as(f32, -2), sdf_arc(top_x, top_y, size, size, thickness, 0.5, 0.2), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -2), sdf_arc(top_x, top_y, size, size, thickness, 0.5, 0), 0.0001);
+    const start_x = size * 0.5 + @cos(theme.arc_start) * mid;
+    const start_y = size * 0.5 + @sin(theme.arc_start) * mid;
+    try std.testing.expect(sdf_arc(start_x, start_y, size, size, thickness, 0.5, 0.2) > 0);
 }
 
 // Locks that a sharp box includes its edges and a rounded box rejects the pixel just inside
@@ -851,7 +878,7 @@ test "constructors match the literals byte for byte" {
         .thickness = 4,
         .sweep = 1,
         .hover = 0,
-        .pad = 0,
+        .start = 0,
     };
     const built_arc = Arc.of(rect, clip, .{ .color = .{ 1, 1, 1, 1 }, .thickness = 4 });
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&plain_arc), std.mem.asBytes(&built_arc));

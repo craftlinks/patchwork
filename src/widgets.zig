@@ -210,6 +210,7 @@ pub const ring_size = knob.ring_size;
 pub const ring_thickness = knob.ring_thickness;
 pub const ring_inset = knob.ring_inset;
 pub const ring_min = knob.ring_min;
+pub const name_max = knob.name_max;
 pub const label_gap = knob.label_gap;
 pub const knob_height = knob.knob_height;
 pub const label_line_px = knob.label_line_px;

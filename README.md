@@ -589,8 +589,9 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   inside, a repaint on hover), and `kit.Interaction` (or `kit.respond` on a widget's own
   animators) is the hover and press table every library widget follows. The records come from
   `draw.Box.of(rect, clip, BoxLook)` and `draw.Arc.of(ring, clip, ArcLook)`, whose looks
-  default to no border, hover, or press and the full sweep; `ui` and `draw` use the
-  constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
+  default to no border, hover, or press and the full sweep from the theme's start
+  (`ArcLook.start`, a fraction of the sweep, moves the arc along the ring: a pan is an arc
+  from 0.5); `ui` and `draw` use the constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
   re-exports every name. Each widget is generic over a skin that draws it (`KnobOf(Skin)`;
   see Make a Skin below).
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
@@ -697,6 +698,13 @@ const Skin = struct {
 };
 const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of widgets.Knob
 ```
+
+- **The value's text.** `knob.draw(cx, walk)` hands the skin hundredths (`"0.50"`);
+  `knob.draw_text(cx, walk, text)` hands it the app's own text instead, read during the call
+  (`"-27.7db"`, `"100ms"`). Names of knobs and toggles are at most `widgets.name_max` (16)
+  bytes; the default skin's label column fits about eight.
+- **A toggle's accent.** `Toggle.accent` (null by default) is the thumb's colour when on and
+  reaches the skin as `ToggleLook.accent`, so one toggle type serves toggles of many colours.
 
 - **The contract.** `button`, `slider` (with `slider_travel(area) [2]f32`, the x span a press
   maps onto `[0, 1]`), `knob`, `toggle`, `dropdown`, `tab`, `divider`, and `number_face` return
@@ -1231,13 +1239,14 @@ close log, Load: the default again).
 A live-coding music screen rebuilt from two photos of another tool, with the public API only:
 a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels)
 with widgets in its margins, a compander row of ring knobs over a transfer curve and a
-spectrum, upright toggles and knobs at their lines, a five-strip mixer (pan and send knobs,
+spectrum, upright toggles (one `ToggleOf(Pill)` with an accent each) and knobs at their lines, a
+five-strip mixer (pan knobs with arcs from the top, send knobs,
 mute and solo, a scope, a fader with a stereo meter, a spectrum, readouts), and a card with a
 piano keyboard, the song's overview, and a transport. The patch's numbers are formatted from
 the widgets every frame, so a fader rewrites `level = ...`. The view and the card follow the
 window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps. Scenarios:
 `still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
-`mix` (bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
+`mix` (pads panned right, bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
 and `keys` (E4 held, the mix section off).
 
 ## Drags Between Widgets

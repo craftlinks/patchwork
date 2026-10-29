@@ -27,17 +27,22 @@
 //! A right press resets the value to `default`, its value at `init`. Test "knob drag is
 //! relative and clamped".
 //!
+//! A knob's and a toggle's name is at most `name_max` bytes; the default skin's label column
+//! fits about eight, so a longer name suits a skin that places its own.
+//!
 //! ## 3. Drawing
 //! `KnobOf(Skin)` hands the skin a `KnobLook` and records the hit shape it returns
 //! (`widgets/skin.zig`); `Knob` is `KnobOf(skins.Default)`. The default look is a track arc
 //! over the whole sweep, the value arc over `value` of it in `accent` (omitted at 0,
 //! lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed `[8]u8`
-//! `value_text`, tail zeroed.
+//! `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a value
+//! in its units, "-27.7db"), valid for the call.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const input = @import("../input.zig");
+const text = @import("../text.zig");
 const theme = @import("../theme.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
@@ -68,6 +73,8 @@ pub const knob_height: f32 = 72;
 /// The height of one text line beside the ring.
 pub const label_line_px: f32 = 36;
 pub const accent_count: u32 = 4;
+/// Bytes of a knob's or a toggle's name at most.
+pub const name_max: u32 = 16;
 
 /// A knob's ring area: it takes the wheel and shows the grab cursor.
 pub const knob_flags: ui.Flags = .{
@@ -129,7 +136,7 @@ pub fn KnobOf(comptime Skin: type) type {
         /// A knob at `value` (also its default) with its text written.
         pub fn init(id: Id, name: []const u8, value: f32, accent: kit.Paint) Self {
             assert(id != .none);
-            assert(name.len <= 8);
+            assert(name.len <= name_max);
             var knob: Self = .{
                 .id = id,
                 .name = name,
@@ -194,8 +201,15 @@ pub fn KnobOf(comptime Skin: type) type {
         /// area. The default skin draws the ring, the value arc, the name, and the value text,
         /// and nothing in a box shorter than the ring.
         pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
+            self.draw_text(cx, walk, self.value_text[0..4]);
+        }
+
+        /// `draw` with `value_text` as the value's text: the app's formatting in its units,
+        /// read only during the call.
+        pub fn draw_text(self: *const Self, cx: anytype, walk: Walk, value_text: []const u8) void {
             assert(self.value >= 0);
             assert(self.value <= 1);
+            assert(value_text.len <= text.byte_cap);
             const row = cx.walk(walk);
             const clip = cx.visible(row) orelse return;
             const shape = Skin.knob(cx, .{
@@ -206,7 +220,7 @@ pub fn KnobOf(comptime Skin: type) type {
                 .hover = self.hover.value,
                 .accent = self.accent,
                 .name = self.name,
-                .value_text = self.value_text[0..4],
+                .value_text = value_text,
             }) orelse return;
             cx.area(self.id, shape.rect, shape.radius, knob_flags);
         }
@@ -380,4 +394,19 @@ test "a knob under the light theme draws in its colors" {
     for (cx.draw.items(quads.Glyph)) |glyph| {
         try testing.expectEqual(theme.light.colors.text, glyph.color);
     }
+}
+
+// Locks `draw_text`: the default skin draws the name and the text it is handed, so "gain" at
+// 0.5 draws 4 + 4 glyphs ("0.50") and with "-6.0db" 4 + 6; a 16-byte name is accepted.
+test "a knob draws the app's value text" {
+    const cx = test_context();
+    var knob = Knob.init(ui.id("knob", 0), "gain", 0.5, accents[0]);
+    draw_one(cx, &knob, at(0, 0, 200, knob_height));
+    try testing.expectEqual(@as(usize, 8), cx.draw.items(quads.Glyph).len);
+    cx.begin_frame(1280, 720, 120);
+    knob.draw_text(cx, at(0, 0, 200, knob_height), "-6.0db");
+    _ = cx.end_frame();
+    try testing.expectEqual(@as(usize, 10), cx.draw.items(quads.Glyph).len);
+    const long = Knob.init(ui.id("knob", 1), "sixteen-letters!", 0, accents[0]);
+    try testing.expectEqual(@as(usize, name_max), long.name.len);
 }
