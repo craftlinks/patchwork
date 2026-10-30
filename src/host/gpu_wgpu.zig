@@ -116,18 +116,20 @@
 //! type before any window opens. The stream may hold setup ops only; a frame op would reach
 //! the missing surface and panics. The adapter may differ from a windowed run's when the
 //! preference is `default`, so the check is run with `--adapter low` and `--adapter high`.
-//! `create_headless` makes that device; the check and the regress host share it.
+//! `create_headless` makes that device; the check and `host/offscreen.zig` share it.
 //!
 //! ## 10a. Headless Target
-//! The regress host (`host/headless.zig`) renders frames on a `create_headless` device.
+//! `host/offscreen.zig` renders frames on a `create_headless` device.
 //! `headless_target_create` gives it a `bgra8unorm` texture (render attachment, copy source
 //! and destination) that stands in for the swapchain: while `Gpu.headless` is set,
 //! acquiring the surface texture returns a new reference to it (checked against the frame's
 //! size), and presenting is a no-op, so the renderer's stream (direct passes, `present_copy`
 //! from the kept target) replays unchanged and the renderer never knows. `read_target`
-//! copies the target to a mapped buffer and converts it to RGB rows. `reset` releases every
-//! table entry so the next run's setup stream starts from empty tables on the same device;
-//! `destroy` also releases the target and the device.
+//! copies the target to one staging buffer kept with it, maps it, converts it to RGB or RGBA
+//! rows, and unmaps it before returning, on error paths too. `reset` releases every table
+//! entry so the next run's setup stream starts from empty tables on the same device, and keeps
+//! the target and the buffer; `destroy` also releases those and the device. A side is at most
+//! `bench.width_max`, the default `maxTextureDimension2D`; no higher limits are requested.
 //!
 //! ## 11. TigerStyle Invariants
 //! Long-lived resources are created only by setup ops, into fixed tables; frame ops create
@@ -142,7 +144,7 @@ const bench = @import("../bench.zig");
 
 /// Every native WebGPU handle the backend owns. The device objects are created by `create`
 /// (or `create_headless`) and the resource tables are filled by setup ops. A windowed device
-/// frees nothing, since the process lifetime equals the window lifetime; the regress host
+/// frees nothing, since the process lifetime equals the window lifetime; `host/offscreen.zig`
 /// empties a headless one's tables between runs with `reset` (module guide section 10a).
 pub const Gpu = struct {
     instance: Instance,
@@ -173,6 +175,12 @@ pub const Gpu = struct {
     /// The headless device's stand-in for the swapchain (module guide section 10a), a
     /// `configured_width` by `configured_height` texture; null on a device with a surface.
     headless: ?Texture,
+    /// The kept staging buffer `read_target` copies into (module guide section 10a); null
+    /// with no headless target.
+    readback: ?Buffer,
+    /// A read holds the buffer mapped. wgpu-native has no `wgpuBufferGetMapState`, so this
+    /// says what its assert would.
+    readback_mapped: bool,
 };
 
 /// How `create` picks the adapter and whether it profiles (module guide section 9).
@@ -952,6 +960,8 @@ pub fn create(display: *anyopaque, wl_surface: *anyopaque, options: Options) !Gp
             .inside_encoders = inside_encoders,
         }),
         .headless = null,
+        .readback = null,
+        .readback_mapped = false,
     };
 }
 
@@ -1007,8 +1017,8 @@ pub fn check(setup: *const commands.CommandBuffer, preference: bench.Adapter) !C
 /// Creates a device with no surface (module guide section 10): an instance, an adapter
 /// requested with no compatible surface and `preference`'s power preference, a device with
 /// `uncaptured_error` installed, and `format_bgra8_unorm` standing in for the surface format.
-/// `check` replays a setup stream on it; the regress host (`host/headless.zig`) also gives it
-/// a target with `headless_target_create` and renders frames into that.
+/// `check` replays a setup stream on it; `host/offscreen.zig` also gives it a target with
+/// `headless_target_create` and renders frames into that.
 pub fn create_headless(preference: bench.Adapter) !Gpu {
     const instance = try create_instance();
     const adapter = try request_adapter(instance, null, preference);
@@ -1042,16 +1052,20 @@ pub fn create_headless(preference: bench.Adapter) !Gpu {
             .inside_encoders = false,
         }),
         .headless = null,
+        .readback = null,
+        .readback_mapped = false,
     };
 }
 
 /// Gives a headless device its swapchain stand-in (module guide section 10a): a
 /// `width_px` by `height_px` texture in `Gpu.format` that surface passes and `present_copy`
-/// draw into, and `read_target` copies out. Called once per device, before any frame.
+/// draw into, and the staging buffer `read_target` copies it to. Called once per device, before
+/// any frame.
 pub fn headless_target_create(self: *Gpu, width_px: u32, height_px: u32) !void {
     assert(self.headless == null);
+    assert(self.readback == null);
     assert(width_px != 0 and width_px <= bench.width_max);
-    assert(height_px != 0);
+    assert(height_px != 0 and height_px <= bench.width_max);
     const descriptor: TextureDescriptor = .{
         .next_in_chain = null,
         .label = empty_label,
@@ -1064,26 +1078,35 @@ pub fn headless_target_create(self: *Gpu, width_px: u32, height_px: u32) !void {
         .view_format_count = 0,
         .view_formats = null,
     };
-    self.headless = wgpuDeviceCreateTexture(self.device, &descriptor) orelse {
+    const texture = wgpuDeviceCreateTexture(self.device, &descriptor) orelse {
         return error.TextureFailed;
     };
+    const row_bytes = std.mem.alignForward(u32, width_px * 4, copy_row_align);
+    const usage = buffer_usage_map_read | usage_copy_dst;
+    const size = @as(u64, row_bytes) * height_px;
+    self.readback = create_profile_buffer(self.device, usage, size) orelse {
+        wgpuTextureRelease(texture);
+        return error.BufferFailed;
+    };
+    self.headless = texture;
     self.configured_width = width_px;
     self.configured_height = height_px;
 }
 
-/// Copies the headless target into `rgb`: `configured_height` rows of `configured_width`
-/// RGB pixels, top to bottom (the PPM order, `bench.ppm_row`). Blocks until the copy is
-/// mapped, bounded by `wait_max` device polls.
-pub fn read_target(self: *Gpu, rgb: []u8) !void {
+/// Copies the headless target into `out`: `configured_height` rows of `configured_width`
+/// pixels in `layout`, top to bottom (`bench.ppm_row`, `bench.rgba_row`). Blocks until the
+/// copy is mapped, bounded by `wait_max` device polls; the kept buffer is unmapped on every
+/// path out, so the next read's copy never meets a mapped buffer.
+pub fn read_target(self: *Gpu, out: []u8, layout: bench.Layout) !void {
     const texture = self.headless.?;
+    const buffer = self.readback.?;
     const width = self.configured_width;
     const height = self.configured_height;
-    assert(rgb.len == @as(usize, width) * height * 3);
+    const pixel_bytes = layout.pixel_bytes();
+    assert(out.len == @as(usize, width) * height * pixel_bytes);
+    assert(!self.readback_mapped);
     const row_bytes = std.mem.alignForward(u32, width * 4, copy_row_align);
     const size = @as(u64, row_bytes) * height;
-    const usage = buffer_usage_map_read | usage_copy_dst;
-    const buffer = create_profile_buffer(self.device, usage, size) orelse return error.BufferFailed;
-    defer wgpuBufferRelease(buffer);
     const encoder = wgpuDeviceCreateCommandEncoder(self.device, null);
     assert(@intFromPtr(encoder) != 0);
     const source: TexelCopyTextureInfo = .{
@@ -1102,20 +1125,30 @@ pub fn read_target(self: *Gpu, rgb: []u8) !void {
     wgpuQueueSubmit(self.queue, 1, @ptrCast(&commands_buffer));
     wgpuCommandBufferRelease(commands_buffer);
     wgpuCommandEncoderRelease(encoder);
+    // A map that never finished is cancelled by the unmap, so this comes before the wait.
+    self.readback_mapped = true;
+    defer {
+        wgpuBufferUnmap(buffer);
+        self.readback_mapped = false;
+    }
     if (!map_blocking(self, buffer, size)) return error.MapFailed;
-    defer wgpuBufferUnmap(buffer);
     const range = wgpuBufferGetConstMappedRange(buffer, 0, @intCast(size)) orelse
         return error.MapFailed;
     const bytes: [*]const u8 = @ptrCast(range);
+    const out_row = @as(usize, width) * pixel_bytes;
     for (0..height) |y| {
         const row = bytes[y * row_bytes ..][0 .. width * 4];
-        bench.ppm_row(rgb[y * width * 3 ..][0 .. width * 3], row);
+        const pixels = out[y * out_row ..][0..out_row];
+        switch (layout) {
+            .rgb => bench.ppm_row(pixels, row),
+            .rgba => bench.rgba_row(pixels, row),
+        }
     }
 }
 
 /// Releases every resource the setup and frame ops created and empties the tables, keeping
 /// the device and the headless target, so the next setup stream may create the same ids again
-/// (the regress host's fresh state per run, `host/headless.zig`).
+/// (a fresh start on the same device, `host/offscreen.zig`).
 pub fn reset(self: *Gpu) void {
     assert(@intFromPtr(self.device) != 0);
     for (&self.bind_groups) |*slot| release_slot(BindGroup, slot, wgpuBindGroupRelease);
@@ -1132,9 +1165,12 @@ pub fn reset(self: *Gpu) void {
     assert(self.textures[0] == null);
 }
 
-/// Releases a device `create_headless` made: its tables, the target, and the device objects.
+/// Releases a device `create_headless` made: its tables, the target and its staging buffer,
+/// and the device objects.
 pub fn destroy(self: *Gpu) void {
     reset(self);
+    if (self.readback) |buffer| wgpuBufferRelease(buffer);
+    self.readback = null;
     if (self.headless) |texture| wgpuTextureRelease(texture);
     self.headless = null;
     wgpuQueueRelease(self.queue);

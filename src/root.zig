@@ -30,7 +30,10 @@ pub const drop = @import("drop.zig");
 /// points an app build uses.
 pub const host = struct {
     pub const linux_window = @import("host/linux_window.zig");
-    /// The windowless regress host (`--regress`); its tests need no GPU.
+    /// Frames with no window, at a size and a time the caller picks; native only. Its tests
+    /// need no GPU.
+    pub const offscreen = @import("host/offscreen.zig");
+    /// The windowless scenario host (`--regress`, `--render`); its tests need no GPU.
     pub const headless = @import("host/headless.zig");
     pub const web_exports = @import("host/web_exports.zig");
     /// Protocol tables and pure timestamp assembly for `wp_presentation`. Listed in the test
@@ -80,6 +83,7 @@ test {
     _ = host.xdg_decoration;
     _ = host.wl_data_device;
     _ = host.clipboard;
+    _ = host.offscreen;
     _ = host.headless;
     // These two hosts carry layout asserts and tests shared with the web shell and the wgpu
     // pipelines; referencing them here makes those checks part of `zig build test`.

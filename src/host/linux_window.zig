@@ -63,7 +63,9 @@
 //! ## 4. Loop State Machine
 //! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_audio`, `bench_step`,
 //! `sync_clock`, `present_if_dirty`, `sync_timer`, `sync_engine`, `wait_for_events`.
-//! Callbacks only write `State`; all app calls happen in this order on the main thread.
+//! Callbacks only write `State`; all app calls happen in this order on the main thread. A bench
+//! frame's work runs in the order `host/offscreen.zig` states (section 2); this host adds the
+//! pacing and the presentation.
 //! - Draw rule (`prepare_app`): `ui.draw_frame` runs `App.draw` when the UI context is dirty
 //!   or when the glyph cache owes a draw (`Cache.owes_draw`: the scale moved since the last
 //!   draw, or glyphs were skipped for the per-frame budget or a full atlas). After the

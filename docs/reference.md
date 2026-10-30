@@ -189,7 +189,8 @@ patchwork/
 │   ├── audio_thread.zig        # Native audio engine: the app's source on a paced thread
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
 │   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain, headless target
-│   ├── headless.zig            # `--regress`: every scenario with no window, against the goldens
+│   ├── offscreen.zig           # Offscreen(App): frames with no window, at any size and time
+│   ├── headless.zig            # `--regress` and `--render`: scenarios on Offscreen, goldens
 │   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
 │   ├── xkb.zig                 # libxkbcommon: keymap, modifiers, text, compose, repeat
 │   ├── wp_cursor_shape.zig     # wp_cursor_shape_v1 bindings and the cursor shape map
@@ -359,6 +360,7 @@ zig build check -- --adapter low   # The same on the integrated GPU
 zig build regress -Doptimize=ReleaseFast   # Every example's scenarios headless on both GPUs,
                           # cache on and off, against test/golden (needs a GPU; see Regression)
 zig build regress -Doptimize=ReleaseFast -- --bless   # Rewrite the goldens from this run
+./zig-out/bin/gallery --render still --out frames     # A scenario's frames as PNGs
 python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
 
 # Bench mode (see Bench Mode below)
@@ -1412,6 +1414,8 @@ it runs, no GPU feature is requested, and the frame path is unchanged.
 ```text
 <app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
       [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
+<app> --render <scenario> [--size WxH] [--scale S] [--fps N] [--frames N]
+      [--adapter low|high] [--no-cache] --out <dir>|-
 zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 ```
 
@@ -1454,6 +1458,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   the copy to the surface when the adapter supports timestamps inside encoders. `gpu pass` is
   every pass of the frame plus the copy; `gpu target i` is the frame's i-th offscreen target
   pass, and the report ends with each target's device size and memory.
+- **Render.** `--render` writes a scenario's frames instead of timing them (see Rendering
+  Frames).
 - **Audio.** No thread runs in bench mode: while the app's audio is on, every frame is
   presented and first fed `realtime.blocks_for_frame(n)` blocks (6, 6, 6, 7) rendered on the UI
   thread, so dumps are deterministic. The report adds the blocks, drops, the most drained at
@@ -1474,9 +1480,9 @@ zig build regress -Doptimize=ReleaseFast [-- options]
 ```
 
 - **Headless.** `--regress` (`src/host/headless.zig`) opens no Wayland connection. Per adapter
-  it creates a device with no surface and a `bgra8unorm` target that stands in for the
-  swapchain (`gpu_wgpu.headless_target_create`): acquiring returns it, presenting is a no-op,
-  so the renderer's stream replays unchanged. Every scenario with `regress = true` (the
+  it opens an `Offscreen` (see Rendering Frames): a device with no surface and a `bgra8unorm`
+  target that stands in for the swapchain (`gpu_wgpu.headless_target_create`): acquiring
+  returns it, presenting is a no-op, so the renderer's stream replays unchanged. Every scenario with `regress = true` (the
   default) renders cache on and off, each from fresh state (app, UI context, renderer, and GPU
   tables re-created), at 1280 x 720 and scale 1 (`pub const regress_size: [2]u32` overrides,
   1 to 4096 a side), and the last frame's RGB rows are hashed (XxHash64, seed 0).
@@ -1500,6 +1506,56 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   frame, serves the app, drives system Chromium over CDP, and compares the screenshot: it
   passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
   console errors.
+
+## Rendering Frames
+
+`--render` writes a scenario's frames with no window, at any size, scale, and frame rate. It is
+native only: the browser renders live. Every frame the scenario draws is written, from frame 0,
+so a scenario's frame count is its `setup` plus `frames` plus one.
+
+```bash
+./zig-out/bin/gallery --render still --out frames
+./zig-out/bin/fx --render scope --size 1920x1080 --scale 2 --fps 60 --frames 600 --out - \
+  | ffmpeg -f rawvideo -pix_fmt rgba -s 3840x2160 -r 60 -i - -c:v libx264 -pix_fmt yuv420p scope.mp4
+```
+
+- **Size.** `--size` is logical pixels (the regress size without it) and `--scale` the display
+  scale, 0.25 to 16. Device pixels follow the window's rule, `round(logical * scale)` rounding
+  half up, so 1366 at 1.25 is 1708. A side is at most 8192 device pixels, and a frame must fit
+  `pub const render_size_max: [2]u32` (device pixels, at least the regress size, 3840 x 2160 by
+  default), the size of a static buffer that only `--render` touches.
+- **Rate.** `--fps` is 10 to 240. Frame `n` is at `n * 1000 / fps` ms in whole milliseconds, the
+  app timer ticks as time passes each multiple of its period, and audio blocks per frame follow
+  the rate (`bench.blocks_for_frame_at`), 375 a second at every rate. The output is the same
+  bytes every run.
+- **Output.** `--out <dir>` writes `<dir>/<scenario>-000000.png` and so on (RGB, stored, about
+  24.9 MB a frame at 4K, so use a pipe for a video). `--out -` writes raw RGBA frames back to
+  back on stdout and nothing else; the encoder sets the pace, and a closed pipe ends the run
+  with "output closed after N frames", exit 1. Frames are opaque: alpha is 255.
+- **Report.** One line on stderr: the size, the frame count, the last frame's hash, and the time
+  per frame. `draw` is the CPU's side of the frame; the GPU's work is waited on in `read`. At
+  the regress size, scale 1, and 60 fps the hash is the scenario's golden on that adapter, a
+  check that needs no picture. `--adapter` is `high` by default; `both` is refused.
+
+`--regress` and `--render` are clients of a library type, `patchwork.host.offscreen`, which any
+native caller can drive at a time it picks:
+
+```zig
+const Off = patchwork.host.offscreen.Offscreen(App);
+try Off.open(.{ .width = 1920, .height = 1080, .scale_120 = 240, .fps = 60 });
+defer Off.close();
+try Off.start(.{ .cache = true });
+Off.dispatch(event);                         // or Off.step(step, time_ms); Off.app(), Off.context()
+try Off.frame(patchwork.host.offscreen.at_frame(n, 60));
+const pixels = try Off.read(.rgba, out);     // out.len == width_px * height_px * 4 (see Off.size_px())
+```
+
+`Offscreen` has static storage, so there is one live instance per `App` type. `open` returns
+`error.TooLarge` or `error.BadScale` for a size it cannot make. `frame` takes any
+`.{ .time_ms, .dt_ms }`, and time may go backwards: the shader clock follows it exactly, timer
+ticks fire only as time passes the next multiple of the period, and the app is never rewound, so
+a caller that scrubs keeps its state outside the app timer. `read` is separate because a caller
+may draw many frames and read one; it blocks until the GPU has caught up.
 
 ## GPU Command Stream
 
