@@ -63,8 +63,14 @@ pub const slot_count: u32 = @typeInfo(Slot).@"enum".field_names.len;
 pub const token_cap: u32 = 96;
 /// Errors kept; the rest go unmarked.
 pub const error_cap: u32 = 16;
-/// Bytes of the longest literal a widget writes: "-60.00db".
-pub const literal_cap: u32 = 8;
+/// The largest number the text may hold. A `k`'s ends are the text's, so a knob can write a value
+/// this large, and it must read back what it wrote.
+pub const number_max: f32 = 1e13;
+/// Characters of a number after its sign and unit: 14 digits, a point, and two decimals, and one
+/// spare, so everything `format` writes reads back.
+const number_chars: u32 = 18;
+/// Bytes of the longest literal a widget writes: `number_chars`, a sign, and the unit.
+pub const literal_cap: u32 = number_chars + 3;
 /// The range of a level or a send, in decibels.
 pub const db_lo: f32 = -60;
 pub const db_hi: f32 = 6;
@@ -147,6 +153,8 @@ pub const Parse = struct {
 
     fn flag(self: *Parse, scan: Scan, index: u32, slot: Slot) void {
         const span = scan.span(index);
+        // A line that stops at `mute[0] =` has no word to read.
+        if (index >= scan.words.len) return self.mark(span);
         const number = read_number(scan.at(index)) orelse return self.mark(span);
         self.take(slot, .{ .range = span, .number = number });
         if (number != 0 and number != 1) self.mark(span);
@@ -267,7 +275,7 @@ pub fn read_number(bytes: []const u8) ?f32 {
     if (std.mem.endsWith(u8, rest, "db")) rest = rest[0 .. rest.len - 2];
     const negative = rest.len > 0 and rest[0] == '-';
     if (negative) rest = rest[1..];
-    if (rest.len == 0 or rest.len > 12) return null;
+    if (rest.len == 0 or rest.len > number_chars) return null;
     var units: f32 = 0;
     var scale: f32 = 1;
     var fraction = false;
@@ -284,6 +292,7 @@ pub fn read_number(bytes: []const u8) ?f32 {
     }
     if (digits == 0) return null;
     const number = units / scale;
+    if (number > number_max) return null;
     return if (negative) -number else number;
 }
 
@@ -380,6 +389,32 @@ test "only the first real call binds" {
     try testing.expectEqual(@as(?Value, null), Parse.run("# k(0~0.5~1, \"wet\")").get(.wet));
     const twice = Parse.run("k(0~0.1~1, \"wet\");\nk(0~0.2~1, \"wet\");");
     try testing.expectEqual(@as(f32, 0.1), twice.get(.wet).?.number);
+}
+
+// Locks that a widget reads what it wrote: the largest number the text may hold, in the widest
+// format, fits `literal_cap` and reads back, and a number past the limit is no number.
+test "the longest literal round trips" {
+    var out: [literal_cap]u8 = undefined;
+    const bytes = format(.shimmer, -number_max, &out);
+    try testing.expectApproxEqRel(-number_max, read_number(bytes).?, 1e-5);
+    try testing.expectEqual(@as(?f32, null), read_number("99999999999999999"));
+}
+
+// Locks a line cut anywhere, as typing and deleting leave it: every prefix of every line, and
+// every line with one byte gone, parses without reading past its tokens. The worked case is
+// `mute[1] =` at a line's end, whose value is the word after the last.
+test "a line cut anywhere parses" {
+    const cut = Parse.run("mute[1] =");
+    try testing.expectEqual(@as(?Value, null), cut.get(.mute_1));
+    try testing.expectEqual(@as(u32, 1), cut.error_count);
+    var buffer: [512]u8 = undefined;
+    for (0..sample.len + 1) |length| _ = Parse.run(sample[0..length]);
+    for (0..sample.len) |gone| {
+        @memcpy(buffer[0..gone], sample[0..gone]);
+        const tail = sample[gone + 1 ..];
+        @memcpy(buffer[gone..][0..tail.len], tail);
+        _ = Parse.run(buffer[0 .. sample.len - 1]);
+    }
 }
 
 // Locks `shift` against a full parse: rewriting each slot's literal to a longer one, its later

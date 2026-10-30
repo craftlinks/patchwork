@@ -2197,3 +2197,74 @@ test "a section keeps its colour through moves and renames" {
     try std.testing.expectEqual(@as(u8, 0), app.sections[3].colour);
     try std.testing.expectEqual(pad_colour, app.sections[4].colour);
 }
+
+// Locks the screen against what editing leaves behind: with each byte of the mix's lines deleted
+// in turn, and each of those lines cut at every byte, a frame draws, and undo restores the text
+// and every binding.
+test "the mix survives any single cut" {
+    const app = new_app();
+    frame(app);
+    const end: u32 = @intCast(std.mem.indexOf(u8, app.editor.text(), "# osc").?);
+    var at: u32 = 0;
+    while (at < end) : (at += 1) {
+        if (!std.unicode.utf8ValidateSlice(app.editor.text()[at .. at + 1])) continue;
+        app.editor.caret = 0;
+        app.editor.anchor = 0;
+        try std.testing.expect(app.editor.replace(.{ .start = at, .end = at + 1 }, ""));
+        frame(app);
+        try std.testing.expect(app.editor.buffer.undo() != null);
+        frame(app);
+        const line = app.editor.buffer.line_range(app.editor.buffer.line_of(at));
+        if (at < line.end) {
+            try std.testing.expect(app.editor.replace(.{ .start = at, .end = line.end }, ""));
+            frame(app);
+            try std.testing.expect(app.editor.buffer.undo() != null);
+            frame(app);
+        }
+    }
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+    for (app.parse.values) |value| try std.testing.expect(value != null);
+}
+
+// Locks what typing can put in the text: each awkward character inserted at every byte of the mix's
+// lines draws a frame, and undo restores the text.
+test "the mix survives anything typed into it" {
+    const app = new_app();
+    frame(app);
+    const end: u32 = @intCast(std.mem.indexOf(u8, app.editor.text(), "# osc").?);
+    for ([_][]const u8{ "-", "\"", "(", "~", "=", ",", "0", "# ", "\n", "\u{3b1}" }) |typed| {
+        var at: u32 = 0;
+        while (at < end) : (at += 1) {
+            if (app.editor.text()[at] & 0xC0 == 0x80) continue;
+            app.editor.caret = 0;
+            app.editor.anchor = 0;
+            try std.testing.expect(app.editor.replace(.{ .start = at, .end = at }, typed));
+            frame(app);
+            try std.testing.expect(app.editor.buffer.undo() != null);
+        }
+        frame(app);
+    }
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+}
+
+// Locks a knob whose ends the text made wide: its value is a long literal, and moving it writes
+// that literal instead of overrunning `literal_cap`.
+test "a knob with wide ends writes its literal" {
+    const app = new_app();
+    frame(app);
+    frame(app);
+    const range = app.parse.get(.wet).?.range;
+    const start = range.start - 2;
+    try std.testing.expect(app.editor.replace(.{ .start = start, .end = range.end + 2 }, "0~777777~999999999999"));
+    frame(app);
+    frame(app);
+    try std.testing.expectEqual(@as(u32, 0), app.parse.error_count);
+    const area = test_context.find(wet_id).?;
+    const from: input.Point = .{ .x = area.rect[0] + 20, .y = area.rect[1] + 20 };
+    deliver(app, .{ .pointer_move = from });
+    deliver(app, .{ .pointer_down = input.left_at(from) });
+    deliver(app, .{ .pointer_move = .{ .x = from.x, .y = from.y - 30 } });
+    deliver(app, .{ .pointer_up = input.left_at(from) });
+    frame(app);
+    try std.testing.expect(app.parse.get(.wet).?.number > 777777);
+}
