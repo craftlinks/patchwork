@@ -26,7 +26,8 @@
 //! ## 3. Flattening
 //! A quadratic `P0, P1, P2` is replaced by `n` chords at evenly spaced `t`. The largest
 //! distance between the curve and a chord is `|P0 - 2 P1 + P2| / (8 n^2)`, so
-//! `n = ceil(sqrt(|P0 - 2 P1 + P2| / (8 * tolerance_px)))`, clamped to `[1, segment_cap]`.
+//! `n = ceil(sqrt(|P0 - 2 P1 + P2| / (8 * tolerance_px)))`, clamped to `[1, segment_cap]`
+//! (`quad_chords`, which `draw/fill.zig` shares).
 //! Two consecutive off-curve points imply an on-curve point at their midpoint; a contour
 //! that starts off-curve starts at an implied point. Horizontal chords are kept so each
 //! contour stays a closed polygon (`contour_ends`), and the accumulator skips them.
@@ -202,14 +203,20 @@ fn flatten_contour(
     return true;
 }
 
-fn add_quad(raster: *Raster, p0: Point, p1: Point, p2: Point) bool {
-    const ddx = p0.x - 2 * p1.x + p2.x;
-    const ddy = p0.y - 2 * p1.y + p2.y;
-    const deviation = @sqrt(ddx * ddx + ddy * ddy);
+/// Chords a quadratic of `deviation = |P0 - 2 P1 + P2|` pixels flattens to (section 3).
+pub fn quad_chords(deviation: f32) u32 {
+    assert(deviation >= 0);
     const wanted = @ceil(@sqrt(deviation / (8 * tolerance_px)));
     const count: u32 = @intFromFloat(std.math.clamp(wanted, 1, @as(f32, segment_cap)));
     assert(count >= 1);
     assert(count <= segment_cap);
+    return count;
+}
+
+fn add_quad(raster: *Raster, p0: Point, p1: Point, p2: Point) bool {
+    const ddx = p0.x - 2 * p1.x + p2.x;
+    const ddy = p0.y - 2 * p1.y + p2.y;
+    const count = quad_chords(@sqrt(ddx * ddx + ddy * ddy));
     const count_f: f32 = @floatFromInt(count);
     var previous = p0;
     var step: u32 = 1;

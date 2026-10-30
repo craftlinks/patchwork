@@ -3,22 +3,22 @@
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
 scenario      hash
-bind-break    c08beaf532325996
-bind-drag     f75cbd69cc8ef286
-bind-toggle   823152cd346d8e7e
-bind-type     0d1ff8644c6219cb
-bind-undo     1aa954d50ad2fa2e
+bind-break    1a8387d20e1321e7
+bind-drag     984ca79572cecece
+bind-toggle   4c22ce305dcee52a
+bind-type     72fbcc9a5c42c39f
+bind-undo     d54a957af27e5099
 edit          45edc9caa1f797e2
-keys          d3a45cebe7da2681
-knobs         55375174f60757b3
-mix           8031abe700c8fafb
-play          37041df7b22b75d2
+keys          3cc0f6940d4b9ac4
+knobs         59516d31994d7e0a
+mix           5116246f72e945d5
+play          889909912fcff6f1
 rename        a346b838710af4e1
 reorder       0373409a0cfd1fa5
 reorder-hold  0581777a69ad4687
-reorder-undo  a2093f0f0eb14d2b
+reorder-undo  4b869354561b3dd9
 scroll        db92a619031b48ac
 section       bbd10a8bab7a2d0b
 select        71f4205e455fa926
-still         1aa954d50ad2fa2e
+still         d54a957af27e5099
 undo          3bc7bf59db799521

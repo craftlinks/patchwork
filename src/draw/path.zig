@@ -47,6 +47,12 @@
 //! other more than one segment apart across a seam, or that cross: there both chunks draw.
 //! Test "seams blend once and crossings twice" measures both.
 //!
+//! `polygon` closes the path: its last chunk's `next` joins its first, so the rule holds at the
+//! closure too. The stored points are the ring of `n` points with its last point before it and
+//! its first two after it, so `points[head - 1]` and `points[tail + 1]` exist; a chunk measures
+//! the same indices as anywhere else, and the closure's tie goes to the last chunk. A ring of one
+//! chunk has no seam and sets neither flag.
+//!
 //! ## 5. Coordinates
 //! Points are stored relative to the path's origin, the top-left of its unpadded bounds, and
 //! each chunk carries `anchor = origin - rect.xy`. `polyline_at` takes the origin from the
@@ -123,6 +129,9 @@ pub const hit_slop: f32 = 3;
 /// Samples `plot` takes at most.
 pub const plot_samples_max: u32 = 256;
 
+/// Points `polygon` takes at most.
+pub const polygon_points_max: u32 = 256;
+
 /// Color, width in logical pixels, and the hover mix toward `theme.lighten`.
 pub const Stroke = struct {
     color: [4]f32,
@@ -155,9 +164,9 @@ pub fn cubic_segments(p0: Point, p1: Point, p2: Point, p3: Point) u32 {
 pub fn cubic_segments_at(p0: Point, p1: Point, p2: Point, p3: Point, zoom: f32) u32 {
     assert(zoom > 0);
     const chord = length(p0, p3);
-    const polygon = length(p0, p1) + length(p1, p2) + length(p2, p3);
-    assert(chord <= polygon + 0.001 * polygon + 0.001);
-    const estimate = (chord + polygon) * 0.5;
+    const hull = length(p0, p1) + length(p1, p2) + length(p2, p3);
+    assert(chord <= hull + 0.001 * hull + 0.001);
+    const estimate = (chord + hull) * 0.5;
     const wanted = @ceil(estimate * zoom / flatten_px);
     const lo: f32 = @floatFromInt(segments_min);
     const hi: f32 = @floatFromInt(segments_max);
@@ -473,6 +482,59 @@ pub fn plot(
     var points: [plot_samples_max]Point = undefined;
     plot_points(points[0..samples.len], samples, rect, range);
     return polyline(cx, points[0..samples.len], stroke, clip);
+}
+
+/// Appends the closed stroke through `points` (absolute, at least three) as `polyline` does,
+/// joining the last point to the first with the seam rule (section 4). `Placed` covers the ring
+/// with its first point again at the end, so a path area measures the closing segment too.
+pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?Placed {
+    assert(points.len >= 3);
+    assert(points.len <= polygon_points_max);
+    assert(stroke.width > 0);
+    assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
+    const count: u32 = @intCast(points.len);
+    var closed: [polygon_points_max + 1]Point = undefined;
+    @memcpy(closed[0..count], points);
+    closed[count] = points[0];
+    const ring = closed[0 .. count + 1];
+    const chunks = chunk_count(ring, stroke.width);
+    if (cx.room(types.Path) < chunks) {
+        cx.refuse();
+        return null;
+    }
+    const bounds = bounds_of(points);
+    const origin: Point = .{ bounds.x, bounds.y };
+    // The ring, its last point before it, and its second point after it (section 4).
+    const stored = count + 3;
+    const reserved = cx.reserve_points(stored) orelse return null;
+    const relative = cx.points[reserved..][0..stored];
+    relative[0] = .{ points[count - 1][0] - origin[0], points[count - 1][1] - origin[1] };
+    for (relative[1 .. count + 2], ring) |*slot, point| {
+        slot.* = .{ point[0] - origin[0], point[1] - origin[1] };
+    }
+    relative[count + 2] = .{ points[1][0] - origin[0], points[1][1] - origin[1] };
+    const first = reserved + 1;
+    var start: u32 = 0;
+    while (start < count) {
+        const end = chunk_end(ring, start, stroke.width);
+        var instance = chunk_of(ring, start, end, first, origin, stroke, clip);
+        if (chunks > 1) {
+            if (start == 0) instance.prev = 1;
+            if (end == count) instance.next = 1;
+        }
+        cx.append(types.Path, null, instance) catch |err| switch (err) {
+            // Only the first chunk can open a batch: the rest share its layer and type.
+            error.BatchFull => {
+                assert(start == 0);
+                cx.release_points(reserved);
+                return null;
+            },
+            error.PoolFull, error.EdgeNotPositive, error.ClipUnordered => unreachable,
+        };
+        start = end;
+    }
+    return .{ .first = first, .count = count + 1, .bounds = bounds };
 }
 
 /// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index
@@ -816,6 +878,43 @@ test "seams blend once and close folds twice" {
     const folded = composite_max(cx);
     try testing.expect(folded <= twice);
     try testing.expectApproxEqAbs(@as(f32, 0.0956), folded - alpha, 1.0e-4);
+}
+
+// Locks the closure (section 4): a translucent circle of 64 points splits into several chunks and
+// blends once all round, the closure included, where it has no gap either: a point on the stroke
+// by the first vertex draws the full alpha. `Placed` measures the closing segment. A triangle is
+// one chunk, sets neither flag, and draws its closure too.
+test "a polygon closes with the seam rule" {
+    const alpha = cable_stroke.color[3];
+    const cx = new_context();
+    var points: [64]Point = undefined;
+    for (&points, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.tau / 64;
+        point.* = .{ 300 + 200 * @cos(turn), 300 + 200 * @sin(turn) };
+    }
+    const placed = polygon(cx, &points, cable_stroke, window).?;
+    try testing.expectEqual(@as(u32, 65), placed.count);
+    const chunks = cx.items(types.Path);
+    try testing.expect(chunks.len >= 2);
+    try testing.expectEqual(@as(f32, 1), chunks[0].prev);
+    try testing.expectEqual(@as(f32, 1), chunks[chunks.len - 1].next);
+    try testing.expect(composite_max(cx) <= alpha + 1.0e-4);
+    for ([_]f32{ -1.25, -0.25, 0.25, 1.25 }) |dy| {
+        try testing.expectApproxEqAbs(alpha, composite(cx, 500, 300 + dy, 1), 1.0e-4);
+    }
+    const stored = cx.point_items()[placed.first..][0..placed.count];
+    const ring_end = stored[placed.count - 1];
+    try testing.expectEqual(stored[0], ring_end);
+    const at = distance_to_polyline(stored, 500 - placed.bounds.x, 300 - placed.bounds.y);
+    try testing.expectApproxEqAbs(@as(f32, 0), at, 1.0e-3);
+    cx.reset();
+    const triangle = [_]Point{ .{ 10, 10 }, .{ 40, 10 }, .{ 10, 40 } };
+    _ = polygon(cx, &triangle, cable_stroke, window).?;
+    try testing.expectEqual(@as(usize, 1), cx.items(types.Path).len);
+    try testing.expectEqual(@as(f32, 0), cx.items(types.Path)[0].prev);
+    try testing.expectEqual(@as(f32, 0), cx.items(types.Path)[0].next);
+    try testing.expectApproxEqAbs(alpha, composite(cx, 10, 25, 1), 1.0e-4);
+    try testing.expect(composite_max(cx) <= alpha + 1.0e-4);
 }
 
 // Locks the chunk area choice by the fragments it rasterizes and the segments they measure:

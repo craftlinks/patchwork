@@ -17,6 +17,7 @@
 //! draw/types.zig      Box, Arc, Surface, Glyph, Image, Path, AppendError, and the CPU twins
 //! draw/pools.zig      Context: per-type pools, the point pool, layers, sort, sticky batches
 //! draw/path.zig       stroked paths: flattening, chunking, twins, and the appenders
+//! draw/fill.zig       filled shapes: Builder, bands, exact-area coverage, twins, the appender
 //! draw/wave.zig       Waveform and Ring types, the waveform appender, the zoom pyramid
 //! draw/fx.zig         offscreen targets: device rects, projection, Composite and Blur
 //! draw/backdrop.zig   backdrops: the blur chain's sizes and passes, Glass, and the twins
@@ -105,6 +106,9 @@ const types = @import("draw/types.zig");
 
 /// Stroked paths: `path.cubic`, `path.polyline`, `path.plot`, and their CPU twins.
 pub const path = @import("draw/path.zig");
+
+/// Filled shapes: `fill.Builder`, `fill.append`, and their CPU twins.
+pub const fill = @import("draw/fill.zig");
 
 /// Offscreen effects: target device rects, `fx.composite`, `fx.blur`, and their types.
 pub const fx = @import("draw/fx.zig");
@@ -209,6 +213,7 @@ pub const Arc = types.Arc;
 pub const Glyph = types.Glyph;
 pub const Image = types.Image;
 pub const Path = types.Path;
+pub const Fill = fill.Fill;
 pub const Waveform = wave.Waveform;
 pub const Ring = wave.Ring;
 pub const Composite = fx.Composite;
@@ -449,6 +454,7 @@ test {
     _ = textures_module;
     _ = types;
     _ = path;
+    _ = fill;
     _ = wave;
     _ = fx;
     _ = backdrop;

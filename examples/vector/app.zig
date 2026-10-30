@@ -1,0 +1,467 @@
+//! Vector example: filled shapes on the GPU, from a star to a glyph outline.
+//!
+//! # Deep Architectural Guide for Reviewers:
+//!
+//! ## 1. What It Demonstrates
+//! `draw.fill` on one screen: a five-point star filled non-zero and even-odd side by side, whose
+//! inner edges draw nothing under non-zero; a ring, a hole by winding; the region under a plotted
+//! curve with its `draw.Path` stroke on top; one glyph from `ttf.load` filled beside the same
+//! glyph from the atlas; a translucent comb tall enough to split into bands, whose seams show
+//! as a stripe if a row ever blends twice; a closed stroke from `path.polygon` round a hexagon;
+//! and a shape morphing from a circle to a rounded square.
+//!
+//! ## 2. Pages
+//! Digit keys pick a page, so the two cost scenarios draw one thing over the whole window:
+//! ```text
+//! 1  shapes     everything above
+//! 2  glyph      one '&', em = window height / 1.08: 1,000 logical px in 1920 x 1080
+//! 3  curtain    a single band at the 48-segment cap over the whole window: the worst fragment
+//! ```
+//!
+//! ## 3. The Morph
+//! Space runs it. The shape is four lines and four cubics with a corner radius between half its
+//! side (a circle) and a quarter of that, on the `frame` event's delta, so it rebuilds and uploads
+//! its points on every frame while it runs, and the app sleeps once it stops.
+//!
+//! ## 4. TigerStyle Invariants
+//! - No allocation: a `Builder` and an outline are static, and every shape is bounded by
+//!   `fill.segment_cap`.
+//! - The tests assert no shape is refused, on any page.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const patchwork = @import("patchwork");
+const input = patchwork.input;
+const quads = patchwork.draw;
+const text = patchwork.text;
+const theme = patchwork.theme;
+const ttf = text.ttf;
+const ui = patchwork.ui;
+const fill = quads.fill;
+const Point = quads.Point;
+const Rect = quads.Rect;
+const Clip = quads.Clip;
+
+const star_radius: f32 = 92;
+const curve_samples: u32 = 128;
+const glyph_em: f32 = 120;
+/// Seconds for the morph to go from the circle to the square and back.
+const morph_period_s: f32 = 2;
+const morph_side: f32 = 150;
+/// Teeth of the tall comb: enough for at least three bands.
+const comb_teeth: u32 = 60;
+const comb_pitch: f32 = 5.5;
+/// Edges of the curtain, all of them the window's height: the band cap.
+const curtain_edges: u32 = fill.segments_max;
+
+const orange: [4]f32 = .{ 0.95, 0.60, 0.25, 1 };
+const blue: [4]f32 = .{ 0.35, 0.60, 0.95, 1 };
+const green: [4]f32 = .{ 0.45, 0.80, 0.55, 1 };
+const pink: [4]f32 = .{ 0.92, 0.45, 0.68, 1 };
+const violet: [4]f32 = .{ 0.65, 0.55, 0.95, 1 };
+
+const title_style: text.Style = .{ .face = .sans_bold, .size = 14, .color = theme.dark.colors.text };
+const label_style: text.Style = .{ .face = .sans, .size = 12, .color = theme.dark.colors.text };
+const glyph_style: text.Style = .{ .face = .sans, .size = glyph_em, .color = pink };
+const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
+
+const Page = enum { shapes, glyph, curtain };
+
+/// Static, so a frame's shapes are not 16 KiB of stack each, and one outline at a time.
+var shape: fill.Builder = undefined;
+var outline: ttf.Outline = undefined;
+
+/// The vector screen. See the module guide.
+pub const App = struct {
+    page: Page,
+    /// The morph's clock, in seconds, and whether it runs.
+    morph_s: f32,
+    running: bool,
+
+    pub const config: patchwork.app.Config = .{
+        .title = "vector",
+        .timer_period_ms = 0,
+        .draw = &.{
+            .{ .type = quads.Box, .cap = 16 },
+            .{ .type = quads.Fill, .cap = 96 },
+            .{ .type = quads.Path, .cap = 96 },
+            .{ .type = quads.Glyph, .cap = 256 },
+        },
+        .batch_order = .registered,
+        .batch_cap = 16,
+        .area_cap = 2,
+        .point_cap = 16384,
+    };
+
+    pub const scenarios: []const patchwork.bench.Scenario = &.{
+        .{ .name = "still", .setup = &.{.{ .wait = 3 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 10 },
+        .{
+            .name = "morph",
+            .setup = &.{.{ .key = .{ .key = .other, .text = " " } }},
+            .cycle = &.{},
+            .frames = 90,
+        },
+        .{
+            .name = "glyph",
+            .setup = &.{ .{ .key = .{ .key = .other, .text = "2" } }, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 300,
+        },
+        .{
+            .name = "curtain",
+            .setup = &.{ .{ .key = .{ .key = .other, .text = "3" } }, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 300,
+        },
+    };
+
+    pub fn init(app: *App, textures: *quads.Textures) void {
+        _ = textures;
+        app.page = .shapes;
+        app.morph_s = 0;
+        app.running = false;
+    }
+
+    pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (event_value) {
+            .frame => |dt_ms| {
+                if (!app.running) return;
+                app.morph_s += dt_ms / 1000;
+                cx.redraw();
+                cx.keep_animating();
+            },
+            .key_down => |press| {
+                if (press.key != .other or press.typed().len != 1) return;
+                switch (press.typed()[0]) {
+                    ' ' => app.running = !app.running,
+                    '1' => app.page = .shapes,
+                    '2' => app.page = .glyph,
+                    '3' => app.page = .curtain,
+                    else => return,
+                }
+                cx.redraw();
+            },
+            else => {},
+        }
+    }
+
+    pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
+        _ = app;
+        _ = cx;
+        _ = now_ms;
+    }
+
+    pub fn draw(app: *App, cx: *Context) void {
+        const draw_cx = cx.drawing();
+        const window = cx.window;
+        const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = window.width, .y1 = window.height };
+        // Screen pixels per logical pixel, so chords follow the shape's size on screen.
+        const zoom = @as(f32, @floatFromInt(draw_cx.text.scale_120)) / 120 * draw_cx.view_zoom;
+        shape = .init(zoom);
+        switch (app.page) {
+            .shapes => app.draw_shapes(cx, clip),
+            .glyph => draw_big_glyph(cx, clip),
+            .curtain => draw_curtain(cx, clip),
+        }
+    }
+
+    fn draw_shapes(app: *const App, cx: *Context, clip: Clip) void {
+        const draw_cx = cx.drawing();
+        const band: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+        const title = "vector: draw.Fill, space runs the morph, 1 2 3 pick a page";
+        text.place(draw_cx, title_style, title, band, clip, left);
+        const labels = [_]struct { x: f32, y: f32, name: []const u8 }{
+            .{ .x = 24, .y = 240, .name = "non-zero" },
+            .{ .x = 224, .y = 240, .name = "even-odd" },
+            .{ .x = 424, .y = 240, .name = "ring, closed stroke" },
+            .{ .x = 624, .y = 392, .name = "translucent bands" },
+            .{ .x = 824, .y = 240, .name = "morph" },
+            .{ .x = 24, .y = 480, .name = "under a curve" },
+            .{ .x = 624, .y = 480, .name = "filled, atlas" },
+        };
+        for (labels) |item| {
+            const rect: Rect = .{ .x = item.x, .y = item.y, .width = 190, .height = 20 };
+            text.place(draw_cx, label_style, item.name, rect, clip, left);
+        }
+        star_at(.{ 116, 144 });
+        _ = fill.append(draw_cx, &shape, .{ .color = orange }, clip);
+        shape.reset();
+        star_at(.{ 316, 144 });
+        _ = fill.append(draw_cx, &shape, .{ .color = blue, .rule = .even_odd }, clip);
+        shape.reset();
+        ring_at(.{ 516, 144 });
+        _ = fill.append(draw_cx, &shape, .{ .color = green }, clip);
+        shape.reset();
+        draw_hexagon(cx, .{ 516, 144 }, clip);
+        draw_comb(cx, clip);
+        morph_at(.{ 900, 144 }, morph_amount(app.morph_s));
+        _ = fill.append(draw_cx, &shape, .{ .color = violet }, clip);
+        shape.reset();
+        draw_curve(cx, .{ .x = 24, .y = 280, .width = 560, .height = 190 }, clip);
+        draw_glyphs(cx, clip);
+    }
+};
+
+pub const Context = patchwork.app.Context(App);
+
+/// The five points of a star of `star_radius` round `centre`, joined every second point, so the
+/// contour crosses itself.
+fn star_at(centre: Point) void {
+    var points: [5]Point = undefined;
+    for (&points, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * 4 * std.math.pi / 5;
+        point.* = .{
+            centre[0] + star_radius * @sin(turn),
+            centre[1] - star_radius * @cos(turn),
+        };
+    }
+    shape.polygon(&points);
+}
+
+/// A circle of four cubics, run clockwise or counterclockwise.
+fn circle_at(centre: Point, radius: f32, clockwise: bool) void {
+    const k = 0.5523 * radius;
+    const c = centre;
+    const r = if (clockwise) radius else -radius;
+    const j = if (clockwise) k else -k;
+    shape.move_to(.{ c[0], c[1] - radius });
+    shape.cubic_to(.{ .{ c[0] + j, c[1] - radius }, .{ c[0] + r, c[1] - k } }, .{ c[0] + r, c[1] });
+    shape.cubic_to(.{ .{ c[0] + r, c[1] + k }, .{ c[0] + j, c[1] + radius } }, .{ c[0], c[1] + radius });
+    shape.cubic_to(.{ .{ c[0] - j, c[1] + radius }, .{ c[0] - r, c[1] + k } }, .{ c[0] - r, c[1] });
+    shape.cubic_to(.{ .{ c[0] - r, c[1] - k }, .{ c[0] - j, c[1] - radius } }, .{ c[0], c[1] - radius });
+    shape.close();
+}
+
+/// A disc with a hole: the inner contour runs the other way.
+fn ring_at(centre: Point) void {
+    circle_at(centre, 80, true);
+    circle_at(centre, 44, false);
+}
+
+/// A closed stroke inside the ring's hole, which `path.polygon` joins at its start.
+fn draw_hexagon(cx: *Context, centre: Point, clip: Clip) void {
+    var points: [6]Point = undefined;
+    for (&points, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.pi / 3;
+        point.* = .{ centre[0] + 30 * @cos(turn), centre[1] + 30 * @sin(turn) };
+    }
+    const stroke: quads.path.Stroke = .{ .color = orange, .width = 3, .hover = 0 };
+    _ = quads.path.polygon(cx.drawing(), &points, stroke, clip);
+}
+
+/// The comb, translucent over a bright bar, so a row blended twice shows as a stripe.
+fn draw_comb(cx: *Context, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    const bar: Rect = .{ .x = 660, .y = 44, .width = 24, .height = 346 };
+    draw_cx.append(quads.Box, null, .of(bar, clip, .{ .fill = blue })) catch {};
+    const x: f32 = 628;
+    const y: f32 = 56;
+    shape.move_to(.{ x, y });
+    var tooth: u32 = 0;
+    while (tooth < comb_teeth) : (tooth += 1) {
+        const top = y + @as(f32, @floatFromInt(tooth)) * comb_pitch;
+        shape.line_to(.{ x + 150, top + 0.25 * comb_pitch });
+        shape.line_to(.{ x + 150, top + 0.5 * comb_pitch });
+        shape.line_to(.{ x + 90, top + 0.75 * comb_pitch });
+        shape.line_to(.{ x + 90, top + comb_pitch });
+    }
+    shape.line_to(.{ x, y + @as(f32, @floatFromInt(comb_teeth)) * comb_pitch });
+    _ = fill.append(draw_cx, &shape, .{ .color = .{ 1, 1, 1, 0.5 } }, clip);
+    shape.reset();
+}
+
+/// How far the morph is from the circle, 0 to 1 and back on `morph_period_s`, eased.
+fn morph_amount(seconds: f32) f32 {
+    const phase = @mod(seconds / morph_period_s, 1);
+    const up = 1 - @abs(2 * phase - 1);
+    return up * up * (3 - 2 * up);
+}
+
+/// A rounded square of `morph_side`: `amount` 0 is a circle, 1 a square with corners of a quarter
+/// of that radius.
+fn morph_at(centre: Point, amount: f32) void {
+    const half = morph_side / 2;
+    const radius = half * (1 - 0.75 * amount);
+    const k = 0.5523 * radius;
+    const x0 = centre[0] - half;
+    const x1 = centre[0] + half;
+    const y0 = centre[1] - half;
+    const y1 = centre[1] + half;
+    shape.move_to(.{ x0 + radius, y0 });
+    shape.line_to(.{ x1 - radius, y0 });
+    shape.cubic_to(.{ .{ x1 - radius + k, y0 }, .{ x1, y0 + radius - k } }, .{ x1, y0 + radius });
+    shape.line_to(.{ x1, y1 - radius });
+    shape.cubic_to(.{ .{ x1, y1 - radius + k }, .{ x1 - radius + k, y1 } }, .{ x1 - radius, y1 });
+    shape.line_to(.{ x0 + radius, y1 });
+    shape.cubic_to(.{ .{ x0 + radius - k, y1 }, .{ x0, y1 - radius + k } }, .{ x0, y1 - radius });
+    shape.line_to(.{ x0, y0 + radius });
+    shape.cubic_to(.{ .{ x0, y0 + radius - k }, .{ x0 + radius - k, y0 } }, .{ x0 + radius, y0 });
+    shape.close();
+}
+
+/// The region under a plotted curve, with the same samples stroked on top.
+fn draw_curve(cx: *Context, rect: Rect, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    var samples: [curve_samples]f32 = undefined;
+    var points: [curve_samples]Point = undefined;
+    for (&samples, 0..) |*sample, index| {
+        const t = @as(f32, @floatFromInt(index)) / (curve_samples - 1);
+        const wave = @sin(t * 9) * 0.28 + @sin(t * 23 + 1) * 0.12;
+        sample.* = 0.5 + wave * (0.4 + 0.6 * t);
+    }
+    quads.path.plot_points(&points, &samples, rect, .{ 0, 1 });
+    const floor = rect.y + rect.height;
+    shape.move_to(.{ rect.x, floor });
+    for (points) |point| shape.line_to(point);
+    shape.line_to(.{ rect.x + rect.width, floor });
+    const area = .{ green[0], green[1], green[2], 0.35 };
+    _ = fill.append(draw_cx, &shape, .{ .color = area }, clip);
+    shape.reset();
+    const stroke: quads.path.Stroke = .{ .color = green, .width = 2, .hover = 0 };
+    _ = quads.path.plot(draw_cx, &samples, rect, .{ 0, 1 }, stroke, clip);
+}
+
+/// `code` of the sans face at `em` logical pixels with its pen at `pen`, into `shape`.
+fn glyph_at(code: u21, em: f32, pen: Point) void {
+    const font = text.font_of(.sans);
+    const id = ttf.glyph_id(font, code);
+    assert(id != 0);
+    const loaded = ttf.load(font, id, &outline);
+    assert(loaded == .ready);
+    shape.outline(&outline, em / @as(f32, @floatFromInt(font.units_per_em)), pen);
+}
+
+/// The same glyph at one size: from its outline as a shape, then from the atlas.
+fn draw_glyphs(cx: *Context, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    glyph_at('g', glyph_em, .{ 632, 620 });
+    _ = fill.append(draw_cx, &shape, .{ .color = pink }, clip);
+    shape.reset();
+    const rect: Rect = .{ .x = 780, .y = 500, .width = 120, .height = 160 };
+    text.place(draw_cx, glyph_style, "g", rect, clip, left);
+}
+
+/// The cost page: one large glyph, em a fixed share of the window's height.
+fn draw_big_glyph(cx: *Context, clip: Clip) void {
+    const em = cx.window.height / 1.08;
+    glyph_at('&', em, .{ 0.5 * (cx.window.width - em * 0.75), cx.window.height * 0.86 });
+    _ = fill.append(cx.drawing(), &shape, .{ .color = pink }, clip);
+    shape.reset();
+}
+
+/// The cost page's worst case: long edges side by side over the whole window, so every fragment
+/// loops over `curtain_edges` segments.
+fn draw_curtain(cx: *Context, clip: Clip) void {
+    const window = cx.window;
+    const step = window.width / @as(f32, @floatFromInt(curtain_edges));
+    shape.move_to(.{ 0, 0 });
+    var edge: u32 = 1;
+    while (edge <= curtain_edges) : (edge += 1) {
+        const x = @as(f32, @floatFromInt(edge)) * step;
+        shape.line_to(.{ x, if (edge % 2 == 1) window.height else 0 });
+    }
+    shape.line_to(.{ window.width, 0 });
+    const color = .{ violet[0], violet[1], violet[2], 0.8 };
+    _ = fill.append(cx.drawing(), &shape, .{ .color = color, .rule = .even_odd }, clip);
+    shape.reset();
+}
+
+const fixture = struct {
+    var context: Context = undefined;
+    var app: App = undefined;
+};
+
+fn new_app() *App {
+    fixture.context.init();
+    patchwork.app.start(App, &fixture.context);
+    var textures: quads.Textures = undefined;
+    App.init(&fixture.app, &textures);
+    return &fixture.app;
+}
+
+fn frame_at(app: *App) *Context {
+    const cx = &fixture.context;
+    cx.redraw();
+    assert(ui.draw_frame(App, app, cx, 1280, 720, 120));
+    return cx;
+}
+
+fn send(app: *App, event_value: input.Event) void {
+    ui.dispatch(App, app, &fixture.context, event_value);
+}
+
+// Locks every page: no shape is refused on any page at 1x or at 2x, the comb splits into at
+// least three bands, the star's points are 2 per segment, and the curtain is one band at the cap.
+test "every page's shapes fit" {
+    const app = new_app();
+    const cx = frame_at(app);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    const bands = cx.draw.items(quads.Fill);
+    try std.testing.expectEqual(@as(f32, 10), bands[0].point_count);
+    var tallest: u32 = 0;
+    for (bands) |band| {
+        try std.testing.expect(band.point_count <= 2 * fill.segments_max);
+        tallest = @max(tallest, @as(u32, @intFromFloat(band.point_count)));
+    }
+    try std.testing.expect(tallest > 48);
+    cx.redraw();
+    assert(ui.draw_frame(App, app, cx, 1280, 720, 240));
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "2") });
+    try std.testing.expectEqual(Page.glyph, app.page);
+    _ = frame_at(app);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    try std.testing.expect(cx.draw.items(quads.Fill).len >= 2);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "3") });
+    _ = frame_at(app);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    try std.testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Fill).len);
+    const curtain = cx.draw.items(quads.Fill)[0];
+    try std.testing.expectEqual(@as(f32, 2 * fill.segments_max), curtain.point_count);
+}
+
+// Locks the comb's bands, the seam the translucent golden shows: at least three, whose rects meet.
+test "the tall comb splits into at least three bands" {
+    const app = new_app();
+    const cx = frame_at(app);
+    var comb_bands: u32 = 0;
+    var last_bottom: f32 = 0;
+    for (cx.draw.items(quads.Fill)) |band| {
+        if (band.color[3] != 0.5) continue;
+        if (comb_bands != 0) try std.testing.expectEqual(last_bottom, band.rect[1]);
+        comb_bands += 1;
+        last_bottom = band.rect[1] + band.rect[3];
+    }
+    try std.testing.expect(comb_bands >= 3);
+}
+
+// Locks the morph's ends and its clock: 0 at the start, 1 at half the period, 0 again at the
+// period; it runs on Space, and asks for no frame once stopped.
+test "the morph runs on space and sleeps when stopped" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0), morph_amount(0), 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), morph_amount(1), 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), morph_amount(2), 1.0e-6);
+    const app = new_app();
+    _ = frame_at(app);
+    try std.testing.expect(!ui.animate(App, app, &fixture.context, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+    try std.testing.expect(ui.animate(App, app, &fixture.context, 16));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.016), app.morph_s, 1.0e-5);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+    try std.testing.expect(!ui.animate(App, app, &fixture.context, 16));
+}
+
+// Locks the scenarios without a GPU (`patchwork.bench`, section 2a).
+test "the scenarios replay headless" {
+    const bench = patchwork.bench;
+    const cx = &fixture.context;
+    for (App.scenarios) |*scenario| {
+        const app = new_app();
+        _ = try bench.replay_headless(App, app, cx, scenario, .{ 1280, 720 }, 6);
+        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    }
+}
+
+comptime {
+    patchwork.app.check(App);
+}

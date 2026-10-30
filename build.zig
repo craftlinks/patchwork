@@ -682,7 +682,16 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(session.install);
     add_example_steps(b, "-session", "the live-coding session", session);
-    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session };
+    const vector = addApp(b, b, .{
+        .name = "vector",
+        .root_source_file = b.path("examples/vector/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    b.getInstallStep().dependOn(vector.install);
+    add_example_steps(b, "-vector", "the filled shapes", vector);
+    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session, vector };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
@@ -753,7 +762,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [11]AppSteps,
+    examples: [12]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

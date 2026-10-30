@@ -8,7 +8,7 @@
 //! ## 1. What It Demonstrates
 //! Whether an app can build an atypical screen from the public API alone. Everything here is
 //! library widgets under app skins (`look.zig`: ring knobs, upright toggles), library draw
-//! types (Box, Waveform, Arc, Path, Glyph), an `EditorOf(patch)` set in serif (`patch.zig`),
+//! types (Box, Waveform, Fill, Arc, Path, Glyph), an `EditorOf(patch)` set in serif (`patch.zig`),
 //! and pieces the library does not have: two-way bindings (`bindings.zig`), a fader with a
 //! stereo meter (`fader.zig`), a piano keyboard (`keys.zig`), and the plots (`plots.zig`). The
 //! sound is made up (`signal.zig`).
@@ -319,6 +319,8 @@ const box_cap: u32 = 1024;
 const arc_cap: u32 = 64;
 const path_cap: u32 = 1024;
 const wave_cap: u32 = 4;
+/// Bands of the one spectrum fill.
+const fill_cap: u32 = 8;
 const area_cap: u32 = 192;
 
 const Strip = struct {
@@ -437,6 +439,7 @@ pub const App = struct {
         .draw = &.{
             .{ .type = quads.Box, .cap = box_cap },
             .{ .type = quads.Waveform, .cap = wave_cap },
+            .{ .type = quads.Fill, .cap = fill_cap },
             .{ .type = quads.Arc, .cap = arc_cap },
             .{ .type = quads.Path, .cap = path_cap },
             .{ .type = quads.Glyph, .cap = glyph_cap },
@@ -1624,8 +1627,6 @@ comptime {
     assert(section_gap + heading_h + rule_room == 72);
     assert(mixer_h <= patchwork.editor.row_height_max);
     assert(2 * section_cap + 2 <= patchwork.editor.row_cap);
-    // The spectrum fill's 48 columns are 3 px each.
-    assert(plot_w / signal.bins == 3);
     // The overview's 540 columns are 2 px each.
     assert(overview_w / overview_columns == 2);
     assert(code_x + strip_count * strip_w + (strip_count - 1) * strip_gap < code_end);

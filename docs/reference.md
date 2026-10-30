@@ -158,6 +158,7 @@ patchwork/
 │   ├── draw/types.zig          # Library draw types (Box, Arc, Surface, Glyph, Image, Path), twins
 │   ├── draw/pools.zig          # Context: per-type pools, point pool, layers, sort, batches
 │   ├── draw/path.zig           # Stroked paths: flattening, chunking, twins, appenders
+│   ├── draw/fill.zig           # Filled shapes: Builder, bands, exact-area coverage, twins
 │   ├── draw/backdrop.zig       # Backdrops: the blur chain's levels, passes, reach; Glass; twins
 │   ├── draw/textures.zig       # Textures: queued creates and writes, TextureId, write revisions
 │   ├── draw/tiles.zig          # Pixel cache tiles: hashes, dirty bits, scissor rects, record keys
@@ -345,8 +346,13 @@ zig build run-session     # Build and run the live-coding session natively
 zig build wasm-session    # Compile it to zig-out/bin/session.wasm
 zig build serve-session   # Serve it on localhost (prints the address)
 
+# Examples (Vector)
+zig build run-vector      # Build and run the filled shapes natively
+zig build wasm-vector     # Compile it to zig-out/bin/vector.wasm
+zig build serve-vector    # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the eleven examples
+zig build test            # Run unit tests across the library and the twelve examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
                           # `Audio` source without `audio`, a theme color of 1.5, a
@@ -1269,6 +1275,16 @@ double click in italics and Shift+Down), `undo`, `section` (`# chorus` typed at 
 (the same, in flight), `reorder-undo`, `bind-type` (a digit typed into a level), `bind-drag` (a
 fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call deleted).
 
+### 12. Vector (`examples/vector/app.zig`)
+
+`draw.fill` on one screen: a five-point star under non-zero and even-odd, a ring with a closed
+stroke in its hole, the region under a plotted curve with its stroke on top, a glyph from
+`ttf.load` beside the same glyph from the atlas, a translucent comb tall enough to split into
+bands over a bright bar, so a row blended twice would show, and a shape morphing from a circle
+to a rounded square on the `frame` event's delta. Space runs the morph, and 1, 2, and 3 pick a
+page: the shapes, one `&` an em of the window's height / 1.08, and a single band at the
+48-segment cap over the whole window. Scenarios `still`, `morph`, `glyph`, and `curtain`.
+
 ## Drags Between Widgets
 
 A widget that holds a press may turn it into a drag that another widget receives: a tab
@@ -1802,7 +1818,7 @@ if (!kit.glass(cx, sidebar, clip, kit.glass_look(cx.theme(), .frosted, 22)))
   face draw under it. Append faces before any text on the layer, or put what must cover on a
   higher layer. First appearance also depends on what is on screen, so scrolling can change
   it. `config.batch_order = .registered` fixes the order for the whole app: a layer's batches
-  draw in `config.draw`'s order, then by texture, on every frame, so `Box, Waveform, Arc, Path,
+  draw in `config.draw`'s order, then by texture, on every frame, so `Box, Waveform, Fill, Arc, Path,
   Glyph` keeps faces under plots under text. Pick it for a new screen; `.appearance` stays the
   default. An app on `.appearance` can call `draw.covered_glyphs(cx.drawing())` in a test, after
   `finalize`: it counts glyphs an opaque box in a later batch of their layer covers, and 0 means
@@ -1865,6 +1881,7 @@ const placed = draw.path.cubic(cx.drawing(), .{ p0, p1, p2, p3 }, stroke, clip);
 _ = draw.path.polyline(cx.drawing(), &points, stroke, clip);
 _ = draw.path.plot(cx.drawing(), &samples, rect, .{ lo, hi }, stroke, clip);
 _ = draw.path.polyline_at(cx.drawing(), &points, origin, stroke, clip);  // bool, no area
+_ = draw.path.polygon(cx.drawing(), &points, stroke, clip);            // closed, ?Placed
 if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit within width / 2 + 3
 ```
 
@@ -1892,9 +1909,55 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   every unmoved point's stored value when the bounds change (an automation lane).
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
+- **Closed strokes.** `polygon` joins the last point to the first with the seam rule, so a
+  translucent ring shows no dot at its start. A ring of one chunk has no seam.
 
 The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `draw.sdf_segment`)
 check the shader's math, the chunk rects and quads, and the seam blending without a GPU.
+
+## Fills
+
+`draw.fill` fills closed contours on the GPU through the `Fill` draw type
+(`src/draw/fill.zig`), so a shape that changes every frame uploads only its points:
+
+```zig
+var shape: draw.fill.Builder = .init(zoom);       // screen px per logical px; 16 KiB on the stack
+shape.move_to(.{ 10, 10 });
+shape.line_to(.{ 90, 10 });
+shape.quad_to(control, end);
+shape.cubic_to(.{ control_a, control_b }, end);
+shape.close();                                    // the next move_to or the append closes too
+shape.polygon(&points);                           // a closed contour in one call
+shape.outline(&ttf_outline, scale, pen);          // a font outline, +y down, the atlas's chords
+const placed = draw.fill.append(cx.drawing(), &shape, .{ .color = color, .rule = .even_odd }, clip);
+```
+
+- **Flattening.** Quadratics use the glyph rasterizer's rule (`raster.quad_chords`, 0.2 px, at
+  most 16 chords) and cubics the stroke's (`path.cubic_segments_at`), both at `zoom`, so pass the
+  display scale times `cx.view_zoom` for chords that follow the screen. A larger `zoom` gives finer
+  chords: at 2,000 px on a flat colour the 16-chord limit shows as faint facets.
+- **Bands.** A shape is cut into horizontal bands, halved until each lists at most 48 segments
+  (`segments_max`), and each band is one `Fill` instance (80 bytes) whose fragment loops over
+  its list. Points are 2 per segment per band it meets. Neighbouring bands share one edge, so a
+  translucent shape blends once. A Builder holds 1,024 segments.
+- **Coverage.** A fragment sums, over its band's segments, the signed part of its pixel left of
+  each: the exact area, as `text/raster.zig` writes it. So corners and hairlines are exact, and
+  an edge between two inside regions (the arms of a star) draws nothing. `.non_zero` is
+  `min(|sum|, 1)` and `.even_odd` folds the sum. Regions of opposite winding that meet inside one
+  pixel stay approximate.
+- **Appends are atomic.** A shape over the Builder's cap, a band under 1 logical pixel still over
+  48 segments, or a full pool is refused whole and counted in `overflow_count`. A shape with no
+  area appends nothing and counts nothing.
+- **Paint** is one solid colour with a `hover` mix, and there are no hit areas yet: record a box or
+  a path area beside it.
+
+| 3840 x 2160, full redraws | Instances, points | RTX 3060 | UHD 770 |
+| --- | --- | --- | --- |
+| A 2,000 px `&`, 220 segments | 7, 496 | +0.75 ms | +9.8 ms |
+| One band at the cap over the window | 1, 96 | +5.7 ms | +47.8 ms |
+
+The CPU twins (`signed_area`, `coverage`, `band_alpha`) check the shader's math, the bands, and
+the seams without a GPU, against `raster.zig` on glyph outlines and polygons.
 
 ## Code Editor
 
