@@ -181,6 +181,8 @@ pub const Layer = pools.Layer;
 /// A layer's pan/zoom view (`draw/pools.zig`, section 5c).
 pub const View = pools.View;
 pub const Batch = pools.Batch;
+/// How a layer's batches order (`draw/pools.zig`, section 1).
+pub const BatchOrder = pools.BatchOrder;
 pub const layer_count = pools.layer_count;
 pub const Textures = textures_module.Textures;
 pub const TextureId = textures_module.TextureId;
@@ -334,6 +336,56 @@ pub fn dirty_range(comptime T: type, old: []const T, new: []const T) ?Range {
 
 fn same_record(comptime T: type, a: *const T, b: *const T) bool {
     return std.mem.eql(u8, std.mem.asBytes(a), std.mem.asBytes(b));
+}
+
+/// Shortest side, in logical pixels, at which a rounded box counts as covering a glyph
+/// (`covered_glyphs`): below it the corners leave too much of a glyph to call covered.
+const covered_side_min: f32 = 8;
+
+/// Glyphs an opaque box in a later batch of the same layer covers. O(boxes * glyphs): a test
+/// aid, never called while drawing. `cx` is a finalized draw context (`cx.drawing()` in an app).
+pub fn covered_glyphs(cx: anytype) u32 {
+    const Draw = @TypeOf(cx.*);
+    comptime {
+        const R = Draw.Registry;
+        if (!R.has(Box)) @compileError("covered_glyphs needs Box in App.config.draw");
+        if (!R.has(Glyph)) @compileError("covered_glyphs needs Glyph in App.config.draw");
+    }
+    const batches = cx.batch_list();
+    const glyphs = cx.items(Glyph);
+    var covered: u32 = 0;
+    for (batches, 0..) |batch, index| {
+        if (batch.type_id != comptime Draw.Registry.id(Glyph)) continue;
+        for (glyphs[batch.first..][0..batch.count]) |*glyph| {
+            if (glyph_covered(cx, glyph, batch.layer, batches[index + 1 ..])) covered += 1;
+        }
+    }
+    assert(covered <= glyphs.len);
+    return covered;
+}
+
+fn glyph_covered(cx: anytype, glyph: *const Glyph, layer: u8, later: []const Batch) bool {
+    const boxes = cx.items(Box);
+    for (later) |batch| {
+        if (batch.layer != layer) continue;
+        if (batch.type_id != comptime @TypeOf(cx.*).Registry.id(Box)) continue;
+        for (boxes[batch.first..][0..batch.count]) |*box| {
+            if (box_covers(box, glyph)) return true;
+        }
+    }
+    return false;
+}
+
+fn box_covers(box: *const Box, glyph: *const Glyph) bool {
+    if (box.fill[3] != 1) return false;
+    if (box.radius != 0 and @min(box.rect[2], box.rect[3]) < covered_side_min) return false;
+    const box_right = @min(box.rect[0] + box.rect[2], box.clip[2]);
+    const box_bottom = @min(box.rect[1] + box.rect[3], box.clip[3]);
+    const glyph_right = @min(glyph.rect[0] + glyph.rect[2], glyph.clip[2]);
+    const glyph_bottom = @min(glyph.rect[1] + glyph.rect[3], glyph.clip[3]);
+    const left = @max(@max(box.rect[0], box.clip[0]), @max(glyph.rect[0], glyph.clip[0]));
+    const top = @max(@max(box.rect[1], box.clip[1]), @max(glyph.rect[1], glyph.clip[1]));
+    return left < @min(box_right, glyph_right) and top < @min(box_bottom, glyph_bottom);
 }
 
 /// Writes the column-major projection from top-left, Y-down logical pixels to WebGPU NDC for
@@ -530,6 +582,96 @@ test "dirty_range covers changed records and a grown tail" {
     try std.testing.expectEqual(Range{ .first = 1, .end = 4 }, dirty_range(Record, &old, &two).?);
     const grown = records(8, null);
     try std.testing.expectEqual(Range{ .first = 6, .end = 8 }, dirty_range(Record, &old, &grown).?);
+}
+
+const audit_draw = [_]DrawType{
+    .{ .type = Box, .cap = 4 },
+    .{ .type = Glyph, .cap = 4 },
+};
+
+const AuditContext = Context(&audit_draw, 8, 0);
+
+fn audit_context() *AuditContext {
+    const static = struct {
+        var context: AuditContext = undefined;
+    };
+    static.context.init();
+    return &static.context;
+}
+
+fn audit_glyph() Glyph {
+    return .{
+        .rect = .{ 2, 2, 6, 10 },
+        .clip = .{ 0, 0, 200, 200 },
+        .uv = .{ 0, 0, 1, 1 },
+        .color = .{ 1, 1, 1, 1 },
+    };
+}
+
+fn audit_box(look: BoxLook) Box {
+    const rect: Rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 };
+    const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 200, .y1 = 200 };
+    return .of(rect, clip, look);
+}
+
+// Locks the audit's four worked cases: "#" at (0, 0) then a 100 x 100 opaque box on the base
+// layer counts 1; the box first counts 0; the glyph on a higher layer counts 0; a translucent
+// box counts 0. A second box over the same glyph still counts it once.
+test "covered_glyphs counts text an opaque later box hides" {
+    const opaque_look: BoxLook = .{ .fill = .{ 0, 0, 0, 1 } };
+    const after = audit_context();
+    try after.append(Glyph, .atlas, audit_glyph());
+    try after.append(Box, null, audit_box(opaque_look));
+    try after.append(Box, null, audit_box(opaque_look));
+    after.finalize();
+    try std.testing.expectEqual(@as(u32, 1), covered_glyphs(after));
+
+    const first = audit_context();
+    try first.append(Box, null, audit_box(opaque_look));
+    try first.append(Glyph, .atlas, audit_glyph());
+    first.finalize();
+    try std.testing.expectEqual(@as(u32, 0), covered_glyphs(first));
+
+    const higher = audit_context();
+    _ = higher.layer(.overlay);
+    try higher.append(Glyph, .atlas, audit_glyph());
+    _ = higher.layer(.base);
+    try higher.append(Box, null, audit_box(opaque_look));
+    higher.finalize();
+    try std.testing.expectEqual(@as(u32, 0), covered_glyphs(higher));
+
+    const translucent = audit_context();
+    try translucent.append(Glyph, .atlas, audit_glyph());
+    try translucent.append(Box, null, audit_box(.{ .fill = .{ 0, 0, 0, 0.5 } }));
+    translucent.finalize();
+    try std.testing.expectEqual(@as(u32, 0), covered_glyphs(translucent));
+}
+
+// Locks what else keeps a box from counting: a clip that ends before the glyph, a rounded box
+// under 8 px on a side (6 x 20 at radius 3), where the same box with square corners counts.
+test "covered_glyphs needs the overlap inside both clips and a box big enough to cover" {
+    const opaque_look: BoxLook = .{ .fill = .{ 0, 0, 0, 1 } };
+    const clipped = audit_context();
+    try clipped.append(Glyph, .atlas, audit_glyph());
+    var box = audit_box(opaque_look);
+    box.clip = .{ 50, 0, 200, 200 };
+    try clipped.append(Box, null, box);
+    clipped.finalize();
+    try std.testing.expectEqual(@as(u32, 0), covered_glyphs(clipped));
+
+    const small: Rect = .{ .x = 0, .y = 0, .width = 6, .height = 20 };
+    const window: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 200, .y1 = 200 };
+    const rounded = audit_context();
+    try rounded.append(Glyph, .atlas, audit_glyph());
+    try rounded.append(Box, null, .of(small, window, .{ .fill = .{ 0, 0, 0, 1 }, .radius = 3 }));
+    rounded.finalize();
+    try std.testing.expectEqual(@as(u32, 0), covered_glyphs(rounded));
+
+    const square = audit_context();
+    try square.append(Glyph, .atlas, audit_glyph());
+    try square.append(Box, null, .of(small, window, opaque_look));
+    square.finalize();
+    try std.testing.expectEqual(@as(u32, 1), covered_glyphs(square));
 }
 
 // Locks the array views in instance order and the inset constructors: `all`, `xy` (left and

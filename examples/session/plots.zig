@@ -167,8 +167,8 @@ pub fn slider(cx: anytype, rect: Rect, clip: Clip, value: f32, lo: f32, hi: f32,
 
 pub const fill_bins_max: u32 = 64;
 
-/// A filled spectrum over `rect`: one column per value from 0 up, then its outline on the
-/// over layer. `values.len` must divide the rect's width in device pixels.
+/// A filled spectrum over `rect`: one column per value from 0 up, then its outline, which
+/// `config.draw` puts over them. `values.len` must divide the rect's width in device pixels.
 pub fn fill(cx: anytype, rect: Rect, clip: Clip, values: []const f32, area: [4]f32, outline: [4]f32) void {
     assert(values.len >= 2 and values.len <= fill_bins_max);
     var columns: [fill_bins_max]quads.wave.Column = undefined;
@@ -179,9 +179,7 @@ pub fn fill(cx: anytype, rect: Rect, clip: Clip, values: []const f32, area: [4]f
         point.* = .{ x, rect.y + rect.height * (1 - value) };
     }
     _ = quads.wave.append(cx.drawing(), rect.array(), clip.array(), columns[0..values.len], .{ .color = area, .rms_color = null, .lo = 0, .hi = 1 });
-    const previous = cx.drawing().layer(look.over_layer);
     _ = kit.stroke(cx, points[0..values.len], clip, outline, 1.2);
-    _ = cx.drawing().layer(previous);
 }
 
 pub const upright_max: u32 = 96;

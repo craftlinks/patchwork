@@ -76,9 +76,9 @@
 //!   `zig build test-contract` compiles an app with no `draw`, an app whose draw type is not a
 //!   multiple of 16 bytes, an app whose draw type reads time without declaring `animated`, an
 //!   app that declares `Audio` without `audio`, a theme color out of range, a knob whose
-//!   skin lacks `knob`, overlays on a type without an overlay field, and an editor whose
-//!   language lacks `next`, and passes only if the compiler rejects each with its expected
-//!   message.
+//!   skin lacks `knob`, overlays on a type without an overlay field, an editor whose
+//!   language lacks `next`, and the batch audit without a `Box`, and passes only if the
+//!   compiler rejects each with its expected message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
@@ -818,6 +818,10 @@ fn add_test_steps(
             .path = "test/contract_language_missing.zig",
             .expected = "contract_language_missing.Bare: missing `pub fn next(line: []const u8, " ++
                 "at: *u32, state: *State) ?editor.Token(Class)`",
+        },
+        .{
+            .path = "test/contract_audit_no_box.zig",
+            .expected = "covered_glyphs needs Box in App.config.draw",
         },
     };
     for (contracts) |case| {

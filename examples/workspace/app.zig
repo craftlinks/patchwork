@@ -502,6 +502,8 @@ test "the workspace's default layout" {
     try expect_page(slot_log, 270, 535, 994, 153);
     try std.testing.expectEqual(app.dock.tab_id(panel_log).?, tab_target(slot_log, panel_log).id);
     try std.testing.expectEqualStrings("ready", app.status_text());
+    test_context.draw.finalize();
+    try std.testing.expectEqual(@as(u32, 0), quads.covered_glyphs(&test_context.draw));
 }
 
 // Locks the drop scenarios (section 1): log into the editor's centre joins its set; appearance
