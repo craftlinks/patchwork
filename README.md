@@ -44,6 +44,7 @@ Every example has `run-<name>`, `wasm-<name>` and `serve-<name>` steps:
 | `column` | One scrolling view of mixed controls |
 | `live` | Code editor with syntax colors |
 | `session` | Live-coding screen, rebuilt from photos with the public API only |
+| `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph |
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
 | `audio` | Audio meters and scope (silent natively, audible in the browser) |
 | `canvas` | Pan and zoom canvas |
@@ -103,7 +104,7 @@ Native flags: `<app> [--adapter low|high] [--no-cache] [--check] [--decorations 
 src/            library: draw, ui, widgets, text, editor, gpu
 src/host/       platform hosts: Wayland + wgpu-native (native_main), browser (web_main)
 web/            browser shell: shell.js, worklet.js, index.html
-examples/       eleven apps
+examples/       twelve apps
 test/golden/    frame hashes per adapter
 tools/          frame comparison, font subsetting
 docs/           reference manual

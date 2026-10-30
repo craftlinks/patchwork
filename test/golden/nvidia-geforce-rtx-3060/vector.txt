@@ -1,0 +1,9 @@
+# patchwork regress golden v1
+# adapter: NVIDIA GeForce RTX 3060
+# driver: 615.78.08
+# size: 1280x720 @120
+scenario  hash
+curtain   316da33052959088
+glyph     4681f460a66bf098
+morph     780bdc382dd89518
+still     7c889ed1a65ab696

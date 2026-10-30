@@ -3,22 +3,22 @@
 # driver: 615.78.08
 # size: 1280x720 @120
 scenario      hash
-bind-break    17643186ee544cc6
-bind-drag     8c6343069ee65b53
-bind-toggle   2cc04a5a4a0a6743
-bind-type     9f13da1e0aa8d24a
-bind-undo     97ddfc09ff6bf31d
+bind-break    f966c3894abb1cf4
+bind-drag     cf3f001801c14021
+bind-toggle   0a0522989ed9cb9d
+bind-type     e17a7830e458d752
+bind-undo     5536b1296407abaa
 edit          c050691e7f69569c
-keys          4fa57c1a8e47f257
-knobs         d1d36cc8c24b994a
-mix           bf29ee3079553b45
-play          a4186c646326ca7c
+keys          fc6a799699e85570
+knobs         3e2967e6593557a6
+mix           6330c6ccba311eb3
+play          ff106a7a4337af7a
 rename        ed0a307b5484d5c0
 reorder       69146f1a7129a9e8
 reorder-hold  85e2b8b7178c5db9
-reorder-undo  8ed1cccb3606c104
+reorder-undo  2b10f0024c9d4122
 scroll        d2ecc6d7e84aabcb
 section       eb640de0ac327e61
 select        6dc34a651b31a1c4
-still         97ddfc09ff6bf31d
+still         5536b1296407abaa
 undo          819d2ea053f22f72

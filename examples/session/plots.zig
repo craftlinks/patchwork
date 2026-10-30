@@ -10,11 +10,9 @@
 //! response   draw.Path of a two-pole low-pass on a log axis; faint decade ticks
 //! bars       two boxes (left and right) whose length follows decibels; a tick at 0 dB
 //! slider     a line with ticks and a box at the modulator's value
-//! fill       draw.Waveform columns from 0 to each bin (a filled area) and its outline
+//! fill       draw.Fill under the bins' curve, and its outline
 //! upright    a vertical draw.Path: a scope or a spectrum turned on its side
 //! ```
-//! The library has strokes and min/max columns but no filled shape (step 49), so an area
-//! under a curve is a `Waveform` whose columns run from 0 to the value.
 //!
 //! ## 2. TigerStyle Invariants
 //! - Stack buffers of named sizes; every loop is bounded by them.
@@ -167,19 +165,25 @@ pub fn slider(cx: anytype, rect: Rect, clip: Clip, value: f32, lo: f32, hi: f32,
 
 pub const fill_bins_max: u32 = 64;
 
-/// A filled spectrum over `rect`: one column per value from 0 up, then its outline, which
-/// `config.draw` puts over them. `values.len` must divide the rect's width in device pixels.
+/// A filled spectrum over `rect`: the region under one point per value, held flat out to the
+/// rect's sides, then its outline, which `config.draw` puts over it.
 pub fn fill(cx: anytype, rect: Rect, clip: Clip, values: []const f32, area: [4]f32, outline: [4]f32) void {
     assert(values.len >= 2 and values.len <= fill_bins_max);
-    var columns: [fill_bins_max]quads.wave.Column = undefined;
     var points: [fill_bins_max]Point = undefined;
-    for (values, columns[0..values.len], points[0..values.len], 0..) |value, *column, *point, index| {
-        column.* = .{ .min = 0, .max = value, .rms = 0 };
+    for (values, points[0..values.len], 0..) |value, *point, index| {
         const x = rect.x + rect.width * (@as(f32, @floatFromInt(index)) + 0.5) / @as(f32, @floatFromInt(values.len));
         point.* = .{ x, rect.y + rect.height * (1 - value) };
     }
-    _ = quads.wave.append(cx.drawing(), rect.array(), clip.array(), columns[0..values.len], .{ .color = area, .rms_color = null, .lo = 0, .hi = 1 });
-    _ = kit.stroke(cx, points[0..values.len], clip, outline, 1.2);
+    const curve = points[0..values.len];
+    const floor = rect.y + rect.height;
+    var shape: quads.fill.Builder = .init(1);
+    shape.move_to(.{ rect.x, floor });
+    shape.line_to(.{ rect.x, curve[0][1] });
+    for (curve) |point| shape.line_to(point);
+    shape.line_to(.{ rect.x + rect.width, curve[curve.len - 1][1] });
+    shape.line_to(.{ rect.x + rect.width, floor });
+    _ = quads.fill.append(cx.drawing(), &shape, .{ .color = area }, clip);
+    _ = kit.stroke(cx, curve, clip, outline, 1.2);
 }
 
 pub const upright_max: u32 = 96;
