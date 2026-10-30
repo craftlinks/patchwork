@@ -1245,18 +1245,21 @@ five-strip mixer (pan knobs with arcs from the top, send knobs,
 mute and solo, a scope, a fader with a stereo meter, a spectrum, readouts), and a card with a
 piano keyboard, the song's overview, and a transport. A section is a line starting `# `, found
 in the text, so typing `# Chorus` adds one, with a mark and a fold bracket, and a mark's state
-is kept by name. The mix body is typeset in one inline row under the line `# mix`: its numbers
-are formatted from the widgets every frame, so a fader rewrites `level = ...`, and binding them
-both ways is a job of its own. Deleting or renaming that line removes the panel until undo; the
-widgets keep their values. The editor has no gutter and is as tall as its content, so the
+and colour are kept by name. Dragging a heading's `#` moves its section: a ghost follows the
+pointer, a line shows the slot, Escape cancels, and the drop is one edit, so one Ctrl+Z restores
+the order. The mix body is typeset in one inline row under its section, `# mix` to
+begin with, which may be renamed: its numbers are formatted from the widgets every frame, so a
+fader rewrites `level = ...`, and binding them both ways is a job of its own. Deleting that
+heading removes the panel until undo or typing its name again; the widgets keep their values. The editor has no gutter and is as tall as its content, so the
 wheel scrolls the document through it; margin widgets anchor to `rect_of` by what a line starts
 with, so they follow an edit. While the editor has focus, Space and the tracker keys type. The
 view and the card follow the window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps.
 Scenarios: `still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
 `mix` (pads panned right, bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
 `keys` (E4 held, the mix section off), `edit` (a click after `saws` and typing), `select` (a
-double click in italics and Shift+Down), `undo`, `section` (`# chorus` typed at the end), and
-`rename` (a heading edited).
+double click in italics and Shift+Down), `undo`, `section` (`# chorus` typed at the end),
+`rename` (a heading edited), `reorder` (`# reverb tank` dragged above `# pad`), `reorder-hold`
+(the same, in flight), and `reorder-undo`.
 
 ## Drags Between Widgets
 
@@ -1911,6 +1914,9 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   rebuilds them on a new `revision()`. Rows are filled through
   `draw_begin` / `while (next_row(cx)) |slot|` / `draw_end`; `rect_of(byte)` is the
   character's unclamped logical rect for anchors and `viewport()` the box to clamp against.
+- **Programmatic edits.** `replace(range, utf8)` keeps the caret in the text around the range.
+  `replace_keeping(range, utf8, after)` takes the selection from the caller and keeps it in the
+  undo entry, for an edit that moves text, whose caret should move with it.
 
 ## Text
 

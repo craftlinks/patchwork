@@ -34,14 +34,27 @@
 //! ## 2a. Sections
 //! A section is a line starting "# ", found in the text on a new revision (`build_sections`), so
 //! typing "# Chorus" adds one. Its gap, rule, and mark hang off that line: inline rows reserve
-//! the gap and the rule's room, and `draw_chrome` draws at `rect_of`. Its mark's state is kept by
-//! name, so a section inserted above changes nothing, and its colour cycles.
+//! the gap and the rule's room, and `draw_chrome` draws at `rect_of`. Its mark's state and its
+//! colour are kept by name, so a section inserted above or moved changes nothing. A name not seen
+//! before inherits from the same place when the count held, so renaming keeps both, and a new
+//! section takes the next colour.
 //!
-//! The line that reads exactly "# mix" holds the mix body, in one inline row. Its numbers are
+//! One section holds the mix body, in one inline row: "# mix" to begin with, and whatever it is
+//! renamed to, because the body belongs to the section and not to its spelling. Its numbers are
 //! slots written from widgets every frame, so they cannot be text in the buffer. The row only
 //! reserves the room: the body draws after `draw_end`, in the view's clip, because its margin
-//! widgets lie left of the editor's viewport. Without that line there is no body, until undo
-//! brings it back; the widgets keep their values, because the app owns them.
+//! widgets lie left of the editor's viewport. Delete the heading and the body goes with it,
+//! until undo or typing the name again brings it back (`find_mix`); the widgets keep their
+//! values, because the app owns them.
+//!
+//! ## 2b. Moving a Section
+//! A section's "#" is a drag handle: its area sits above the editor's, so a press there never
+//! reaches the text and a click on the name still places the caret. Past `drag_start_px` the
+//! press becomes a drag between widgets (`ui/cx.zig`, section 7b), with a ghost of the heading at
+//! the pointer and a line at the slot it would land in. Slots lie between sections; `slot_ys`
+//! keeps where they were drawn. A drop is one edit (`sections.zig`), so one undo restores the
+//! order, and it gives the editor focus, so that undo reaches it. Marks, colours, brackets,
+//! margins, and the mix body move by themselves: they are found from the text.
 //!
 //! ## 3. Bindings
 //! Widgets own their values; the patch's text is formatted from them every frame (`code.Slots`,
@@ -73,6 +86,7 @@ const kit = widgets.kit;
 const look = @import("look.zig");
 const code = @import("code.zig");
 const patch = @import("patch.zig");
+const sections_file = @import("sections.zig");
 const signal = @import("signal.zig");
 const plots = @import("plots.zig");
 const fader_file = @import("fader.zig");
@@ -123,6 +137,10 @@ const rule_room: f32 = 4;
 /// A heading's line.
 const heading_h: f32 = patchwork.editor.line_height_of(patch, look.code_size * patch.scales[1]);
 const end_gap: f32 = 40;
+/// How far a press on a "#" travels before it is a drag.
+const drag_start_px: f32 = 4;
+/// How far a "#" handle reaches past its glyph on each side.
+const handle_slop: f32 = 4;
 
 const comp_box: f32 = 64;
 const comp_ring: f32 = 52;
@@ -322,6 +340,10 @@ fn solo_id(strip: u32) ui.Id {
 fn mark_id(section: u32) ui.Id {
     return ui.id("mark", section);
 }
+fn hash_id(section: u32) ui.Id {
+    return ui.id("hash", section);
+}
+const drop_id = ui.id("drop", 0);
 pub const editor_id = ui.id("editor", 0);
 const keyboard_id = ui.id("keyboard", 0);
 const play_id = ui.id("play", 0);
@@ -374,10 +396,26 @@ const Section = struct {
     /// The hash of its name, which keeps `enabled` across edits.
     name: u64,
     enabled: bool,
+    /// Its index into the cycle of `look.section_colors`.
+    colour: u8,
+    /// It holds the mix body (section 2a).
+    holds_mix: bool,
     line: u32,
 };
 
 const RowKind = enum { room, mix_body };
+
+/// A section whose colour is not settled yet, while `build_sections` runs.
+const no_colour: u8 = 255;
+
+/// What keeps a section across edits: its name, whatever its case or outer spaces.
+fn name_key(name: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (std.mem.trim(u8, name, " ")) |byte| {
+        hasher.update(&.{std.ascii.toLower(byte)});
+    }
+    return hasher.final();
+}
 
 pub const App = struct {
     view: ui.ViewState,
@@ -395,8 +433,18 @@ pub const App = struct {
     section_count: u32,
     /// The section that holds the mix body, if the text has one.
     mix_section: ?u32,
+    /// The name of the last section that held it.
+    mix_name: u64,
     row_kinds: [patchwork.editor.row_cap]RowKind,
     sections_revision: u64,
+    /// The colour the next new section takes.
+    colour_next: u8,
+    /// Where each slot was drawn (section 2b): the sections' tops, then the end of the text.
+    slot_ys: [section_cap + 1]f32,
+    /// Where a press on a "#" began.
+    grab: [2]f32,
+    /// The rebuilt bytes of a move.
+    move_scratch: [patchwork.editor.buffer.buffer_cap]u8,
     playing: bool,
     looping: bool,
     t: f32,
@@ -431,6 +479,9 @@ pub const App = struct {
         .{ .name = "undo", .setup = &undo_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "section", .setup = &section_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "rename", .setup = &rename_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "reorder", .setup = &reorder_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "reorder-hold", .setup = &hold_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "reorder-undo", .setup = &reorder_undo_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
@@ -464,7 +515,11 @@ pub const App = struct {
         app.editor.init(editor_id, editor_style());
         assert(app.editor.load(patch_text));
         app.section_count = 0;
+        app.colour_next = 0;
+        app.mix_name = name_key("mix");
         app.build_sections();
+        app.slot_ys = @splat(0);
+        app.grab = .{ 0, 0 };
         app.playing = false;
         app.looping = true;
         app.t = start_s;
@@ -501,6 +556,7 @@ pub const App = struct {
                 cx.redraw();
             }
         }
+        app.handle_move(cx, event_value);
         // A release still counts: its note may have started before the editor took focus.
         if (!(typing and event_value == .key_down)) _ = app.keyboard.handle(cx, event_value);
         if (kit.clicked(cx, play_id, event_value)) app.set_playing(cx, !app.playing);
@@ -518,6 +574,61 @@ pub const App = struct {
             },
             else => {},
         }
+    }
+
+    /// The press, drag, and drop of a section's "#" (section 2b).
+    fn handle_move(app: *App, cx: *Context, event_value: input.Event) void {
+        for (0..app.section_count) |index| {
+            const id = hash_id(@intCast(index));
+            switch (cx.hit(id, event_value)) {
+                .down => |press| app.grab = .{ press.x, press.y },
+                .drag => |press| {
+                    const moved = @abs(press.x - app.grab[0]) + @abs(press.y - app.grab[1]);
+                    if (cx.dragging() == null and moved >= drag_start_px) cx.drag_begin(id, index);
+                },
+                else => {},
+            }
+        }
+        switch (cx.drag_hit(drop_id, event_value)) {
+            .dropped => |over| {
+                if (!app.move_section(@intCast(over.payload), app.slot_of(over.y))) return;
+                cx.set_focus(editor_id);
+                cx.redraw();
+            },
+            else => {},
+        }
+    }
+
+    /// Moves section `index` to `slot` as one edit; false when that changes nothing or is
+    /// refused. The caret and selection travel with the text.
+    fn move_section(app: *App, index: u32, slot: u32) bool {
+        assert(index < app.section_count);
+        const editor = &app.editor;
+        var starts: [section_cap]u32 = undefined;
+        for (app.sections[0..app.section_count], 0..) |section, at| {
+            starts[at] = editor.buffer.line_range(section.line).start;
+        }
+        const text_now = editor.text();
+        const move = sections_file.plan(text_now, starts[0..app.section_count], index, slot, &app.move_scratch) orelse return false;
+        const after: patchwork.editor.buffer.Selection = .{ .caret = move.map(editor.caret), .anchor = move.map(editor.anchor) };
+        return editor.replace_keeping(.{ .start = move.range.start, .end = move.range.end }, move.bytes, after);
+    }
+
+    /// The slot nearest the window y `y`.
+    fn slot_of(app: *const App, y: f32) u32 {
+        var best: u32 = 0;
+        for (app.slot_ys[0 .. app.section_count + 1], 0..) |slot_y, slot| {
+            if (@abs(slot_y - y) < @abs(app.slot_ys[best] - y)) best = @intCast(slot);
+        }
+        return best;
+    }
+
+    /// The section a drag of ours is moving.
+    fn dragged_section(app: *const App, cx: *const Context) ?u32 {
+        const drag = cx.dragging() orelse return null;
+        if (drag.payload >= app.section_count) return null;
+        const index: u32 = @intCast(drag.payload);
+        return if (drag.source == hash_id(index)) index else null;
     }
 
     /// Keeps the caret in the view: the editor never scrolls itself (section 2).
@@ -559,6 +670,7 @@ pub const App = struct {
         var placed: Placed = .{};
         app.draw_editor(cx, &placed, sound);
         _ = cx.walk(ui.sized(.fill, .{ .fixed = end_gap }));
+        app.draw_drop(cx);
         app.draw_folds(cx, &placed);
         if (app.mix_section != null) {
             app.draw_connector(cx, &placed);
@@ -566,6 +678,7 @@ pub const App = struct {
         }
         cx.end_view();
         app.draw_card(cx, bottom_of(screen));
+        app.draw_ghost(cx);
         _ = cx.end();
         assert(cx.area_overflow == 0);
     }
@@ -620,13 +733,18 @@ pub const App = struct {
 
     // ------------------------------------------------------------------------ rows
 
-    /// A section's rule and mark, in the 44 px its heading sits in; `top` is the heading's top.
-    fn draw_chrome(app: *const App, cx: *Context, index: u32, top: f32) void {
-        const rect: Rect = .{ .x = 0, .y = top - rule_room, .width = rule_end + 16, .height = header_h };
+    /// A section's rule, mark, and handle, in the 44 px its heading sits in; `hash` is the
+    /// rect of the heading's "#".
+    fn draw_chrome(app: *const App, cx: *Context, index: u32, hash: Rect) void {
+        const rect: Rect = .{ .x = 0, .y = hash.y - rule_room, .width = rule_end + 16, .height = header_h };
         const clip = cx.visible(rect) orelse return;
+        var grab = ui.cx.plain;
+        grab.cursor = .grab;
+        const handle: Rect = .{ .x = hash.x - handle_slop, .y = hash.y, .width = hash.width + 2 * handle_slop, .height = hash.height };
+        cx.area(hash_id(index), handle, 0, grab);
         look.hline(cx, code_x, rule_end, rect.y + rect.height - 3, clip, look.rule);
         const on = app.sections[index].enabled;
-        const color = if (on) look.section_colors[index % look.section_colors.len] else look.faint;
+        const color = if (on) look.section_colors[app.sections[index].colour] else look.faint;
         const box: Rect = .{ .x = mark_x, .y = rect.y + 13, .width = 16, .height = 18 };
         kit.face(cx, box, clip, .{ .fill = look.background, .border_color = color, .border_width = 1.5, .radius = 1 });
         if (on) look.fill(cx, .{ .x = box.x + 7, .y = box.y + 5, .width = 2, .height = 8 }, clip, color);
@@ -710,28 +828,60 @@ pub const App = struct {
         const before = app.sections;
         const before_count = app.section_count;
         app.section_count = 0;
-        app.mix_section = null;
-        editor.row_count = 0;
         for (0..editor.buffer.line_count) |index| {
             const line: u32 = @intCast(index);
             const bytes = editor.buffer.line_bytes(line);
             if (patch.level_of(bytes) == 0 or app.section_count == section_cap) continue;
-            const name = std.mem.trim(u8, bytes[2..], " ");
-            const hash = std.hash.Wyhash.hash(0, name);
-            var enabled = true;
+            const key = name_key(bytes[2..]);
+            var section: Section = .{ .name = key, .enabled = true, .colour = no_colour, .holds_mix = false, .line = line };
             for (before[0..before_count]) |old| {
-                if (old.name == hash) enabled = old.enabled;
+                if (old.name != key) continue;
+                section.enabled = old.enabled;
+                section.colour = old.colour;
+                section.holds_mix = old.holds_mix;
             }
-            if (line > 0) app.add_row(line - 1, section_gap, .room);
-            app.add_row(line, rule_room, .room);
-            if (app.mix_section == null and std.mem.eql(u8, name, "mix")) {
-                app.mix_section = app.section_count;
-                app.add_row(line, mix_body_h, .mix_body);
-            }
-            app.sections[app.section_count] = .{ .name = hash, .enabled = enabled, .line = line };
+            app.sections[app.section_count] = section;
             app.section_count += 1;
         }
+        // A name not seen: the same place if the count held, a rename; else a new section.
+        for (app.sections[0..app.section_count], 0..) |*section, index| {
+            if (section.colour != no_colour) continue;
+            if (before_count == app.section_count) {
+                section.enabled = before[index].enabled;
+                section.colour = before[index].colour;
+                section.holds_mix = before[index].holds_mix;
+            } else {
+                section.colour = app.colour_next;
+                app.colour_next = @intCast((app.colour_next + 1) % look.section_colors.len);
+            }
+        }
+        app.find_mix();
+        editor.row_count = 0;
+        for (app.sections[0..app.section_count], 0..) |section, index| {
+            if (section.line > 0) app.add_row(section.line - 1, section_gap, .room);
+            app.add_row(section.line, rule_room, .room);
+            if (app.mix_section == @as(u32, @intCast(index))) app.add_row(section.line, mix_body_h, .mix_body);
+        }
         app.sections_revision = editor.revision();
+    }
+
+    /// The section that holds the mix body: the one that had it, else the first of its last
+    /// name, so undoing a deleted heading or typing it again brings the panel back.
+    fn find_mix(app: *App) void {
+        app.mix_section = null;
+        for (app.sections[0..app.section_count], 0..) |*section, index| {
+            if (section.holds_mix and app.mix_section != null) section.holds_mix = false;
+            if (section.holds_mix) app.mix_section = @intCast(index);
+        }
+        if (app.mix_section == null) {
+            for (app.sections[0..app.section_count], 0..) |*section, index| {
+                if (section.name != app.mix_name) continue;
+                section.holds_mix = true;
+                app.mix_section = @intCast(index);
+                break;
+            }
+        }
+        if (app.mix_section) |index| app.mix_name = app.sections[index].name;
     }
 
     fn add_row(app: *App, after_line: u32, height: f32, kind: RowKind) void {
@@ -763,7 +913,8 @@ pub const App = struct {
             if (next < app.section_count and app.sections[next].line == line) {
                 section = next;
                 next += 1;
-                app.draw_chrome(cx, section.?, top.y);
+                app.slot_ys[section.?] = top.y;
+                app.draw_chrome(cx, section.?, top);
                 continue;
             }
             const rect: Rect = .{ .x = 0, .y = top.y, .width = rule_end, .height = top.height };
@@ -774,8 +925,42 @@ pub const App = struct {
             const clip = cx.visible(rect) orelse continue;
             app.draw_margin(cx, margin_of(editor.buffer.line_bytes(line)), 1, rect, clip, sound);
         }
+        const last = editor.buffer.line_count - 1;
+        const bottom = editor.rect_of(editor.buffer.line_range(last).start);
+        app.slot_ys[app.section_count] = bottom.y + bottom.height;
         app.draw_veils(cx, placed);
         if (mix_top) |y| app.draw_mix(cx, y, placed, sound);
+    }
+
+    /// While a section is dragged: the drop's area, and a line where it would land.
+    fn draw_drop(app: *const App, cx: *Context) void {
+        const index = app.dragged_section(cx) orelse return;
+        const port = app.view.viewport;
+        cx.area(drop_id, port, 0, ui.cx.drag_target_flag);
+        const slot = app.slot_of(cx.dragging().?.y);
+        if (sections_file.unchanged(index, slot)) return;
+        const clip = cx.clip() orelse return;
+        const gap = if (slot > 0 and slot < app.section_count) section_gap * 0.5 else 0;
+        const color = look.section_colors[app.sections[index].colour];
+        const previous = cx.drawing().layer(look.over_layer);
+        look.fill(cx, .{ .x = code_x, .y = app.slot_ys[slot] - gap - 1, .width = rule_end - code_x, .height = 2 }, clip, color);
+        _ = cx.drawing().layer(previous);
+    }
+
+    /// The dragged section's heading at the pointer, above everything.
+    fn draw_ghost(app: *const App, cx: *Context) void {
+        const index = app.dragged_section(cx) orelse return;
+        const clip = cx.clip() orelse return;
+        const drag = cx.dragging().?;
+        const bytes = app.editor.buffer.line_bytes(app.sections[index].line);
+        const previous = cx.drawing().layer(.popup);
+        const style = look.style(.serif_bold, look.code_size * patch.scales[1], look.ink);
+        const box: Rect = .{ .x = drag.x + 12, .y = drag.y - heading_h * 0.5, .width = text.measure(style, bytes), .height = heading_h };
+        // On a plate, or the ghost is a smear over the heading it passes.
+        const plate: Rect = .{ .x = box.x - 8, .y = box.y - 2, .width = box.width + 16, .height = box.height + 4 };
+        look.fill(cx, plate, clip, look.with_alpha(look.cell, 0.9));
+        kit.label(cx, style, bytes, box, clip, look.start);
+        _ = cx.drawing().layer(previous);
     }
 
     /// The typeset mix body, where its inline row put it (section 2a).
@@ -1226,6 +1411,23 @@ const rename_steps = [_]bench.Step{
     .{ .key = .{ .key = .other, .text = "2" } },
     .{ .wait = 4 },
 };
+const tank_hash: bench.Target = bench.area("hash", 3);
+/// `# reverb tank`'s "#" taken up the screen to above `# pad`, held there.
+const hold_tank: bench.Drag = .{ .target = tank_hash, .from_x = 6, .from_y = 18, .dx = 0, .dy = -270 };
+const hold_steps = [_]bench.Step{
+    .{ .wheel = .{ .target = .{ .id = view_id, .name = "view", .index = 0 }, .dx = 0, .dy = 700 } },
+    .{ .wait = 2 },
+    .{ .hold = hold_tank },
+    .{ .wait = 2 },
+};
+const reorder_steps = hold_steps ++ [_]bench.Step{
+    .{ .release = .{ .target = tank_hash, .x = 6, .y = 18 - 270 } },
+    .{ .wait = 4 },
+};
+const reorder_undo_steps = reorder_steps ++ [_]bench.Step{
+    .{ .key = .{ .key = .z, .text = "", .mods = with_ctrl } },
+    .{ .wait = 4 },
+};
 /// A word typed after `saws` and taken back: the text is the starting text, the caret stays.
 const undo_steps = [_]bench.Step{
     .{ .wheel = .{ .target = .{ .id = view_id, .name = "view", .index = 0 }, .dx = 0, .dy = 700 } },
@@ -1266,6 +1468,7 @@ test {
     _ = look;
     _ = code;
     _ = patch;
+    _ = sections_file;
     _ = signal;
     _ = plots;
     _ = fader_file;
@@ -1293,7 +1496,10 @@ fn scenario_app(name: []const u8) !*App {
     const app = new_app();
     frame(app);
     const scenario = bench.find(App.scenarios, name).?;
-    _ = try bench.replay_headless(App, app, &test_context, scenario, .{ 1280, 720 }, @intCast(scenario.setup.len + 1));
+    // A wait takes its frames from the limit, so count them or the last steps never run.
+    var steps_limit: u32 = 1;
+    for (scenario.setup) |step| steps_limit += if (step == .wait) step.wait else 1;
+    _ = try bench.replay_headless(App, app, &test_context, scenario, .{ 1280, 720 }, steps_limit);
     frame(app);
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
     try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
@@ -1507,7 +1713,7 @@ fn insert_section(app: *App, name: []const u8, before: []const u8) void {
 }
 
 // Locks a section's state by name: pad turned off stays off when a section is inserted above it,
-// though its index moved, and renaming it turns it back on.
+// though its index moved.
 test "a section stays off across edits around it" {
     const app = new_app();
     frame(app);
@@ -1520,8 +1726,8 @@ test "a section stays off across edits around it" {
     try std.testing.expectEqual(@as(u32, 5), app.section_count);
 }
 
-// Locks the mix body as the text's: it follows its heading, and leaves and returns with it, its
-// widgets keeping their values; a second "# mix" is an ordinary section.
+// Locks the mix body as a section's: it leaves and returns with its heading, its widgets keeping
+// their values, and a second "# mix" is an ordinary section.
 test "the mix body follows its heading" {
     const app = new_app();
     frame(app);
@@ -1542,6 +1748,53 @@ test "the mix body follows its heading" {
     try std.testing.expectEqual(@as(u32, 5), app.section_count);
 }
 
+fn set_heading(app: *App, line: u32, heading: []const u8) void {
+    const range = app.editor.buffer.line_range(line);
+    assert(app.editor.replace(.{ .start = range.start, .end = range.end }, heading));
+    frame(app);
+}
+
+// Locks the bug a rename of "# mix" was: the panel stays through a change of case, a new name,
+// and every step of retyping it, and it stays when the section is then moved. A section keeps
+// it by what it is, not how it is spelled.
+test "renaming the mix section keeps its panel" {
+    const app = new_app();
+    frame(app);
+    const height = app.editor.content_height();
+    for ([_][]const u8{ "# Mix", "# M", "# ", "# master bus" }) |heading| {
+        set_heading(app, 0, heading);
+        try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
+        try std.testing.expect(test_context.find(fader_id(0)) != null);
+        try std.testing.expectEqual(height, app.editor.content_height());
+    }
+    try std.testing.expect(app.move_section(0, 2));
+    frame(app);
+    try std.testing.expectEqual(@as(?u32, 1), app.mix_section);
+    try std.testing.expect(test_context.find(fader_id(0)) != null);
+}
+
+// Locks getting the panel back: deleting a renamed heading drops it; undo restores it; and with
+// the line gone, typing its last name again brings it back, in any case.
+test "the panel comes back with its section's name" {
+    const app = new_app();
+    frame(app);
+    set_heading(app, 0, "# Bus");
+    const range = app.editor.buffer.line_range(0);
+    try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end + 1 }, ""));
+    frame(app);
+    try std.testing.expectEqual(@as(?u32, null), app.mix_section);
+    try std.testing.expect(app.editor.buffer.undo() != null);
+    frame(app);
+    try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
+    const again = app.editor.buffer.line_range(0);
+    try std.testing.expect(app.editor.replace(.{ .start = again.start, .end = again.end + 1 }, ""));
+    frame(app);
+    try std.testing.expectEqual(@as(?u32, null), app.mix_section);
+    insert_section(app, "# BUS\n", "# osc");
+    try std.testing.expect(app.mix_section != null);
+    try std.testing.expect(test_context.find(fader_id(0)) != null);
+}
+
 // Locks deleting a heading: its lines join the section before, whose fold bracket grows.
 test "deleting a heading merges its lines into the section before" {
     const app = new_app();
@@ -1551,4 +1804,119 @@ test "deleting a heading merges its lines into the section before" {
     try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end + 1 }, ""));
     frame(app);
     try std.testing.expectEqual(@as(u32, 3), app.section_count);
+}
+
+// Locks the reorder scenario: `# reverb tank` dropped above `# pad` moves its whole section, gives
+// the editor focus, and leaves four sections in the new order.
+test "dragging a heading's hash moves its section" {
+    const app = try scenario_app("reorder");
+    const text_now = app.editor.text();
+    const tank = std.mem.indexOf(u8, text_now, "# reverb tank").?;
+    const pad = std.mem.indexOf(u8, text_now, "# pad").?;
+    try std.testing.expect(tank < pad);
+    try std.testing.expect(std.mem.endsWith(u8, text_now, "env.gate;\n}"));
+    try std.testing.expectEqual(patch_text.len, text_now.len);
+    try std.testing.expectEqual(@as(u32, 4), app.section_count);
+    try std.testing.expect(test_context.focused(editor_id));
+}
+
+// Locks the undo of a move: one Ctrl+Z restores the text byte for byte.
+test "one undo restores the order" {
+    const app = try scenario_app("reorder-undo");
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+}
+
+// Locks the wheel and Escape in flight: the wheel still scrolls the document during a drag, and
+// Escape ends the drag with nothing moved, the release that follows included.
+test "a held drag scrolls and Escape cancels it" {
+    const app = try scenario_app("reorder-hold");
+    try std.testing.expect(app.dragged_section(&test_context) != null);
+    const before = app.view.scroll_y;
+    deliver(app, .{ .wheel = .{ .x = 400, .y = 300, .dx = 0, .dy = -30 } });
+    try std.testing.expectEqual(before - 30, app.view.scroll_y);
+    frame(app);
+    deliver(app, .{ .key_down = key_press(.escape, "", .none) });
+    try std.testing.expectEqual(@as(?u32, null), app.dragged_section(&test_context));
+    deliver(app, .{ .pointer_up = input.left_at(.{ .x = 200, .y = 200 }) });
+    frame(app);
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+}
+
+// Locks the handle against the text: a click on the "#" moves nothing and places no caret, and a
+// click on the name beside it still does.
+test "the hash is a handle and the name is text" {
+    const app = new_app();
+    frame(app);
+    frame(app);
+    const handle = test_context.find(hash_id(0)).?;
+    const on_hash: input.Point = .{ .x = handle.rect[0] + 4, .y = handle.rect[1] + 10 };
+    deliver(app, .{ .pointer_move = on_hash });
+    deliver(app, .{ .pointer_down = input.left_at(on_hash) });
+    deliver(app, .{ .pointer_up = input.left_at(on_hash) });
+    try std.testing.expect(!test_context.focused(editor_id));
+    const on_name: input.Point = .{ .x = handle.rect[0] + 45, .y = on_hash.y };
+    deliver(app, .{ .pointer_move = on_name });
+    deliver(app, .{ .pointer_down = input.left_at(on_name) });
+    deliver(app, .{ .pointer_up = input.left_at(on_name) });
+    try std.testing.expect(test_context.focused(editor_id));
+    try std.testing.expect(app.editor.caret > 0);
+}
+
+// Locks what travels with a section: a caret stays on its word, a section off stays off under its
+// name, and a slot beside the section makes no edit.
+test "a move carries the caret and the section's state" {
+    const app = new_app();
+    frame(app);
+    const revision = app.editor.revision();
+    try std.testing.expect(!app.move_section(2, 2));
+    try std.testing.expect(!app.move_section(2, 3));
+    try std.testing.expectEqual(revision, app.editor.revision());
+    const word: u32 = @intCast(std.mem.indexOf(u8, app.editor.text(), "diffused :=").?);
+    app.editor.caret = word;
+    app.editor.anchor = word;
+    app.sections[3].enabled = false;
+    try std.testing.expect(app.move_section(3, 1));
+    frame(app);
+    try std.testing.expect(std.mem.startsWith(u8, app.editor.text()[app.editor.caret..], "diffused :="));
+    try std.testing.expect(!app.sections[1].enabled);
+    try std.testing.expect(app.sections[2].enabled);
+}
+
+// Locks the mix panel in a move: moved below `# osc` the body follows its heading, its widgets
+// keep working, and its fader's value is untouched.
+test "the mix panel moves like any section" {
+    const app = new_app();
+    frame(app);
+    const fader = app.strips[0].fader.value;
+    const top = test_context.find(fader_id(0)).?.rect[1];
+    try std.testing.expect(app.move_section(0, 2));
+    frame(app);
+    frame(app);
+    try std.testing.expectEqual(@as(?u32, 1), app.mix_section);
+    const moved = test_context.find(fader_id(0)).?;
+    try std.testing.expect(moved.rect[1] > top);
+    try std.testing.expectEqual(fader, app.strips[0].fader.value);
+    try std.testing.expect(std.mem.startsWith(u8, app.editor.text(), "# osc\n"));
+}
+
+// Locks a section's colour as its own: a move keeps each mark's colour, a rename keeps its colour
+// and its state letter by letter, and a new section takes the next colour.
+test "a section keeps its colour through moves and renames" {
+    const app = new_app();
+    frame(app);
+    const tank_colour = app.sections[3].colour;
+    const pad_colour = app.sections[2].colour;
+    try std.testing.expect(tank_colour != pad_colour);
+    try std.testing.expect(app.move_section(3, 2));
+    frame(app);
+    try std.testing.expectEqual(tank_colour, app.sections[2].colour);
+    try std.testing.expectEqual(pad_colour, app.sections[3].colour);
+    app.sections[2].enabled = false;
+    insert_section(app, "x", " tank");
+    insert_section(app, "y", " tank");
+    try std.testing.expectEqual(tank_colour, app.sections[2].colour);
+    try std.testing.expect(!app.sections[2].enabled);
+    insert_section(app, "# chorus\n", "# pad");
+    try std.testing.expectEqual(@as(u8, 0), app.sections[3].colour);
+    try std.testing.expectEqual(pad_colour, app.sections[4].colour);
 }
