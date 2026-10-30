@@ -738,7 +738,7 @@ fn glyph_width(font: *const ttf.Font, codepoint: u21, size: f32) f32 {
     return units_to_logical(units, size, font.units_per_em);
 }
 
-fn units_to_logical(units: u32, size: f32, units_per_em: u32) f32 {
+pub fn units_to_logical(units: u32, size: f32, units_per_em: u32) f32 {
     assert(units_per_em >= 1);
     const em: f32 = @floatFromInt(units_per_em);
     return @as(f32, @floatFromInt(units)) * size / em;
@@ -1112,6 +1112,28 @@ test "lines outside the clip append nothing" {
     const band: draw.Clip = .{ .x0 = 0, .y0 = 14, .x1 = 100, .y1 = 28 };
     place_wrapped(cx, mono_10, "the quick brown fox", rect, band, .{});
     try testing.expectEqual(@as(usize, 5), cx.items(types.Glyph).len);
+}
+
+// Locks `text.run_cap`: 64 runs of one byte place like the 64 bytes as one run.
+test "a line of 64 runs places like one run" {
+    const bytes: [text.run_cap]u8 = @splat('a');
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 900, .height = 24 };
+    const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 900, .y1 = 24 };
+    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
+    const style: text.Style = .{ .face = .sans, .size = 15, .color = .{ 1, 1, 1, 1 } };
+    const cx = test_context(120);
+    place(cx, style, &bytes, rect, clip, options);
+    var whole: [64]types.Glyph = undefined;
+    @memcpy(&whole, cx.items(types.Glyph));
+    cx.reset();
+    var runs: [text.run_cap]text.Run = undefined;
+    for (&runs, 0..) |*run, index| run.* = .{ .style = style, .bytes = bytes[index..][0..1] };
+    place_runs(cx, &runs, rect, clip, options);
+    try testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(&whole),
+        std.mem.sliceAsBytes(cx.items(types.Glyph)),
+    );
 }
 
 // Locks one-line equality (section 2b): in a rect one line high, a wrapped line writes the

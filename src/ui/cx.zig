@@ -445,6 +445,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// Set for a view: its state, id, viewport, and the walk and rect in its parent.
         view: ?*ViewState,
         view_id: Id,
+        /// The view's own area in `areas`, or null when it stored none.
+        view_area: ?u32,
         viewport: Rect,
         outer_walk: turtle.Walk,
         outer_rect: Rect,
@@ -971,7 +973,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         }
 
         /// `begin_view` whose own area carries `flags` (which take the wheel): a list box makes
-        /// its view focusable, so Tab reaches it and its keys follow focus.
+        /// its view focusable, so Tab reaches it and its keys follow focus. A view with nothing
+        /// to scroll drops the wheel flag, so the wheel reaches the view around it.
         pub fn begin_view_with(
             self: *Self,
             id: Id,
@@ -990,6 +993,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             const viewport = inset(rect, layout.padding);
             state.viewport = viewport;
             state.scroll_y = std.math.clamp(state.scroll_y, 0, state.max_scroll());
+            const first_area = self.area_count;
             if (viewport.width > 0 and viewport.height > 0) {
                 self.area(id, viewport, 0, flags);
             }
@@ -1007,6 +1011,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             var entry = self.entry_of(turtle.root(content, inner), clipped);
             entry.view = state;
             entry.view_id = id;
+            entry.view_area = if (self.area_count > first_area) first_area else null;
             entry.viewport = viewport;
             entry.outer_walk = child;
             entry.outer_rect = rect;
@@ -1026,7 +1031,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.depth -= 1;
             const parent = self.top();
             turtle.advance(&parent.turtle, entry.outer_walk, entry.outer_rect);
-            if (!(state.max_scroll() > 0)) return;
+            if (!(state.max_scroll() > 0)) {
+                // Only now is this frame's content known, so a first frame scrolls at once.
+                if (entry.view_area) |index| self.areas[index].flags.wheel = false;
+                return;
+            }
             if (!(state.viewport.height > 0)) return;
             const thumb = state.thumb_rect();
             const outer = parent.clip orelse return;
@@ -2026,6 +2035,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .clip_total = self.clip_total,
                 .view = null,
                 .view_id = .none,
+                .view_area = null,
                 .viewport = value.rect,
                 .outer_walk = value.walk,
                 .outer_rect = value.rect,
@@ -2289,6 +2299,37 @@ test "end_frame reports hover that a redraw moved" {
 // Locks the virtualized list: in a 240 px view of 1,000 rows of 24 px scrolled to 100, only
 // rows 4 to 14 emit boxes and areas, the measured content is the whole list, the thumb draws
 // with its area, a wheel over a row scrolls the view, and the next frame clamps the offset.
+// Locks the wheel of nested views: an inner view whose content fits has `max_scroll` 0 and leaves
+// the wheel to the outer view; once its content is 400 px in a 100 px view it keeps the wheel.
+test "a view with nothing to scroll leaves the wheel to its parent" {
+    const context = new_context();
+    const outer_id = areas.id("outer", 0);
+    const inner_id = areas.id("inner", 0);
+    var outer = ViewState.init();
+    var inner = ViewState.init();
+    outer.content_h = 1000;
+    for ([_]f32{ 50, 400 }) |content| {
+        var frame: u32 = 0;
+        while (frame < 2) : (frame += 1) {
+            context.begin_frame(400, 300, 120);
+            const down = flow_of(.down);
+            _ = context.begin_view(outer_id, sized(.fill, .{ .fixed = 300 }), down, &outer);
+            _ = context.begin_view(inner_id, sized(.fill, .{ .fixed = 100 }), down, &inner);
+            context.skip(content);
+            context.end_view();
+            context.skip(900);
+            context.end_view();
+            _ = context.end_frame();
+        }
+        const wheel: input.Event = .{ .wheel = .{ .x = 20, .y = 20, .dx = 0, .dy = 10 } };
+        context.event_begin(wheel);
+        const want = if (content == 50) outer_id else inner_id;
+        try testing.expectEqual(want, context.wheel);
+        context.event_end();
+    }
+    try testing.expectEqual(@as(f32, 300), inner.max_scroll());
+}
+
 test "a 1,000-row list emits only visible rows" {
     const context = new_context();
     const list: view.List = .{ .row_height = 24, .count = 1000 };

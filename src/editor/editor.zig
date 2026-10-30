@@ -1,5 +1,6 @@
-//! The code editor widget: a buffer drawn on the monospace grid in a scrolling view, with a
-//! caret, selection, keys, clipboard, undo, decorations, and inline rows.
+//! The code editor widget: a buffer drawn on the monospace grid, or in a language's own faces,
+//! in a scrolling view, with a caret, selection, keys, clipboard, undo, decorations, and inline
+//! rows.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -27,7 +28,25 @@
 //! `column(b)` counts the codepoints from the line start (the buffer holds no tabs), so it
 //! is O(column); `line_of` is a binary search and `line_top` adds at most `row_cap` rows:
 //! `rect_of` is O(log lines + column + rows). The rect is unclamped: a byte scrolled out
-//! lies outside `viewport()`, and an app anchoring to it clamps.
+//! lies outside `viewport()`, and an app anchoring to it clamps. `style.gutter` off drops the
+//! numbers: `gutter_w` is 0 and `text_left` is `viewport.x + padding_px`.
+//!
+//! In a language with `faces` (section 8) a line is a sum of advances, so "column to x" is a
+//! table instead of a multiplication; a mono editor stores none of it (test "a mono editor pays
+//! nothing for proportional faces").
+//! ```text
+//!                mono                         proportional
+//! x of a byte    column * adv                 pens[line][column] when visible, else a walk
+//! x to a byte    round(x / adv)               walk until pen + advance / 2 > x
+//! goal           a column                     an x
+//! widest line    (longest + 1) * adv          widest_px(), a walk of the text per revision
+//! lh             text/mono.zig                text/faces.zig: the faces' largest
+//! ```
+//! `pens` is filled at the top of `draw_begin` for the visible lines, from each line's cached
+//! state, and read wherever a rect is made, so a decoration stays O(1). It belongs to one
+//! revision and size: between an edit and the next draw, `x_of` walks the line instead. The
+//! gutter stays on the mono grid, so digits align. `rect_of`'s width is the codepoint's advance,
+//! a space's at a line's end, and at least 1 for a mark that advances nothing.
 //!
 //! ## 3. Scrolling
 //! Vertical: the step 14 view (`ViewState`): the wheel's `dy`, the thumb, and a measured
@@ -37,7 +56,8 @@
 //! the buffer's longest line; there is no horizontal thumb. Every caret move and edit keeps
 //! the caret visible both ways (`follow`). Dragging a selection past an edge selects what
 //! lies there but does not scroll, because scrolling would need frames while the pointer
-//! rests.
+//! rests. A view with no height to scroll leaves the wheel alone (`ui/view.zig`, section 3),
+//! so the editor's own area takes it while there is a horizontal range.
 //!
 //! ## 4. Drawing (per frame, visible lines only)
 //! ```text
@@ -56,7 +76,9 @@
 //!                         + digits_max)                        x in (clip.x0 - 2 adv, x1)
 //! ```
 //! Both are callable at compile time, so an app sizes its glyph pool by its editors'
-//! largest viewports (`glyph_max` is the bound for a viewport of any size). Boxes
+//! largest viewports (`glyph_max` is the bound for a viewport of any size). In proportional
+//! faces a width bounds no columns, so `glyph_bound_of(L, w, h, s)` allows each drawn line
+//! `columns_max`, and the slop left of the clip is `2 * s`, for italic overhang. Boxes
 //! appended before the first glyph put the base layer's box batch under its glyph batch.
 //! The caret is steady and nothing animates, so an idle editor never wakes the host.
 //!
@@ -98,10 +120,11 @@
 //! `EditorOf(L)` checks `L` against the contract in `language.zig` at compile time (a named
 //! compile error, like a skin) and keeps `L.State` per line in its `BufferOf(L)`. The
 //! language decides the states, the classes, their default colours (`L.palette`, which
-//! `default_palette` puts over the chrome colours), and the tokens. It cannot change the
-//! grid: one column per codepoint, and a gap between tokens is spaces, one column per byte
-//! (asserted in safe builds). Colours are per instance: an app may set `style.palette` at
-//! any time. `default_palette` suits a dark scheme and `light_palette` a light one (the
+//! `default_palette` puts over the chrome colours), and the tokens. Columns are not its to
+//! change: one per codepoint, and a gap between tokens is spaces, one column per byte (asserted
+//! in safe builds). An optional `L.faces` sets each class in its own face, which changes where
+//! a column lands and nothing else (section 2). Colours are per instance: an app may set
+//! `style.palette` at any time. `default_palette` suits a dark scheme and `light_palette` a light one (the
 //! language's optional `palette_light` over a light chrome); an app sets one when its scheme
 //! changes. The editor never reads the theme itself.
 
@@ -141,9 +164,13 @@ pub const glyph_max: u32 = lines_max * (columns_max + digits_max);
 /// Lines one draw shows at most in a viewport `height` logical pixels tall at text `size`:
 /// those whose tops fall inside it, plus the one the top edge cuts. At most `lines_max`.
 pub fn lines_bound(height: f32, size: f32) u32 {
+    return lines_of_pitch(height, mono_grid.line_height_of(size));
+}
+
+fn lines_of_pitch(height: f32, pitch: f32) u32 {
     assert(height >= 0);
-    assert(size > 0);
-    const fit = @min(height / mono_grid.line_height_of(size), @as(f32, lines_max));
+    assert(pitch > 0);
+    const fit = @min(height / pitch, @as(f32, lines_max));
     return @min(lines_max, @as(u32, @intFromFloat(@floor(fit))) + 2);
 }
 
@@ -157,6 +184,32 @@ pub fn glyph_bound(width: f32, height: f32, size: f32) u32 {
     const fit = @min(width / mono_grid.advance_of(size), @as(f32, columns_max));
     const columns = @min(columns_max, @as(u32, @intFromFloat(@floor(fit))) + 3);
     const bound = lines_bound(height, size) * (columns + digits_max);
+    assert(bound <= glyph_max);
+    return bound;
+}
+
+/// The face tables of language `L`: a `text.FaceSet` when `L` declares `faces`, else nothing.
+fn FacesOf(comptime L: type) type {
+    return if (language.proportional(L)) text.FaceSet(&L.faces) else void;
+}
+
+/// The line pitch of language `L` at `size`. Callable at compile time.
+pub fn line_height_of(comptime L: type, size: f32) f32 {
+    if (comptime language.proportional(L)) return FacesOf(L).line_height_of(size);
+    return mono_grid.line_height_of(size);
+}
+
+/// `lines_bound` for language `L`, whose pitch comes from its faces (section 4).
+pub fn lines_bound_of(comptime L: type, height: f32, size: f32) u32 {
+    return lines_of_pitch(height, line_height_of(L, size));
+}
+
+/// `glyph_bound` for language `L`. A width bounds no columns in proportional faces, where an
+/// "i" is a quarter of an em, so each drawn line may take `columns_max` (section 4).
+pub fn glyph_bound_of(comptime L: type, width: f32, height: f32, size: f32) u32 {
+    if (comptime !language.proportional(L)) return glyph_bound(width, height, size);
+    assert(width >= 0);
+    const bound = lines_bound_of(L, height, size) * (columns_max + digits_max);
     assert(bound <= glyph_max);
     return bound;
 }
@@ -199,6 +252,8 @@ pub fn StyleOf(comptime L: type) type {
     return struct {
         size: f32,
         palette: PaletteOf(L),
+        /// False: no line numbers, and the text starts `padding_px` into the viewport.
+        gutter: bool = true,
     };
 }
 
@@ -269,12 +324,85 @@ const Visible = struct {
     tops: [lines_max]f32,
 };
 
+/// What a proportional editor keeps of its lines' x (section 2): the pens of the visible lines
+/// and the widest line. A mono editor has none of it.
+const Pens = struct {
+    /// Each visible line's pens, relative to column 0: `x[offset][column]`.
+    x: [lines_max][columns_max + 1]f32,
+    /// Pens per visible line: its codepoints plus one, at most `columns_max + 1`.
+    counts: [lines_max]u16,
+    first: u32,
+    lines: u32,
+    /// The text and size the table was filled for; an edit outdates it until the next draw.
+    revision: u64,
+    size: f32,
+    /// The widest line in pixels, and the text and size it was measured for.
+    widest: f32,
+    widest_revision: u64,
+    widest_size: f32,
+    /// Walks of the whole text, which one revision pays once.
+    widest_walks: u32,
+};
+
+/// One codepoint of a line in a proportional walk: bytes `byte .. end` of the line.
+const Cell = struct {
+    byte: u32,
+    end: u32,
+    codepoint: u21,
+    /// `L.Class` as a number; a gap between tokens is class 0 (`language.zig`, section 2).
+    class: u8,
+    gap: bool,
+};
+
+/// Walks a line codepoint by codepoint, gaps included, from its cached start state.
+fn LineWalk(comptime L: type) type {
+    return struct {
+        const Self = @This();
+
+        bytes: []const u8,
+        state: L.State,
+        at: u32 = 0,
+        byte: u32 = 0,
+        token: ?language.Token(L.Class) = null,
+        spent: bool = false,
+
+        fn next(self: *Self) ?Cell {
+            assert(self.byte <= self.bytes.len);
+            if (self.byte == self.bytes.len) return null;
+            if (self.token == null and !self.spent) {
+                self.token = L.next(self.bytes, &self.at, &self.state);
+                self.spent = self.token == null;
+            }
+            const start = self.byte;
+            if (self.token) |token| {
+                if (start >= token.start) {
+                    const codepoint = layout.decode(self.bytes, &self.byte);
+                    if (self.byte >= token.end) self.token = null;
+                    return .{
+                        .byte = start,
+                        .end = self.byte,
+                        .codepoint = codepoint,
+                        .class = @backingInt(token.class),
+                        .gap = false,
+                    };
+                }
+            }
+            self.byte += 1;
+            return .{ .byte = start, .end = self.byte, .codepoint = ' ', .class = 0, .gap = true };
+        }
+    };
+}
+
 /// The editor of language `L` (`language.zig`; section 8). `L` is checked at compile time.
 pub fn EditorOf(comptime L: type) type {
     if (comptime language.check(L)) |problem| @compileError(problem);
+    const proportional = language.proportional(L);
     return struct {
         const Self = @This();
         const Buffer = buffer_module.BufferOf(L);
+        const Faces = FacesOf(L);
+        /// What Up and Down aim for: a column on the grid, an x in proportional faces.
+        const Goal = if (proportional) f32 else u32;
 
         /// The language this editor colours.
         pub const Language = L;
@@ -323,8 +451,8 @@ pub fn EditorOf(comptime L: type) type {
         buffer: Buffer,
         caret: u32,
         anchor: u32,
-        /// The column Up and Down aim for, kept across vertical moves.
-        goal: ?u32,
+        /// What Up and Down aim for, kept across vertical moves.
+        goal: ?Goal,
         view: ui.ViewState,
         scroll_x: f32,
         decorations: [decoration_cap]Decoration,
@@ -336,6 +464,8 @@ pub fn EditorOf(comptime L: type) type {
         /// Paste sanitizing and load staging.
         scratch: [buffer_module.buffer_cap]u8,
         mono: mono_grid.Mono,
+        faces: Faces,
+        pens: if (proportional) Pens else void,
         geometry: Geometry,
         pass: Pass,
 
@@ -363,6 +493,12 @@ pub fn EditorOf(comptime L: type) type {
                 .drawn = false,
             };
             self.pass = .{ .open = false, .empty = true, .next_row = 0 };
+            if (comptime proportional) {
+                self.pens.lines = 0;
+                self.pens.size = 0;
+                self.pens.widest_size = 0;
+                self.pens.widest_walks = 0;
+            }
             assert(self.buffer.len == 0);
         }
 
@@ -435,11 +571,10 @@ pub fn EditorOf(comptime L: type) type {
             assert(byte <= self.buffer.len);
             const g = self.geometry;
             const line = self.buffer.line_of(byte);
-            const column: f32 = @floatFromInt(self.column_of(byte));
             const rect: Rect = .{
-                .x = g.text_left - self.scroll_x + column * self.advance(),
+                .x = g.text_left - self.scroll_x + self.x_of(line, byte),
                 .y = g.viewport.y - self.view.scroll_y + self.line_top(line),
-                .width = self.advance(),
+                .width = self.width_at(line, byte),
                 .height = self.line_height(),
             };
             assert(rect.width > 0);
@@ -512,9 +647,11 @@ pub fn EditorOf(comptime L: type) type {
                     return self.paste(cx, pasted);
                 },
                 .wheel => {
-                    switch (cx.hit(self.view_id(), event)) {
-                        .wheel => |wheel| self.scroll_by(cx, wheel),
-                        else => {},
+                    for ([_]Id{ self.view_id(), self.id }) |target| {
+                        switch (cx.hit(target, event)) {
+                            .wheel => |wheel| self.scroll_by(cx, wheel),
+                            else => {},
+                        }
                     }
                     return .none;
                 },
@@ -681,14 +818,20 @@ pub fn EditorOf(comptime L: type) type {
             assert(edit.is_boundary(self.text(), self.caret));
         }
 
-        /// The byte `lines` lines away at the goal column, which the first vertical move sets.
+        /// The byte `lines` lines away at the goal, which the first vertical move sets.
         fn vertical_target(self: *Self, lines: i32) u32 {
-            const goal = self.goal orelse self.column_of(self.caret);
+            const goal = self.goal orelse self.goal_now();
             self.goal = goal;
             const line: i64 = @as(i64, self.caret_line()) + lines;
             if (line < 0) return 0;
             if (line >= self.buffer.line_count) return self.buffer.len;
+            if (comptime proportional) return self.byte_at_x(@intCast(line), goal);
             return self.byte_of_column(@intCast(line), goal);
+        }
+
+        fn goal_now(self: *const Self) Goal {
+            if (comptime proportional) return self.x_of(self.caret_line(), self.caret);
+            return self.column_of(self.caret);
         }
 
         fn type_text(self: *Self, cx: anytype, typed: []const u8) Action {
@@ -849,10 +992,12 @@ pub fn EditorOf(comptime L: type) type {
             if (top - padding_px < scroll_y) scroll_y = top - padding_px;
             if (bottom > scroll_y + g.viewport.height) scroll_y = bottom - g.viewport.height;
             self.view.scroll_y = std.math.clamp(scroll_y, 0, self.view.max_scroll());
-            const x = @as(f32, @floatFromInt(self.column_of(self.caret))) * self.advance();
+            const line = self.caret_line();
+            const x = self.x_of(line, self.caret);
+            const width = self.width_at(line, self.caret);
             if (x < self.scroll_x) self.scroll_x = x;
-            if (x + self.advance() > self.scroll_x + g.text_width) {
-                self.scroll_x = x + self.advance() - g.text_width;
+            if (x + width > self.scroll_x + g.text_width) {
+                self.scroll_x = x + width - g.text_width;
             }
             self.scroll_x = std.math.clamp(self.scroll_x, 0, self.scroll_x_max());
             assert(self.view.scroll_y >= 0);
@@ -865,8 +1010,136 @@ pub fn EditorOf(comptime L: type) type {
             return mono_grid.advance_of(self.style.size);
         }
 
+        /// The space between the gutter's right edge and column 0.
+        fn lead(self: *const Self) f32 {
+            return if (self.style.gutter) self.advance() * 0.5 else padding_px;
+        }
+
         fn line_height(self: *const Self) f32 {
-            return mono_grid.line_height_of(self.style.size);
+            return line_height_of(L, self.style.size);
+        }
+
+        /// The device row of the baseline of a line whose top is `top`.
+        fn baseline_of(self: *const Self, top: f32) f32 {
+            if (comptime proportional) return self.faces.baseline_of(top);
+            return self.mono.baseline_of(top);
+        }
+
+        fn device_scale(self: *const Self) f32 {
+            if (comptime proportional) return self.faces.scale;
+            return self.mono.scale;
+        }
+
+        fn line_walk(self: *const Self, line: u32) LineWalk(L) {
+            return .{ .bytes = self.buffer.line_bytes(line), .state = self.buffer.states[line] };
+        }
+
+        fn cell_advance(self: *const Self, cell: Cell) f32 {
+            return self.faces.advance(Faces.slots[cell.class], cell.codepoint);
+        }
+
+        /// A space of `faces[0]`: what a gap is made of, and the column past a line's end.
+        fn space_advance(self: *const Self) f32 {
+            return self.faces.advance(0, ' ');
+        }
+
+        /// The x of `byte` on `line`, relative to column 0 (section 2).
+        pub fn x_of(self: *const Self, line: u32, byte: u32) f32 {
+            const range = self.buffer.line_range(line);
+            assert(byte >= range.start);
+            assert(byte <= range.end);
+            return self.x_of_column(line, codepoints(self.text()[range.start..byte]));
+        }
+
+        /// The x of codepoint column `column` of `line`; past its end, columns of spaces.
+        fn x_of_column(self: *const Self, line: u32, column: u32) f32 {
+            if (comptime !proportional) return @as(f32, @floatFromInt(column)) * self.advance();
+            const pens = &self.pens;
+            const current = pens.revision == self.buffer.revision and pens.size == self.style.size;
+            if (current and line >= pens.first and line - pens.first < pens.lines) {
+                const offset = line - pens.first;
+                const count = pens.counts[offset];
+                if (column < count) return pens.x[offset][column];
+                // A table that stopped short of `columns_max` holds the whole line.
+                if (count <= columns_max) {
+                    const past: f32 = @floatFromInt(column - count + 1);
+                    return pens.x[offset][count - 1] + past * self.space_advance();
+                }
+            }
+            var walk = self.line_walk(line);
+            var pen: f32 = 0;
+            var at: u32 = 0;
+            while (walk.next()) |cell| : (at += 1) {
+                if (at == column) return pen;
+                pen += self.cell_advance(cell);
+            }
+            return pen + @as(f32, @floatFromInt(column - at)) * self.space_advance();
+        }
+
+        /// The width of the codepoint at `byte`, or of a space at the line's end; at least 1,
+        /// because `rect_of` promises a rect and a mark advances nothing.
+        fn width_at(self: *const Self, line: u32, byte: u32) f32 {
+            if (comptime !proportional) return self.advance();
+            const range = self.buffer.line_range(line);
+            const column = codepoints(self.text()[range.start..byte]);
+            return @max(1, self.x_of_column(line, column + 1) - self.x_of_column(line, column));
+        }
+
+        /// The byte of `line` nearest the x `x`, relative to column 0: the walk stops at the
+        /// first codepoint whose middle lies right of it, as `@round` does on the grid.
+        pub fn byte_at_x(self: *const Self, line: u32, x: f32) u32 {
+            comptime assert(proportional);
+            const range = self.buffer.line_range(line);
+            var walk = self.line_walk(line);
+            var pen: f32 = 0;
+            while (walk.next()) |cell| {
+                const width = self.cell_advance(cell);
+                if (pen + width * 0.5 > x) return range.start + cell.byte;
+                pen += width;
+            }
+            return range.end;
+        }
+
+        /// Fills the pens of the visible lines, at most `columns_max` columns each.
+        fn fill_pens(self: *Self, visible: *const Visible) void {
+            comptime assert(proportional);
+            const pens = &self.pens;
+            pens.first = visible.first;
+            pens.lines = visible.count;
+            for (0..visible.count) |offset| {
+                var walk = self.line_walk(visible.first + @as(u32, @intCast(offset)));
+                const row = &pens.x[offset];
+                row[0] = 0;
+                var count: u16 = 1;
+                while (count <= columns_max) : (count += 1) {
+                    const cell = walk.next() orelse break;
+                    row[count] = row[count - 1] + self.cell_advance(cell);
+                }
+                pens.counts[offset] = count;
+            }
+            pens.revision = self.buffer.revision;
+            pens.size = self.style.size;
+        }
+
+        /// The widest line in pixels: a walk of the whole text, once per revision and size.
+        pub fn widest_px(self: *Self) f32 {
+            comptime assert(proportional);
+            const pens = &self.pens;
+            const current = pens.widest_revision == self.buffer.revision and
+                pens.widest_size == self.style.size;
+            if (current) return pens.widest;
+            var most: f32 = 0;
+            for (0..self.buffer.line_count) |line| {
+                var walk = self.line_walk(@intCast(line));
+                var pen: f32 = 0;
+                while (walk.next()) |cell| pen += self.cell_advance(cell);
+                most = @max(most, pen);
+            }
+            pens.widest = most;
+            pens.widest_revision = self.buffer.revision;
+            pens.widest_size = self.style.size;
+            pens.widest_walks += 1;
+            return most;
         }
 
         fn caret_line(self: *const Self) u32 {
@@ -905,7 +1178,9 @@ pub fn EditorOf(comptime L: type) type {
         fn byte_at(self: *const Self, x: f32, y: f32) u32 {
             const g = self.geometry;
             const line = self.line_at(y - g.viewport.y + self.view.scroll_y);
-            const column = @round((x - g.text_left + self.scroll_x) / self.advance());
+            const offset = x - g.text_left + self.scroll_x;
+            if (comptime proportional) return self.byte_at_x(line, offset);
+            const column = @round(offset / self.advance());
             return self.byte_of_column(line, @intFromFloat(@max(0, column)));
         }
 
@@ -949,15 +1224,19 @@ pub fn EditorOf(comptime L: type) type {
             return @intFromFloat(std.math.clamp(lines, 0, last));
         }
 
-        fn content_height(self: *const Self) f32 {
+        /// The height of every line and row with the padding (section 2).
+        pub fn content_height(self: *const Self) f32 {
             var rows: f32 = 0;
             for (self.rows[0..self.row_count]) |row| rows += row.height;
             const lines: f32 = @floatFromInt(self.buffer.line_count);
             return 2 * padding_px + lines * self.line_height() + rows;
         }
 
-        fn scroll_x_max(self: *const Self) f32 {
-            const wide = @as(f32, @floatFromInt(self.buffer.longest + 1)) * self.advance();
+        fn scroll_x_max(self: *Self) f32 {
+            const wide = if (comptime proportional)
+                self.widest_px() + self.space_advance()
+            else
+                @as(f32, @floatFromInt(self.buffer.longest + 1)) * self.advance();
             return @max(0, wide - self.geometry.text_width);
         }
 
@@ -979,13 +1258,17 @@ pub fn EditorOf(comptime L: type) type {
             self.view.content_h = self.content_height();
             const port = cx.begin_view(self.view_id(), walk, ui.flow_of(.down), &self.view);
             self.pass = .{ .open = true, .empty = true, .next_row = 0 };
-            self.mono.prepare(cx.drawing(), self.style.size);
+            // The grid draws the gutter's numbers whatever the text is set in.
+            const drawing = cx.drawing();
+            if (!proportional or self.style.gutter) self.mono.prepare(drawing, self.style.size);
+            if (comptime proportional) self.faces.prepare(drawing, self.style.size);
             const digits = @max(3, digit_count(self.buffer.line_count));
-            const gutter = @as(f32, @floatFromInt(digits + 2)) * self.advance();
+            const columns: f32 = @floatFromInt(digits + 2);
+            const gutter = if (self.style.gutter) columns * self.advance() else 0;
             self.geometry = .{
                 .viewport = port,
-                .text_left = port.x + gutter + self.advance() * 0.5,
-                .text_width = @max(0, port.width - gutter - self.advance() * 0.5 - view.gutter_px),
+                .text_left = port.x + gutter + self.lead(),
+                .text_width = @max(0, port.width - gutter - self.lead() - view.gutter_px),
                 .gutter_width = gutter,
                 .drawn = true,
             };
@@ -995,13 +1278,17 @@ pub fn EditorOf(comptime L: type) type {
             const clip = cx.clip() orelse return;
             if (!(port.width > 0) or !(port.height > 0)) return;
             self.pass.empty = false;
-            cx.area(self.id, port, 0, flags);
+            // A view with no height to scroll drops the wheel, and `dx` still needs it.
+            var own = flags;
+            own.wheel = self.scroll_x_max() > 0;
+            cx.area(self.id, port, 0, own);
             var visible: Visible = undefined;
             self.visible_lines(&visible);
+            if (comptime proportional) self.fill_pens(&visible);
             self.draw_faces(cx, clip, &visible, cx.focused(self.id));
             self.draw_decorations(cx, clip, &visible, false);
             const glyphs = self.draw_text(cx, clip, &visible);
-            assert(glyphs <= glyph_bound(port.width, port.height, self.style.size));
+            assert(glyphs <= glyph_bound_of(L, port.width, port.height, self.style.size));
             const previous = cx.drawing().layer(over_layer);
             self.draw_decorations(cx, clip, &visible, true);
             if (cx.focused(self.id)) self.draw_caret(cx, clip, &visible);
@@ -1025,7 +1312,7 @@ pub fn EditorOf(comptime L: type) type {
                 assert(span > -0.01);
                 cx.skip(@max(0, span));
                 // From the gutter's right edge to the thumb's gutter, like the text clip.
-                const width = g.text_width + self.advance() * 0.5;
+                const width = g.text_width + self.lead();
                 var walk = ui.sized(.{ .fixed = width }, .{ .fixed = height });
                 walk.margin.left = g.gutter_width;
                 return .{ .index = index, .walk = walk, .rect = cx.peek(walk) };
@@ -1096,7 +1383,7 @@ pub fn EditorOf(comptime L: type) type {
                 .height = g.viewport.height,
             };
             push_box(cx, g.viewport, clip, palette.background);
-            push_box(cx, gutter, clip, palette.gutter);
+            if (self.style.gutter) push_box(cx, gutter, clip, palette.gutter);
             const text_clip = self.clip_text(clip) orelse return;
             const range = self.selection();
             const current = self.caret_line();
@@ -1113,7 +1400,7 @@ pub fn EditorOf(comptime L: type) type {
                     push_box(cx, band, text_clip, palette.current_line);
                 }
                 const span = self.line_span(line, range.start, range.end, true) orelse continue;
-                push_box(cx, self.span_rect(span, top), text_clip, palette.selection);
+                push_box(cx, self.span_rect(line, span, top), text_clip, palette.selection);
             }
         }
 
@@ -1132,9 +1419,18 @@ pub fn EditorOf(comptime L: type) type {
             return .{ first, last };
         }
 
-        fn span_rect(self: *const Self, columns: [2]u32, top: f32) Rect {
+        fn span_rect(self: *const Self, line: u32, columns: [2]u32, top: f32) Rect {
             assert(columns[1] > columns[0]);
             const x0 = self.geometry.text_left - self.scroll_x;
+            if (comptime proportional) {
+                const left = self.x_of_column(line, columns[0]);
+                return .{
+                    .x = x0 + left,
+                    .y = top,
+                    .width = self.x_of_column(line, columns[1]) - left,
+                    .height = self.line_height(),
+                };
+            }
             const first: f32 = @floatFromInt(columns[0]);
             const count: f32 = @floatFromInt(columns[1] - columns[0]);
             return .{
@@ -1151,7 +1447,7 @@ pub fn EditorOf(comptime L: type) type {
             const area: Rect = .{
                 .x = g.viewport.x + g.gutter_width,
                 .y = g.viewport.y,
-                .width = g.text_width + self.advance() * 0.5,
+                .width = g.text_width + self.lead(),
                 .height = g.viewport.height,
             };
             return ui.cx.intersect(clip, area);
@@ -1181,7 +1477,7 @@ pub fn EditorOf(comptime L: type) type {
                 while (line <= to) : (line += 1) {
                     const found = self.line_span(line, decoration.start, decoration.end, false);
                     const span = found orelse continue;
-                    const rect = self.span_rect(span, visible.tops[line - visible.first]);
+                    const rect = self.span_rect(line, span, visible.tops[line - visible.first]);
                     self.draw_decoration(cx, decoration.kind, rect, text_clip);
                 }
             }
@@ -1237,14 +1533,17 @@ pub fn EditorOf(comptime L: type) type {
                 .width = g.gutter_width,
                 .height = g.viewport.height,
             };
-            const gutter_clip = ui.cx.intersect(clip, gutter_area);
+            const gutter_clip = if (self.style.gutter)
+                ui.cx.intersect(clip, gutter_area)
+            else
+                null;
             const text_clip = self.clip_text(clip);
             const current = self.caret_line();
             const palette = &self.style.palette;
             var emitted: u32 = 0;
             for (0..visible.count) |offset| {
                 const line = visible.first + @as(u32, @intCast(offset));
-                const baseline = self.mono.baseline_of(visible.tops[offset]);
+                const baseline = self.baseline_of(visible.tops[offset]);
                 if (gutter_clip) |numbers| {
                     const now = line == current;
                     const color = if (now) palette.gutter_current else palette.gutter_text;
@@ -1252,14 +1551,18 @@ pub fn EditorOf(comptime L: type) type {
                     emitted += self.draw_number(cx, line + 1, baseline, paint);
                 }
                 if (text_clip) |cells| {
-                    emitted += emit_line(L, &self.mono, cx.drawing(), .{
+                    const job: LineJob(L) = .{
                         .bytes = self.buffer.line_bytes(line),
                         .state = self.buffer.states[line],
                         .left = g.text_left - self.scroll_x,
                         .baseline_px = baseline,
                         .clip = cells,
                         .palette = &palette.classes,
-                    });
+                    };
+                    emitted += if (comptime proportional)
+                        emit_line_faces(L, &self.faces, cx.drawing(), job)
+                    else
+                        emit_line(L, &self.mono, cx.drawing(), job);
                 }
             }
             return emitted;
@@ -1289,9 +1592,8 @@ pub fn EditorOf(comptime L: type) type {
             const line = self.caret_line();
             if (line < visible.first or line >= visible.first + visible.count) return;
             const text_clip = self.clip_text(clip) orelse return;
-            const scale = self.mono.scale;
-            const column: f32 = @floatFromInt(self.column_of(self.caret));
-            const x = self.geometry.text_left - self.scroll_x + column * self.advance();
+            const scale = self.device_scale();
+            const x = self.geometry.text_left - self.scroll_x + self.x_of(line, self.caret);
             const caret: Rect = .{
                 .x = @round(x * scale) / scale - 1 / scale,
                 .y = visible.tops[line - visible.first],
@@ -1352,6 +1654,29 @@ fn emit_line(comptime L: type, grid: *const mono_grid.Mono, cx: anytype, job: Li
             emitted += 1;
             if (emitted == columns_max) return emitted;
         }
+    }
+    return emitted;
+}
+
+/// `emit_line` in proportional faces: each token's class picks its slot and the pen is a sum of
+/// advances. Gaps advance and draw nothing. The slop left of the clip is `2 * size`, for wide
+/// glyphs and italic overhang. Returns the glyphs emitted.
+fn emit_line_faces(comptime L: type, faces: *const FacesOf(L), cx: anytype, job: LineJob(L)) u32 {
+    assert(job.clip.x1 > job.clip.x0);
+    const slop = 2 * faces.size;
+    var walk: LineWalk(L) = .{ .bytes = job.bytes, .state = job.state };
+    var pen = job.left;
+    var emitted: u32 = 0;
+    while (walk.next()) |cell| {
+        const slot = FacesOf(L).slots[cell.class];
+        const x = pen;
+        pen += faces.advance(slot, cell.codepoint);
+        if (x >= job.clip.x1) return emitted;
+        if (cell.gap or x + slop <= job.clip.x0) continue;
+        const paint: mono_grid.Paint = .{ .clip = job.clip, .color = job.palette[cell.class] };
+        faces.emit(cx, slot, cell.codepoint, x, job.baseline_px, paint);
+        emitted += 1;
+        if (emitted == columns_max) return emitted;
     }
     return emitted;
 }
@@ -1765,6 +2090,47 @@ test "wheels scroll both ways and replace keeps the caret" {
     try testing.expectEqual(@as(u32, 1), editor.buffer.entry_count);
 }
 
+// Locks `Style.gutter` off: no gutter box and no numbers, column 0 at the viewport's left plus
+// `padding_px`, and an inline row from the viewport's left edge, its width the text clip's.
+test "an editor without a gutter starts at the padding" {
+    const editor = test_fresh("ab\ncd\n");
+    editor.style.gutter = false;
+    editor.rows[0] = .{ .after_line = 0, .height = 40 };
+    editor.row_count = 1;
+    const context = &fixture.context;
+    context.begin_frame(800, 600, 120);
+    editor.draw_begin(context, ui.sized(.fill, .fill));
+    const slot = editor.next_row(context).?;
+    try testing.expectEqual(@as(f32, 0), slot.rect.x);
+    try testing.expectEqual(@as(f32, 800 - 16), slot.rect.width);
+    editor.draw_end(context);
+    _ = context.end_frame();
+    try testing.expectEqual(@as(f32, padding_px), editor.rect_of(0).x);
+    try testing.expectEqual(@as(usize, 4), context.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(f32, 0), editor.geometry.gutter_width);
+}
+
+// Locks the wheel of a text that fits its height: the view has nothing to scroll and drops the
+// wheel, and a long line keeps it through the editor's own area, so `dx` still scrolls; with
+// no range either way the editor takes no wheel at all, leaving it to a view around it.
+test "a short editor scrolls sideways and leaves the rest of the wheel alone" {
+    var long: [101]u8 = @splat('x');
+    long[100] = '\n';
+    const editor = test_fresh(&long);
+    _ = test_frame(400, 300);
+    _ = test_frame(400, 300);
+    try testing.expectEqual(@as(f32, 0), editor.view.max_scroll());
+    const wheel: input.Wheel = .{ .x = 200, .y = 100, .dx = 30, .dy = 0 };
+    _ = test_send(.{ .wheel = wheel });
+    try testing.expectEqual(@as(f32, 30), editor.scroll_x);
+    const short = test_fresh("x\n");
+    _ = test_frame(400, 300);
+    _ = test_frame(400, 300);
+    _ = test_send(.{ .wheel = wheel });
+    try testing.expectEqual(@as(f32, 0), short.scroll_x);
+    try testing.expectEqual(ui.Id.none, fixture.context.wheel);
+}
+
 // Locks inline rows: the iterator offers the visible row with a walk that lands it right
 // under its line and right of the gutter, the app fills it with its own container, and the
 // view still measures the whole content.
@@ -1790,4 +2156,196 @@ test "inline rows are handed to the app in place" {
     editor.draw_end(context);
     _ = context.end_frame();
     try testing.expectEqual(@as(f32, 2 * 4 + 4 * 21 + 80), editor.view.content_h);
+}
+
+/// A language in a narrow and a wide face: words in sans, numbers on the mono face's 9 px.
+const Pair = struct {
+    pub const State = Duo.State;
+    pub const Class = Duo.Class;
+    pub const palette = Duo.palette;
+    pub const faces: [2]text.Face = .{ .sans, .mono };
+    pub const next = Duo.next;
+};
+
+const PairEditor = EditorOf(Pair);
+
+const pair_fixture = struct {
+    var editor: PairEditor = undefined;
+};
+
+fn pair_fresh(utf8: []const u8) *PairEditor {
+    fixture.context.init();
+    const editor = &pair_fixture.editor;
+    editor.init(test_id, PairEditor.default_style);
+    assert(editor.load(utf8));
+    return editor;
+}
+
+fn pair_frame(width: u32, height: u32) *TestContext {
+    const context = &fixture.context;
+    context.begin_frame(width, height, 120);
+    pair_fixture.editor.draw(context, ui.sized(.fill, .fill));
+    _ = context.end_frame();
+    return context;
+}
+
+fn pair_send(event: input.Event) Action {
+    const context = &fixture.context;
+    context.event_begin(event);
+    const action = pair_fixture.editor.handle(context, event);
+    context.event_end();
+    return action;
+}
+
+fn pair_key(name: input.Key, mods: input.Mods) Action {
+    return pair_send(.{ .key_down = input.key_press(name, mods, false, "") });
+}
+
+// Locks the seam of section 2: on a line of both classes every boundary round-trips through
+// `x_of` and `byte_at_x`, a number's digits are 9 px apart, a word's "i" is narrower, a click
+// left of a glyph's middle lands before it and right of it after, and past the end is the end.
+test "x_of and byte_at_x round trip on every boundary of a mixed line" {
+    const line = "if 12 il 7w";
+    const editor = pair_fresh(line);
+    _ = pair_frame(800, 300);
+    var byte: u32 = 0;
+    while (byte <= line.len) : (byte += 1) {
+        try testing.expectEqual(byte, editor.byte_at_x(0, editor.x_of(0, byte)));
+    }
+    try testing.expectEqual(@as(f32, 9), editor.x_of(0, 4) - editor.x_of(0, 3));
+    try testing.expect(editor.x_of(0, 1) < 9);
+    const left = editor.x_of(0, 3);
+    const middle = left + 4.5;
+    try testing.expectEqual(@as(u32, 3), editor.byte_at_x(0, middle - 0.5));
+    try testing.expectEqual(@as(u32, 4), editor.byte_at_x(0, middle + 0.5));
+    try testing.expectEqual(@as(u32, line.len), editor.byte_at_x(0, 1e6));
+    try testing.expectEqual(@as(u32, 0), editor.byte_at_x(0, -5));
+}
+
+// Locks every helper against `x_of`: a rect's x and width, a selection band over a gap and into
+// the newline's extra column, a box decoration, and the caret. The pens agree with the walk
+// past `columns_max`, where a line outruns the table.
+test "rects, spans, decorations, and the caret follow the pens" {
+    const editor = pair_fresh("word 12 w\nnext\n");
+    _ = pair_frame(800, 300);
+    const left = editor.geometry.text_left;
+    const rect = editor.rect_of(5);
+    try testing.expectEqual(left + editor.x_of(0, 5), rect.x);
+    try testing.expectEqual(@as(f32, 9), rect.width);
+    try testing.expectApproxEqAbs(editor.space_advance(), editor.rect_of(9).width, 0.001);
+    try testing.expectEqual(editor.x_of(0, 9) + editor.space_advance(), editor.x_of_column(0, 10));
+    const band = editor.span_rect(0, editor.line_span(0, 2, 12, true).?, 4);
+    try testing.expectEqual(left + editor.x_of(0, 2), band.x);
+    try testing.expectEqual(editor.x_of_column(0, 10) - editor.x_of(0, 2), band.width);
+    editor.decorations[0] = .{ .start = 5, .end = 7, .kind = .strike };
+    editor.decoration_count = 1;
+    editor.caret = 7;
+    editor.anchor = 7;
+    test_focus_pair(editor);
+    const context = pair_frame(800, 300);
+    var found_strike = false;
+    var found_caret = false;
+    for (context.draw.items(draw.Box)) |box| {
+        if (std.meta.eql(box.fill, editor.style.palette.strike)) {
+            found_strike = true;
+            try testing.expectEqual(left + editor.x_of(0, 5), box.rect[0]);
+            try testing.expectEqual(@as(f32, 18), box.rect[2]);
+        }
+        if (std.meta.eql(box.fill, editor.style.palette.caret)) {
+            found_caret = true;
+            try testing.expectEqual(@round(left + editor.x_of(0, 7)) - 1, box.rect[0]);
+        }
+    }
+    try testing.expect(found_strike and found_caret);
+    var long: [260]u8 = @splat('i');
+    long[259] = '\n';
+    const wide = pair_fresh(&long);
+    _ = pair_frame(800, 300);
+    const walked = wide.x_of(0, 250);
+    try testing.expectApproxEqAbs(@as(f32, 250) * wide.x_of(0, 1), walked, 0.01);
+    try testing.expectEqual(@as(u32, 250), wide.byte_at_x(0, walked));
+}
+
+fn test_focus_pair(editor: *PairEditor) void {
+    const point: input.Point = .{ .x = 700, .y = 200 };
+    const saved = [2]u32{ editor.caret, editor.anchor };
+    _ = pair_send(.{ .pointer_move = point });
+    _ = pair_send(.{ .pointer_down = input.left_at(point) });
+    _ = pair_send(.{ .pointer_up = input.left_at(point) });
+    editor.caret = saved[0];
+    editor.anchor = saved[1];
+}
+
+// Locks a stale table: an edit moves the text before any draw, and `x_of` walks the new text
+// instead of reading the last frame's pens, here the 9 px of a digit typed at the start.
+test "x_of after an edit does not read last frame's pens" {
+    const editor = pair_fresh("iii");
+    _ = pair_frame(800, 300);
+    const before = editor.x_of(0, 3);
+    try testing.expect(editor.replace(.{ .start = 0, .end = 0 }, "7 "));
+    try testing.expectEqual(9 + editor.space_advance() + before, editor.x_of(0, 5));
+}
+
+// Locks the goal as an x: from the end of a long word line, Down lands on the column nearest the
+// same x on a line of wide digits, not the same column; the short line in between clamps the
+// caret and keeps the goal; a horizontal move clears it.
+test "up and down keep their x across a short line" {
+    const editor = pair_fresh("iiiiiiiiiiii\ni\n7777777777\n");
+    _ = pair_frame(800, 300);
+    editor.caret = 12;
+    editor.anchor = 12;
+    test_focus_pair(editor);
+    const x = editor.x_of(0, 12);
+    _ = pair_key(.down, .none);
+    try testing.expectEqual(@as(u32, 14), editor.caret);
+    try testing.expectEqual(@as(?f32, x), editor.goal);
+    _ = pair_key(.down, .none);
+    try testing.expectEqual(editor.byte_at_x(2, x), editor.caret);
+    try testing.expect(editor.caret - 15 < 12);
+    _ = pair_key(.left, .none);
+    try testing.expectEqual(@as(?f32, null), editor.goal);
+}
+
+// Locks the measured range of section 3: `widest_px` follows an edit, a load, and a size change,
+// and however often the range is read it walks the text once per revision and size.
+test "widest_px is measured once per revision" {
+    const editor = pair_fresh("i\n77\n");
+    _ = pair_frame(800, 300);
+    try testing.expectEqual(@as(f32, 18), editor.widest_px());
+    const walks = editor.pens.widest_walks;
+    _ = editor.scroll_x_max();
+    _ = editor.widest_px();
+    try testing.expectEqual(walks, editor.pens.widest_walks);
+    try testing.expect(editor.replace(.{ .start = 2, .end = 2 }, "7"));
+    try testing.expectEqual(@as(f32, 27), editor.widest_px());
+    try testing.expectEqual(walks + 1, editor.pens.widest_walks);
+    try testing.expect(editor.load("7777"));
+    try testing.expectEqual(@as(f32, 36), editor.widest_px());
+    editor.style.size = 30;
+    _ = pair_frame(800, 300);
+    try testing.expectEqual(@as(f32, 72), editor.widest_px());
+}
+
+// Locks the wide cost of proportional faces: a line of 200 "i" shows every column in a viewport
+// the grid would fill with far fewer, inside `glyph_bound_of`, which a width does not bound;
+// `lines_bound_of` takes the faces' pitch.
+test "glyph_bound_of holds on a line of narrow glyphs" {
+    var line: [200]u8 = @splat('i');
+    line[199] = '\n';
+    const editor = pair_fresh(&line);
+    _ = pair_frame(800, 300);
+    const glyphs = fixture.context.draw.items(draw.Glyph).len;
+    try testing.expect(glyphs > glyph_bound(800, 21, 15) / 2);
+    const bound = comptime glyph_bound_of(Pair, 800, 300, 15);
+    try testing.expectEqual(lines_bound_of(Pair, 300, 15) * (columns_max + digits_max), bound);
+    const mono_bound = comptime glyph_bound_of(tokenizer, 800, 300, 15);
+    try testing.expectEqual(glyph_bound(800, 300, 15), mono_bound);
+    try testing.expectEqual(editor.line_height(), comptime line_height_of(Pair, 15));
+}
+
+// Locks the price of the seam: a mono editor stores no pens or faces, so its size is what it
+// was plus `Style.gutter`, and a proportional one carries 103 KB of pens on top.
+test "a mono editor pays nothing for proportional faces" {
+    try testing.expectEqual(@as(usize, 322_272 + 8), @sizeOf(Editor));
+    try testing.expect(@sizeOf(PairEditor) > @sizeOf(EditorOf(Duo)) + @sizeOf(Pens));
 }

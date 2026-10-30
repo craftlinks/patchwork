@@ -148,7 +148,7 @@ patchwork/
 │   ├── widgets/menu_bar.zig    # MenuBar: menus side by side; hover and Left / Right switch them
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: EditorOf, Editor, Style, Decoration
-│   ├── editor/language.zig     # The language contract (State, Class, palette, next), its check
+│   ├── editor/language.zig     # The language contract (State, Class, palette, faces, next)
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
 │   ├── editor/tokenizer.zig    # The patch language (the default): per-line states, seven classes
 │   ├── editor/editor.zig       # The editor widget: grid, view, keys, selection, rows
@@ -349,7 +349,8 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
                           # `Audio` source without `audio`, a theme color of 1.5, a
                           # knob skin without `knob`, `ui.overlays` of a target
                           # with no `draw_overlay`, an editor language without
-                          # `next`, and `draw.covered_glyphs` without a `Box`
+                          # `next`, `draw.covered_glyphs` without a `Box`, and too few
+                          # `faces` in an editor language
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -1237,17 +1238,22 @@ close log, Load: the default again).
 ### 11. Live-Coding Session (`examples/session/app.zig`)
 
 A live-coding music screen rebuilt from two photos of another tool, with the public API only:
-a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels)
-with widgets in its margins, a compander row of ring knobs over a transfer curve and a
+a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels),
+whose osc, pad, and reverb tank are one editable `EditorOf(patch)`, with widgets in its margins, a compander row of ring knobs over a transfer curve and a
 spectrum, upright toggles (one `ToggleOf(Pill)` with an accent each) and knobs at their lines, a
 five-strip mixer (pan knobs with arcs from the top, send knobs,
 mute and solo, a scope, a fader with a stereo meter, a spectrum, readouts), and a card with a
-piano keyboard, the song's overview, and a transport. The patch's numbers are formatted from
-the widgets every frame, so a fader rewrites `level = ...`. The view and the card follow the
-window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps. Scenarios:
-`still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
+piano keyboard, the song's overview, and a transport. The mix section's numbers are formatted
+from the widgets every frame, so a fader rewrites `level = ...`; it stays typeset, because
+binding those numbers both ways is a job of its own. The editor has no gutter and is as tall as
+its content, so the wheel scrolls the document through it; headers are inline rows found in
+the text, and margin widgets anchor to `rect_of` by what a line starts with, so both follow an
+edit. While the editor has focus, Space and the tracker keys type. The view and the card
+follow the window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps.
+Scenarios: `still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
 `mix` (pads panned right, bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
-and `keys` (E4 held, the mix section off).
+`keys` (E4 held, the mix section off), `edit` (a click after `saws` and typing), `select` (a
+double click in italics and Shift+Down), and `undo`.
 
 ## Drags Between Widgets
 
@@ -1848,6 +1854,15 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   them, `ui.edit.sanitize_text`). `text/mono.zig` builds a per-frame table of the ASCII
   glyph entries (which also pre-warms them) and appends glyphs directly, with the same
   instances `text.place` writes.
+- **Proportional faces.** A language that declares `faces: [N]text.Face`, one per class, is set
+  in those faces instead of on the grid, chosen at compile time, so a mono editor keeps its
+  code. There is no shaping or kerning: a line is a sum of advances, as in `text.place`.
+  `text.FaceSet` holds one pair of tables per distinct face and the line pitch is the faces'
+  largest (`editor.line_height_of(L, size)`). A click lands on the nearest boundary, Up and Down
+  keep an x instead of a column, and the horizontal range is the widest line in pixels, measured
+  once per revision. Tab still inserts spaces to a multiple of four columns, which do not line
+  up in a proportional face. It costs 103 KB of pens per editor. `examples/session/patch.zig`
+  is the recipe.
 - **Keys.** Arrows, words with Ctrl, goal column on Up and Down, Home, End, Page Up and
   Down, Ctrl+Home and End, Shift selection, Backspace and Delete (words with Ctrl), Enter
   with the line's indent, Tab and Shift+Tab (several selected lines indent and outdent as
@@ -1855,17 +1870,22 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   a word, and select a line; a drag extends without scrolling past an edge.
 - **Scrolling.** Vertical in a step 14 view (thumb, wheel `dy`); horizontal is the editor's
   own `scroll_x` (wheel `dx`, or `dy` with Shift), clamped by the longest line. Every edit
-  and caret move keeps the caret visible.
+  and caret move keeps the caret visible. A view with nothing to scroll leaves the wheel to the
+  one around it, so an editor as tall as its text scrolls its document. `style.gutter = false`
+  drops the line numbers and starts the text `padding_px` in.
 - **Bounds.** At most `editor.lines_max` (128, which fills a 2,688 px viewport) lines of
   `editor.columns_max` (200) columns draw, so a draw appends at most `editor.glyph_max`
   (26,112) glyphs. A known viewport bounds it tighter: `editor.glyph_bound(width, height,
   size)` is its lines (`lines_bound`: those whose tops fall inside, plus the cut one) times
   its visible columns plus the gutter digits, callable at compile time, and every draw
-  asserts it. The gallery budgets its two editors with it: 6,608 glyphs, not 52,224.
+  asserts it. The gallery budgets its two editors with it: 6,608 glyphs, not 52,224. In
+  proportional faces a width bounds no columns, so `editor.glyph_bound_of(L, width, height,
+  size)` allows each drawn line its `columns_max`.
 - **Languages.** `editor.EditorOf(L)` is the editor of language `L`, and `editor.Editor` is
   `EditorOf` the patch language (`editor/tokenizer.zig`). A language is a file or struct that
   declares `State` (an `enum(u8)` with a `normal` tag, kept per line: one byte each), `Class`
-  (an `enum(u8)` of 1 to 16 tags), `palette` (one colour per class), and
+  (an `enum(u8)` of 1 to 16 tags), `palette` (one colour per class), optionally `faces` (one
+  face per class), and
   `next(line, at, state) ?editor.Token(Class)`, which returns a line's tokens one at a time.
   Tokens come in order and are not empty, every byte between them is a space, and they depend
   only on the line and its start state, so the buffer caches start states and re-tokenizes

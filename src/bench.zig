@@ -25,7 +25,8 @@
 //! count is its step count. A scenario with an empty `cycle` measures the frames the app
 //! presents by itself (a transport driven by the app timer). Steps address areas of the last
 //! frame by `Target`, so they survive layout changes; an unknown target ends the run with its
-//! name. Pointer steps: `click` and `click_at` press and release, then leave the window, and
+//! name. A `key` step carries its `mods` (Ctrl+Z in an editor scenario). Pointer steps: `click`
+//! and `click_at` press and release, then leave the window, and
 //! `right_click` does the same with the right button (a context menu);
 //! `wheel` turns at the centre, then leaves; `hover` moves to a point and stays, so hover
 //! animations and tooltips settle; `drag` presses, moves by a delta, and releases, and the
@@ -149,6 +150,7 @@ pub fn area(comptime name: []const u8, index: u32) Target {
 pub const Press = struct {
     key: input.Key,
     text: []const u8,
+    mods: input.Mods = .none,
 };
 
 /// A point at `(x, y)` logical pixels from the target's top-left.
@@ -401,7 +403,7 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             assert(press.text.len <= input.key_text_cap);
             var key: input.KeyPress = .{
                 .key = press.key,
-                .mods = .none,
+                .mods = press.mods,
                 .repeat = false,
                 .len = @intCast(press.text.len),
                 .text = @splat(0),
