@@ -77,8 +77,9 @@
 //!   multiple of 16 bytes, an app whose draw type reads time without declaring `animated`, an
 //!   app that declares `Audio` without `audio`, a theme color out of range, a knob whose
 //!   skin lacks `knob`, overlays on a type without an overlay field, an editor whose
-//!   language lacks `next`, the batch audit without a `Box`, and an editor language with
-//!   too few `faces`, and passes only if the compiler rejects each with its expected message.
+//!   language lacks `next`, the batch audit without a `Box`, an editor language with too few
+//!   `faces` or `scales` without them, and passes only if the compiler rejects each with its
+//!   expected message.
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
@@ -826,6 +827,10 @@ fn add_test_steps(
         .{
             .path = "test/contract_faces_short.zig",
             .expected = "contract_faces_short.Short: `faces` must be [2]text.Face, one face per Class",
+        },
+        .{
+            .path = "test/contract_scales_no_faces.zig",
+            .expected = "contract_scales_no_faces.Mono: `scales` needs `faces`",
         },
     };
     for (contracts) |case| {

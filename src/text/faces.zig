@@ -38,6 +38,12 @@
 //! face writes the records `place` writes (test "a line in one face writes what text.place
 //! writes").
 //!
+//! ## 4a. Scales
+//! A heading is the same faces at `size * scale`. It takes no second set of tables: three faces
+//! at two sizes would be 564 lookups a frame, for a handful of glyphs. `advance_at`, `emit_at`,
+//! and `baseline_at` read the font and probe the cache per glyph at a scale other than 1, as a
+//! non-ASCII glyph already costs, and write the records `text.place` writes at that size.
+//!
 //! ## 5. TigerStyle Invariants
 //! - Tables are fixed arrays sized by the slots; nothing allocates.
 //! - `emit` and `advance` are O(1), with one cache probe at most.
@@ -164,6 +170,47 @@ pub fn FaceSet(comptime faces: []const text.Face) type {
             if (codepoint < 128) return self.advances[slot][codepoint];
             const font = text.font_of(face_of[slot]);
             return logical(font, ttf.glyph_id(font, codepoint), self.size);
+        }
+
+        /// `advance` at `size * scale` (section 4a).
+        pub fn advance_at(self: *const Self, slot: u8, codepoint: u21, scale: f32) f32 {
+            assert(scale >= 1);
+            if (scale == 1) return self.advance(slot, codepoint);
+            const font = text.font_of(face_of[slot]);
+            return logical(font, ttf.glyph_id(font, codepoint), self.size * scale);
+        }
+
+        /// `baseline_of` for a line at `size * scale` (section 4a).
+        pub fn baseline_at(self: *const Self, top: f32, scale: f32) f32 {
+            assert(scale >= 1);
+            if (scale == 1) return self.baseline_of(top);
+            const size = self.size * scale;
+            const ascent = ascent_of(size);
+            const gap = line_height_of(size) - ascent - descent_of(size);
+            return @round((top + gap * 0.5 + ascent) * self.scale);
+        }
+
+        /// `emit` at `size * scale` (section 4a).
+        pub fn emit_at(
+            self: *const Self,
+            cx: anytype,
+            slot: u8,
+            codepoint: u21,
+            pen_x: f32,
+            baseline_px: f32,
+            scale: f32,
+            paint: Paint,
+        ) void {
+            assert(scale >= 1);
+            if (scale == 1) return self.emit(cx, slot, codepoint, pen_x, baseline_px, paint);
+            const face = face_of[slot];
+            const font = text.font_of(face);
+            const size_q = cx.text.size_key_of(self.size * scale);
+            const id = ttf.glyph_id(font, codepoint);
+            const entry = cx.text.glyph(@backingInt(face), font, id, size_q) orelse return;
+            if (entry.width == 0) return;
+            const glyph = layout.instance_of(entry, size_q, pen_x, baseline_px, self.scale, paint);
+            layout.append_glyph(cx, glyph);
         }
 
         /// The device row of the baseline of a line whose top is `top` (section 4).
@@ -310,6 +357,43 @@ test "a line in one face writes what text.place writes" {
             std.mem.sliceAsBytes(expected[0..count]),
             std.mem.sliceAsBytes(set_cx.items(types.Glyph)),
         );
+    }
+}
+
+// Locks section 4a: a line at scale 1.625 of a 16 px set, its pen a running sum of `advance_at`,
+// writes exactly the records `text.place` writes at 26 px in a rect one such line tall, and costs
+// no second table.
+test "a line at a scale writes what text.place writes at that size" {
+    const One = FaceSet(&.{.sans});
+    const line = "# reverb tank";
+    const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+    const color: [4]f32 = .{ 0.5, 0.75, 1, 1 };
+    const height = One.line_height_of(26);
+    const rect: draw.Rect = .{ .x = 10.25, .y = 31.5, .width = 900, .height = height };
+    const placed = test_context(120);
+    const style: text.Style = .{ .face = .sans, .size = 26, .color = color };
+    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
+    text.place(placed, style, line, rect, clip, options);
+    var expected: [64]types.Glyph = undefined;
+    const count = placed.items(types.Glyph).len;
+    @memcpy(expected[0..count], placed.items(types.Glyph));
+    const cx = test_context(120);
+    var set: One = undefined;
+    set.prepare(cx, 16);
+    cx.text.new_count = 0;
+    const baseline = set.baseline_at(rect.y, 1.625);
+    var pen = rect.x;
+    var index: u32 = 0;
+    while (index < line.len) {
+        const codepoint = layout.decode(line, &index);
+        set.emit_at(cx, 0, codepoint, pen, baseline, 1.625, .{ .clip = clip, .color = color });
+        pen += set.advance_at(0, codepoint, 1.625);
+    }
+    try testing.expectEqual(count, cx.items(types.Glyph).len);
+    const got = cx.items(types.Glyph);
+    for (expected[0..count], got) |want, glyph| {
+        try testing.expectEqual(want.rect, glyph.rect);
+        try testing.expectEqual(want.color, glyph.color);
     }
 }
 

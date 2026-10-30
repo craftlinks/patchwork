@@ -19,6 +19,10 @@
 //! It may declare `faces: [N]text.Face`, one face per class: `proportional(L)` is then true and
 //! `EditorOf(L)` sets each class in its own face instead of on the monospace grid, chosen at
 //! compile time, so a mono editor keeps its code and its size (`editor.zig`, section 2).
+//! With `faces` it may also declare `scales: [K]f32` and `fn level_of(line) u8`: a line's size
+//! is `style.size * scales[level_of(line)]`, so a heading is a taller line of real text.
+//! `scales[0]` is 1 and none is below it, and `level_of` is a pure function of the line's bytes,
+//! with no start state, so an edit on one line never changes another's height.
 //! The editor caches one `State` per line (`[line_cap]State`, one byte each) and tokenizes
 //! only the visible lines, each from its cached start state (`buffer.zig`, section 2). The
 //! patch language (`tokenizer.zig`) is the reference implementation and the default.
@@ -77,6 +81,31 @@ pub fn proportional(comptime L: type) bool {
     return @hasDecl(L, "faces");
 }
 
+/// Sizes a language has at most.
+pub const scale_max: u32 = 4;
+
+/// True when `L` sizes its lines (section 1).
+pub fn scaled(comptime L: type) bool {
+    return @hasDecl(L, "scales");
+}
+
+/// The problem with `L`'s `scales` and `level_of`, or null.
+fn scales_problem(comptime L: type) ?[]const u8 {
+    if (!proportional(L)) return "`scales` needs `faces`";
+    const shown = "`scales` must be [K]f32 of 1 to 4 sizes";
+    const info = @typeInfo(@TypeOf(L.scales));
+    if (info != .array or info.array.child != f32) return shown;
+    if (info.array.len < 1 or info.array.len > scale_max) return shown;
+    if (L.scales[0] != 1) return "`scales[0]` must be 1";
+    for (L.scales) |scale| {
+        if (scale < 1) return "every scale must be at least 1";
+    }
+    const wanted = "pub fn level_of(line: []const u8) u8";
+    if (!@hasDecl(L, "level_of")) return "missing `" ++ wanted ++ "`";
+    if (@TypeOf(L.level_of) != fn ([]const u8) u8) return "`level_of` must be `" ++ wanted ++ "`";
+    return null;
+}
+
 /// The first reason `L` is not a language, naming `L` and the declaration, or null.
 pub fn check(comptime L: type) ?[]const u8 {
     const prefix = @typeName(L) ++ ": ";
@@ -105,6 +134,9 @@ pub fn check(comptime L: type) ?[]const u8 {
     }
     if (@hasDecl(L, "faces") and @TypeOf(L.faces) != [class_count(L)]text.Face) {
         return prefix ++ "`faces` must be [" ++ count ++ "]text.Face, one face per Class";
+    }
+    if (scaled(L)) {
+        if (scales_problem(L)) |problem| return prefix ++ problem;
     }
     const shown = "pub fn next(line: []const u8, at: *u32, state: *State) " ++
         "?editor.Token(Class)";
@@ -150,6 +182,7 @@ pub fn end_state(comptime L: type, line: []const u8, start: L.State) L.State {
 /// Walks `line` from `start`, asserting the rules of section 2 at every token, and returns
 /// the end state. O(line length); for tests and `Buffer.verify`.
 pub fn verify_line(comptime L: type, line: []const u8, start: L.State) L.State {
+    if (comptime scaled(L)) assert(L.level_of(line) < L.scales.len);
     var state = start;
     var at: u32 = 0;
     var position: u32 = 0;
@@ -271,6 +304,26 @@ const ShortFaces = struct {
     pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
     pub const faces: [1]text.Face = .{.sans};
 };
+const NoFacesScales = struct {
+    pub const State = enum(u8) { normal };
+    pub const Class = enum(u8) { a, b };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
+    pub const scales: [1]f32 = .{1};
+};
+const OddScales = struct {
+    pub const State = enum(u8) { normal };
+    pub const Class = enum(u8) { a, b };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
+    pub const faces: [2]text.Face = .{ .sans, .sans };
+    pub const scales: [2]f32 = .{ 2, 1 };
+};
+const NoLevel = struct {
+    pub const State = enum(u8) { normal };
+    pub const Class = enum(u8) { a, b };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
+    pub const faces: [2]text.Face = .{ .sans, .sans };
+    pub const scales: [2]f32 = .{ 1, 2 };
+};
 const NoNext = struct {
     pub const State = enum(u8) { normal };
     pub const Class = enum(u8) { a, b };
@@ -307,6 +360,9 @@ test "check names the first problem of a language" {
         .{ ShortPalette, "`palette` must be [2][4]f32, one colour per Class" },
         .{ ShortLight, "`palette_light` must be [2][4]f32, one colour per Class" },
         .{ ShortFaces, "`faces` must be [2]text.Face, one face per Class" },
+        .{ NoFacesScales, "`scales` needs `faces`" },
+        .{ OddScales, "`scales[0]` must be 1" },
+        .{ NoLevel, "missing `pub fn level_of(line: []const u8) u8`" },
         .{ NoNext, "missing `pub fn next(line: []const u8, at: *u32, " ++
             "state: *State) ?editor.Token(Class)`" },
         .{ OwnToken, "`next` must be `pub fn next(line: []const u8, " ++

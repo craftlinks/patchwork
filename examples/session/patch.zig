@@ -9,6 +9,9 @@
 //! typeset there, because its numbers are slots bound to widgets. Both share `code.token_at`,
 //! so a line reads the same in either.
 //!
+//! A line starting "# " is a heading: `level_of` sizes it (`scales`), its "#" is one token and
+//! the rest of the line another, so a section's name may hold spaces.
+//!
 //! ## 2. A Pure Function of the Line
 //! `next` sees one line and keeps no state, so `State` is `normal` alone and declared names are
 //! a fixed list. A real language would resolve scopes; a recipe need not. Whether a "-" leads a
@@ -26,15 +29,22 @@ const look = @import("look.zig");
 const code = @import("code.zig");
 
 pub const State = enum(u8) { normal };
-pub const Class = enum(u8) { plain, keyword, call, declared, number, range_end, string, punctuation };
+pub const Class = enum(u8) { plain, keyword, call, declared, number, range_end, string, punctuation, hash, heading };
 
-pub const faces: [8]text.Face = .{
-    .serif, .serif, .serif_italic, .serif_bold, .serif, .serif, .serif, .serif,
+pub const faces: [10]text.Face = .{
+    .serif, .serif, .serif_italic, .serif_bold, .serif, .serif, .serif, .serif, .serif, .serif_bold,
 };
 
-pub const palette: [8][4]f32 = .{
-    look.ink, look.keyword, look.ink, look.ink, look.number, look.range_end, look.string, look.punctuation,
+pub const palette: [10][4]f32 = .{
+    look.ink, look.keyword, look.ink, look.ink, look.number, look.range_end, look.string, look.punctuation, look.faint, look.ink,
 };
+
+/// A heading is 26 px over code's 16.
+pub const scales: [2]f32 = .{ 1, 26.0 / look.code_size };
+
+pub fn level_of(line: []const u8) u8 {
+    return if (std.mem.startsWith(u8, line, "# ")) 1 else 0;
+}
 
 /// Names the pad and the tank declare.
 const declared = [_][]const u8{ "env", "a", "b", "hiss", "mixed", "diffused" };
@@ -52,9 +62,17 @@ pub fn next(line: []const u8, at: *u32, state: *State) ?editor.Token(Class) {
     assert(state.* == .normal);
     assert(at.* <= line.len);
     var index = at.*;
+    if (index == 0 and level_of(line) == 1) {
+        at.* = 1;
+        return .{ .start = 0, .end = 1, .class = .hash };
+    }
     while (index < line.len and line[index] == ' ') index += 1;
     at.* = index;
     if (index == line.len) return null;
+    if (level_of(line) == 1) {
+        at.* = @intCast(line.len);
+        return .{ .start = index, .end = at.*, .class = .heading };
+    }
     const token = code.token_at(line, index, after_value(line, index), .{ .declared = &declared });
     at.* = token.end;
     return .{ .start = token.start, .end = token.end, .class = class_of(token.class) };
@@ -99,6 +117,19 @@ test "tokens of the pad's lines" {
     count = classes_of("b := sine(n - 12) * sub;", &classes);
     try std.testing.expectEqual(Class.punctuation, classes[6]);
     try std.testing.expectEqual(Class.number, classes[7]);
+}
+
+// Locks a heading: the "#" and the name are one token each, the name keeps its spaces, a line
+// of "# " alone has no name, and a "#" elsewhere is punctuation at the body size.
+test "a heading is two tokens and a size" {
+    var classes: [4]Class = undefined;
+    try std.testing.expectEqual(@as(u32, 2), classes_of("# reverb tank", &classes));
+    try std.testing.expectEqualSlices(Class, &.{ .hash, .heading }, classes[0..2]);
+    try std.testing.expectEqual(@as(u32, 1), classes_of("# ", &classes));
+    try std.testing.expectEqual(@as(u8, 1), level_of("# "));
+    try std.testing.expectEqual(@as(u8, 0), level_of("#x"));
+    try std.testing.expectEqual(@as(u8, 0), level_of(" # x"));
+    try std.testing.expectEqual(@as(f32, 1.625), scales[1]);
 }
 
 // Locks the contract of `language.zig`, section 2, on every line of the patch.
