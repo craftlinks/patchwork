@@ -1,5 +1,6 @@
-//! `Fader`: an upright level control with a stereo meter in its track, the session's own
-//! widget (the library has a horizontal `Slider` and a passive `Meter`, no fader).
+//! `Fader`: an upright level control with a stereo meter in its track. App code, and a recipe:
+//! a screen that wants one copies this file (the library has a horizontal `Slider` and a
+//! passive `Meter`, no fader, and step 35 and 47.3 left it that way).
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!

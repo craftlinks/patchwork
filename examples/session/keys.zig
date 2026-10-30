@@ -1,5 +1,5 @@
 //! `Keyboard`: a piano of `white_count` white keys from `first_note`, played with the pointer
-//! or the computer's keys, the session's own widget.
+//! or the computer's keys. App code, and a recipe: a screen that wants one copies this file.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -13,8 +13,10 @@
 //! A press holds the note under it; a drag slides to the note under the pointer; a release
 //! lets it go. Computer keys play two rows from `row_base` (z s x d c v g b h n j m , l . ; /)
 //! and `row_base + 12` (q 2 w 3 e r 5 t 6 y 7 u i 9 o 0 p), the tracker layout; their letters
-//! are printed on the keys. A key's release carries no text, so `,` `.` `;` `/` (key `other`)
-//! release the last such note.
+//! are printed on the keys. A press with Ctrl or Meta is a shortcut and plays nothing; a
+//! release always counts. A key's release carries no text and `,` `.` `;` `/` are all key
+//! `other`, so any `other` release lets go of every such note. Losing the window lets go of
+//! everything, since the releases will not arrive.
 //!
 //! ## 3. TigerStyle Invariants
 //! - `held` is a 128-bit set; every loop is bounded by the key count.
@@ -120,17 +122,21 @@ pub const Keyboard = struct {
     held: std.StaticBitSet(128) = .empty,
     rect: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     pointer_note: ?u8 = null,
-    other_note: ?u8 = null,
+    /// Notes held by keys a release cannot name (section 2).
+    other_notes: std.StaticBitSet(128) = .empty,
 
     pub fn handle(self: *Keyboard, cx: anytype, event: input.Event) bool {
         switch (event) {
             .key_down => |press| return self.key(cx, press, true),
             .key_up => |press| return self.key(cx, press, false),
             .window_focus => |focused| {
-                if (focused or self.held.count() == 0) return false;
+                if (focused) return false;
+                const sounding = self.held.count() > 0;
                 self.held = .empty;
-                cx.redraw();
-                return true;
+                self.other_notes = .empty;
+                self.pointer_note = null;
+                if (sounding) cx.redraw();
+                return sounding;
             },
             else => {},
         }
@@ -151,15 +157,26 @@ pub const Keyboard = struct {
     }
 
     fn key(self: *Keyboard, cx: anytype, press: input.KeyPress, down: bool) bool {
-        if (press.mods.shortcut() or press.repeat) return false;
-        var byte: u8 = 0;
-        if (down and press.len == 1) byte = std.ascii.toLower(press.text[0]);
-        if (!down) byte = switch (press.key) {
-            .other => 0,
-            else => letter_of(press.key) orelse return false,
-        };
-        const note = if (byte != 0) note_of_key(byte) orelse return false else self.other_note orelse return false;
-        if (down and press.key == .other) self.other_note = note;
+        if (!down) return self.key_up(cx, press);
+        if (press.mods.shortcut() or press.repeat or press.len != 1) return false;
+        const note = note_of_key(std.ascii.toLower(press.text[0])) orelse return false;
+        if (press.key == .other) self.other_notes.set(note);
+        return self.set_note(cx, note, true);
+    }
+
+    fn key_up(self: *Keyboard, cx: anytype, press: input.KeyPress) bool {
+        if (press.key == .other) {
+            if (self.other_notes.count() == 0) return false;
+            self.held = self.held.differenceWith(self.other_notes);
+            self.other_notes = .empty;
+            cx.redraw();
+            return true;
+        }
+        const byte = letter_of(press.key) orelse return false;
+        return self.set_note(cx, note_of_key(byte) orelse return false, false);
+    }
+
+    fn set_note(self: *Keyboard, cx: anytype, note: u8, down: bool) bool {
         if (down == self.held.isSet(note)) return false;
         self.held.setValue(note, down);
         cx.redraw();

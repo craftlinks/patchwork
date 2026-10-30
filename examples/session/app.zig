@@ -1094,3 +1094,58 @@ test "knob values in their units" {
     var position: [16]u8 = undefined;
     try std.testing.expectEqualStrings("1e1.2c", position_text(&position, 2.35));
 }
+
+fn key_press(key: input.Key, typed: []const u8, mods: input.Mods) input.KeyPress {
+    var press: input.KeyPress = .{ .key = key, .mods = mods, .repeat = false, .len = @intCast(typed.len), .text = undefined };
+    press.text = @splat(0);
+    @memcpy(press.text[0..typed.len], typed);
+    return press;
+}
+
+fn deliver(app: *App, event_value: input.Event) void {
+    ui.dispatch(App, app, &test_context, event_value);
+}
+
+// Locks that a lost window resets the pointer's note: pressing E4 (x 60 + 16 * 33 + 10), losing
+// focus so its release never arrives, and pressing E4 again lights it, where a stale
+// `pointer_note` left it dark.
+test "the same key plays again after the window loses focus" {
+    const app = new_app();
+    frame(app);
+    const e4: input.Point = .{ .x = 598, .y = 680 };
+    deliver(app, .{ .pointer_move = e4 });
+    deliver(app, .{ .pointer_down = input.left_at(e4) });
+    try std.testing.expect(app.keyboard.held.isSet(64));
+    deliver(app, .{ .window_focus = false });
+    try std.testing.expectEqual(@as(usize, 0), app.keyboard.held.count());
+    deliver(app, .{ .window_focus = true });
+    deliver(app, .{ .pointer_down = input.left_at(e4) });
+    try std.testing.expect(app.keyboard.held.isSet(64));
+}
+
+// Locks the keys a release cannot name: "," and "." arrive as `other` and their releases carry
+// no text, so one release lets go of both (C4 and D4) instead of leaving the first stuck.
+test "an other key's release lets go of every other note" {
+    const app = new_app();
+    frame(app);
+    deliver(app, .{ .key_down = key_press(.other, ",", .none) });
+    deliver(app, .{ .key_down = key_press(.other, ".", .none) });
+    try std.testing.expect(app.keyboard.held.isSet(60) and app.keyboard.held.isSet(62));
+    deliver(app, .{ .key_up = key_press(.other, "", .none) });
+    try std.testing.expectEqual(@as(usize, 0), app.keyboard.held.count());
+}
+
+// Locks that a release always counts: z pressed plain and released with Ctrl down lets C3 go,
+// while a press with Ctrl down, a shortcut, plays nothing.
+test "a note ends on its release whatever the modifiers" {
+    const app = new_app();
+    frame(app);
+    deliver(app, .{ .key_down = key_press(.z, "z", .none) });
+    try std.testing.expect(app.keyboard.held.isSet(48));
+    var ctrl: input.Mods = .none;
+    ctrl.ctrl = true;
+    deliver(app, .{ .key_up = key_press(.z, "", ctrl) });
+    try std.testing.expectEqual(@as(usize, 0), app.keyboard.held.count());
+    deliver(app, .{ .key_down = key_press(.z, "z", ctrl) });
+    try std.testing.expectEqual(@as(usize, 0), app.keyboard.held.count());
+}
