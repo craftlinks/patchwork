@@ -145,6 +145,9 @@ pub const Config = struct {
     draw: []const quads.DrawType,
     /// Upper bound on batches per frame: distinct (layer, type, texture) runs.
     batch_cap: u32 = 256,
+    /// How a layer's batches order: by first appearance, or by `draw`'s order, then texture
+    /// (`draw/pools.zig`, section 1).
+    batch_order: quads.BatchOrder = .appearance,
     /// Upper bound on hit areas per frame; the rest are counted and not hittable.
     area_cap: u32 = 1024,
     /// Upper bound on path points per frame, when a registered type reads points.
@@ -165,12 +168,13 @@ pub fn Context(comptime App: type) type {
 }
 
 /// Records `App.config`'s timer (section 4), whether the app has an audio source (section
-/// 4a), and its theme (section 4b) in a freshly initialized context. Both hosts call it after
-/// `cx.init`; app tests call it to start where a host starts.
+/// 4a), its theme (section 4b), and its batch order in a freshly initialized context. Both
+/// hosts call it after `cx.init`; app tests call it to start where a host starts.
 pub fn start(comptime App: type, cx: *Context(App)) void {
     cx.timer_setup(App.config.timer_period_ms, App.config.timer_armed);
     cx.audio_setup(has_audio(App));
     cx.theme_setup(App.config.theme);
+    cx.draw.batch_order = App.config.batch_order;
     if (App.config.timer_period_ms == 0) assert(!cx.timer_on);
     assert(!cx.audio_on);
 }
@@ -618,6 +622,29 @@ test "a theme color out of range is rejected by name" {
     const expected = "App.config.theme.colors.panel: a component is outside [0, 1]";
     try std.testing.expectEqualStrings(expected, bright);
     try std.testing.expect(std.meta.eql(theme.dark, GoodApp.config.theme));
+}
+
+const RegisteredOrder = struct {
+    pub const config: Config = .{
+        .title = "registered",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .batch_order = .registered,
+    };
+};
+
+// Locks that `start` copies `config.batch_order` into the draw context, where `init` left the
+// default, and that the default is `.appearance`.
+test "start copies the batch order" {
+    const static = struct {
+        var context: Context(RegisteredOrder) = undefined;
+    };
+    const cx = &static.context;
+    cx.init();
+    try std.testing.expectEqual(quads.BatchOrder.appearance, cx.draw.batch_order);
+    start(RegisteredOrder, cx);
+    try std.testing.expectEqual(quads.BatchOrder.registered, cx.draw.batch_order);
+    try std.testing.expectEqual(quads.BatchOrder.appearance, GoodApp.config.batch_order);
 }
 
 comptime {

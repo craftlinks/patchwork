@@ -5,8 +5,8 @@
 //!
 //! ## 1. Skins
 //! - `Ring` (`KnobOf(Ring)`): a thin track arc, the value arc in the knob's accent, and a dot
-//!   at the value's end on `over_layer` (a box appended on the base layer would draw under
-//!   the arcs, whose batch comes later). The name sits in the ring's top in small italics and
+//!   at the value's end on `over_layer` (a box on the base layer draws under the arcs, which
+//!   `config.draw` lists after it). The name sits in the ring's top in small italics and
 //!   the value text in its middle: the app's units through `Knob.draw_text`.
 //! - `Bipolar`: `Ring` whose value arc runs from the top (`ArcLook.start` 0.5), for pans.
 //! - `Pill` (`ToggleOf(Pill)`): an upright capsule whose thumb rises when on and takes the

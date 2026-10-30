@@ -18,6 +18,14 @@
 //! audio example orders its faces first for this reason). There is no runtime warning: the
 //! only symptom is overlap, and finding it would cost a pass over every pair of batches.
 //!
+//! First appearance also depends on what is on screen: scrolling can change which row appends
+//! first, and with it the order. `App.config.batch_order` picks the rule for the whole app.
+//! `.appearance`, the default, is the one above. `.registered` draws a layer's batches in
+//! `App.config.draw`'s order, then by texture, on every frame, so a screen that lists faces
+//! before text needs no care about what it appends first. Pick `.registered` for a new screen;
+//! an app on `.appearance` can assert `draw.covered_glyphs` is 0 in a test instead. Within a
+//! batch, instances keep append order under either rule.
+//!
 //! ## 2. Data Flow
 //! ```text
 //! reset                 empty every pool, layer = base, and   (the host, before App.draw)
@@ -26,7 +34,8 @@
 //!                       first use of (layer, T, texture) appends to `appearance`
 //! finalize              per pool: prefix sums of the key histogram -> starts;
 //!                       if a key ever decreased, stable counting sort by key
-//!                       batches = appearance stably sorted by layer, with first/count
+//!                       batches = appearance (sorted by registered order under
+//!                       `.registered`) stably sorted by layer, with first/count
 //!                       read from the pool's starts and histogram
 //! ```
 //! The histogram is filled by `append`, so `finalize` is linear in the instance count plus
@@ -126,6 +135,10 @@ pub const Layer = enum(u8) {
     _,
 };
 
+/// How a layer's batches order (section 1): by first appearance in the frame, or by
+/// `App.config.draw`'s order, then texture.
+pub const BatchOrder = enum(u8) { appearance, registered };
+
 /// A layer drawn into an offscreen target this frame (`Context.offscreen`): its target and the
 /// logical rect the target covers (x, y, width, height).
 pub const Binding = struct {
@@ -176,6 +189,12 @@ const Appearance = struct {
     type_id: u8,
     key: u16,
     layer: u8,
+
+    fn before(_: void, a: Appearance, b: Appearance) bool {
+        if (a.layer != b.layer) return a.layer < b.layer;
+        if (a.type_id != b.type_id) return a.type_id < b.type_id;
+        return a.key < b.key;
+    }
 };
 
 /// The pool of one draw type. See the module guide.
@@ -246,6 +265,9 @@ pub fn Context(
         batches: [batch_cap]Batch,
         batch_count: u32,
         finalized: bool,
+        /// The rule `form_batches` orders a layer by (section 1): `.appearance` from `init`,
+        /// `App.config.batch_order` from `app.start`. `reset` keeps it.
+        batch_order: BatchOrder,
         /// Counting-sort target, sized for the largest pool and shared by all of them.
         scratch: [scratch_bytes]u8 align(16),
         /// The point pool (section 5b): `points[0..point_count]` are this frame's points.
@@ -293,6 +315,7 @@ pub fn Context(
             self.point_revision = 0;
             self.backdrop_count = 0;
             for (&self.backdrop_ids) |*id| id.* = .atlas;
+            self.batch_order = .appearance;
             self.theme = theme.dark.record();
             self.reset();
             assert(self.textures.count == 1);
@@ -676,8 +699,22 @@ pub fn Context(
         }
 
         fn form_batches(self: *Self) void {
+            const seen = self.appearance[0..self.appearance_count];
+            if (self.batch_order == .appearance) {
+                self.place_batches(seen);
+                return;
+            }
+            var sorted: [batch_cap]Appearance = undefined;
+            assert(seen.len <= sorted.len);
+            const order = sorted[0..seen.len];
+            @memcpy(order, seen);
+            std.sort.insertion(Appearance, order, {}, Appearance.before);
+            self.place_batches(order);
+        }
+
+        fn place_batches(self: *Self, order: []const Appearance) void {
             var layer_starts: [layer_count]u32 = @splat(0);
-            for (self.appearance[0..self.appearance_count]) |entry| {
+            for (order) |entry| {
                 layer_starts[entry.layer] += 1;
             }
             var total: u32 = 0;
@@ -687,7 +724,7 @@ pub fn Context(
                 total += here;
             }
             assert(total == self.appearance_count);
-            for (self.appearance[0..self.appearance_count]) |entry| {
+            for (order) |entry| {
                 const at = layer_starts[entry.layer];
                 layer_starts[entry.layer] += 1;
                 self.batches[at] = self.batch_of(entry);
@@ -900,6 +937,96 @@ test "ordered appends skip the sort and textures split a type" {
     _ = cx.layer(.overlay);
     try cx.append(types.Box, null, test_box(1));
     try testing.expect(cx.pools[0].ordered);
+}
+
+/// One frame of a glyph on the overlay and, on the base layer, two textures of images, a glyph,
+/// and a box, appended in the order `scrambled` or its reverse.
+fn append_scrambled(
+    cx: *TestContext,
+    first: textures.TextureId,
+    second: textures.TextureId,
+    scrambled: bool,
+) !void {
+    const image: types.Image = .{
+        .rect = .{ 0, 0, 2, 2 },
+        .clip = .{ 0, 0, 10, 10 },
+        .uv = .{ 0, 0, 1, 1 },
+        .tint = .{ 1, 1, 1, 1 },
+    };
+    if (scrambled) {
+        _ = cx.layer(.overlay);
+        try cx.append(types.Glyph, .atlas, test_glyph(0));
+        _ = cx.layer(.base);
+        try cx.append(types.Image, second, image);
+        try cx.append(types.Glyph, .atlas, test_glyph(0));
+        try cx.append(types.Image, first, image);
+        try cx.append(types.Box, null, test_box(0));
+    } else {
+        try cx.append(types.Box, null, test_box(0));
+        try cx.append(types.Image, first, image);
+        try cx.append(types.Glyph, .atlas, test_glyph(0));
+        try cx.append(types.Image, second, image);
+        _ = cx.layer(.overlay);
+        try cx.append(types.Glyph, .atlas, test_glyph(0));
+    }
+}
+
+// Locks the two orders (section 1): a scrambled frame keeps its first appearance under
+// `.appearance`; `.registered` gives Box, Glyph, Image of the lower texture, Image of the
+// higher, then the overlay's Glyph, the same batches for the reverse append order, and `reset`
+// keeps it.
+test "registered order follows the draw list whatever was appended first" {
+    const cx = new_context();
+    const first = cx.textures.create(.rgba8, 2, 2);
+    const second = cx.textures.create(.rgba8, 2, 2);
+    try testing.expectEqual(BatchOrder.appearance, cx.batch_order);
+    try append_scrambled(cx, first, second, true);
+    cx.finalize();
+    const seen = cx.batch_list();
+    try testing.expectEqual(@as(usize, 5), seen.len);
+    try testing.expectEqual(@as(u8, 2), seen[0].type_id);
+    try testing.expectEqual(second, seen[0].texture);
+    try testing.expectEqual(@as(u8, 1), seen[1].type_id);
+    try testing.expectEqual(@as(u8, 2), seen[2].type_id);
+    try testing.expectEqual(first, seen[2].texture);
+    try testing.expectEqual(@as(u8, 0), seen[3].type_id);
+    try testing.expectEqual(@as(u8, 4), seen[4].layer);
+
+    cx.reset();
+    cx.batch_order = .registered;
+    try append_scrambled(cx, first, second, true);
+    cx.finalize();
+    var scrambled: [5]Batch = undefined;
+    @memcpy(&scrambled, cx.batch_list());
+    try testing.expectEqual(@as(u8, 0), scrambled[0].type_id);
+    try testing.expectEqual(@as(u8, 1), scrambled[1].type_id);
+    try testing.expectEqual(@as(u8, 2), scrambled[2].type_id);
+    try testing.expectEqual(first, scrambled[2].texture);
+    try testing.expectEqual(@as(u8, 2), scrambled[3].type_id);
+    try testing.expectEqual(second, scrambled[3].texture);
+    try testing.expectEqual(@as(u8, 1), scrambled[4].type_id);
+    try testing.expectEqual(@as(u8, 4), scrambled[4].layer);
+
+    cx.reset();
+    try testing.expectEqual(BatchOrder.registered, cx.batch_order);
+    try append_scrambled(cx, first, second, false);
+    cx.finalize();
+    try testing.expectEqualSlices(Batch, &scrambled, cx.batch_list());
+}
+
+// Locks that a frame finalized under `.registered` takes a late append: a box appended after
+// `finalize` still draws before the glyph that came first.
+test "registered order holds through an append after finalize" {
+    const cx = new_context();
+    cx.batch_order = .registered;
+    try cx.append(types.Glyph, .atlas, test_glyph(0));
+    cx.finalize();
+    try cx.append(types.Box, null, test_box(0));
+    cx.finalize();
+    const batches = cx.batch_list();
+    try testing.expectEqual(@as(usize, 2), batches.len);
+    try testing.expectEqual(@as(u8, 0), batches[0].type_id);
+    try testing.expectEqual(@as(u8, 1), batches[1].type_id);
 }
 
 // Locks that `shift` moves only what was appended after the snapshot, in every pool and on

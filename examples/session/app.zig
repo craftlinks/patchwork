@@ -8,7 +8,7 @@
 //! ## 1. What It Demonstrates
 //! Whether an app can build an atypical screen from the public API alone. Everything here is
 //! library widgets under app skins (`look.zig`: ring knobs, upright toggles), library draw
-//! types (Box, Arc, Glyph, Path, Waveform), and four pieces the library does not have: code
+//! types (Box, Waveform, Arc, Path, Glyph), and four pieces the library does not have: code
 //! set in a proportional face (`code.zig`), a fader with a stereo meter (`fader.zig`), a piano
 //! keyboard (`keys.zig`), and the plots (`plots.zig`). The sound is made up (`signal.zig`).
 //!
@@ -367,11 +367,12 @@ pub const App = struct {
         .timer_armed = false,
         .draw = &.{
             .{ .type = quads.Box, .cap = box_cap },
-            .{ .type = quads.Arc, .cap = arc_cap },
-            .{ .type = quads.Glyph, .cap = glyph_cap },
-            .{ .type = quads.Path, .cap = path_cap },
             .{ .type = quads.Waveform, .cap = wave_cap },
+            .{ .type = quads.Arc, .cap = arc_cap },
+            .{ .type = quads.Path, .cap = path_cap },
+            .{ .type = quads.Glyph, .cap = glyph_cap },
         },
+        .batch_order = .registered,
         .area_cap = area_cap,
         .theme = look.scheme,
     };
@@ -482,9 +483,6 @@ pub const App = struct {
         app.update_slots();
         const sound = app.mixdown();
         const screen = cx.begin(ui.sized(.fill, .fill), .{ .flow = .down });
-        // A box first, so the base layer's box batch draws under its glyph batch: the first
-        // row's first append is the header's "#".
-        look.fill(cx, screen, cx.clip().?, look.background);
         const viewport_h = @max(line_h, screen.height - card_space);
         _ = cx.begin_view(view_id, ui.sized(.fill, .{ .fixed = viewport_h }), .{ .flow = .down }, &app.view);
         var placed: Placed = .{};
@@ -1054,6 +1052,8 @@ test "the first frame binds the patch to its widgets" {
     try std.testing.expectEqual(content_h, app.view.content_h);
     try std.testing.expectEqual(@as(f32, 1314), content_h);
     try std.testing.expect(!app.playing);
+    test_context.draw.finalize();
+    try std.testing.expectEqual(@as(u32, 0), quads.covered_glyphs(&test_context.draw));
 }
 
 // Locks the scenarios' effects: the wheel scrolls 686 px (the whole range), play runs 30

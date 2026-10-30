@@ -32,7 +32,7 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `area_cap`, `point_cap`, `theme` (see Theme). |
+| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `batch_order` (see Draw order), `area_cap`, `point_cap`, `theme` (see Theme). |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, file drop, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
@@ -348,8 +348,8 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
                           # a type that reads time without declaring `animated`, an
                           # `Audio` source without `audio`, a theme color of 1.5, a
                           # knob skin without `knob`, `ui.overlays` of a target
-                          # with no `draw_overlay`, and an editor language without
-                          # `next`
+                          # with no `draw_overlay`, an editor language without
+                          # `next`, and `draw.covered_glyphs` without a `Box`
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -1720,12 +1720,20 @@ if (!kit.glass(cx, sidebar, clip, kit.glass_look(cx.theme(), .frosted, 22)))
 - **Sticky batches.** At frame end each pool is stably sorted by (layer, texture) with a
   counting sort, skipped when appends were already in order, and each (layer, type, texture)
   run is one draw call. Layers draw in order; within a layer, batches draw in order of first
-  appearance. Box, glyph, box, glyph in one layer is two draw calls, not four.
+  appearance, or `config.draw`'s order with `.registered` (next item). Box, glyph, box, glyph
+  in one layer is two draw calls, not four.
 - **Draw order inside a layer.** Because a batch draws where its first instance appeared, a
   Box appended after any Glyph on the same layer draws under every glyph: a panel face drawn
   after a title hides nothing, but the title's batch already opened, so labels placed on that
   face draw under it. Append faces before any text on the layer, or put what must cover on a
-  higher layer. The sort key is 16 bits (`layer * 64 + texture`), so up to 64 textures and the
+  higher layer. First appearance also depends on what is on screen, so scrolling can change
+  it. `config.batch_order = .registered` fixes the order for the whole app: a layer's batches
+  draw in `config.draw`'s order, then by texture, on every frame, so `Box, Waveform, Arc, Path,
+  Glyph` keeps faces under plots under text. Pick it for a new screen; `.appearance` stays the
+  default. An app on `.appearance` can call `draw.covered_glyphs(cx.drawing())` in a test, after
+  `finalize`: it counts glyphs an opaque box in a later batch of their layer covers, and 0 means
+  none are hidden. It is O(boxes * glyphs), a test aid, and needs `Box` and `Glyph` registered.
+  The sort key is 16 bits (`layer * 64 + texture`), so up to 64 textures and the
   8 layers no longer bound each other.
 - **Uploads.** Each pool uploads up to four ranges of changed records (`draw.dirty_ranges`),
   bridging gaps of up to 8 unchanged records, so changes at both ends of a pool write two short
