@@ -148,7 +148,7 @@ patchwork/
 │   ├── widgets/menu_bar.zig    # MenuBar: menus side by side; hover and Left / Right switch them
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: EditorOf, Editor, Style, Decoration
-│   ├── editor/language.zig     # The language contract (State, Class, palette, faces, next)
+│   ├── editor/language.zig     # The language contract (State, Class, palette, faces, scales, next)
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
 │   ├── editor/tokenizer.zig    # The patch language (the default): per-line states, seven classes
 │   ├── editor/editor.zig       # The editor widget: grid, view, keys, selection, rows
@@ -349,8 +349,8 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
                           # `Audio` source without `audio`, a theme color of 1.5, a
                           # knob skin without `knob`, `ui.overlays` of a target
                           # with no `draw_overlay`, an editor language without
-                          # `next`, `draw.covered_glyphs` without a `Box`, and too few
-                          # `faces` in an editor language
+                          # `next`, `draw.covered_glyphs` without a `Box`, too few `faces`
+                          # in an editor language, and `scales` without `faces`
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -1238,22 +1238,25 @@ close log, Load: the default again).
 ### 11. Live-Coding Session (`examples/session/app.zig`)
 
 A live-coding music screen rebuilt from two photos of another tool, with the public API only:
-a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels),
-whose osc, pad, and reverb tank are one editable `EditorOf(patch)`, with widgets in its margins, a compander row of ring knobs over a transfer curve and a
+a patch set in Noto Serif (italic calls, bold declarations, coloured numbers and channels), one
+editable `EditorOf(patch)` whose headings are real lines, with widgets in its margins, a compander row of ring knobs over a transfer curve and a
 spectrum, upright toggles (one `ToggleOf(Pill)` with an accent each) and knobs at their lines, a
 five-strip mixer (pan knobs with arcs from the top, send knobs,
 mute and solo, a scope, a fader with a stereo meter, a spectrum, readouts), and a card with a
-piano keyboard, the song's overview, and a transport. The mix section's numbers are formatted
-from the widgets every frame, so a fader rewrites `level = ...`; it stays typeset, because
-binding those numbers both ways is a job of its own. The editor has no gutter and is as tall as
-its content, so the wheel scrolls the document through it; headers are inline rows found in
-the text, and margin widgets anchor to `rect_of` by what a line starts with, so both follow an
-edit. While the editor has focus, Space and the tracker keys type. The view and the card
-follow the window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps.
+piano keyboard, the song's overview, and a transport. A section is a line starting `# `, found
+in the text, so typing `# Chorus` adds one, with a mark and a fold bracket, and a mark's state
+is kept by name. The mix body is typeset in one inline row under the line `# mix`: its numbers
+are formatted from the widgets every frame, so a fader rewrites `level = ...`, and binding them
+both ways is a job of its own. Deleting or renaming that line removes the panel until undo; the
+widgets keep their values. The editor has no gutter and is as tall as its content, so the
+wheel scrolls the document through it; margin widgets anchor to `rect_of` by what a line starts
+with, so they follow an edit. While the editor has focus, Space and the tracker keys type. The
+view and the card follow the window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps.
 Scenarios: `still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about a second),
 `mix` (pads panned right, bass fader up, pads muted, line soloed, eq off), `knobs` (below, down, and wet turned),
 `keys` (E4 held, the mix section off), `edit` (a click after `saws` and typing), `select` (a
-double click in italics and Shift+Down), and `undo`.
+double click in italics and Shift+Down), `undo`, `section` (`# chorus` typed at the end), and
+`rename` (a heading edited).
 
 ## Drags Between Widgets
 
@@ -1863,6 +1866,13 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   once per revision. Tab still inserts spaces to a multiple of four columns, which do not line
   up in a proportional face. It costs 103 KB of pens per editor. `examples/session/patch.zig`
   is the recipe.
+- **Line sizes.** With `faces`, a language may declare `scales: [K]f32` (1 to 4, `scales[0]` is
+  1, none below it) and `level_of(line) u8`: a line's size is `style.size * scales[level]`, so a
+  heading is a taller line of real text that the caret, selection, and undo treat like any
+  other. `level_of` sees only the line's bytes, so an edit never changes another line's height.
+  The buffer keeps the first `editor.tall_cap` (64) such lines; past them a line is a body line.
+  A scaled glyph is one cache lookup each, with no second set of tables. Page Up and Down and
+  the bounds stay on the body pitch.
 - **Keys.** Arrows, words with Ctrl, goal column on Up and Down, Home, End, Page Up and
   Down, Ctrl+Home and End, Shift selection, Backspace and Delete (words with Ctrl), Enter
   with the line's indent, Tab and Shift+Tab (several selected lines indent and outdent as
@@ -1896,7 +1906,8 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   sets `style.palette` when its scheme changes, since the editor never reads the theme. The gallery's `c.zig` and `xml.zig` are recipes:
   copy one into your app; a language moves into the library when three apps need it.
 - **Decorations and rows.** The app sets up to 2,048 `Decoration{start, end, kind}` (`box`,
-  `strike` over the text on layer 1, `error`) and 32 `InlineRow{after_line, height}`, and
+  `strike` over the text on layer 1, `error`) and 32 `InlineRow{after_line, height}`, up to 640
+  px high, and
   rebuilds them on a new `revision()`. Rows are filled through
   `draw_begin` / `while (next_row(cx)) |slot|` / `draw_end`; `rect_of(byte)` is the
   character's unclamped logical rect for anchors and `viewport()` the box to clamp against.

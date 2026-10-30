@@ -62,6 +62,7 @@ pub const row_height_max = editor.row_height_max;
 pub const lines_max = editor.lines_max;
 pub const columns_max = editor.columns_max;
 pub const glyph_max = editor.glyph_max;
+pub const tall_cap = buffer.tall_cap;
 pub const padding_px = editor.padding_px;
 pub const over_layer = editor.over_layer;
 

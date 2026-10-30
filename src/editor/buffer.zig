@@ -24,6 +24,7 @@
 //! states   from the first edited line: compute its end state; continue while the next
 //!          line is new or its cached start state differs (`language.zig`, section 1)
 //! longest  the longest line in bytes, rescanned over the index (O(lines))
+//! tall     a sized language's lines above level 0, rescanned with it (`find_tall`)
 //! revision += 1
 //! ```
 //! Lines are numbered from 0; line `i` is `bytes[line_starts[i] .. end)` where `end` is the
@@ -124,10 +125,21 @@ const Entry = struct {
     sealed: bool,
 };
 
+/// Lines above level 0 a text keeps; the rest of them stay body lines. Size and height both
+/// read the list, so they agree.
+pub const tall_cap: u32 = 64;
+
+/// A line above level 0 (`language.zig`, section 1).
+pub const TallLine = struct {
+    line: u32,
+    level: u8,
+};
+
 /// The buffer of a text in language `L` (`language.zig`): its start states are `L.State`.
 pub fn BufferOf(comptime L: type) type {
     if (comptime language.check(L)) |problem| @compileError(problem);
     comptime assert(@sizeOf([line_cap]L.State) == line_cap);
+    const sized = language.scaled(L);
     return struct {
         const Self = @This();
 
@@ -139,6 +151,9 @@ pub fn BufferOf(comptime L: type) type {
         states: [line_cap]L.State,
         /// Bytes of the longest line, LF excluded.
         longest: u32,
+        /// A sized language's tall lines, by line, the first `tall_cap` of them.
+        tall: if (sized) [tall_cap]TallLine else void,
+        tall_count: if (sized) u32 else void,
         /// Moves on every change of the text, undo and redo included.
         revision: u64,
         refusal: Refusal,
@@ -184,6 +199,7 @@ pub fn BufferOf(comptime L: type) type {
             self.states[0] = .normal;
             self.retokenize(0, self.line_count - 1);
             self.longest = self.longest_line();
+            if (comptime sized) self.find_tall();
             self.entry_count = 0;
             self.undo_count = 0;
             self.arena_used = 0;
@@ -338,6 +354,7 @@ pub fn BufferOf(comptime L: type) type {
                 state = language.verify_line(L, self.line_bytes(line), state);
             }
             assert(self.longest == self.longest_line());
+            if (comptime sized) assert(self.tall_count <= tall_cap);
             assert(self.undo_count <= self.entry_count);
             assert(std.unicode.utf8ValidateSlice(self.text()));
         }
@@ -504,6 +521,7 @@ pub fn BufferOf(comptime L: type) type {
             self.line_count = target + tail;
             self.retokenize(first, first + added);
             self.longest = self.longest_line();
+            if (comptime sized) self.find_tall();
             self.revision += 1;
             assert(self.line_starts[0] == 0);
         }
@@ -520,6 +538,33 @@ pub fn BufferOf(comptime L: type) type {
                 self.states[line + 1] = state;
             }
             assert(line < self.line_count);
+        }
+
+        fn find_tall(self: *Self) void {
+            comptime assert(sized);
+            self.tall_count = 0;
+            var line: u32 = 0;
+            while (line < self.line_count and self.tall_count < tall_cap) : (line += 1) {
+                const level = L.level_of(self.line_bytes(line));
+                if (level == 0) continue;
+                self.tall[self.tall_count] = .{ .line = line, .level = level };
+                self.tall_count += 1;
+            }
+            assert(self.tall_count <= tall_cap);
+        }
+
+        /// The level of `line`: its entry in `tall`, by binary search, else 0.
+        pub fn level_at(self: *const Self, line: u32) u8 {
+            comptime assert(sized);
+            var low: u32 = 0;
+            var high = self.tall_count;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                const entry = self.tall[middle];
+                if (entry.line == line) return entry.level;
+                if (entry.line < line) low = middle + 1 else high = middle;
+            }
+            return 0;
         }
 
         fn longest_line(self: *const Self) u32 {

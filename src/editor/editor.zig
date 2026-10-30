@@ -48,6 +48,16 @@
 //! gutter stays on the mono grid, so digits align. `rect_of`'s width is the codepoint's advance,
 //! a space's at a line's end, and at least 1 for a mark that advances nothing.
 //!
+//! In a language with `scales` a tall line is a body line plus an extra height, so the buffer's
+//! list of tall lines joins inline rows in the walks above:
+//! ```text
+//! line_top(i)  = padding_px + i * lh + (rows before i) + (extras of tall lines before i)
+//! content_h    = 2 * padding_px + line_count * lh + (all rows) + (all extras)
+//! ```
+//! Its pens, advances, and baseline are `FaceSet`'s at that scale (`text/faces.zig`, section 4a).
+//! Page Up and Down and the bounds of section 4 stay on the body pitch: a tall line only makes
+//! fewer lines fit.
+//!
 //! ## 3. Scrolling
 //! Vertical: the step 14 view (`ViewState`): the wheel's `dy`, the thumb, and a measured
 //! content height; the editor skips the turtle over everything it draws itself, so the
@@ -217,7 +227,7 @@ pub fn glyph_bound_of(comptime L: type, width: f32, height: f32, size: f32) u32 
 /// Space above the first line and below the last.
 pub const padding_px: f32 = 4;
 /// Tallest inline row.
-pub const row_height_max: f32 = 512;
+pub const row_height_max: f32 = 640;
 /// The `derive` salt of the editor's view id.
 pub const view_salt: u64 = 1;
 /// The layer of strikes and the caret, above the base layer's glyphs.
@@ -397,6 +407,7 @@ fn LineWalk(comptime L: type) type {
 pub fn EditorOf(comptime L: type) type {
     if (comptime language.check(L)) |problem| @compileError(problem);
     const proportional = language.proportional(L);
+    const sized = language.scaled(L);
     return struct {
         const Self = @This();
         const Buffer = buffer_module.BufferOf(L);
@@ -575,7 +586,7 @@ pub fn EditorOf(comptime L: type) type {
                 .x = g.text_left - self.scroll_x + self.x_of(line, byte),
                 .y = g.viewport.y - self.view.scroll_y + self.line_top(line),
                 .width = self.width_at(line, byte),
-                .height = self.line_height(),
+                .height = self.height_of_line(line),
             };
             assert(rect.width > 0);
             return rect;
@@ -987,7 +998,7 @@ pub fn EditorOf(comptime L: type) type {
             if (!g.drawn) return;
             self.view.content_h = self.content_height();
             const top = self.line_top(self.caret_line());
-            const bottom = top + self.line_height() + padding_px;
+            const bottom = top + self.height_of_line(self.caret_line()) + padding_px;
             var scroll_y = self.view.scroll_y;
             if (top - padding_px < scroll_y) scroll_y = top - padding_px;
             if (bottom > scroll_y + g.viewport.height) scroll_y = bottom - g.viewport.height;
@@ -1019,10 +1030,45 @@ pub fn EditorOf(comptime L: type) type {
             return line_height_of(L, self.style.size);
         }
 
-        /// The device row of the baseline of a line whose top is `top`.
-        fn baseline_of(self: *const Self, top: f32) f32 {
-            if (comptime proportional) return self.faces.baseline_of(top);
+        /// The device row of the baseline of `line`, whose top is `top`.
+        fn baseline_of(self: *const Self, line: u32, top: f32) f32 {
+            if (comptime proportional) return self.faces.baseline_at(top, self.scale_at(line));
             return self.mono.baseline_of(top);
+        }
+
+        /// The scale of `line`; 1 unless the language sizes its lines.
+        fn scale_at(self: *const Self, line: u32) f32 {
+            if (comptime !sized) return 1;
+            return L.scales[self.buffer.level_at(line)];
+        }
+
+        /// How much taller than a body line each level is.
+        fn extras(self: *const Self) [L.scales.len]f32 {
+            comptime assert(sized);
+            var out: [L.scales.len]f32 = undefined;
+            const body = self.line_height();
+            for (&out, L.scales) |*extra, scale| {
+                extra.* = line_height_of(L, self.style.size * scale) - body;
+            }
+            return out;
+        }
+
+        /// The height of `line`.
+        fn height_of_line(self: *const Self, line: u32) f32 {
+            if (comptime !sized) return self.line_height();
+            return line_height_of(L, self.style.size * self.scale_at(line));
+        }
+
+        /// The extra heights of the tall lines before `line`; 0 unless the language sizes lines.
+        fn extra_above(self: *const Self, line: u32) f32 {
+            if (comptime !sized) return 0;
+            const each = self.extras();
+            var sum: f32 = 0;
+            for (self.buffer.tall[0..self.buffer.tall_count]) |entry| {
+                if (entry.line >= line) break;
+                sum += each[entry.level];
+            }
+            return sum;
         }
 
         fn device_scale(self: *const Self) f32 {
@@ -1034,13 +1080,13 @@ pub fn EditorOf(comptime L: type) type {
             return .{ .bytes = self.buffer.line_bytes(line), .state = self.buffer.states[line] };
         }
 
-        fn cell_advance(self: *const Self, cell: Cell) f32 {
-            return self.faces.advance(Faces.slots[cell.class], cell.codepoint);
+        fn cell_advance(self: *const Self, cell: Cell, scale: f32) f32 {
+            return self.faces.advance_at(Faces.slots[cell.class], cell.codepoint, scale);
         }
 
         /// A space of `faces[0]`: what a gap is made of, and the column past a line's end.
-        fn space_advance(self: *const Self) f32 {
-            return self.faces.advance(0, ' ');
+        fn space_advance(self: *const Self, scale: f32) f32 {
+            return self.faces.advance_at(0, ' ', scale);
         }
 
         /// The x of `byte` on `line`, relative to column 0 (section 2).
@@ -1055,6 +1101,7 @@ pub fn EditorOf(comptime L: type) type {
         fn x_of_column(self: *const Self, line: u32, column: u32) f32 {
             if (comptime !proportional) return @as(f32, @floatFromInt(column)) * self.advance();
             const pens = &self.pens;
+            const scale = self.scale_at(line);
             const current = pens.revision == self.buffer.revision and pens.size == self.style.size;
             if (current and line >= pens.first and line - pens.first < pens.lines) {
                 const offset = line - pens.first;
@@ -1063,7 +1110,7 @@ pub fn EditorOf(comptime L: type) type {
                 // A table that stopped short of `columns_max` holds the whole line.
                 if (count <= columns_max) {
                     const past: f32 = @floatFromInt(column - count + 1);
-                    return pens.x[offset][count - 1] + past * self.space_advance();
+                    return pens.x[offset][count - 1] + past * self.space_advance(scale);
                 }
             }
             var walk = self.line_walk(line);
@@ -1071,9 +1118,9 @@ pub fn EditorOf(comptime L: type) type {
             var at: u32 = 0;
             while (walk.next()) |cell| : (at += 1) {
                 if (at == column) return pen;
-                pen += self.cell_advance(cell);
+                pen += self.cell_advance(cell, scale);
             }
-            return pen + @as(f32, @floatFromInt(column - at)) * self.space_advance();
+            return pen + @as(f32, @floatFromInt(column - at)) * self.space_advance(scale);
         }
 
         /// The width of the codepoint at `byte`, or of a space at the line's end; at least 1,
@@ -1090,10 +1137,11 @@ pub fn EditorOf(comptime L: type) type {
         pub fn byte_at_x(self: *const Self, line: u32, x: f32) u32 {
             comptime assert(proportional);
             const range = self.buffer.line_range(line);
+            const scale = self.scale_at(line);
             var walk = self.line_walk(line);
             var pen: f32 = 0;
             while (walk.next()) |cell| {
-                const width = self.cell_advance(cell);
+                const width = self.cell_advance(cell, scale);
                 if (pen + width * 0.5 > x) return range.start + cell.byte;
                 pen += width;
             }
@@ -1107,13 +1155,15 @@ pub fn EditorOf(comptime L: type) type {
             pens.first = visible.first;
             pens.lines = visible.count;
             for (0..visible.count) |offset| {
-                var walk = self.line_walk(visible.first + @as(u32, @intCast(offset)));
+                const line = visible.first + @as(u32, @intCast(offset));
+                const scale = self.scale_at(line);
+                var walk = self.line_walk(line);
                 const row = &pens.x[offset];
                 row[0] = 0;
                 var count: u16 = 1;
                 while (count <= columns_max) : (count += 1) {
                     const cell = walk.next() orelse break;
-                    row[count] = row[count - 1] + self.cell_advance(cell);
+                    row[count] = row[count - 1] + self.cell_advance(cell, scale);
                 }
                 pens.counts[offset] = count;
             }
@@ -1130,9 +1180,10 @@ pub fn EditorOf(comptime L: type) type {
             if (current) return pens.widest;
             var most: f32 = 0;
             for (0..self.buffer.line_count) |line| {
+                const scale = self.scale_at(@intCast(line));
                 var walk = self.line_walk(@intCast(line));
                 var pen: f32 = 0;
-                while (walk.next()) |cell| pen += self.cell_advance(cell);
+                while (walk.next()) |cell| pen += self.cell_advance(cell, scale);
                 most = @max(most, pen);
             }
             pens.widest = most;
@@ -1198,7 +1249,8 @@ pub fn EditorOf(comptime L: type) type {
                 if (self.row_line(@intCast(index)) >= line) break;
                 above += self.rows[index].height;
             }
-            return padding_px + @as(f32, @floatFromInt(line)) * self.line_height() + above;
+            return padding_px + @as(f32, @floatFromInt(line)) * self.line_height() + above +
+                self.extra_above(line);
         }
 
         /// The content y of the top of row `index`.
@@ -1206,7 +1258,8 @@ pub fn EditorOf(comptime L: type) type {
             const line = self.row_line(index);
             var above: f32 = 0;
             for (self.rows[0..index]) |row| above += row.height;
-            return padding_px + @as(f32, @floatFromInt(line + 1)) * self.line_height() + above;
+            return padding_px + @as(f32, @floatFromInt(line + 1)) * self.line_height() + above +
+                self.extra_above(line + 1);
         }
 
         /// The line at content y `y`; a row maps to the line above it.
@@ -1219,9 +1272,31 @@ pub fn EditorOf(comptime L: type) type {
                 if (y < row_y + self.rows[index].height) return self.row_line(@intCast(index));
                 above += self.rows[index].height;
             }
-            const lines = @floor((y - padding_px - above) / height);
+            const rest = y - padding_px - above;
+            const extra = if (comptime sized) self.tall_walk(rest) else 0;
+            if (comptime sized) {
+                if (extra.line) |line| return line;
+            }
+            const taller = if (comptime sized) extra.above else 0;
+            const lines = @floor((rest - taller) / height);
             const last: f32 = @floatFromInt(self.buffer.line_count - 1);
             return @intFromFloat(std.math.clamp(lines, 0, last));
+        }
+
+        /// Walks the tall lines at `y` past the padding and the rows above it: the tall line
+        /// there, if any, and the extra heights before `y`.
+        fn tall_walk(self: *const Self, y: f32) struct { line: ?u32, above: f32 } {
+            comptime assert(sized);
+            const each = self.extras();
+            const height = self.line_height();
+            var above: f32 = 0;
+            for (self.buffer.tall[0..self.buffer.tall_count]) |entry| {
+                const top = @as(f32, @floatFromInt(entry.line)) * height + above;
+                if (y < top) break;
+                if (y < top + height + each[entry.level]) return .{ .line = entry.line, .above = above };
+                above += each[entry.level];
+            }
+            return .{ .line = null, .above = above };
         }
 
         /// The height of every line and row with the padding (section 2).
@@ -1229,12 +1304,13 @@ pub fn EditorOf(comptime L: type) type {
             var rows: f32 = 0;
             for (self.rows[0..self.row_count]) |row| rows += row.height;
             const lines: f32 = @floatFromInt(self.buffer.line_count);
-            return 2 * padding_px + lines * self.line_height() + rows;
+            const last = self.buffer.line_count;
+            return 2 * padding_px + lines * self.line_height() + rows + self.extra_above(last);
         }
 
         fn scroll_x_max(self: *Self) f32 {
             const wide = if (comptime proportional)
-                self.widest_px() + self.space_advance()
+                self.widest_px() + self.space_advance(1)
             else
                 @as(f32, @floatFromInt(self.buffer.longest + 1)) * self.advance();
             return @max(0, wide - self.geometry.text_width);
@@ -1346,7 +1422,6 @@ pub fn EditorOf(comptime L: type) type {
         /// The lines that overlap the viewport, at most `lines_max`, with their window tops.
         fn visible_lines(self: *const Self, visible: *Visible) void {
             const g = self.geometry;
-            const height = self.line_height();
             const first = self.line_at(self.view.scroll_y);
             var top = g.viewport.y - self.view.scroll_y + self.line_top(first);
             var row: u32 = 0;
@@ -1358,7 +1433,7 @@ pub fn EditorOf(comptime L: type) type {
                 if (top >= g.viewport.y + g.viewport.height) break;
                 visible.tops[visible.count] = top;
                 visible.count += 1;
-                top += height;
+                top += self.height_of_line(line);
                 while (row < self.row_count and self.row_line(row) == line) : (row += 1) {
                     top += self.rows[row].height;
                 }
@@ -1395,7 +1470,7 @@ pub fn EditorOf(comptime L: type) type {
                         .x = g.text_left,
                         .y = top,
                         .width = g.text_width,
-                        .height = self.line_height(),
+                        .height = self.height_of_line(line),
                     };
                     push_box(cx, band, text_clip, palette.current_line);
                 }
@@ -1428,7 +1503,7 @@ pub fn EditorOf(comptime L: type) type {
                     .x = x0 + left,
                     .y = top,
                     .width = self.x_of_column(line, columns[1]) - left,
-                    .height = self.line_height(),
+                    .height = self.height_of_line(line),
                 };
             }
             const first: f32 = @floatFromInt(columns[0]);
@@ -1543,7 +1618,7 @@ pub fn EditorOf(comptime L: type) type {
             var emitted: u32 = 0;
             for (0..visible.count) |offset| {
                 const line = visible.first + @as(u32, @intCast(offset));
-                const baseline = self.baseline_of(visible.tops[offset]);
+                const baseline = self.baseline_of(line, visible.tops[offset]);
                 if (gutter_clip) |numbers| {
                     const now = line == current;
                     const color = if (now) palette.gutter_current else palette.gutter_text;
@@ -1556,6 +1631,7 @@ pub fn EditorOf(comptime L: type) type {
                         .state = self.buffer.states[line],
                         .left = g.text_left - self.scroll_x,
                         .baseline_px = baseline,
+                        .scale = self.scale_at(line),
                         .clip = cells,
                         .palette = &palette.classes,
                     };
@@ -1598,7 +1674,7 @@ pub fn EditorOf(comptime L: type) type {
                 .x = @round(x * scale) / scale - 1 / scale,
                 .y = visible.tops[line - visible.first],
                 .width = caret_px / scale,
-                .height = self.line_height(),
+                .height = self.height_of_line(line),
             };
             push_box(cx, caret, text_clip, self.style.palette.caret);
         }
@@ -1616,6 +1692,8 @@ fn LineJob(comptime L: type) type {
         /// Window x of column 0.
         left: f32,
         baseline_px: f32,
+        /// The line's scale; 1 but for a sized language's tall lines.
+        scale: f32 = 1,
         clip: Clip,
         palette: *const [language.class_count(L)][4]f32,
     };
@@ -1663,18 +1741,18 @@ fn emit_line(comptime L: type, grid: *const mono_grid.Mono, cx: anytype, job: Li
 /// glyphs and italic overhang. Returns the glyphs emitted.
 fn emit_line_faces(comptime L: type, faces: *const FacesOf(L), cx: anytype, job: LineJob(L)) u32 {
     assert(job.clip.x1 > job.clip.x0);
-    const slop = 2 * faces.size;
+    const slop = 2 * faces.size * job.scale;
     var walk: LineWalk(L) = .{ .bytes = job.bytes, .state = job.state };
     var pen = job.left;
     var emitted: u32 = 0;
     while (walk.next()) |cell| {
         const slot = FacesOf(L).slots[cell.class];
         const x = pen;
-        pen += faces.advance(slot, cell.codepoint);
+        pen += faces.advance_at(slot, cell.codepoint, job.scale);
         if (x >= job.clip.x1) return emitted;
         if (cell.gap or x + slop <= job.clip.x0) continue;
         const paint: mono_grid.Paint = .{ .clip = job.clip, .color = job.palette[cell.class] };
-        faces.emit(cx, slot, cell.codepoint, x, job.baseline_px, paint);
+        faces.emit_at(cx, slot, cell.codepoint, x, job.baseline_px, job.scale, paint);
         emitted += 1;
         if (emitted == columns_max) return emitted;
     }
@@ -2232,8 +2310,8 @@ test "rects, spans, decorations, and the caret follow the pens" {
     const rect = editor.rect_of(5);
     try testing.expectEqual(left + editor.x_of(0, 5), rect.x);
     try testing.expectEqual(@as(f32, 9), rect.width);
-    try testing.expectApproxEqAbs(editor.space_advance(), editor.rect_of(9).width, 0.001);
-    try testing.expectEqual(editor.x_of(0, 9) + editor.space_advance(), editor.x_of_column(0, 10));
+    try testing.expectApproxEqAbs(editor.space_advance(1), editor.rect_of(9).width, 0.001);
+    try testing.expectEqual(editor.x_of(0, 9) + editor.space_advance(1), editor.x_of_column(0, 10));
     const band = editor.span_rect(0, editor.line_span(0, 2, 12, true).?, 4);
     try testing.expectEqual(left + editor.x_of(0, 2), band.x);
     try testing.expectEqual(editor.x_of_column(0, 10) - editor.x_of(0, 2), band.width);
@@ -2283,7 +2361,7 @@ test "x_of after an edit does not read last frame's pens" {
     _ = pair_frame(800, 300);
     const before = editor.x_of(0, 3);
     try testing.expect(editor.replace(.{ .start = 0, .end = 0 }, "7 "));
-    try testing.expectEqual(9 + editor.space_advance() + before, editor.x_of(0, 5));
+    try testing.expectEqual(9 + editor.space_advance(1) + before, editor.x_of(0, 5));
 }
 
 // Locks the goal as an x: from the end of a long word line, Down lands on the column nearest the
@@ -2348,4 +2426,136 @@ test "glyph_bound_of holds on a line of narrow glyphs" {
 test "a mono editor pays nothing for proportional faces" {
     try testing.expectEqual(@as(usize, 322_272 + 8), @sizeOf(Editor));
     try testing.expect(@sizeOf(PairEditor) > @sizeOf(EditorOf(Duo)) + @sizeOf(Pens));
+}
+
+/// `Pair` with headings: a line starting "# " is twice the size.
+const Tiered = struct {
+    pub const State = Pair.State;
+    pub const Class = Pair.Class;
+    pub const palette = Pair.palette;
+    pub const faces = Pair.faces;
+    pub const next = Pair.next;
+    pub const scales: [2]f32 = .{ 1, 2 };
+
+    pub fn level_of(line: []const u8) u8 {
+        return if (std.mem.startsWith(u8, line, "# ")) 1 else 0;
+    }
+};
+
+const TieredEditor = EditorOf(Tiered);
+
+const tiered_fixture = struct {
+    var editor: TieredEditor = undefined;
+};
+
+fn tiered_fresh(utf8: []const u8) *TieredEditor {
+    fixture.context.init();
+    const editor = &tiered_fixture.editor;
+    editor.init(test_id, TieredEditor.default_style);
+    assert(editor.load(utf8));
+    return editor;
+}
+
+fn tiered_frame(width: u32, height: u32) *TestContext {
+    const context = &fixture.context;
+    context.begin_frame(width, height, 120);
+    tiered_fixture.editor.draw(context, ui.sized(.fill, .fill));
+    _ = context.end_frame();
+    return context;
+}
+
+fn tiered_send(event: input.Event) Action {
+    const context = &fixture.context;
+    context.event_begin(event);
+    const action = tiered_fixture.editor.handle(context, event);
+    context.event_end();
+    return action;
+}
+
+// Locks the walk of section 2 over tall lines and rows in any order: every line's top maps back
+// to the line through `line_at`, as do its bottom edge and its middle; a y in a row is the line
+// above it; and the content height is the bottom of the last line.
+test "line_top and line_at round trip across tall lines and rows" {
+    const editor = tiered_fresh("# a\nb\n# c\n# d\ne\nf\n# g");
+    editor.rows[0] = .{ .after_line = 0, .height = 30 };
+    editor.rows[1] = .{ .after_line = 3, .height = 50 };
+    editor.rows[2] = .{ .after_line = 3, .height = 10 };
+    editor.row_count = 3;
+    var line: u32 = 0;
+    while (line < editor.buffer.line_count) : (line += 1) {
+        const top = editor.line_top(line);
+        const height = editor.height_of_line(line);
+        try testing.expectEqual(line, editor.line_at(top));
+        try testing.expectEqual(line, editor.line_at(top + height * 0.5));
+        try testing.expectEqual(line, editor.line_at(top + height - 0.25));
+    }
+    try testing.expectEqual(@as(u32, 0), editor.line_at(editor.row_top(0) + 5));
+    try testing.expectEqual(@as(u32, 3), editor.line_at(editor.row_top(2) + 5));
+    const last = editor.buffer.line_count - 1;
+    const bottom = editor.line_top(last) + editor.height_of_line(last) + padding_px;
+    try testing.expectEqual(bottom, editor.content_height());
+    try testing.expectEqual(line_height_of(Tiered, 30), editor.height_of_line(0));
+}
+
+// Locks a heading's geometry: a click on it lands on it, `x_of` and `byte_at_x` round trip at its
+// scale, its caret and band take its height, its glyphs are twice the size, and the line after
+// it starts where it ends.
+test "a heading is a taller line of real text" {
+    const line = "# title word";
+    const editor = tiered_fresh(line ++ "\nbody\n");
+    _ = tiered_frame(800, 300);
+    var byte: u32 = 0;
+    while (byte <= line.len) : (byte += 1) {
+        try testing.expectEqual(byte, editor.byte_at_x(0, editor.x_of(0, byte)));
+    }
+    const tall = editor.rect_of(4);
+    const body = editor.rect_of(13);
+    try testing.expectEqual(editor.height_of_line(0), tall.height);
+    try testing.expectEqual(tall.y + tall.height, body.y);
+    const point: input.Point = .{ .x = tall.x + tall.width * 0.25, .y = tall.y + tall.height - 2 };
+    _ = tiered_send(.{ .pointer_move = point });
+    _ = tiered_send(.{ .pointer_down = input.left_at(point) });
+    _ = tiered_send(.{ .pointer_up = input.left_at(point) });
+    try testing.expectEqual(@as(u32, 4), editor.caret);
+    const context = tiered_frame(800, 300);
+    var found = false;
+    for (context.draw.items(draw.Box)) |box| {
+        if (!std.meta.eql(box.fill, editor.style.palette.caret)) continue;
+        found = true;
+        try testing.expectEqual(tall.height, box.rect[3]);
+    }
+    try testing.expect(found);
+    const glyphs = context.draw.items(draw.Glyph);
+    const big = glyphs[1].rect[3];
+    try testing.expect(big > 1.5 * glyphs[glyphs.len - 1].rect[3]);
+}
+
+// Locks the list: an edit, undo, and a load all move it; an edit on one line changes no other's
+// height; past `tall_cap` a heading is a body line in size and height alike.
+test "the tall lines follow the text" {
+    const editor = tiered_fresh("a\nb\n");
+    _ = tiered_frame(800, 300);
+    const body = editor.line_height();
+    try testing.expectEqual(body, editor.height_of_line(0));
+    try testing.expect(editor.replace(.{ .start = 0, .end = 0 }, "# "));
+    try testing.expectEqual(line_height_of(Tiered, 30), editor.height_of_line(0));
+    try testing.expectEqual(body, editor.height_of_line(1));
+    _ = tiered_send(.{ .key_down = input.key_press(.left, .none, false, "") });
+    try testing.expectEqual(@as(u32, 1), editor.buffer.tall_count);
+    try testing.expect(editor.buffer.undo() != null);
+    try testing.expectEqual(@as(u32, 0), editor.buffer.tall_count);
+    var many: [(buffer_module.tall_cap + 2) * 4]u8 = undefined;
+    for (0..buffer_module.tall_cap + 2) |index| @memcpy(many[index * 4 ..][0..4], "# a\n");
+    try testing.expect(editor.load(&many));
+    try testing.expectEqual(buffer_module.tall_cap, editor.buffer.tall_count);
+    const past = buffer_module.tall_cap + 1;
+    try testing.expectEqual(body, editor.height_of_line(past));
+    try testing.expectEqual(@as(f32, 1), editor.scale_at(past));
+}
+
+// Locks that sizing lines costs other languages nothing: a language of faces alone stays as it
+// was, and only a sized one carries the list.
+test "only a sized language keeps tall lines" {
+    try testing.expectEqual(@as(usize, 0), @sizeOf(@TypeOf(pair_fixture.editor.buffer.tall)));
+    try testing.expect(@sizeOf(TieredEditor) > @sizeOf(PairEditor));
 }

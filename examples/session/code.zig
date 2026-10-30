@@ -4,9 +4,9 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Why Not the Editor
-//! The osc, pad, and reverb tank sections are an `editor.EditorOf(patch)` (`patch.zig`). The mix
-//! section stays typeset here: its numbers are slots bound to widgets, and binding them both
-//! ways is a job of its own. So these lines are read-only and placed token by token with
+//! The text is an `editor.EditorOf(patch)` (`patch.zig`). The mix body stays typeset here, in
+//! an inline row: its numbers are slots bound to widgets, and binding them both ways is a job
+//! of its own. So these lines are read-only and placed token by token with
 //! `text.measure` and `kit.label`, which is also what lets a token's alpha follow its gate.
 //!
 //! ## 2. Templates and Slots
