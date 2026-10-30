@@ -9,9 +9,9 @@
 //! Whether an app can build an atypical screen from the public API alone. Everything here is
 //! library widgets under app skins (`look.zig`: ring knobs, upright toggles), library draw
 //! types (Box, Waveform, Arc, Path, Glyph), an `EditorOf(patch)` set in serif (`patch.zig`),
-//! and four pieces the library does not have: the mix section's typeset code (`code.zig`), a
-//! fader with a stereo meter (`fader.zig`), a piano keyboard (`keys.zig`), and the plots
-//! (`plots.zig`). The sound is made up (`signal.zig`).
+//! and pieces the library does not have: two-way bindings (`bindings.zig`), a fader with a
+//! stereo meter (`fader.zig`), a piano keyboard (`keys.zig`), and the plots (`plots.zig`). The
+//! sound is made up (`signal.zig`).
 //!
 //! ## 2. Layout (logical pixels, shown at 1280 by 720)
 //! The view and the card follow the window: the view is the window's height less
@@ -20,16 +20,15 @@
 //! view      0..1280 x 0..628, scrolling: the document's rows, top to bottom
 //!   x 18          fold brackets, one per section's lines
 //!   x 32..168     margin widgets on their line: sliders, level bars, envelope, response
-//!   x 184..1088   the editor, its viewport from x 180: every section's heading, and the
-//!                 code of all but the mix, whose body is typeset: its code, the compander
-//!                 row, and the mixer (five strips 120 wide, 10 apart)
+//!   x 184..1088   the editor, its viewport from x 180: the whole text, with the compander
+//!                 row and the mixer (five strips 120 wide, 10 apart) as inline rows
 //!   x 1100..1140  toggles; x 1148..1228 knobs: each at its line, pushed down past the last
 //! card      8..1272 x 634..716: octave box, keys (36 white, 33 wide, from x 60), the song
 //!           overview (540 columns over 1080 px), and the transport
 //! ```
-//! Rows: a typeset line is 26 high, the compander row 92, the mixer 324. The editor is as tall
-//! as its content, so it never scrolls itself and the wheel reaches the view; its lines are 22
-//! high (Noto Serif at 16 px) and a heading 36.
+//! Rows: the compander row is 92 high, the mixer 324. The editor is as tall as its content, so
+//! it never scrolls itself and the wheel reaches the view; its lines are 22 high (Noto Serif at
+//! 16 px) and a heading 36.
 //!
 //! ## 2a. Sections
 //! A section is a line starting "# ", found in the text on a new revision (`build_sections`), so
@@ -39,13 +38,10 @@
 //! before inherits from the same place when the count held, so renaming keeps both, and a new
 //! section takes the next colour.
 //!
-//! One section holds the mix body, in one inline row: "# mix" to begin with, and whatever it is
-//! renamed to, because the body belongs to the section and not to its spelling. Its numbers are
-//! slots written from widgets every frame, so they cannot be text in the buffer. The row only
-//! reserves the room: the body draws after `draw_end`, in the view's clip, because its margin
-//! widgets lie left of the editor's viewport. Delete the heading and the body goes with it,
-//! until undo or typing the name again brings it back (`find_mix`); the widgets keep their
-//! values, because the app owns them.
+//! The compander's row follows the line starting `round :=`, the mixer's the line starting
+//! `send =`. Their widgets draw after `draw_end`, in the view's clip, because the rows' margin
+//! widgets lie left of the editor's viewport. Delete such a line and its row goes until undo or
+//! typing it again; the widgets keep their values.
 //!
 //! ## 2b. Moving a Section
 //! A section's "#" is a drag handle: its area sits above the editor's, so a press there never
@@ -54,15 +50,21 @@
 //! the pointer and a line at the slot it would land in. Slots lie between sections; `slot_ys`
 //! keeps where they were drawn. A drop is one edit (`sections.zig`), so one undo restores the
 //! order, and it gives the editor focus, so that undo reaches it. Marks, colours, brackets,
-//! margins, and the mix body move by themselves: they are found from the text.
+//! margins, and the rows move by themselves: they are found from the text.
 //!
 //! ## 3. Bindings
-//! Widgets own their values; the patch's text is formatted from them every frame (`code.Slots`,
-//! `update_slots`): toggles write `tog(1, ...)`, the shimmer and wet knobs their `k(...)`
-//! values, faders `level = ...`, send knobs `send = ...`, mutes `mute[i] = ...`. A section's
-//! mark turns it off (its code dims); a toggle off dims its line. The editor's text is the
-//! user's: nothing writes to it. While it has focus, Space and the tracker keys type; a section
-//! off dims its lines with a veil on `over_layer`, because a palette is per class, not per line.
+//! The text is the truth (`bindings.zig`). An edit the app did not cause is parsed into the
+//! widgets (`sync`). `event` compares the bound widgets around their handlers, and one that
+//! moved rewrites its literal (`write`): that one place catches drags, wheels, and resets alike.
+//! A pointer drag or a run of wheel notches is one gesture, so one undo entry; while a drag
+//! holds a gesture, keys and pastes are dropped, because undo asserts inside one.
+//!
+//! A widget whose call is gone keeps its value, dims, and writes nothing; it binds again when
+//! the call returns. Moving a widget takes focus from the editor, and giving it back would make
+//! the next Space type, so `event` routes Ctrl+Z and Ctrl+Y to the editor when nothing holds
+//! focus. A section's mark or a toggle turns its code down with a veil over the line, because a
+//! palette is per class, not per line. While the editor has focus, Space and the tracker keys
+//! type.
 //!
 //! ## 4. Transport
 //! `timer_period_ms` is 33 and the timer starts disarmed: the screen sleeps until Space or
@@ -70,8 +72,8 @@
 //! the modulator, the spinner, the position, and the overview's playhead follow `t`.
 //!
 //! ## 5. TigerStyle Invariants
-//! - Static: the app, its slots, and its overview; nothing allocates.
-//! - Per-frame work is bounded by the rows table and the signal's constants.
+//! - Static: the app and its overview; nothing allocates.
+//! - Per-frame work is bounded by the text's caps and the signal's constants.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -84,8 +86,8 @@ const widgets = patchwork.widgets;
 const bench = patchwork.bench;
 const kit = widgets.kit;
 const look = @import("look.zig");
-const code = @import("code.zig");
 const patch = @import("patch.zig");
+const bindings = @import("bindings.zig");
 const sections_file = @import("sections.zig");
 const signal = @import("signal.zig");
 const plots = @import("plots.zig");
@@ -97,6 +99,7 @@ const Clip = quads.Clip;
 const Point = quads.Point;
 const Context = patchwork.app.Context(App);
 const Fader = fader_file.Fader;
+const Slot = bindings.Slot;
 
 const Editor = patchwork.editor.EditorOf(patch);
 const RingKnob = widgets.KnobOf(look.Ring);
@@ -125,7 +128,8 @@ const mark_x: f32 = 1196;
 const rule_end: f32 = 1240;
 
 const header_h: f32 = 44;
-const line_h: f32 = 26;
+/// A line of code.
+const line_h: f32 = patchwork.editor.line_height_of(patch, look.code_size);
 const compander_h: f32 = 92;
 const mixer_h: f32 = 324;
 /// The editor's viewport: its text starts `padding_px` in, at `code_x`.
@@ -172,47 +176,20 @@ const bpm: f32 = 120;
 const mix: u8 = 0;
 /// Sections the text may have: two inline rows each, and one for the mix body.
 const section_cap: u32 = 15;
-const mix_declared = [_][]const u8{ "round", "wet", "mixed", "room" };
-const channel_names = [_][]const u8{ "bass", "pads", "line", "wet" };
 const strip_names = [_][]const u8{ "bass", "pads", "line", "wet", "master" };
 
 const Margin = enum { none, modulator, envelope, response, saws, sub, noise, pad_mix, wet, master };
-const Side = enum { none, eq, shimmer, wet };
-const Gate = enum { none, eq, shimmer };
-
-const Line = struct {
-    template: []const u8,
-    /// Indent to the pen after the previous hanging line's first "(".
-    hang: bool = false,
-    margin: Margin = .none,
-    side: Side = .none,
-    gate: Gate = .none,
-    rule_above: bool = false,
-};
-
-const Row = union(enum) {
-    line: Line,
-    compander,
-    mixer,
-};
-
-/// The mix body (section 2a). Slots: a eq, b shimmer on, c shimmer, d wet, e..h levels,
-/// i..l sends, m and n the first two mutes.
-const mix_rows = [_]Row{
-    .{ .line = .{ .template = "round := compander(pads + line);" } },
-    .compander,
-    .{ .line = .{ .template = "if (tog($a, \"eq\")) round = round.tilt(gain = m(range=-1~4, period=25s));", .margin = .modulator, .side = .eq, .gate = .eq, .rule_above = true } },
-    .{ .line = .{ .template = "if (tog($b, \"shimmer\")) round = round.pitch_shift(2, 80ms).α(k(0~$c~1, name=\"shimmer\"));", .side = .shimmer, .gate = .shimmer } },
-    .{ .line = .{ .template = "wet := room.wet * k(0~$d~1, \"wet\");", .margin = .wet, .side = .wet } },
-    .{ .line = .{ .template = "mixed := mixer(bass, pads, line, wet, level = $e, $f, $g, $h,", .margin = .master } },
-    .{ .line = .{ .template = "send = $i, $j, $k, $l, pre = 0, 0, 0, safe[3] = 1, mute[0] = $m, mute[1] = $n);", .hang = true } },
-    .mixer,
-};
 
 /// The editor's starting text. Six spaces of serif are about the 24 px a block is indented,
 /// eleven the 44 px a continued line is.
 pub const patch_text =
     \\# mix
+    \\round := compander(pads + line);
+    \\if (tog(1, "eq")) round = round.tilt(gain = m(range=-1~4, period=25s));
+    \\if (tog(1, "shimmer")) round = round.pitch_shift(2, 80ms).α(k(0~0.16~1, name="shimmer"));
+    \\wet := room.wet * k(0~0.73~1, "wet");
+    \\mixed := mixer(bass, pads, line, wet, level = -2.68db, -8.45db, -5.14db, -4.11db,
+    \\                             send = -60db, 0db, 0db, -60db, pre = 0, 0, 0, safe[3] = 1, mute[0] = 0, mute[1] = 0);
     \\# osc
     \\module unison(Note n, detune = 0~0.12~1, width = 0~0.8~1) -> ꝏ {
     \\      return sum (j, 8) => saw(n + j.across(0, 7) * detune, φ = 0~1).pan(j.across(0, 7) * width) * 0.35f;
@@ -235,23 +212,8 @@ pub const patch_text =
     \\}
 ;
 
-/// The mix body's height: one inline row.
-const mix_body_h: f32 = blk: {
-    var sum: f32 = 0;
-    for (mix_rows) |row| sum += row_height(row);
-    break :blk sum;
-};
-
-/// The editor's height for `patch_text`: 17 lines of code, 4 headings, and their rows.
-const patch_h: f32 = 2 * patchwork.editor.padding_px + 17 * patchwork.editor.line_height_of(patch, look.code_size) + 4 * heading_h + 4 * rule_room + 3 * section_gap + mix_body_h;
-
-fn row_height(row: Row) f32 {
-    return switch (row) {
-        .line => line_h,
-        .compander => compander_h,
-        .mixer => mixer_h,
-    };
-}
+/// The editor's height for `patch_text`: 23 lines of code, 4 headings, and their rows.
+const patch_h: f32 = 2 * patchwork.editor.padding_px + 23 * line_h + 4 * heading_h + 4 * rule_room + 3 * section_gap + compander_h + mixer_h;
 
 /// The document's height for `patch_text`: the view's content.
 pub const content_h: f32 = patch_h + end_gap;
@@ -265,7 +227,7 @@ const Param = struct {
     name: []const u8,
     lo: f32,
     hi: f32,
-    initial: f32,
+    initial: f32 = 0,
     unit: Unit,
     log: bool = false,
 
@@ -304,12 +266,12 @@ const comp_params = [_]Param{
     .{ .name = "r", .lo = 1, .hi = 1000, .initial = 100, .unit = .ms, .log = true },
     .{ .name = "makeup", .lo = -12, .hi = 12, .initial = 0, .unit = .db },
 };
-const shimmer_param: Param = .{ .name = "shimmer", .lo = 0, .hi = 1, .initial = 0.16, .unit = .percent };
-const wet_param: Param = .{ .name = "wet", .lo = 0, .hi = 1, .initial = 0.73, .unit = .percent };
+const shimmer_param: Param = .{ .name = "shimmer", .lo = 0, .hi = 1, .unit = .percent };
+const wet_param: Param = .{ .name = "wet", .lo = 0, .hi = 1, .unit = .percent };
 const pan_param: Param = .{ .name = "pan", .lo = -1, .hi = 1, .initial = 0, .unit = .pan };
-const send_param: Param = .{ .name = "send", .lo = -60, .hi = 6, .initial = -60, .unit = .send };
-const initial_levels = [_]f32{ -2.68, -8.45, -5.14, -4.11, 0 };
-const initial_sends = [_]f32{ -60, 0, 0, -60 };
+const send_param: Param = .{ .name = "send", .lo = -60, .hi = 6, .unit = .send };
+/// The master fader's level: it has no line in the text.
+const master_level: f32 = 0;
 
 // ---------------------------------------------------------------------------- ids
 
@@ -384,11 +346,12 @@ const Placed = struct {
     last_y: [section_cap]f32 = @splat(-std.math.inf(f32)),
     toggle_y: [3]f32 = @splat(0),
     knob_y: [2]f32 = @splat(0),
-    hang_x: f32 = code_x,
+    /// The compander row's line sits in a section that is on.
+    compander_on: bool = true,
     /// The "mixer" word's span and the bottom of its line, and the mixer row's top.
     mixer_word: [2]f32 = .{ 0, 0 },
     mixer_line: f32 = 0,
-    mixer_top: f32 = 0,
+    mixer_top: ?f32 = null,
 };
 
 /// A heading in the text (section 2a).
@@ -398,12 +361,24 @@ const Section = struct {
     enabled: bool,
     /// Its index into the cycle of `look.section_colors`.
     colour: u8,
-    /// It holds the mix body (section 2a).
-    holds_mix: bool,
     line: u32,
 };
 
-const RowKind = enum { room, mix_body };
+const RowKind = enum { room, compander, mixer };
+
+/// An inline row before they are sorted by line.
+const PlannedRow = struct {
+    after_line: u32,
+    height: f32,
+    kind: RowKind,
+
+    fn before(_: void, a: PlannedRow, b: PlannedRow) bool {
+        return a.after_line < b.after_line;
+    }
+};
+
+/// What a gesture on a bound widget is, which says what ends it (section 3).
+const Gesture = enum { none, drag, wheel };
 
 /// A section whose colour is not settled yet, while `build_sections` runs.
 const no_colour: u8 = 255;
@@ -431,10 +406,9 @@ pub const App = struct {
     /// The text's sections and what the editor's rows hold (section 2a), for one revision.
     sections: [section_cap]Section,
     section_count: u32,
-    /// The section that holds the mix body, if the text has one.
-    mix_section: ?u32,
-    /// The name of the last section that held it.
-    mix_name: u64,
+    /// The lines the compander's and the mixer's rows follow.
+    compander_line: ?u32,
+    mixer_line: ?u32,
     row_kinds: [patchwork.editor.row_cap]RowKind,
     sections_revision: u64,
     /// The colour the next new section takes.
@@ -445,10 +419,15 @@ pub const App = struct {
     grab: [2]f32,
     /// The rebuilt bytes of a move.
     move_scratch: [patchwork.editor.buffer.buffer_cap]u8,
+    /// The values read out of the text (section 3), for `parsed_revision`.
+    parse: bindings.Parse,
+    parsed_revision: u64,
+    gesture: Gesture,
+    /// The side widgets' last content y: compander, eq, shimmer toggles; shimmer, wet knobs.
+    side_y: [5]f32,
     playing: bool,
     looping: bool,
     t: f32,
-    slots: code.Slots,
     overview: [overview_columns]quads.wave.Column,
 
     pub const config: patchwork.app.Config = .{
@@ -482,6 +461,11 @@ pub const App = struct {
         .{ .name = "reorder", .setup = &reorder_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "reorder-hold", .setup = &hold_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "reorder-undo", .setup = &reorder_undo_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "bind-type", .setup = &bind_type_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "bind-drag", .setup = &bind_drag_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "bind-undo", .setup = &bind_undo_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "bind-toggle", .setup = &bind_toggle_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "bind-break", .setup = &bind_break_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
@@ -491,8 +475,8 @@ pub const App = struct {
             const accent = look.pastels[index % look.pastels.len];
             knob.* = RingKnob.init(comp_id(@intCast(index)), param.name, param.position(param.initial), paint(accent)).sized(comp_ring);
         }
-        app.shimmer = RingKnob.init(shimmer_id, "shimmer", shimmer_param.position(shimmer_param.initial), paint(shimmer_color)).sized(side_ring);
-        app.wet = RingKnob.init(wet_id, "wet", wet_param.position(wet_param.initial), paint(look.pastels[2])).sized(side_ring);
+        app.shimmer = RingKnob.init(shimmer_id, "shimmer", 0, paint(shimmer_color)).sized(side_ring);
+        app.wet = RingKnob.init(wet_id, "wet", 0, paint(look.pastels[2])).sized(side_ring);
         app.comp_on = SideToggle.init(comp_on_id, "compander", true);
         app.comp_on.accent = compander_color;
         app.eq_on = SideToggle.init(eq_on_id, "eq", true);
@@ -502,11 +486,10 @@ pub const App = struct {
         for (&app.strips, 0..) |*strip, index| {
             const at: u32 = @intCast(index);
             const color = strip_color(at);
-            const send = if (index < initial_sends.len) send_param.position(initial_sends[index]) else 0;
             strip.* = .{
                 .pan = PanKnob.init(pan_id(at), "pan", 0.5, paint(look.white)).sized(strip_ring),
-                .send = RingKnob.init(send_id(at), "send", send, paint(color)).sized(strip_ring),
-                .fader = Fader.init(fader_id(at), initial_levels[index]),
+                .send = RingKnob.init(send_id(at), "send", 0, paint(color)).sized(strip_ring),
+                .fader = Fader.init(fader_id(at), master_level),
                 .mute = small_button(mute_id(at), "M"),
                 .solo = small_button(solo_id(at), "S"),
             };
@@ -516,20 +499,26 @@ pub const App = struct {
         assert(app.editor.load(patch_text));
         app.section_count = 0;
         app.colour_next = 0;
-        app.mix_name = name_key("mix");
         app.build_sections();
         app.slot_ys = @splat(0);
         app.grab = .{ 0, 0 };
+        app.side_y = @splat(0);
+        app.gesture = .none;
+        app.parsed_revision = 0;
+        app.sync();
+        app.settle_defaults();
         app.playing = false;
         app.looping = true;
         app.t = start_s;
-        app.slots = .{};
         build_overview(&app.overview);
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
+        if (app.gesture_drops(event_value)) return;
         _ = app.editor.handle(cx, event_value);
+        app.sync();
         const typing = cx.focused(editor_id);
+        const before = app.numbers();
         _ = app.view.handle(cx, view_id, event_value);
         for (&app.comp) |*knob| _ = knob.handle(cx, event_value);
         _ = app.shimmer.handle(cx, event_value);
@@ -556,6 +545,7 @@ pub const App = struct {
                 cx.redraw();
             }
         }
+        app.write_moved(cx, event_value, before);
         app.handle_move(cx, event_value);
         // A release still counts: its note may have started before the editor took focus.
         if (!(typing and event_value == .key_down)) _ = app.keyboard.handle(cx, event_value);
@@ -570,9 +560,150 @@ pub const App = struct {
                     app.follow_caret(cx);
                 } else if (kit.is_space(press) and !press.repeat) {
                     app.set_playing(cx, !app.playing);
+                } else if (press.mods.shortcut() and cx.focus == .none) {
+                    app.route_history(cx, press);
                 }
             },
             else => {},
+        }
+    }
+
+    /// Ctrl+Z and Ctrl+Y with nothing focused: moving a widget took focus from the editor, and
+    /// a widget's move is an edit like any other (section 3).
+    fn route_history(app: *App, cx: *Context, press: input.KeyPress) void {
+        const action = switch (press.key) {
+            .z => if (press.mods.shift) app.editor.redo(cx) else app.editor.undo(cx),
+            .y => app.editor.redo(cx),
+            else => return,
+        };
+        if (action != .changed) return;
+        app.sync();
+        app.follow_caret(cx);
+    }
+
+    /// True when a gesture swallows the event; closes one the event ends (section 3).
+    fn gesture_drops(app: *App, event_value: input.Event) bool {
+        if (app.gesture == .none) return false;
+        switch (event_value) {
+            .frame, .pointer_move, .wheel, .key_up => return false,
+            .key_down, .paste => {
+                if (app.gesture == .drag) return true;
+            },
+            else => {},
+        }
+        app.close_gesture();
+        return false;
+    }
+
+    fn close_gesture(app: *App) void {
+        assert(app.gesture != .none);
+        app.editor.gesture_end();
+        app.gesture = .none;
+        app.parsed_revision = 0;
+        app.sync();
+    }
+
+    /// Reads the text into the widgets when it moved without them (section 3).
+    fn sync(app: *App) void {
+        const revision = app.editor.revision();
+        if (revision == app.parsed_revision) return;
+        app.parsed_revision = revision;
+        app.parse = .run(app.editor.text());
+        for (0..bindings.slot_count) |index| {
+            const slot: Slot = @fromBackingInt(@as(u8, @intCast(index)));
+            if (app.parse.get(slot)) |value| app.set_slot(slot, value);
+        }
+        app.decorate();
+    }
+
+    /// The starting text's values are what a right press restores.
+    fn settle_defaults(app: *App) void {
+        app.shimmer.default = app.shimmer.value;
+        app.wet.default = app.wet.value;
+        for (&app.strips) |*strip| {
+            strip.fader.default = strip.fader.value;
+            strip.send.default = strip.send.value;
+        }
+    }
+
+    fn set_slot(app: *App, slot: Slot, value: bindings.Value) void {
+        const number = value.number;
+        switch (slot) {
+            .eq_on => set_toggle(&app.eq_on, number != 0),
+            .shimmer_on => set_toggle(&app.shimmer_on, number != 0),
+            .shimmer => app.shimmer.set_value(unit_of(value)),
+            .wet => app.wet.set_value(unit_of(value)),
+            .level_0, .level_1, .level_2, .level_3 => {
+                app.strips[strip_of(slot, .level_0)].fader.value = fader_file.position(number);
+            },
+            .send_0, .send_1, .send_2, .send_3 => {
+                app.strips[strip_of(slot, .send_0)].send.set_value(send_param.position(number));
+            },
+            .mute_0, .mute_1 => app.strips[strip_of(slot, .mute_0)].muted = number != 0,
+        }
+    }
+
+    /// The bound widget's value in the text's units.
+    fn number_of(app: *const App, slot: Slot) f32 {
+        const ends = app.parse.get(slot);
+        const lo = if (ends) |value| value.lo else 0;
+        const hi = if (ends) |value| value.hi else 1;
+        return switch (slot) {
+            .eq_on => @floatFromInt(@intFromBool(app.eq_on.on)),
+            .shimmer_on => @floatFromInt(@intFromBool(app.shimmer_on.on)),
+            .shimmer => lo + app.shimmer.value * (hi - lo),
+            .wet => lo + app.wet.value * (hi - lo),
+            .level_0, .level_1, .level_2, .level_3 => app.strips[strip_of(slot, .level_0)].fader.db(),
+            .send_0, .send_1, .send_2, .send_3 => send_param.display(app.strips[strip_of(slot, .send_0)].send.value),
+            .mute_0, .mute_1 => @floatFromInt(@intFromBool(app.strips[strip_of(slot, .mute_0)].muted)),
+        };
+    }
+
+    fn numbers(app: *const App) [bindings.slot_count]f32 {
+        var out: [bindings.slot_count]f32 = undefined;
+        for (&out, 0..) |*number, index| number.* = app.number_of(@fromBackingInt(@as(u8, @intCast(index))));
+        return out;
+    }
+
+    /// Rewrites the literal of every bound widget this event moved (section 3).
+    fn write_moved(app: *App, cx: *Context, event_value: input.Event, before: [bindings.slot_count]f32) void {
+        const now = app.numbers();
+        for (now, before, 0..) |number, was, index| {
+            if (number == was) continue;
+            const slot: Slot = @fromBackingInt(@as(u8, @intCast(index)));
+            if (app.parse.get(slot) == null) continue;
+            if (app.gesture == .none and (event_value == .pointer_move or event_value == .wheel)) {
+                app.editor.gesture_begin();
+                app.gesture = if (event_value == .wheel) .wheel else .drag;
+            }
+            app.write(slot, number);
+            cx.redraw();
+        }
+    }
+
+    /// A parse never writes and a write never parses: the other ranges shift instead.
+    fn write(app: *App, slot: Slot, number: f32) void {
+        const entry = &app.parse.values[@backingInt(slot)];
+        const value = entry.*.?;
+        var out: [bindings.literal_cap]u8 = undefined;
+        const bytes = bindings.format(slot, number, &out);
+        const range = value.range;
+        if (!app.editor.replace(.{ .start = range.start, .end = range.end }, bytes)) return;
+        const delta = @as(i32, @intCast(bytes.len)) - @as(i32, @intCast(range.end - range.start));
+        app.parse.shift(range.end, delta);
+        entry.*.?.range.end = range.start + @as(u32, @intCast(bytes.len));
+        entry.*.?.number = number;
+        app.parsed_revision = app.editor.revision();
+        app.decorate();
+    }
+
+    /// The parse's errors as the editor's decorations.
+    fn decorate(app: *App) void {
+        const editor = &app.editor;
+        editor.decoration_count = 0;
+        for (app.parse.errors[0..app.parse.error_count]) |span| {
+            editor.decorations[editor.decoration_count] = .{ .start = span.start, .end = span.end, .kind = .@"error" };
+            editor.decoration_count += 1;
         }
     }
 
@@ -662,7 +793,7 @@ pub const App = struct {
     }
 
     pub fn draw(app: *App, cx: *Context) void {
-        app.update_slots();
+        app.sync();
         const sound = app.mixdown();
         const screen = cx.begin(ui.sized(.fill, .fill), .{ .flow = .down });
         const viewport_h = @max(line_h, screen.height - card_space);
@@ -672,32 +803,13 @@ pub const App = struct {
         _ = cx.walk(ui.sized(.fill, .{ .fixed = end_gap }));
         app.draw_drop(cx);
         app.draw_folds(cx, &placed);
-        if (app.mix_section != null) {
-            app.draw_connector(cx, &placed);
-            app.draw_side(cx, &placed);
-        }
+        app.draw_connector(cx, &placed);
+        app.draw_side(cx, &placed);
         cx.end_view();
         app.draw_card(cx, bottom_of(screen));
         app.draw_ghost(cx);
         _ = cx.end();
         assert(cx.area_overflow == 0);
-    }
-
-    // ------------------------------------------------------------------------ bindings
-
-    fn update_slots(app: *App) void {
-        const slots = &app.slots;
-        slots.set(0, "{d}", .{@intFromBool(app.eq_on.on)});
-        slots.set(1, "{d}", .{@intFromBool(app.shimmer_on.on)});
-        slots.set(2, "{d:.2}", .{app.shimmer.value});
-        slots.set(3, "{d:.2}", .{app.wet.value});
-        for (0..4) |index| {
-            slots.set(@intCast(4 + index), "{d:.2}db", .{app.strips[index].fader.db()});
-            const send = send_param.display(app.strips[index].send.value);
-            slots.set(@intCast(8 + index), "{d:.0}db", .{if (@abs(send) < 0.5) 0 else send});
-        }
-        slots.set(12, "{d}", .{@intFromBool(app.strips[0].muted)});
-        slots.set(13, "{d}", .{@intFromBool(app.strips[1].muted)});
     }
 
     /// The frame's sound (section 4).
@@ -752,52 +864,6 @@ pub const App = struct {
         kit.label(cx, look.style(.serif, 18, look.dim), "+", .{ .x = mark_x + 22, .y = box.y, .width = 16, .height = box.height }, clip, look.centered);
     }
 
-    fn mix_on(app: *const App) bool {
-        const index = app.mix_section orelse return true;
-        return app.sections[index].enabled;
-    }
-
-    fn line_context(app: *const App, line: Line) code.Context {
-        var alpha: f32 = if (app.mix_on()) 1 else 0.35;
-        const gate_on = switch (line.gate) {
-            .none => true,
-            .eq => app.eq_on.on,
-            .shimmer => app.shimmer_on.on,
-        };
-        if (!gate_on) alpha *= 0.45;
-        return .{ .declared = &mix_declared, .channels = &channel_names, .alpha = alpha };
-    }
-
-    fn draw_line(app: *App, cx: *Context, line: Line, rect: Rect, placed: *Placed, sound: Mixdown) void {
-        var buffer: [code.line_cap]u8 = undefined;
-        var spans: [code.slot_count]code.Span = undefined;
-        const bytes = code.expand(&buffer, line.template, &app.slots, &spans);
-        const context = app.line_context(line);
-        const x = if (line.hang) placed.hang_x else code_x;
-        const section = app.mix_section.?;
-        placed.first_y[section] = @min(placed.first_y[section], rect.y);
-        placed.last_y[section] = @max(placed.last_y[section], rect.y + rect.height);
-        if (std.mem.indexOf(u8, bytes, "mixer(")) |at| {
-            const word_x = code.x_of(bytes, @intCast(at), x, context);
-            placed.mixer_word = .{ word_x, code.x_of(bytes, @intCast(at + 5), x, context) };
-            placed.mixer_line = rect.y + rect.height - 2;
-            placed.hang_x = code.x_of(bytes, @intCast(at + 6), x, context);
-        }
-        switch (line.side) {
-            .none => {},
-            .eq => placed.toggle_y[1] = rect.y + rect.height * 0.5,
-            .shimmer => {
-                placed.toggle_y[2] = rect.y + rect.height * 0.5;
-                placed.knob_y[0] = rect.y + rect.height * 0.5;
-            },
-            .wet => placed.knob_y[1] = rect.y + rect.height * 0.5,
-        }
-        const clip = cx.visible(rect) orelse return;
-        if (line.rule_above) look.hline(cx, code_x, rule_end, rect.y, clip, look.rule);
-        _ = code.draw_line(cx, bytes, x, rect, clip, context);
-        app.draw_margin(cx, line.margin, context.alpha, rect, clip, sound);
-    }
-
     fn draw_margin(app: *const App, cx: *Context, margin: Margin, alpha: f32, rect: Rect, clip: Clip, sound: Mixdown) void {
         const box: Rect = .{ .x = margin_x, .y = rect.y + 2, .width = margin_w, .height = rect.height - 4 };
         const pads_db = signal.decibels(signal.level(signal.pads, app.t) * 2.5, -60);
@@ -828,17 +894,21 @@ pub const App = struct {
         const before = app.sections;
         const before_count = app.section_count;
         app.section_count = 0;
+        app.compander_line = null;
+        app.mixer_line = null;
         for (0..editor.buffer.line_count) |index| {
             const line: u32 = @intCast(index);
             const bytes = editor.buffer.line_bytes(line);
+            const code = std.mem.trimStart(u8, bytes, " ");
+            if (app.compander_line == null and std.mem.startsWith(u8, code, "round :=")) app.compander_line = line;
+            if (app.mixer_line == null and std.mem.startsWith(u8, code, "send =")) app.mixer_line = line;
             if (patch.level_of(bytes) == 0 or app.section_count == section_cap) continue;
             const key = name_key(bytes[2..]);
-            var section: Section = .{ .name = key, .enabled = true, .colour = no_colour, .holds_mix = false, .line = line };
+            var section: Section = .{ .name = key, .enabled = true, .colour = no_colour, .line = line };
             for (before[0..before_count]) |old| {
                 if (old.name != key) continue;
                 section.enabled = old.enabled;
                 section.colour = old.colour;
-                section.holds_mix = old.holds_mix;
             }
             app.sections[app.section_count] = section;
             app.section_count += 1;
@@ -849,62 +919,96 @@ pub const App = struct {
             if (before_count == app.section_count) {
                 section.enabled = before[index].enabled;
                 section.colour = before[index].colour;
-                section.holds_mix = before[index].holds_mix;
             } else {
                 section.colour = app.colour_next;
                 app.colour_next = @intCast((app.colour_next + 1) % look.section_colors.len);
             }
         }
-        app.find_mix();
-        editor.row_count = 0;
-        for (app.sections[0..app.section_count], 0..) |section, index| {
-            if (section.line > 0) app.add_row(section.line - 1, section_gap, .room);
-            app.add_row(section.line, rule_room, .room);
-            if (app.mix_section == @as(u32, @intCast(index))) app.add_row(section.line, mix_body_h, .mix_body);
+        var planned: [patchwork.editor.row_cap]PlannedRow = undefined;
+        var count: u32 = 0;
+        // Widgets' rows first: sorting is stable, and a gap after the same line goes below them.
+        if (app.compander_line) |line| {
+            planned[count] = .{ .after_line = line, .height = compander_h, .kind = .compander };
+            count += 1;
         }
+        if (app.mixer_line) |line| {
+            planned[count] = .{ .after_line = line, .height = mixer_h, .kind = .mixer };
+            count += 1;
+        }
+        for (app.sections[0..app.section_count]) |section| {
+            if (section.line > 0) {
+                planned[count] = .{ .after_line = section.line - 1, .height = section_gap, .kind = .room };
+                count += 1;
+            }
+            planned[count] = .{ .after_line = section.line, .height = rule_room, .kind = .room };
+            count += 1;
+        }
+        std.sort.insertion(PlannedRow, planned[0..count], {}, PlannedRow.before);
+        for (planned[0..count], 0..) |row, index| {
+            editor.rows[index] = .{ .after_line = row.after_line, .height = row.height };
+            app.row_kinds[index] = row.kind;
+        }
+        editor.row_count = count;
         app.sections_revision = editor.revision();
     }
 
-    /// The section that holds the mix body: the one that had it, else the first of its last
-    /// name, so undoing a deleted heading or typing it again brings the panel back.
-    fn find_mix(app: *App) void {
-        app.mix_section = null;
-        for (app.sections[0..app.section_count], 0..) |*section, index| {
-            if (section.holds_mix and app.mix_section != null) section.holds_mix = false;
-            if (section.holds_mix) app.mix_section = @intCast(index);
-        }
-        if (app.mix_section == null) {
-            for (app.sections[0..app.section_count], 0..) |*section, index| {
-                if (section.name != app.mix_name) continue;
-                section.holds_mix = true;
-                app.mix_section = @intCast(index);
-                break;
-            }
-        }
-        if (app.mix_section) |index| app.mix_name = app.sections[index].name;
+    /// The window y of the middle of `slot`'s line, while it is bound.
+    fn slot_middle(app: *const App, slot: Slot) ?f32 {
+        const value = app.parse.get(slot) orelse return null;
+        const rect = app.editor.rect_of(value.range.start);
+        return rect.y + rect.height * 0.5;
     }
 
-    fn add_row(app: *App, after_line: u32, height: f32, kind: RowKind) void {
-        const editor = &app.editor;
-        assert(editor.row_count < patchwork.editor.row_cap);
-        editor.rows[editor.row_count] = .{ .after_line = after_line, .height = height };
-        app.row_kinds[editor.row_count] = kind;
-        editor.row_count += 1;
+    /// The window y of side widget `index`: at its line, or where it last was (section 3).
+    fn side_at(app: *App, index: usize, middle: ?f32) f32 {
+        if (middle) |y| app.side_y[index] = y + app.view.scroll_y;
+        return app.side_y[index] - app.view.scroll_y;
     }
 
-    /// The editor, what hangs off its lines, and the mix body (section 2a).
+    /// The editor, what hangs off its lines, and the widgets of its rows (section 2a).
     fn draw_editor(app: *App, cx: *Context, placed: *Placed, sound: Mixdown) void {
         const editor = &app.editor;
         if (editor.revision() != app.sections_revision) app.build_sections();
         var walk = ui.sized(.{ .fixed = editor_w }, .{ .fixed = editor.content_height() });
         walk.margin.left = editor_x;
         editor.draw_begin(cx, walk);
-        var mix_top: ?f32 = null;
+        var compander_top: ?f32 = null;
         while (editor.next_row(cx)) |slot| {
             const rect = cx.walk(slot.walk);
-            if (app.row_kinds[slot.index] == .mix_body) mix_top = rect.y;
+            switch (app.row_kinds[slot.index]) {
+                .room => {},
+                .compander => compander_top = rect.y,
+                .mixer => placed.mixer_top = rect.y,
+            }
         }
         editor.draw_end(cx);
+        app.draw_lines(cx, placed, sound);
+        placed.toggle_y[1] = app.side_at(1, app.slot_middle(.eq_on));
+        placed.toggle_y[2] = app.side_at(2, app.slot_middle(.shimmer_on));
+        placed.knob_y[0] = app.side_at(3, app.slot_middle(.shimmer));
+        placed.knob_y[1] = app.side_at(4, app.slot_middle(.wet));
+        if (std.mem.indexOf(u8, editor.text(), "mixer(")) |at| {
+            const start: u32 = @intCast(at);
+            const word = editor.rect_of(start);
+            placed.mixer_word = .{ word.x, editor.rect_of(start + 5).x };
+            placed.mixer_line = word.y + word.height - 2;
+        }
+        const width = app.view.viewport.width - ui.view.gutter_px;
+        const compander_middle = if (compander_top) |top| top + compander_h * 0.5 else null;
+        placed.toggle_y[0] = app.side_at(0, compander_middle);
+        if (compander_top) |top| {
+            app.draw_compander(cx, .{ .x = 0, .y = top, .width = width, .height = compander_h }, placed);
+        }
+        if (placed.mixer_top) |top| {
+            app.draw_mixer(cx, .{ .x = 0, .y = top, .width = width, .height = mixer_h }, sound);
+        }
+    }
+
+    /// Each line's chrome or margin, and its veil (section 3).
+    fn draw_lines(app: *App, cx: *Context, placed: *Placed, sound: Mixdown) void {
+        const editor = &app.editor;
+        const eq_line = app.line_of(.eq_on);
+        const shimmer_line = app.line_of(.shimmer_on);
         var section: ?u32 = null;
         var next: u32 = 0;
         for (0..editor.buffer.line_count) |index| {
@@ -918,18 +1022,36 @@ pub const App = struct {
                 continue;
             }
             const rect: Rect = .{ .x = 0, .y = top.y, .width = rule_end, .height = top.height };
+            var alpha: f32 = 1;
             if (section) |at| {
                 placed.first_y[at] = @min(placed.first_y[at], rect.y);
                 placed.last_y[at] = @max(placed.last_y[at], rect.y + rect.height);
+                if (!app.sections[at].enabled) alpha = 0.35;
             }
+            if (app.compander_line == line) placed.compander_on = alpha == 1;
+            if (eq_line == line and !app.eq_on.on) alpha *= 0.45;
+            if (shimmer_line == line and !app.shimmer_on.on) alpha *= 0.45;
             const clip = cx.visible(rect) orelse continue;
-            app.draw_margin(cx, margin_of(editor.buffer.line_bytes(line)), 1, rect, clip, sound);
+            if (eq_line == line) look.hline(cx, code_x, rule_end, rect.y, clip, look.rule);
+            if (alpha < 1) veil(cx, .{ .x = editor_x, .y = rect.y, .width = editor_w, .height = rect.height }, clip, 1 - alpha);
+            app.draw_margin(cx, margin_of(editor.buffer.line_bytes(line)), alpha, rect, clip, sound);
         }
         const last = editor.buffer.line_count - 1;
         const bottom = editor.rect_of(editor.buffer.line_range(last).start);
         app.slot_ys[app.section_count] = bottom.y + bottom.height;
-        app.draw_veils(cx, placed);
-        if (mix_top) |y| app.draw_mix(cx, y, placed, sound);
+    }
+
+    /// The line `slot` is bound on.
+    fn line_of(app: *const App, slot: Slot) ?u32 {
+        const value = app.parse.get(slot) orelse return null;
+        return app.editor.buffer.line_of(value.range.start);
+    }
+
+    /// Dims `rect` when `slot` has no call to bind to (section 3).
+    fn dim_unbound(app: *const App, cx: *Context, slot: Slot, rect: Rect) void {
+        if (app.parse.get(slot) != null) return;
+        const clip = cx.clip() orelse return;
+        veil(cx, rect, clip, unbound_veil);
     }
 
     /// While a section is dragged: the drop's area, and a line where it would land.
@@ -963,38 +1085,9 @@ pub const App = struct {
         _ = cx.drawing().layer(previous);
     }
 
-    /// The typeset mix body, where its inline row put it (section 2a).
-    fn draw_mix(app: *App, cx: *Context, top: f32, placed: *Placed, sound: Mixdown) void {
-        const port = app.view.viewport;
-        const box: Rect = .{ .x = port.x, .y = top, .width = port.width - ui.view.gutter_px, .height = mix_body_h };
-        _ = cx.begin_at(box, .{ .flow = .down });
-        for (mix_rows) |row| {
-            const rect = cx.walk(ui.sized(.fill, .{ .fixed = row_height(row) }));
-            switch (row) {
-                .line => |line| app.draw_line(cx, line, rect, placed, sound),
-                .compander => app.draw_compander(cx, rect, placed),
-                .mixer => app.draw_mixer(cx, rect, placed, sound),
-            }
-        }
-        _ = cx.end();
-    }
-
-    /// Dims the code of a section turned off (section 3). The mix dims line by line instead,
-    /// because a veil would not reach its widgets.
-    fn draw_veils(app: *const App, cx: *Context, placed: *const Placed) void {
-        const clip = cx.clip() orelse return;
-        const previous = cx.drawing().layer(look.over_layer);
-        for (app.sections[0..app.section_count], placed.first_y[0..app.section_count], placed.last_y[0..app.section_count]) |section, top, bottom| {
-            if (section.enabled or !(bottom > top)) continue;
-            look.fill(cx, .{ .x = editor_x, .y = top, .width = editor_w, .height = bottom - top }, clip, look.with_alpha(look.background, 0.65));
-        }
-        _ = cx.drawing().layer(previous);
-    }
-
-    fn draw_compander(app: *App, cx: *Context, rect: Rect, placed: *Placed) void {
-        placed.toggle_y[0] = rect.y + rect.height * 0.5;
+    fn draw_compander(app: *App, cx: *Context, rect: Rect, placed: *const Placed) void {
         const clip = cx.visible(rect) orelse return;
-        const alpha: f32 = if (app.comp_on.on and app.mix_on()) 1 else 0.4;
+        const alpha: f32 = if (app.comp_on.on and placed.compander_on) 1 else 0.4;
         for (&app.comp, comp_params, 0..) |*knob, param, index| {
             const box: Rect = .{ .x = code_x + @as(f32, @floatFromInt(index)) * (comp_box + 2), .y = rect.y + (rect.height - comp_box) * 0.5, .width = comp_box, .height = comp_box };
             knob_at(cx, knob, box, param);
@@ -1022,8 +1115,7 @@ pub const App = struct {
         };
     }
 
-    fn draw_mixer(app: *App, cx: *Context, rect: Rect, placed: *Placed, sound: Mixdown) void {
-        placed.mixer_top = rect.y + 4;
+    fn draw_mixer(app: *App, cx: *Context, rect: Rect, sound: Mixdown) void {
         const clip = cx.visible(rect) orelse return;
         look.hline(cx, code_x, rule_end, rect.y + 4, clip, look.rule);
         for (&app.strips, 0..) |*strip, index| {
@@ -1041,17 +1133,25 @@ pub const App = struct {
         kit.label(cx, look.style(.serif_italic, 13, ink), strip_names[index], tab, clip, look.centered);
         look.vline(cx, x, y + 20, y + body_y + body_h, clip, look.with_alpha(color, if (master) 0.3 else 0.6));
         knob_at(cx, &strip.pan, .{ .x = x + 10, .y = y + 26, .width = strip_ring, .height = strip_ring }, pan_param);
-        if (!master) knob_at(cx, &strip.send, .{ .x = x + 70, .y = y + 26, .width = strip_ring, .height = strip_ring }, send_param);
+        const send_box: Rect = .{ .x = x + 70, .y = y + 26, .width = strip_ring, .height = strip_ring };
+        if (!master) knob_at(cx, &strip.send, send_box, send_param);
         strip.mute.paint = toggle_paint(strip.muted, .{ 0.95, 0.55, 0.30, 1 });
         strip.solo.paint = toggle_paint(strip.soloed, .{ 0.92, 0.82, 0.30, 1 });
-        place_button(cx, &strip.mute, .{ .x = x + 2, .y = y + 76, .width = 56, .height = 20 });
+        const mute_box: Rect = .{ .x = x + 2, .y = y + 76, .width = 56, .height = 20 };
+        place_button(cx, &strip.mute, mute_box);
         if (!master) place_button(cx, &strip.solo, .{ .x = x + 62, .y = y + 76, .width = 56, .height = 20 });
         const body: Rect = .{ .x = x, .y = y + body_y, .width = strip_w, .height = body_h };
         var scope: [signal.scope_points]f32 = undefined;
         var spectrum: [signal.bins]f32 = undefined;
         app.strip_signal(index, sound, &scope, &spectrum);
         plots.upright(cx, .{ .x = body.x + 2, .y = body.y, .width = 38, .height = body.height }, clip, &scope, 0.5, 0.48, true, .{ 0.84, 0.84, 0.86, 0.9 });
-        strip.fader.draw(cx, .{ .x = body.x + 54, .y = body.y, .width = 28, .height = body.height }, if (master) look.dim else color, sound.meter[index]);
+        const fader_box: Rect = .{ .x = body.x + 54, .y = body.y, .width = 28, .height = body.height };
+        strip.fader.draw(cx, fader_box, if (master) look.dim else color, sound.meter[index]);
+        if (index < 4) {
+            app.dim_unbound(cx, offset_slot(.level_0, index), fader_box);
+            app.dim_unbound(cx, offset_slot(.send_0, index), send_box);
+        }
+        if (index < 2) app.dim_unbound(cx, offset_slot(.mute_0, index), mute_box);
         const spectrum_color = if (master) look.with_alpha(look.white, 0.6) else look.with_alpha(color, 0.85);
         plots.upright(cx, .{ .x = body.x + 86, .y = body.y + 4, .width = 34, .height = body.height - 8 }, clip, &spectrum, 0, 0.95, false, spectrum_color);
         var level: [12]u8 = undefined;
@@ -1106,9 +1206,10 @@ pub const App = struct {
         const clip = cx.clip() orelse return;
         const word = placed.mixer_word;
         if (!(word[1] > word[0])) return;
+        const top = (placed.mixer_top orelse return) + 4;
         const mid = (word[0] + word[1]) * 0.5;
         const tee = [_]Point{ .{ word[0], placed.mixer_line }, .{ word[1], placed.mixer_line } };
-        const stem = [_]Point{ .{ mid, placed.mixer_line }, .{ mid, placed.mixer_top } };
+        const stem = [_]Point{ .{ mid, placed.mixer_line }, .{ mid, top } };
         _ = kit.stroke(cx, &tee, clip, look.dim, 1.2);
         _ = kit.stroke(cx, &stem, clip, look.dim, 1.2);
     }
@@ -1120,9 +1221,12 @@ pub const App = struct {
         for (placed.toggle_y, toggles) |centre, toggle| {
             const top = @max(centre - look.pill_row_h * 0.5 + 6, bottom + 4);
             bottom = top + look.pill_row_h;
-            _ = cx.begin_at(.{ .x = toggle_x, .y = top, .width = toggle_w, .height = look.pill_row_h }, .{ .flow = .overlay });
+            const box: Rect = .{ .x = toggle_x, .y = top, .width = toggle_w, .height = look.pill_row_h };
+            _ = cx.begin_at(box, .{ .flow = .overlay });
             toggle.draw(cx, ui.sized(.fill, .fill));
             _ = cx.end();
+            if (toggle == toggles[1]) app.dim_unbound(cx, .eq_on, box);
+            if (toggle == toggles[2]) app.dim_unbound(cx, .shimmer_on, box);
         }
         bottom = -std.math.inf(f32);
         for (placed.knob_y, 0..) |centre, index| {
@@ -1130,6 +1234,7 @@ pub const App = struct {
             bottom = top + side_ring;
             const box: Rect = .{ .x = side_knob_x + (side_knob_w - side_ring) * 0.5, .y = top, .width = side_ring, .height = side_ring };
             if (index == 0) knob_at(cx, &app.shimmer, box, shimmer_param) else knob_at(cx, &app.wet, box, wet_param);
+            app.dim_unbound(cx, if (index == 0) .shimmer else .wet, box);
         }
     }
 
@@ -1204,6 +1309,10 @@ fn bottom_of(screen: Rect) Bottom {
 fn margin_of(bytes: []const u8) Margin {
     const code_bytes = std.mem.trimStart(u8, bytes, " ");
     const margins = [_]struct { prefix: []const u8, margin: Margin }{
+        .{ .prefix = "if (tog(1, \"eq\")", .margin = .modulator },
+        .{ .prefix = "if (tog(0, \"eq\")", .margin = .modulator },
+        .{ .prefix = "wet :=", .margin = .wet },
+        .{ .prefix = "mixed := mixer", .margin = .master },
         .{ .prefix = "env :=", .margin = .envelope },
         .{ .prefix = "a :=", .margin = .saws },
         .{ .prefix = "b :=", .margin = .sub },
@@ -1215,6 +1324,35 @@ fn margin_of(bytes: []const u8) Margin {
         if (std.mem.startsWith(u8, code_bytes, entry.prefix)) return entry.margin;
     }
     return .none;
+}
+
+/// How much a widget with no call fades (section 3).
+const unbound_veil: f32 = 0.6;
+
+/// Fades what is drawn under `rect` toward the background, above the base layer's glyphs.
+fn veil(cx: *Context, rect: Rect, clip: Clip, amount: f32) void {
+    const previous = cx.drawing().layer(look.over_layer);
+    look.fill(cx, rect, clip, look.with_alpha(look.background, amount));
+    _ = cx.drawing().layer(previous);
+}
+
+/// Sets a toggle from the text: no animation, because nothing was pressed.
+fn set_toggle(toggle: *SideToggle, on: bool) void {
+    toggle.on = on;
+    toggle.thumb = kit.settled(kit.hover_rate_per_ms, on);
+}
+
+fn strip_of(slot: Slot, first: Slot) usize {
+    return @backingInt(slot) - @backingInt(first);
+}
+
+fn offset_slot(first: Slot, index: u32) Slot {
+    return @fromBackingInt(@backingInt(first) + @as(u8, @intCast(index)));
+}
+
+/// The value of `value` as a unit position between its ends.
+fn unit_of(value: bindings.Value) f32 {
+    return std.math.clamp((value.number - value.lo) / (value.hi - value.lo), 0, 1);
 }
 
 /// The editor's look: the patch's classes over the screen's own colours, with no gutter.
@@ -1360,7 +1498,7 @@ const key_steps = [_]bench.Step{
 const editor_target: bench.Target = .{ .id = editor_id, .name = "editor", .index = 0 };
 /// A point on the pad's `a := n.unison() * saws;` line, from the editor's top-left: past the
 /// mix's heading and body, the osc, and the pad's first three lines, each of two gaps.
-const a_line_y: f32 = 4 + heading_h + rule_room + mix_body_h + 2 * (section_gap + heading_h + rule_room) + 6 * 22 + 11;
+const a_line_y: f32 = 4 + heading_h + rule_room + 6 * line_h + compander_h + mixer_h + 2 * (section_gap + heading_h + rule_room) + 6 * 22 + 11;
 /// The middle of `# reverb tank`: past the rest of the pad and one more gap.
 const tank_heading_y: f32 = a_line_y - 11 + 6 * 22 + section_gap + heading_h * 0.5;
 /// A click just after `saws`, and the word `unison` in italics.
@@ -1428,6 +1566,37 @@ const reorder_undo_steps = reorder_steps ++ [_]bench.Step{
     .{ .key = .{ .key = .z, .text = "", .mods = with_ctrl } },
     .{ .wait = 4 },
 };
+/// The middle of the line that holds the levels, and of the wet line, from the editor's top.
+const mixed_line_y: f32 = 4 + heading_h + rule_room + line_h + compander_h + 3 * line_h + line_h * 0.5;
+const wet_line_y: f32 = mixed_line_y - line_h;
+/// A click after the "-" of `level = -2.68db`, and a digit typed there.
+const bind_type_steps = [_]bench.Step{
+    .{ .click_at = .{ .target = editor_target, .x = 343, .y = mixed_line_y } },
+    .{ .key = .{ .key = .other, .text = "1" } },
+    .{ .wait = 4 },
+};
+/// The bass fader up 40 px: its digits follow.
+const bind_drag_steps = [_]bench.Step{
+    .{ .drag = .{ .target = bench.area("fader", 0), .from_x = 20, .from_y = 30, .dx = 0, .dy = -40 } },
+    .{ .wait = 4 },
+};
+const bind_undo_steps = bind_drag_steps ++ [_]bench.Step{
+    .{ .key = .{ .key = .z, .text = "", .mods = with_ctrl } },
+    .{ .wait = 4 },
+};
+/// The eq's toggle off: its literal and its line follow.
+const bind_toggle_steps = [_]bench.Step{
+    .{ .click = .{ .id = eq_on_id, .name = "eq", .index = 0 } },
+    .{ .wait = 4 },
+};
+/// The wet line selected and deleted: the knob and the wet channel's bars lose their anchors.
+const bind_break_steps = [_]bench.Step{
+    .{ .click_at = .{ .target = editor_target, .x = 40, .y = wet_line_y } },
+    .{ .key = .{ .key = .home, .text = "" } },
+    .{ .key = .{ .key = .end, .text = "", .mods = with_shift } },
+    .{ .key = .{ .key = .backspace, .text = "" } },
+    .{ .wait = 4 },
+};
 /// A word typed after `saws` and taken back: the text is the starting text, the caret stays.
 const undo_steps = [_]bench.Step{
     .{ .wheel = .{ .target = .{ .id = view_id, .name = "view", .index = 0 }, .dx = 0, .dy = 700 } },
@@ -1448,13 +1617,13 @@ comptime {
     assert(bottom.card.y == 634 and bottom.card.width == 1264);
     assert(bottom.keys.x + bottom.keys.width <= bottom.card.x + bottom.card.width);
     assert(720 - card_space == view_h);
-    // The starting text has the 21 lines `patch_h` counts, 4 of them headings.
-    assert(std.mem.count(u8, patch_text, "\n") == 20);
+    // The starting text has the 27 lines `patch_h` counts, 4 of them headings.
+    assert(std.mem.count(u8, patch_text, "\n") == 26);
     assert(std.mem.count(u8, patch_text, "# ") == 4);
-    // A heading in its rows is the 72 px of a gap and a header, and the mix body fits a row.
+    // A heading in its rows is the 72 px of a gap and a header, and the mixer fits a row.
     assert(section_gap + heading_h + rule_room == 72);
-    assert(mix_body_h <= patchwork.editor.row_height_max);
-    assert(2 * section_cap + 1 <= patchwork.editor.row_cap);
+    assert(mixer_h <= patchwork.editor.row_height_max);
+    assert(2 * section_cap + 2 <= patchwork.editor.row_cap);
     // The spectrum fill's 48 columns are 3 px each.
     assert(plot_w / signal.bins == 3);
     // The overview's 540 columns are 2 px each.
@@ -1466,7 +1635,7 @@ comptime {
 
 test {
     _ = look;
-    _ = code;
+    _ = bindings;
     _ = patch;
     _ = sections_file;
     _ = signal;
@@ -1506,22 +1675,29 @@ fn scenario_app(name: []const u8) !*App {
     return app;
 }
 
-// Locks the first frame: nothing overflows, the patch's text carries the widgets' values
+fn literal(app: *const App, slot: Slot) []const u8 {
+    const range = app.parse.get(slot).?.range;
+    return app.editor.text()[range.start..range.end];
+}
+
+// Locks the first frame: nothing overflows, every slot binds, the widgets start from the text
 // (tog 1, shimmer 0.16, wet 0.73, the four levels, the sends), and the view scrolls over the
-// document's 1314 px.
+// document.
 test "the first frame binds the patch to its widgets" {
     const app = new_app();
     frame(app);
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
-    try std.testing.expectEqualStrings("1", app.slots.get(0));
-    try std.testing.expectEqualStrings("0.16", app.slots.get(2));
-    try std.testing.expectEqualStrings("0.73", app.slots.get(3));
-    try std.testing.expectEqualStrings("-2.68db", app.slots.get(4));
-    try std.testing.expectEqualStrings("-4.11db", app.slots.get(7));
-    try std.testing.expectEqualStrings("-60db", app.slots.get(8));
-    try std.testing.expectEqualStrings("0db", app.slots.get(9));
+    try std.testing.expectEqual(@as(u32, 0), app.parse.error_count);
+    for (app.parse.values) |value| try std.testing.expect(value != null);
+    try std.testing.expect(app.eq_on.on);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.16), app.shimmer.value, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.73), app.wet.value, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.68), app.strips[0].fader.db(), 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -4.11), app.strips[3].fader.db(), 1e-3);
+    try std.testing.expectEqual(send_param.position(-60), app.strips[0].send.value);
+    try std.testing.expectEqual(send_param.position(0), app.strips[1].send.value);
     try std.testing.expectEqual(content_h, app.view.content_h);
-    try std.testing.expectEqual(@as(f32, 1250), content_h);
+    try std.testing.expectEqual(@as(f32, 1226), content_h);
     try std.testing.expectEqual(@as(u32, 4), app.section_count);
     try std.testing.expect(!app.playing);
     test_context.draw.finalize();
@@ -1543,11 +1719,12 @@ test "scenarios scroll, play, mix, turn, and hold" {
     try std.testing.expectApproxEqAbs(fader_file.position(-2.68) + 0.1, app.strips[0].fader.value, 1e-4);
     try std.testing.expect(app.strips[1].muted and app.strips[2].soloed and !app.eq_on.on);
     try std.testing.expectApproxEqAbs(@as(f32, 0.65), app.strips[1].pan.value, 1e-4);
-    try std.testing.expectEqualStrings("0", app.slots.get(0));
-    try std.testing.expectEqualStrings("1", app.slots.get(13));
+    try std.testing.expectEqualStrings("0", literal(app, .eq_on));
+    try std.testing.expectEqualStrings("1", literal(app, .mute_1));
     app = try scenario_app("knobs");
     try std.testing.expectApproxEqAbs(comp_params[0].position(-27.7) + 0.25, app.comp[0].value, 1e-4);
-    try std.testing.expectApproxEqAbs(wet_param.position(0.73) + 20.0 / 120.0, app.wet.value, 1e-4);
+    // The release reads the text back, so the knob settles on the two decimals it wrote.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), app.wet.value, 1e-5);
     app = try scenario_app("keys");
     try std.testing.expect(app.keyboard.held.isSet(64));
     try std.testing.expect(!app.sections[mix].enabled);
@@ -1726,73 +1903,26 @@ test "a section stays off across edits around it" {
     try std.testing.expectEqual(@as(u32, 5), app.section_count);
 }
 
-// Locks the mix body as a section's: it leaves and returns with its heading, its widgets keeping
-// their values, and a second "# mix" is an ordinary section.
-test "the mix body follows its heading" {
-    const app = new_app();
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
-    const fader_before = app.strips[0].fader.value;
-    const range = app.editor.buffer.line_range(0);
-    try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end + 1 }, ""));
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, null), app.mix_section);
-    try std.testing.expect(test_context.find(fader_id(0)) == null);
-    try std.testing.expectEqual(fader_before, app.strips[0].fader.value);
-    try std.testing.expect(app.editor.buffer.undo() != null);
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
-    try std.testing.expect(test_context.find(fader_id(0)) != null);
-    insert_section(app, "# mix\n", "# pad");
-    try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
-    try std.testing.expectEqual(@as(u32, 5), app.section_count);
-}
-
 fn set_heading(app: *App, line: u32, heading: []const u8) void {
     const range = app.editor.buffer.line_range(line);
     assert(app.editor.replace(.{ .start = range.start, .end = range.end }, heading));
     frame(app);
 }
 
-// Locks the bug a rename of "# mix" was: the panel stays through a change of case, a new name,
-// and every step of retyping it, and it stays when the section is then moved. A section keeps
-// it by what it is, not how it is spelled.
-test "renaming the mix section keeps its panel" {
+// Locks `# mix` as an ordinary heading: renaming it or deleting it touches no widget, and every
+// binding and both rows stay, because they are found from the text and not from the section.
+test "the mix heading is a heading like any other" {
     const app = new_app();
     frame(app);
     const height = app.editor.content_height();
-    for ([_][]const u8{ "# Mix", "# M", "# ", "# master bus" }) |heading| {
-        set_heading(app, 0, heading);
-        try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
-        try std.testing.expect(test_context.find(fader_id(0)) != null);
-        try std.testing.expectEqual(height, app.editor.content_height());
-    }
-    try std.testing.expect(app.move_section(0, 2));
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, 1), app.mix_section);
-    try std.testing.expect(test_context.find(fader_id(0)) != null);
-}
-
-// Locks getting the panel back: deleting a renamed heading drops it; undo restores it; and with
-// the line gone, typing its last name again brings it back, in any case.
-test "the panel comes back with its section's name" {
-    const app = new_app();
-    frame(app);
     set_heading(app, 0, "# Bus");
+    try std.testing.expectEqual(height, app.editor.content_height());
+    try std.testing.expect(test_context.find(fader_id(0)) != null);
     const range = app.editor.buffer.line_range(0);
     try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end + 1 }, ""));
     frame(app);
-    try std.testing.expectEqual(@as(?u32, null), app.mix_section);
-    try std.testing.expect(app.editor.buffer.undo() != null);
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, 0), app.mix_section);
-    const again = app.editor.buffer.line_range(0);
-    try std.testing.expect(app.editor.replace(.{ .start = again.start, .end = again.end + 1 }, ""));
-    frame(app);
-    try std.testing.expectEqual(@as(?u32, null), app.mix_section);
-    insert_section(app, "# BUS\n", "# osc");
-    try std.testing.expect(app.mix_section != null);
     try std.testing.expect(test_context.find(fader_id(0)) != null);
+    for (app.parse.values) |value| try std.testing.expect(value != null);
 }
 
 // Locks deleting a heading: its lines join the section before, whose fold bracket grows.
@@ -1882,21 +2012,168 @@ test "a move carries the caret and the section's state" {
     try std.testing.expect(app.sections[2].enabled);
 }
 
-// Locks the mix panel in a move: moved below `# osc` the body follows its heading, its widgets
-// keep working, and its fader's value is untouched.
-test "the mix panel moves like any section" {
+// Locks the mix in a move: moved below `# osc`, its rows follow their lines, and a fader still
+// rewrites its own literal, because the ranges were parsed from the moved text.
+test "the mix moves like any section and stays bound" {
     const app = new_app();
     frame(app);
-    const fader = app.strips[0].fader.value;
+    frame(app);
     const top = test_context.find(fader_id(0)).?.rect[1];
     try std.testing.expect(app.move_section(0, 2));
     frame(app);
     frame(app);
-    try std.testing.expectEqual(@as(?u32, 1), app.mix_section);
     const moved = test_context.find(fader_id(0)).?;
     try std.testing.expect(moved.rect[1] > top);
-    try std.testing.expectEqual(fader, app.strips[0].fader.value);
     try std.testing.expect(std.mem.startsWith(u8, app.editor.text(), "# osc\n"));
+    drag_fader(app, 0, -20);
+    try std.testing.expect(!std.mem.eql(u8, "-2.68db", literal(app, .level_0)));
+    try std.testing.expectEqual(app.parse.get(.level_1).?.number, @as(f32, -8.45));
+    try std.testing.expectEqualStrings("-8.45db", literal(app, .level_1));
+}
+
+/// A fader dragged by `dy`, released.
+fn drag_fader(app: *App, strip: u32, dy: f32) void {
+    const area = test_context.find(fader_id(strip)).?;
+    const from: input.Point = .{ .x = area.rect[0] + 20, .y = area.rect[1] + 60 };
+    const to: input.Point = .{ .x = from.x, .y = from.y + dy };
+    deliver(app, .{ .pointer_move = from });
+    deliver(app, .{ .pointer_down = input.left_at(from) });
+    deliver(app, .{ .pointer_move = to });
+    deliver(app, .{ .pointer_up = input.left_at(to) });
+    frame(app);
+}
+
+// Locks text to widgets: a typed level moves its fader, a typed tog turns its toggle off, and a
+// parse writes nothing, so the revision is the edit's alone and typed digits stay as typed.
+test "typing a number moves its widget" {
+    const app = new_app();
+    frame(app);
+    const range = app.parse.get(.level_0).?.range;
+    try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end }, "-20db"));
+    const revision = app.editor.revision();
+    frame(app);
+    try std.testing.expectApproxEqAbs(@as(f32, -20), app.strips[0].fader.db(), 1e-3);
+    try std.testing.expectEqualStrings("-20db", literal(app, .level_0));
+    try std.testing.expectEqual(revision, app.editor.revision());
+    const flag = app.parse.get(.eq_on).?.range;
+    try std.testing.expect(app.editor.replace(.{ .start = flag.start, .end = flag.end }, "0"));
+    frame(app);
+    try std.testing.expect(!app.eq_on.on);
+}
+
+// Locks the bind-type scenario: a digit typed into a literal moves the fader, and the mix's lines
+// take keys like any other: Space typed there plays nothing.
+test "the mix's code is text" {
+    const app = try scenario_app("bind-type");
+    try std.testing.expectEqualStrings("-12.68db", literal(app, .level_0));
+    try std.testing.expectApproxEqAbs(@as(f32, -12.68), app.strips[0].fader.db(), 1e-3);
+    deliver(app, .{ .key_down = key_press(.other, " ", .none) });
+    try std.testing.expect(!app.playing);
+}
+
+// Locks widgets to text: a fader's drag rewrites only its literal, as one undo entry, and leaves
+// the widgets and text agreeing with a full parse.
+test "moving a widget rewrites its literal" {
+    const app = try scenario_app("bind-drag");
+    try std.testing.expectEqual(@as(u32, 1), app.editor.buffer.undo_count);
+    try std.testing.expect(!std.mem.eql(u8, literal(app, .level_0), "-2.68db"));
+    try std.testing.expectEqualStrings("-8.45db", literal(app, .level_1));
+    const full = bindings.Parse.run(app.editor.text());
+    for (app.parse.values, full.values) |shifted, whole| {
+        try std.testing.expectEqual(whole.?.range, shifted.?.range);
+    }
+    try std.testing.expectApproxEqAbs(full.get(.level_0).?.number, app.strips[0].fader.db(), 1e-3);
+    try std.testing.expectEqual(Gesture.none, app.gesture);
+}
+
+// Locks the bind-undo scenario: Ctrl+Z with nothing focused takes back a whole drag, and the fader
+// follows the text back.
+test "undo reaches the text with no focus" {
+    const app = try scenario_app("bind-undo");
+    try std.testing.expect(!test_context.focused(editor_id));
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+    try std.testing.expectApproxEqAbs(@as(f32, -2.68), app.strips[0].fader.db(), 1e-3);
+}
+
+// Locks the bind-toggle scenario: a toggle writes its literal, and its line's undo restores it.
+test "a toggle writes its literal" {
+    const app = try scenario_app("bind-toggle");
+    try std.testing.expectEqualStrings("0", literal(app, .eq_on));
+    try std.testing.expect(!app.eq_on.on);
+    deliver(app, .{ .key_down = key_press(.z, "", with_ctrl) });
+    frame(app);
+    try std.testing.expect(app.eq_on.on);
+}
+
+// Locks an open gesture: during a held drag a key is dropped, Ctrl+Z included, so undo never runs
+// inside one; the window going away closes it.
+test "a held drag drops keys and a lost window ends it" {
+    const app = new_app();
+    frame(app);
+    frame(app);
+    const area = test_context.find(fader_id(0)).?;
+    const from: input.Point = .{ .x = area.rect[0] + 20, .y = area.rect[1] + 60 };
+    deliver(app, .{ .pointer_move = from });
+    deliver(app, .{ .pointer_down = input.left_at(from) });
+    deliver(app, .{ .pointer_move = .{ .x = from.x, .y = from.y - 30 } });
+    try std.testing.expectEqual(Gesture.drag, app.gesture);
+    deliver(app, .{ .key_down = key_press(.z, "", with_ctrl) });
+    try std.testing.expectEqual(Gesture.drag, app.gesture);
+    deliver(app, .{ .window_focus = false });
+    try std.testing.expectEqual(Gesture.none, app.gesture);
+}
+
+// Locks a run of wheel notches as one undo entry, ended by the next key, which still gets through.
+test "a wheel run is one gesture" {
+    const app = new_app();
+    frame(app);
+    frame(app);
+    const area = test_context.find(fader_id(0)).?;
+    const wheel: input.Wheel = .{ .x = area.rect[0] + 20, .y = area.rect[1] + 60, .dx = 0, .dy = -8 };
+    deliver(app, .{ .wheel = wheel });
+    deliver(app, .{ .wheel = wheel });
+    try std.testing.expectEqual(Gesture.wheel, app.gesture);
+    deliver(app, .{ .key_down = key_press(.z, "", with_ctrl) });
+    try std.testing.expectEqual(Gesture.none, app.gesture);
+    frame(app);
+    try std.testing.expectEqualStrings(patch_text, app.editor.text());
+}
+
+// Locks an unbound widget: with its call deleted the wet knob keeps its value and writes nothing
+// when turned; undo brings the call, which binds and gives the knob the text's value again.
+test "a widget with no call keeps its value and rebinds" {
+    const app = try scenario_app("bind-break");
+    try std.testing.expectEqual(@as(?bindings.Value, null), app.parse.get(.wet));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.73), app.wet.value, 1e-5);
+    const revision = app.editor.revision();
+    app.wet.set_value(0.2);
+    const area = test_context.find(wet_id).?;
+    const from: input.Point = .{ .x = area.rect[0] + 20, .y = area.rect[1] + 20 };
+    deliver(app, .{ .pointer_move = from });
+    deliver(app, .{ .pointer_down = input.left_at(from) });
+    deliver(app, .{ .pointer_move = .{ .x = from.x, .y = from.y - 20 } });
+    deliver(app, .{ .pointer_up = input.left_at(from) });
+    try std.testing.expectEqual(revision, app.editor.revision());
+    try std.testing.expect(app.wet.value > 0.2);
+    deliver(app, .{ .pointer_move = .{ .x = 600, .y = 300 } });
+    deliver(app, .{ .pointer_down = input.left_at(.{ .x = 600, .y = 300 }) });
+    deliver(app, .{ .pointer_up = input.left_at(.{ .x = 600, .y = 300 }) });
+    deliver(app, .{ .key_down = key_press(.z, "", with_ctrl) });
+    frame(app);
+    try std.testing.expect(app.parse.get(.wet) != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.73), app.wet.value, 1e-5);
+}
+
+// Locks an error mark: a value out of range binds, clamps, and marks its literal as a decoration.
+test "a number out of range is marked and clamps" {
+    const app = new_app();
+    frame(app);
+    const range = app.parse.get(.level_0).?.range;
+    try std.testing.expect(app.editor.replace(.{ .start = range.start, .end = range.end }, "99db"));
+    frame(app);
+    try std.testing.expectEqual(@as(f32, 1), app.strips[0].fader.value);
+    try std.testing.expectEqual(@as(u32, 1), app.editor.decoration_count);
+    try std.testing.expectEqual(patchwork.editor.Decoration.Kind.@"error", app.editor.decorations[0].kind);
 }
 
 // Locks a section's colour as its own: a move keeps each mark's colour, a rename keeps its colour

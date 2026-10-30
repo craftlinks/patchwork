@@ -251,7 +251,9 @@ patchwork/
 │   │   └── sample.c            # The editor's sample
 │   └── session/                # A live-coding music screen rebuilt from photos (step 47)
 │       ├── app.zig             # Session App: the document's rows, mixer, sidebar, card
-│       ├── code.zig            # Read-only code set token by token in proportional serif
+│       ├── patch.zig           # The patch as a language: faces, headings, and channel colours
+│       ├── bindings.zig        # The mix's numbers: parsed from the text, written back to it
+│       ├── sections.zig        # Moving a section: a pure function of the text
 │       ├── look.zig            # Palette, serif styles, Ring/Bipolar knob and Pill skins
 │       ├── fader.zig           # Fader: an upright level with a stereo meter in its track
 │       ├── keys.zig            # Keyboard: a piano played by pointer and tracker keys
@@ -1247,10 +1249,13 @@ piano keyboard, the song's overview, and a transport. A section is a line starti
 in the text, so typing `# Chorus` adds one, with a mark and a fold bracket, and a mark's state
 and colour are kept by name. Dragging a heading's `#` moves its section: a ghost follows the
 pointer, a line shows the slot, Escape cancels, and the drop is one edit, so one Ctrl+Z restores
-the order. The mix body is typeset in one inline row under its section, `# mix` to
-begin with, which may be renamed: its numbers are formatted from the widgets every frame, so a
-fader rewrites `level = ...`, and binding them both ways is a job of its own. Deleting that
-heading removes the panel until undo or typing its name again; the widgets keep their values. The editor has no gutter and is as tall as its content, so the
+the order. The text is the truth for the mix's numbers, as in `live`: toggles, the shimmer and wet knobs,
+four faders, four sends, and two mutes are parsed from it (`examples/session/bindings.zig`), and
+moving one rewrites its literal, so a typed `level = -20db` moves the fader and a dragged fader
+moves the digits. A drag or a run of wheel notches is one undo entry, and Ctrl+Z reaches the
+text with nothing focused. A widget whose call is deleted dims, keeps its value, and binds again
+when the call returns; a number out of range clamps and is marked. The compander and the mixer
+are inline rows after the lines `round :=` and `send =`. The editor has no gutter and is as tall as its content, so the
 wheel scrolls the document through it; margin widgets anchor to `rect_of` by what a line starts
 with, so they follow an edit. While the editor has focus, Space and the tracker keys type. The
 view and the card follow the window. Space or the play mark starts a 33 ms timer; paused, the screen sleeps.
@@ -1259,7 +1264,8 @@ Scenarios: `still`; `scroll` (to the end: osc, pad, reverb tank), `play` (about 
 `keys` (E4 held, the mix section off), `edit` (a click after `saws` and typing), `select` (a
 double click in italics and Shift+Down), `undo`, `section` (`# chorus` typed at the end),
 `rename` (a heading edited), `reorder` (`# reverb tank` dragged above `# pad`), `reorder-hold`
-(the same, in flight), and `reorder-undo`.
+(the same, in flight), `reorder-undo`, `bind-type` (a digit typed into a level), `bind-drag` (a
+fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call deleted).
 
 ## Drags Between Widgets
 
@@ -1916,7 +1922,8 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   character's unclamped logical rect for anchors and `viewport()` the box to clamp against.
 - **Programmatic edits.** `replace(range, utf8)` keeps the caret in the text around the range.
   `replace_keeping(range, utf8, after)` takes the selection from the caller and keeps it in the
-  undo entry, for an edit that moves text, whose caret should move with it.
+  undo entry, for an edit that moves text, whose caret should move with it. `undo(cx)` and
+  `redo(cx)` are what Ctrl+Z and Ctrl+Y do, for an app that routes them with no focus on the text.
 
 ## Text
 
