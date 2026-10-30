@@ -98,8 +98,9 @@
 //! (a word codepoint typed after a separator seals the open entry), runs of single
 //! Backspace or Delete coalesce, and every other edit (Enter with auto-indent, Tab, paste,
 //! cut, a word erase) is its own entry; indenting several lines is one gesture. Any caret
-//! move seals. `replace(range, utf8)` and `gesture_begin`/`gesture_end` are the
-//! programmatic API (step 18's knobs rewrite literals through them).
+//! move seals. `replace(range, utf8)`, `replace_keeping(range, utf8, after)`, and
+//! `gesture_begin`/`gesture_end` are the programmatic API (step 18's knobs rewrite literals
+//! through them).
 //! Keys: arrows (Ctrl or Meta: words), Up and Down keep a goal column, Home and End (with
 //! Ctrl: the text), Page Up and Down by the visible lines, Shift extends, Backspace and
 //! Delete (with Ctrl: words), Enter copies the line's leading spaces, Tab inserts spaces to
@@ -597,14 +598,19 @@ pub fn EditorOf(comptime L: type) type {
         pub fn replace(self: *Self, range: Range, utf8: []const u8) bool {
             assert(range.end <= self.buffer.len);
             const delta_end = range.start + @as(u32, @intCast(utf8.len));
-            const before = self.selection_now();
-            const after: Selection = .{
+            return self.replace_keeping(range, utf8, .{
                 .caret = map_through(self.caret, range, delta_end),
                 .anchor = map_through(self.anchor, range, delta_end),
-            };
+            });
+        }
+
+        /// `replace` with the selection the caller works out, kept in the undo entry so redo
+        /// restores it: for an edit that moves text, whose caret should move with it.
+        pub fn replace_keeping(self: *Self, range: Range, utf8: []const u8, after: Selection) bool {
+            assert(range.end <= self.buffer.len);
             const change: buffer_module.Change = .{
                 .kind = .other,
-                .before = before,
+                .before = self.selection_now(),
                 .after = after,
             };
             if (!self.buffer.replace(range, utf8, change)) {
@@ -2146,6 +2152,26 @@ test "a paste over the cap is refused and reported" {
     try testing.expectEqual(Source.paste, editor.refused_source);
     try testing.expectEqual(buffer_module.Refusal.bytes, editor.refusal);
     try testing.expectEqualStrings("ab  x\ny", editor.text());
+}
+
+// Locks `replace_keeping`: the caret lands where the caller says instead of at the end of the
+// replaced range, and undo and redo restore both selections.
+test "replace_keeping keeps the caller's selection through undo and redo" {
+    const editor = test_fresh("ab cd");
+    editor.caret = 1;
+    editor.anchor = 1;
+    try testing.expect(editor.replace_keeping(.{ .start = 0, .end = 5 }, "cd ab", .{ .caret = 4, .anchor = 4 }));
+    try testing.expectEqualStrings("cd ab", editor.text());
+    try testing.expectEqual(@as(u32, 4), editor.caret);
+    _ = test_frame(400, 300);
+    test_focus_at(300, 200);
+    editor.caret = 4;
+    editor.anchor = 4;
+    _ = test_key(.z, mods_ctrl);
+    try testing.expectEqualStrings("ab cd", editor.text());
+    try testing.expectEqual(@as(u32, 1), editor.caret);
+    _ = test_key(.y, mods_ctrl);
+    try testing.expectEqual(@as(u32, 4), editor.caret);
 }
 
 // Locks scrolling input: the wheel's dy scrolls the view, its dx (or dy with Shift) scrolls
