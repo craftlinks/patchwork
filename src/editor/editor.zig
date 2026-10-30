@@ -783,6 +783,16 @@ pub fn EditorOf(comptime L: type) type {
             return .none;
         }
 
+        /// Takes back the last edit, as Ctrl+Z does, for an app that routes the key itself.
+        pub fn undo(self: *Self, cx: anytype) Action {
+            return self.history(cx, .undo);
+        }
+
+        /// Restores the last edit undone, as Ctrl+Y does.
+        pub fn redo(self: *Self, cx: anytype) Action {
+            return self.history(cx, .redo);
+        }
+
         fn history(self: *Self, cx: anytype, way: enum { undo, redo }) Action {
             const restored = switch (way) {
                 .undo => self.buffer.undo(),
@@ -2152,6 +2162,23 @@ test "a paste over the cap is refused and reported" {
     try testing.expectEqual(Source.paste, editor.refused_source);
     try testing.expectEqual(buffer_module.Refusal.bytes, editor.refusal);
     try testing.expectEqualStrings("ab  x\ny", editor.text());
+}
+
+// Locks the public undo: it takes back an edit with no focus on the editor, redo restores it, and
+// with nothing to take back the action is `none`.
+test "undo and redo work without focus" {
+    const editor = test_fresh("ab");
+    _ = test_frame(400, 300);
+    try testing.expect(editor.replace(.{ .start = 2, .end = 2 }, "c"));
+    const context = &fixture.context;
+    const event: input.Event = .{ .key_down = input.key_press(.z, mods_ctrl, false, "") };
+    context.event_begin(event);
+    try testing.expectEqual(Action.changed, editor.undo(context));
+    try testing.expectEqualStrings("ab", editor.text());
+    try testing.expectEqual(Action.none, editor.undo(context));
+    try testing.expectEqual(Action.changed, editor.redo(context));
+    try testing.expectEqualStrings("abc", editor.text());
+    context.event_end();
 }
 
 // Locks `replace_keeping`: the caret lands where the caller says instead of at the end of the
