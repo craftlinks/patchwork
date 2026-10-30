@@ -4,11 +4,10 @@
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. Why Not the Editor
-//! `editor.EditorOf(L)` draws on the monospace grid: one column per codepoint, one face, a
-//! colour per class. This screen sets code in a proportional serif with italic calls and bold
-//! declarations, which the grid cannot express, so the code here is read-only and placed
-//! token by token with `text.measure` and `kit.label` (`place_runs` takes at most eight runs,
-//! and a line has dozens of tokens).
+//! The osc, pad, and reverb tank sections are an `editor.EditorOf(patch)` (`patch.zig`). The mix
+//! section stays typeset here: its numbers are slots bound to widgets, and binding them both
+//! ways is a job of its own. So these lines are read-only and placed token by token with
+//! `text.measure` and `kit.label`, which is also what lets a token's alpha follow its gate.
 //!
 //! ## 2. Templates and Slots
 //! A line is a template; `$` and a letter is slot `letter - 'a'`, whose text the app formats
@@ -106,7 +105,7 @@ pub const Context = struct {
 
 const keywords = [_][]const u8{ "if", "module", "return", "sum", "Note" };
 
-fn is_ident(byte: u8) bool {
+pub fn is_ident(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte >= 0x80;
 }
 
@@ -119,47 +118,55 @@ pub fn tokenize(bytes: []const u8, context: Context, out: *[token_cap]Token) u32
     var previous_byte: u8 = ' ';
     while (at < bytes.len) {
         assert(count < token_cap);
-        const first = bytes[at];
-        var stop = at + 1;
-        var class: Class = .punctuation;
-        var channel: u8 = 0;
-        const leads_number = first == '-' and at + 1 < bytes.len and std.ascii.isDigit(bytes[at + 1]) and previous != .plain and previous != .number and previous_byte != ')';
-        if (first == ' ') {
-            while (stop < bytes.len and bytes[stop] == ' ') stop += 1;
-            class = .space;
-        } else if (std.ascii.isDigit(first) or leads_number) {
-            while (stop < bytes.len and (std.ascii.isAlphanumeric(bytes[stop]) or bytes[stop] == '.' or bytes[stop] == '%')) stop += 1;
-            const before_tilde = stop < bytes.len and bytes[stop] == '~';
-            const after_tilde = at > 0 and bytes[at - 1] == '~';
-            class = if (after_tilde and !before_tilde) .range_end else if (before_tilde and !after_tilde) .range_end else .number;
-            if (before_tilde and !after_tilde and !three_part(bytes, stop)) class = .number;
-        } else if (is_ident(first)) {
-            while (stop < bytes.len and is_ident(bytes[stop])) stop += 1;
-            const word = bytes[at..stop];
-            class = .plain;
-            for (keywords) |name| if (std.mem.eql(u8, word, name)) {
-                class = .keyword;
-            };
-            for (context.declared) |name| if (std.mem.eql(u8, word, name)) {
-                class = .declared;
-            };
-            for (context.channels, 0..) |name, index| if (std.mem.eql(u8, word, name)) {
-                class = .channel;
-                channel = @intCast(index);
-            };
-            if (class == .plain and stop < bytes.len and bytes[stop] == '(') class = .call;
-        } else if (first == '"') {
-            while (stop < bytes.len and bytes[stop] != '"') stop += 1;
-            stop = @min(stop + 1, @as(u32, @intCast(bytes.len)));
-            class = .string;
-        }
-        out[count] = .{ .start = @intCast(at), .end = @intCast(stop), .class = class, .channel = channel };
+        const value_before = previous == .plain or previous == .number or previous_byte == ')';
+        const token = token_at(bytes, at, value_before, context);
+        out[count] = token;
         count += 1;
-        if (class != .space) previous = class;
-        if (class != .space) previous_byte = bytes[stop - 1];
-        at = stop;
+        if (token.class != .space) previous = token.class;
+        if (token.class != .space) previous_byte = bytes[token.end - 1];
+        at = token.end;
     }
     return count;
+}
+
+/// The token at byte `at`. `value_before`: a value ends before it, so a "-" there subtracts.
+pub fn token_at(bytes: []const u8, at: u32, value_before: bool, context: Context) Token {
+    assert(at < bytes.len);
+    const first = bytes[at];
+    var stop = at + 1;
+    var class: Class = .punctuation;
+    var channel: u8 = 0;
+    const leads_number = first == '-' and at + 1 < bytes.len and std.ascii.isDigit(bytes[at + 1]) and !value_before;
+    if (first == ' ') {
+        while (stop < bytes.len and bytes[stop] == ' ') stop += 1;
+        class = .space;
+    } else if (std.ascii.isDigit(first) or leads_number) {
+        while (stop < bytes.len and (std.ascii.isAlphanumeric(bytes[stop]) or bytes[stop] == '.' or bytes[stop] == '%')) stop += 1;
+        const before_tilde = stop < bytes.len and bytes[stop] == '~';
+        const after_tilde = at > 0 and bytes[at - 1] == '~';
+        class = if (after_tilde and !before_tilde) .range_end else if (before_tilde and !after_tilde) .range_end else .number;
+        if (before_tilde and !after_tilde and !three_part(bytes, stop)) class = .number;
+    } else if (is_ident(first)) {
+        while (stop < bytes.len and is_ident(bytes[stop])) stop += 1;
+        const word = bytes[at..stop];
+        class = .plain;
+        for (keywords) |name| if (std.mem.eql(u8, word, name)) {
+            class = .keyword;
+        };
+        for (context.declared) |name| if (std.mem.eql(u8, word, name)) {
+            class = .declared;
+        };
+        for (context.channels, 0..) |name, index| if (std.mem.eql(u8, word, name)) {
+            class = .channel;
+            channel = @intCast(index);
+        };
+        if (class == .plain and stop < bytes.len and bytes[stop] == '(') class = .call;
+    } else if (first == '"') {
+        while (stop < bytes.len and bytes[stop] != '"') stop += 1;
+        stop = @min(stop + 1, @as(u32, @intCast(bytes.len)));
+        class = .string;
+    }
+    return .{ .start = @intCast(at), .end = @intCast(stop), .class = class, .channel = channel };
 }
 
 /// True when the range starting with a number ending at `stop` (a "~" there) has three parts.

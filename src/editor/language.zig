@@ -16,6 +16,9 @@
 //! ```
 //! A language may also declare `palette_light: [N][4]f32`, its class colours on a light
 //! background (`EditorOf(L).light_palette`); without it the light palette reuses `palette`.
+//! It may declare `faces: [N]text.Face`, one face per class: `proportional(L)` is then true and
+//! `EditorOf(L)` sets each class in its own face instead of on the monospace grid, chosen at
+//! compile time, so a mono editor keeps its code and its size (`editor.zig`, section 2).
 //! The editor caches one `State` per line (`[line_cap]State`, one byte each) and tokenizes
 //! only the visible lines, each from its cached start state (`buffer.zig`, section 2). The
 //! patch language (`tokenizer.zig`) is the reference implementation and the default.
@@ -26,6 +29,8 @@
 //! - Every byte outside a token is a space (0x20): the editor counts a gap as one column per
 //!   byte without decoding it. The text holds no tab, CR, or other control byte
 //!   (`edit.sanitize_text`), so skipping bytes `<= ' '` meets this. A token may hold spaces.
+//!   In a language with `faces` a gap is spaces of `faces[0]`: columns still count codepoints,
+//!   and only their x changes.
 //! - Null only when the line is used up, with `at.* == line.len`; further calls keep
 //!   returning null and leave `state` alone.
 //! - Tokens are a pure function of the line's bytes and its start state, so start states
@@ -44,6 +49,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const text = @import("../text.zig");
 
 /// Classes a language has at most, so a palette is at most 16 colours.
 pub const class_max: u32 = 16;
@@ -64,6 +70,11 @@ pub fn class_count(comptime L: type) u32 {
     comptime assert(count >= 1);
     comptime assert(count <= class_max);
     return count;
+}
+
+/// True when `L` sets each class in its own face (section 1).
+pub fn proportional(comptime L: type) bool {
+    return @hasDecl(L, "faces");
 }
 
 /// The first reason `L` is not a language, naming `L` and the declaration, or null.
@@ -91,6 +102,9 @@ pub fn check(comptime L: type) ?[]const u8 {
     }
     if (@hasDecl(L, "palette_light") and @TypeOf(L.palette_light) != [class_count(L)][4]f32) {
         return prefix ++ "`palette_light` must be [" ++ count ++ "][4]f32, one colour per Class";
+    }
+    if (@hasDecl(L, "faces") and @TypeOf(L.faces) != [class_count(L)]text.Face) {
+        return prefix ++ "`faces` must be [" ++ count ++ "]text.Face, one face per Class";
     }
     const shown = "pub fn next(line: []const u8, at: *u32, state: *State) " ++
         "?editor.Token(Class)";
@@ -251,6 +265,12 @@ const ShortLight = struct {
     pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
     pub const palette_light: [3][4]f32 = .{ .{ 0, 0, 0, 1 }, .{ 0, 0, 0, 1 }, .{ 0, 0, 0, 1 } };
 };
+const ShortFaces = struct {
+    pub const State = enum(u8) { normal };
+    pub const Class = enum(u8) { a, b };
+    pub const palette: [2][4]f32 = .{ .{ 1, 1, 1, 1 }, .{ 1, 1, 1, 1 } };
+    pub const faces: [1]text.Face = .{.sans};
+};
 const NoNext = struct {
     pub const State = enum(u8) { normal };
     pub const Class = enum(u8) { a, b };
@@ -286,6 +306,7 @@ test "check names the first problem of a language" {
         .{ NoPalette, "missing `pub const palette: [2][4]f32`" },
         .{ ShortPalette, "`palette` must be [2][4]f32, one colour per Class" },
         .{ ShortLight, "`palette_light` must be [2][4]f32, one colour per Class" },
+        .{ ShortFaces, "`faces` must be [2]text.Face, one face per Class" },
         .{ NoNext, "missing `pub fn next(line: []const u8, at: *u32, " ++
             "state: *State) ?editor.Token(Class)`" },
         .{ OwnToken, "`next` must be `pub fn next(line: []const u8, " ++
@@ -295,6 +316,12 @@ test "check names the first problem of a language" {
         const expected = @typeName(case[0]) ++ ": " ++ case[1];
         try testing.expectEqualStrings(expected, comptime check(case[0]).?);
     }
+}
+
+// Locks the comptime switch: a language with `faces` is proportional, one without is not.
+test "proportional follows the faces declaration" {
+    try testing.expect(comptime proportional(ShortFaces));
+    try testing.expect(!comptime proportional(tokenizer));
 }
 
 // Locks the derived walks: a quote opened on one line carries `single` or `double` into the

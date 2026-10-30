@@ -28,7 +28,9 @@
 //! A wheel resolved to the view's id adds `dy` to `scroll_y`; a press or drag on the thumb's
 //! id (`view_id.derive(thumb_salt)`) maps the pointer onto the range. The offset is clamped
 //! with the content height the last frame measured, so it is at most one frame stale, and
-//! `begin_view` clamps again before drawing.
+//! `begin_view` clamps again before drawing. `end_view` takes the wheel flag off the view's
+//! area when this frame's content fits, so a view with nothing to scroll leaves the wheel to
+//! the one around it; the wheel target resolves at the next event, after that frame.
 //!
 //! ## 4. Lists
 //! `List.visible` turns the offset into the rows that overlap the viewport. The app skips the

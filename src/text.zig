@@ -68,13 +68,15 @@ pub const ttf = @import("text/ttf.zig");
 pub const raster = @import("text/raster.zig");
 pub const cache = @import("text/cache.zig");
 pub const mono = @import("text/mono.zig");
+pub const faces = @import("text/faces.zig");
 pub const Cache = cache.Cache;
 pub const Mono = mono.Mono;
+pub const FaceSet = faces.FaceSet;
 
 /// Bytes of UTF-8 one `place` or `place_runs` call may lay out.
 pub const byte_cap: u32 = 4096;
 /// Runs one `place_runs` call may lay out.
-pub const run_cap: u32 = 8;
+pub const run_cap: u32 = 64;
 /// Largest `Style.size` in logical pixels.
 pub const size_max: f32 = 512;
 
@@ -218,6 +220,7 @@ comptime {
 test {
     _ = ttf;
     _ = mono;
+    _ = faces;
     _ = @import("text/subset.zig");
     _ = raster;
     _ = cache;
