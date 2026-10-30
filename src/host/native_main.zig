@@ -5,9 +5,9 @@
 //! native and browser. `linux_window.run` checks the app contract at compile time, then
 //! owns all storage on its own stack frame: window state, draw lists, queue, and the app.
 //! The command line selects the adapter, bench mode, the windowless shader check (`--check`,
-//! which returns before any Wayland connection), and the windowless regress run
-//! (`--regress`, `host/headless.zig`, entered here before the window host); `bench.zig`,
-//! `bench.usage`.
+//! which returns before any Wayland connection), and the windowless scenario runs
+//! (`--regress` and `--render`, `host/headless.zig`, entered here before the window host);
+//! `bench.zig`, `bench.usage`.
 
 const std = @import("std");
 const patchwork = @import("patchwork");
@@ -31,5 +31,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     options.program = program;
     if (options.regress) std.process.exit(try patchwork.host.headless.run(app.App, options));
+    if (options.render != null) std.process.exit(patchwork.host.headless.render(app.App, options));
     try patchwork.host.linux_window.run(app.App, options);
 }

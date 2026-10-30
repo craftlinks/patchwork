@@ -9,9 +9,9 @@
 //! and no GPU, so they are unit tested: scenario replay, command-line options, percentile
 //! summaries, the shaded-area counter, and PPM images. The native host (`linux_window.zig`)
 //! wires them to its frame seams, and `gpu_wgpu.zig` adds timestamps and frame readback, both
-//! only when a scenario runs. `--regress` (`host/headless.zig`) and the browser's `?bench=`
-//! replay share the scenarios, the clock (section 5b), and the images. Without `--bench` or
-//! `--regress` nothing here executes.
+//! only when a scenario runs. `--regress` and `--render` (`host/headless.zig`) and the browser's
+//! `?bench=` replay share the scenarios, the clock (section 5b), and the images. Without
+//! `--bench`, `--regress`, or `--render` nothing here executes.
 //!
 //! ## 2. Scenarios
 //! An app may declare `pub const scenarios: []const bench.Scenario`. A scenario has a `setup`
@@ -93,6 +93,13 @@
 //! period `p` ticking at every multiple of `p` up to the frame's time while it is on.
 //! `regress_size` is the size both render at: `App.regress_size`, or 1280 x 720.
 //!
+//! ## 5c. Other Frame Rates
+//! A client of `Offscreen` (`host/offscreen.zig`) picks a rate from `fps_min` to `fps_max`. The
+//! audio a frame receives follows it: `blocks_for_frame_at(k, fps)` is the difference of two
+//! floors, so every rate feeds the same blocks a second, and `ticks_per_frame_max` holds a 1 ms
+//! timer at `fps_min`. The formula lives here because it paces frames: at 60 it is
+//! `realtime.blocks_for_frame`, which the 60 Hz hosts keep calling.
+//!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: replay state is three counters, summaries sort the caller's slice, and
 //!   images are parsed in place.
@@ -108,6 +115,7 @@ const renderer = @import("draw/renderer.zig");
 const textures = @import("draw/textures.zig");
 const realtime = @import("realtime.zig");
 const drop = @import("drop.zig");
+const frame = @import("frame.zig");
 
 /// Most steps in one `setup` or `cycle` list.
 pub const steps_max: u32 = 256;
@@ -128,8 +136,25 @@ pub const event_cap: u32 = 4;
 /// Largest file a `drop` step carries: 64 chunks.
 pub const drop_file_max: u64 = 64 * drop.chunk_cap;
 
-/// Widest image `ppm_row` converts, in pixels.
+/// Widest image `ppm_row` converts, in pixels, and the largest side of a headless target: the
+/// WebGPU default `maxTextureDimension2D`.
 pub const width_max: u32 = 8192;
+
+/// Slowest frame rate a frame clock runs at (section 5c).
+pub const fps_min: u32 = 10;
+
+/// Fastest frame rate a frame clock runs at (section 5c).
+pub const fps_max: u32 = 240;
+
+/// Most audio blocks one frame receives at any rate: `fps_min`'s (section 5c).
+pub const blocks_per_frame_max: u32 = 38;
+
+/// Most frames `--frames` asks `--render` to measure: an hour at 60 fps.
+pub const render_frames_max: u32 = 216_000;
+
+/// The device pixels `--render` keeps a frame for when the app declares no
+/// `render_size_max`: 4K (`render_size`).
+pub const render_size_default: [2]u32 = .{ 3840, 2160 };
 
 /// An area of the last frame, by id, with the name and index it came from for messages.
 pub const Target = struct {
@@ -688,11 +713,34 @@ pub fn regress_size(comptime App: type) [2]u32 {
     return if (@hasDecl(App, "regress_size")) App.regress_size else regress_size_default;
 }
 
+/// The device pixels `--render` keeps a frame for: `App.render_size_max`, or 4K. Without the
+/// declaration it still holds the regress size, so `--render` at that size always fits.
+pub fn render_size(comptime App: type) [2]u32 {
+    if (@hasDecl(App, "render_size_max")) return App.render_size_max;
+    const regress = regress_size(App);
+    return .{
+        @max(render_size_default[0], regress[0]),
+        @max(render_size_default[1], regress[1]),
+    };
+}
+
 /// The simulated frame period, as `ui.animate` receives it.
 pub const frame_ms: f32 = 1000.0 / 60.0;
 
-/// Most app timer ticks one simulated frame runs: a 1 ms timer over a 17 ms step, with margin.
-pub const ticks_per_frame_max: u32 = 32;
+/// Most app timer ticks one simulated frame runs: a 1 ms timer over a 100 ms step (`fps_min`),
+/// with margin.
+pub const ticks_per_frame_max: u32 = 128;
+
+/// Audio blocks frame `k` of a run at `fps` receives (section 5c), counting the frames fed so
+/// far. At 60 this is `realtime.blocks_for_frame(k)`.
+pub fn blocks_for_frame_at(k: u64, fps: u32) u32 {
+    assert(fps >= fps_min and fps <= fps_max);
+    const rate: u64 = realtime.sample_rate;
+    const block: u64 = realtime.block_frames;
+    const count = ((k + 1) * rate / fps) / block - (k * rate / fps) / block;
+    assert(count <= blocks_per_frame_max);
+    return @intCast(count);
+}
 
 /// The simulated clock (section 5b; `host/headless.zig`, section 2): frame times, `ui.animate`'s
 /// delta, and the app timer's ticks.
@@ -779,6 +827,16 @@ pub const Options = struct {
     /// `--decorations client|server`: who draws the window's frame, over the app's
     /// `config.decorations` (native windows only; `host/linux_window.zig`, section 5e).
     decorations: ?input.Decorations,
+    /// `--render <scenario>`: write that scenario's frames (`host/headless.zig`, section 3).
+    render: ?[]const u8,
+    /// `--size WxH`: `--render`'s logical size; the regress size without it.
+    size: ?[2]u32,
+    /// `--scale S`: `--render`'s display scale in 1/120 units; scale 1 without it.
+    scale_120: ?u32,
+    /// `--fps N`: `--render`'s frame rate, `fps_min ..= fps_max`; 60 without it.
+    fps: ?u32,
+    /// `--out <dir>|-`: where `--render` writes PNGs, or `-` for raw RGBA on stdout.
+    out: ?[:0]const u8,
     /// The program's file name without its directory, set by the native entry point: the
     /// golden file's name (`host/headless.zig`).
     program: []const u8,
@@ -798,6 +856,11 @@ pub const Options = struct {
         .only = null,
         .keep = false,
         .decorations = null,
+        .render = null,
+        .size = null,
+        .scale_120 = null,
+        .fps = null,
+        .out = null,
         .program = "",
     };
 };
@@ -806,6 +869,8 @@ pub const usage =
     \\usage: <app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
     \\       [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
     \\       <app> --regress [--adapter high|low|both] [--bless] [--only scenario] [--keep]
+    \\       <app> --render <scenario> [--size WxH] [--scale S] [--fps N] [--frames N]
+    \\       [--adapter low|high] [--no-cache] --out <dir>|-
     \\
 ;
 
@@ -815,11 +880,14 @@ pub const ParseError = error{
     BadNumber,
     BadAdapter,
     BadDecorations,
+    BadMode,
 };
 
 /// Parses the arguments after the program name. `--bench` takes an optional scenario name,
 /// `--no-cache`, `--check`, `--regress`, `--bless`, and `--keep` take none, and every other
-/// option takes one value. `--adapter both` is accepted only with `--regress`.
+/// option takes one value. `--adapter both` is accepted only with `--regress`. `--render`
+/// needs `--out` and refuses another mode, and only it takes `--size`, `--scale`, `--fps`,
+/// `--out`, or `--frames` over `sample_cap`.
 pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
     assert(args.len <= arg_cap);
     var options: Options = .off;
@@ -860,7 +928,8 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
         index += 1;
         if (std.mem.eql(u8, arg, "--frames")) {
             options.frames = std.fmt.parseInt(u32, value, 10) catch return error.BadNumber;
-            if (options.frames.? == 0 or options.frames.? > sample_cap) return error.BadNumber;
+            const most = render_frames_max;
+            if (options.frames.? == 0 or options.frames.? > most) return error.BadNumber;
         } else if (std.mem.eql(u8, arg, "--adapter")) {
             if (std.mem.eql(u8, value, "both")) {
                 options.both = true;
@@ -879,13 +948,55 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
         } else if (std.mem.eql(u8, arg, "--decorations")) {
             options.decorations = std.meta.stringToEnum(input.Decorations, value) orelse
                 return error.BadDecorations;
+        } else if (std.mem.eql(u8, arg, "--render")) {
+            options.render = value;
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            options.size = parse_size(value) orelse return error.BadNumber;
+        } else if (std.mem.eql(u8, arg, "--scale")) {
+            options.scale_120 = parse_scale(value) orelse return error.BadNumber;
+        } else if (std.mem.eql(u8, arg, "--fps")) {
+            const fps = std.fmt.parseInt(u32, value, 10) catch return error.BadNumber;
+            if (fps < fps_min or fps > fps_max) return error.BadNumber;
+            options.fps = fps;
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            options.out = value;
         } else {
             return error.UnknownArgument;
         }
     }
     assert(index == args.len);
     if (options.both and !options.regress) return error.BadAdapter;
+    if (options.render != null) {
+        if (options.regress or options.bench or options.check) return error.BadMode;
+        if (options.out == null) return error.BadMode;
+        return options;
+    }
+    if (options.size != null or options.scale_120 != null) return error.BadMode;
+    if (options.fps != null or options.out != null) return error.BadMode;
+    if (options.frames) |frames| {
+        if (frames > sample_cap) return error.BadNumber;
+    }
     return options;
+}
+
+/// `1920x1080` -> the size, each side at least 1.
+fn parse_size(text: []const u8) ?[2]u32 {
+    const x = std.mem.indexOfScalar(u8, text, 'x') orelse return null;
+    const width = std.fmt.parseInt(u32, text[0..x], 10) catch return null;
+    const height = std.fmt.parseInt(u32, text[x + 1 ..], 10) catch return null;
+    if (width == 0 or height == 0) return null;
+    return .{ width, height };
+}
+
+/// `1.25` -> 150: a display scale rounded to 1/120 units, within what a window accepts.
+fn parse_scale(text: []const u8) ?u32 {
+    const scale = std.fmt.parseFloat(f64, text) catch return null;
+    const units = @round(scale * 120);
+    const low: f64 = @floatFromInt(frame.scale_120_min);
+    const high: f64 = @floatFromInt(frame.scale_120_max);
+    // Written so a NaN is refused too.
+    if (!(units >= low and units <= high)) return null;
+    return @intFromFloat(units);
 }
 
 const Flag = enum { regress, bless, keep };
@@ -905,6 +1016,11 @@ fn is_option(arg: []const u8) bool {
         "--csv",
         "--only",
         "--decorations",
+        "--render",
+        "--size",
+        "--scale",
+        "--fps",
+        "--out",
     };
     for (names) |name| {
         if (std.mem.eql(u8, arg, name)) return true;
@@ -1014,6 +1130,20 @@ pub fn ppm_header(buffer: []u8, width: u32, height: u32) []const u8 {
     return header;
 }
 
+/// How a frame's pixels are laid out when read back: `rgb` is the golden hash's and PNG's
+/// form, `rgba` is what a video encoder takes.
+pub const Layout = enum {
+    rgb,
+    rgba,
+
+    pub fn pixel_bytes(layout: Layout) u32 {
+        return switch (layout) {
+            .rgb => 3,
+            .rgba => 4,
+        };
+    }
+};
+
 /// Converts one row of BGRA texels (the swapchain format) to RGB.
 pub fn ppm_row(rgb: []u8, bgra: []const u8) void {
     assert(bgra.len % 4 == 0);
@@ -1024,6 +1154,21 @@ pub fn ppm_row(rgb: []u8, bgra: []const u8) void {
         rgb[x * 3 + 0] = bgra[x * 4 + 2];
         rgb[x * 3 + 1] = bgra[x * 4 + 1];
         rgb[x * 3 + 2] = bgra[x * 4 + 0];
+    }
+}
+
+/// Converts one row of BGRA texels to RGBA. Frames are opaque, so alpha is 255 whatever the
+/// target held.
+pub fn rgba_row(rgba: []u8, bgra: []const u8) void {
+    assert(bgra.len % 4 == 0);
+    assert(rgba.len == bgra.len);
+    const width = bgra.len / 4;
+    assert(width <= width_max);
+    for (0..width) |x| {
+        rgba[x * 4 + 0] = bgra[x * 4 + 2];
+        rgba[x * 4 + 1] = bgra[x * 4 + 1];
+        rgba[x * 4 + 2] = bgra[x * 4 + 0];
+        rgba[x * 4 + 3] = 255;
     }
 }
 
@@ -1319,6 +1464,23 @@ pub fn diff_rgb(old: []const u8, new: []const u8, out: []u8) void {
 pub fn rgb_hash(rgb: []const u8) u64 {
     assert(rgb.len % 3 == 0);
     return std.hash.XxHash64.hash(0, rgb);
+}
+
+/// `rgb_hash` of an RGBA frame's RGB: the hash is streamed through a row of RGB, so a frame read
+/// for a video still names its golden.
+pub fn rgb_hash_rgba(rgba: []const u8) u64 {
+    assert(rgba.len % 4 == 0);
+    var hasher: std.hash.XxHash64 = .init(0);
+    var row: [width_max * 3]u8 = undefined;
+    var at: usize = 0;
+    while (at < rgba.len) {
+        const pixels: usize = @min((rgba.len - at) / 4, width_max);
+        for (0..pixels) |x| row[x * 3 ..][0..3].* = rgba[at + x * 4 ..][0..3].*;
+        hasher.update(row[0 .. pixels * 3]);
+        at += pixels * 4;
+    }
+    assert(at == rgba.len);
+    return hasher.final();
 }
 
 const testing = std.testing;
@@ -1636,6 +1798,133 @@ test "frames hash with xxhash64 seed 0" {
     try testing.expectEqual(@as(u64, 0xef46db3751d8e999), rgb_hash(""));
 }
 
+// Locks `--render`'s command line: every option; `--scale` 1.25 is 150 and 2 is 240, 0.2 and a
+// bad number refused; fps 9 and 241 refused; `--frames` up to `render_frames_max` with
+// `--render` and `sample_cap` without; `--render` with `--regress`, `--bench`, `--check`,
+// `--adapter both`, or no `--out` refused; its options refused alone; and the longest line, 15
+// arguments, accepted.
+test "render arguments parse" {
+    const longest = [_][:0]const u8{
+        "--render", "scope", "--size",    "1920x1080", "--scale",    "2",     "--fps", "30",
+        "--frames", "600",   "--adapter", "low",       "--no-cache", "--out", "-",
+    };
+    try testing.expect(longest.len < arg_cap);
+    const full = try parse_args(&longest);
+    try testing.expectEqualStrings("scope", full.render.?);
+    try testing.expectEqual(@as(?[2]u32, .{ 1920, 1080 }), full.size);
+    try testing.expectEqual(@as(?u32, 240), full.scale_120);
+    try testing.expectEqual(@as(?u32, 30), full.fps);
+    try testing.expectEqual(@as(?u32, 600), full.frames);
+    try testing.expectEqual(Adapter.low, full.adapter);
+    try testing.expect(!full.cache and !full.regress and !full.bench);
+    try testing.expectEqualStrings("-", full.out.?);
+    const base = [_][:0]const u8{ "--render", "still", "--out", "frames" };
+    const plain = try parse_args(&base);
+    try testing.expectEqualStrings("frames", plain.out.?);
+    try testing.expectEqual(@as(?u32, null), plain.fps);
+    try testing.expectEqual(@as(?u32, 150), (try parse_args(&(base ++ .{ "--scale", "1.25" }))).scale_120);
+    try testing.expectEqual(@as(?u32, 240), (try parse_args(&(base ++ .{ "--scale", "2" }))).scale_120);
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--scale", "0.2" })));
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--scale", "wide" })));
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--scale", "nan" })));
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--fps", "9" })));
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--fps", "241" })));
+    try testing.expectEqual(@as(?u32, 10), (try parse_args(&(base ++ .{ "--fps", "10" }))).fps);
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--size", "1920" })));
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--size", "0x720" })));
+    const most = (try parse_args(&(base ++ .{ "--frames", "216000" }))).frames;
+    try testing.expectEqual(@as(?u32, render_frames_max), most);
+    try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--frames", "216001" })));
+    try testing.expectError(error.BadNumber, parse_args(&.{ "--bench", "--frames", "5000" }));
+    try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--regress"})));
+    try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--bench"})));
+    try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--check"})));
+    try testing.expectError(error.BadAdapter, parse_args(&(base ++ .{ "--adapter", "both" })));
+    try testing.expectError(error.BadMode, parse_args(&.{ "--render", "still" }));
+    try testing.expectError(error.BadMode, parse_args(&.{ "--out", "frames" }));
+    try testing.expectError(error.BadMode, parse_args(&.{ "--fps", "30" }));
+    try testing.expectError(error.BadMode, parse_args(&.{ "--scale", "2" }));
+    try testing.expectError(error.BadMode, parse_args(&.{ "--size", "640x480" }));
+    try testing.expectError(error.MissingValue, parse_args(&.{"--render"}));
+}
+
+// Locks `render_size`: 4K without a declaration, the declaration when there is one, and a
+// declared regress size wider than 4K still fits.
+test "the render frame holds the regress size" {
+    const Plain = struct {};
+    const Declared = struct {
+        pub const render_size_max: [2]u32 = .{ 640, 480 };
+    };
+    const Wide = struct {
+        pub const regress_size: [2]u32 = .{ 4096, 720 };
+    };
+    try testing.expectEqual([2]u32{ 3840, 2160 }, comptime render_size(Plain));
+    try testing.expectEqual([2]u32{ 640, 480 }, comptime render_size(Declared));
+    try testing.expectEqual([2]u32{ 4096, 2160 }, comptime render_size(Wide));
+}
+
+// Locks the row conversion: BGRA swaps to RGBA with alpha 255, even where the source alpha is
+// not 255, and `ppm_row` of the same row keeps its RGB order.
+test "rgba rows swap blue and red and force alpha" {
+    const bgra = [_]u8{ 1, 2, 3, 0, 4, 5, 6, 128 };
+    var rgba: [8]u8 = undefined;
+    rgba_row(&rgba, &bgra);
+    try testing.expectEqualSlices(u8, &.{ 3, 2, 1, 255, 6, 5, 4, 255 }, &rgba);
+    var rgb: [6]u8 = undefined;
+    ppm_row(&rgb, &bgra);
+    try testing.expectEqualSlices(u8, &.{ 3, 2, 1, 6, 5, 4 }, &rgb);
+    try testing.expectEqual(@as(u32, 3), Layout.rgb.pixel_bytes());
+    try testing.expectEqual(@as(u32, 4), Layout.rgba.pixel_bytes());
+}
+
+// Locks the streamed hash: the RGB of an RGBA frame hashes to its `rgb_hash`, alpha ignored, on
+// the 3 x 2 test image, on a 1708 x 3 frame, and on 9000 pixels, which cross `width_max` and so
+// fill the row buffer more than once.
+test "an rgba frame hashes like its rgb" {
+    const static = struct {
+        var rgb: [9000 * 3]u8 = undefined;
+        var rgba: [9000 * 4]u8 = undefined;
+    };
+    var small: [test_rgb.len / 3 * 4]u8 = undefined;
+    for (0..test_rgb.len / 3) |at| {
+        small[at * 4 ..][0..3].* = test_rgb[at * 3 ..][0..3].*;
+        small[at * 4 + 3] = @intCast(at);
+    }
+    try testing.expectEqual(rgb_hash(&test_rgb), rgb_hash_rgba(&small));
+    for (&static.rgb, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% index / 7);
+    for (0..9000) |at| {
+        static.rgba[at * 4 ..][0..3].* = static.rgb[at * 3 ..][0..3].*;
+        static.rgba[at * 4 + 3] = 255;
+    }
+    const frame_pixels = 1708 * 3;
+    const rows = static.rgb[0 .. frame_pixels * 3];
+    try testing.expectEqual(rgb_hash(rows), rgb_hash_rgba(static.rgba[0 .. frame_pixels * 4]));
+    try testing.expectEqual(rgb_hash(&static.rgb), rgb_hash_rgba(&static.rgba));
+}
+
+// Locks audio pacing at any rate: fps 60 is `realtime.blocks_for_frame`; fps 30 feeds 12, 13,
+// 12, 13 and fps 24 feeds 15, 16, 15, 16; every rate feeds 375 blocks a second (48,000 / 128);
+// and no frame takes more than 38, fps 10's most.
+test "audio blocks per frame follow the frame rate" {
+    for (0..10_000) |k| {
+        try testing.expectEqual(realtime.blocks_for_frame(k), blocks_for_frame_at(k, 60));
+    }
+    for ([4]u32{ 12, 13, 12, 13 }, 0..) |blocks, k| {
+        try testing.expectEqual(blocks, blocks_for_frame_at(k, 30));
+    }
+    for ([4]u32{ 15, 16, 15, 16 }, 0..) |blocks, k| {
+        try testing.expectEqual(blocks, blocks_for_frame_at(k, 24));
+    }
+    for ([_]u32{ 10, 24, 25, 30, 50, 60, 120, 240 }) |fps| {
+        var total: u32 = 0;
+        for (0..fps) |k| total += blocks_for_frame_at(k, fps);
+        try testing.expectEqual(@as(u32, 375), total);
+    }
+    var most: u32 = 0;
+    for (0..1000) |k| most = @max(most, blocks_for_frame_at(k, fps_min));
+    try testing.expectEqual(blocks_per_frame_max, most);
+}
+
 // Locks the regress flags: `--regress` alone, then with `--bless`, `--only`, `--keep`, and
 // `--adapter both`, which is refused without `--regress`; and `Scenario.regress` defaults on.
 test "regress arguments parse" {
@@ -1705,7 +1994,10 @@ test "the simulated clock fires timers at multiples of their period" {
 
 comptime {
     assert(event_cap == 4);
-    assert(ticks_per_frame_max >= 17);
+    assert(ticks_per_frame_max >= 1000 / fps_min);
+    assert(blocks_per_frame_max <= realtime.queue_blocks);
+    assert(render_frames_max > sample_cap);
+    assert(render_size_default[0] <= width_max and render_size_default[1] <= width_max);
     assert(sample_cap <= 1 << 16);
     assert(steps_max <= 1 << 16);
 }

@@ -48,6 +48,9 @@
 //!   native host replays with `--bench <name>` (`bench.zig`). `check` validates them.
 //! - Optional: `pub const regress_size: [2]u32`, the logical size `--regress` renders at
 //!   (`host/headless.zig`; 1280 x 720 without it). `check` requires 1 to 4096 for each side.
+//! - Optional: `pub const render_size_max: [2]u32`, the most device pixels `--render` keeps a
+//!   frame for (`bench.render_size`; 3840 x 2160 without it). `check` requires 1 to 8192 for
+//!   each side and at least the regress size, so a render at that size always fits.
 //! - Optional, together: `pub const Audio` and `pub fn audio` (section 4a).
 //!
 //! ## 2a. Draw Configuration
@@ -195,6 +198,9 @@ pub const timer_period_ms_max: u32 = 1000;
 /// Largest side of `App.regress_size`, in logical pixels.
 pub const regress_side_max: u32 = 4096;
 
+/// Largest side of `App.render_size_max`, in device pixels: the largest target.
+pub const render_side_max: u32 = bench.width_max;
+
 /// Returns null when `App` satisfies the contract, otherwise a message naming the first
 /// problem. Pure, so tests can check failure cases without a compile error. Signature types
 /// are compared exactly.
@@ -254,6 +260,19 @@ pub fn conformance(comptime App: type) ?[]const u8 {
             if (side < 1 or side > regress_side_max) {
                 return "App.regress_size: each side must be 1 to 4096";
             }
+        }
+    }
+    if (@hasDecl(App, "render_size_max")) {
+        const render_size = App.render_size_max;
+        if (@TypeOf(render_size) != [2]u32) return "App.render_size_max must have type [2]u32";
+        for (render_size) |side| {
+            if (side < 1 or side > render_side_max) {
+                return "App.render_size_max: each side must be 1 to 8192";
+            }
+        }
+        const regress_size = bench.regress_size(App);
+        if (render_size[0] < regress_size[0] or render_size[1] < regress_size[1]) {
+            return "App.render_size_max must be at least App.regress_size";
         }
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
@@ -513,6 +532,27 @@ const SmallRegress = struct {
     pub const regress_size: [2]u32 = .{ 640, 480 };
 };
 
+const HugeRender = struct {
+    pub const config: Config = .{ .title = "huge", .timer_period_ms = 0, .draw = &test_draw };
+    pub const render_size_max: [2]u32 = .{ 9000, 720 };
+};
+
+const WrongRender = struct {
+    pub const config: Config = .{ .title = "wrong", .timer_period_ms = 0, .draw = &test_draw };
+    pub const render_size_max: u32 = 2160;
+};
+
+const SmallRender = struct {
+    pub const config: Config = .{ .title = "small", .timer_period_ms = 0, .draw = &test_draw };
+    pub const regress_size: [2]u32 = .{ 640, 480 };
+    pub const render_size_max: [2]u32 = .{ 640, 479 };
+};
+
+const FitRender = struct {
+    pub const config: Config = .{ .title = "fit", .timer_period_ms = 0, .draw = &test_draw };
+    pub const render_size_max: [2]u32 = .{ 1280, 720 };
+};
+
 const OldEvent = struct {
     pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
     pub fn init(app: *OldEvent, textures: *quads.Textures) void {
@@ -602,6 +642,26 @@ test "a regress size outside 1 to 4096 is rejected" {
         comptime conformance(WideRegress).?,
     );
     const next = comptime conformance(SmallRegress).?;
+    try std.testing.expectEqualStrings("App is missing `pub fn init`", next);
+}
+
+// Locks `render_size_max` validation: 9000 wide, the wrong type, and a size below the regress
+// size are each refused by name; 1280 x 720 equals the default regress size and passes the check
+// (the next problem reported is the missing `init`).
+test "a render size out of range is rejected" {
+    try std.testing.expectEqualStrings(
+        "App.render_size_max: each side must be 1 to 8192",
+        comptime conformance(HugeRender).?,
+    );
+    try std.testing.expectEqualStrings(
+        "App.render_size_max must have type [2]u32",
+        comptime conformance(WrongRender).?,
+    );
+    try std.testing.expectEqualStrings(
+        "App.render_size_max must be at least App.regress_size",
+        comptime conformance(SmallRender).?,
+    );
+    const next = comptime conformance(FitRender).?;
     try std.testing.expectEqualStrings("App is missing `pub fn init`", next);
 }
 

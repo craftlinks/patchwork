@@ -91,6 +91,7 @@ zig build test-contract         # the app contract rejects malformed apps at com
 zig build check                 # compile every shader and pipeline headless (needs a GPU)
 zig build regress -Doptimize=ReleaseFast   # headless frame hashes against test/golden (GPU)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
+./zig-out/bin/fx --render scope --size 1920x1080 --scale 2 --out -   # raw RGBA for ffmpeg
 ```
 
 Native flags: `<app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]`.
@@ -117,4 +118,5 @@ Everything else is Zig.
 ## Documentation
 
 - [docs/reference.md](docs/reference.md): the full manual covering the app contract, layout,
-  widgets, theming, drawing, text, audio, platform hosts, benchmarks and regression.
+  widgets, theming, drawing, text, audio, platform hosts, benchmarks, regression and
+  rendering frames.

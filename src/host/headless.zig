@@ -10,44 +10,34 @@
 //! `--regress`, before any display is touched, and renders each regressed scenario
 //! (`bench.Scenario.regress`) of the app in this one process:
 //! ```text
-//! for adapter in (high, low):            gpu_wgpu.create_headless + headless_target_create
+//! for adapter in (high, low):            Offscreen.open
 //!   read test/golden/<adapter slug>/<app>.txt; refuse a golden blessed on another driver
 //!   for scenario, for cache in (on, off):
-//!     fresh app, UI context, renderer, GPU tables      (section 3)
-//!     frames on the simulated clock                    (section 2)
-//!     read the target back, hash the RGB rows          (bench.rgb_hash)
+//!     Offscreen.start, then Playback to the end        (section 2)
+//!     Offscreen.read(.rgb), hash the RGB rows          (bench.rgb_hash)
 //!   compare: cache on == cache off; hash == golden line (or bless it)
 //! one report, one write; exit 0 only when every line is the same and ok
 //! ```
-//! Nothing in the renderer knows it is headless: the device's target texture stands in for
-//! the swapchain (`gpu_wgpu.zig`, section 10a).
+//! The frame loop, the fresh state per start, and the device live in `Offscreen`
+//! (`host/offscreen.zig`, sections 2 and 3). Everything here is scenarios: playback, goldens,
+//! pictures, and the report.
 //!
-//! ## 2. The Simulated Clock
-//! Frame `n` is at `t_n = n * 1000 / 60` ms (integer division, the windowed bench's
-//! `bench_time`). Before frame `n` draws, in this order:
-//! 1. the scenario step of this frame (`bench.Replay`, `bench.step_events`), its presses
-//!    stamped `t_n`, through `ui.dispatch`;
-//! 2. every app timer tick due by `t_n` (`bench.Clock.due`, shared with the browser
-//!    replay): with period `p`, a tick at every multiple of `p` up to `t_n`, oldest first,
-//!    while `cx.timer_on`, each one `App.timer` call with the tick's own time; ticks that
-//!    fall while the timer is off are skipped;
-//! 3. `ui.animate` with `dt = 1000 / 60` ms (0 for frame 0, as the first sample after idle);
-//! 4. while `cx.audio_on`, `realtime.blocks_for_frame(k)` blocks rendered on this thread and
-//!    drained through `App.audio`, `k` counting the frames fed so far, exactly as the
-//!    windowed bench does (`linux_window.zig`, section 5c);
-//! 5. `ui.draw_frame` and `Renderer.frame` with `time_s` of `t_n`, then `gpu_wgpu.execute`.
-//! Every frame is drawn: there is no vsync to wait for, and the renderer's own skip and
-//! cache logic runs as in a window. A scenario runs frame 0 (the first draw), then one frame
-//! per step until `frames` are measured; an empty cycle draws clock frames.
+//! ## 2. Playback
+//! `Playback` is a scenario on a frame clock at `fps` (`offscreen.at_frame`): frame 0 draws with
+//! no step, and each later frame `n` applies the scenario's next step (`bench.Replay`), its
+//! presses stamped `t_n`, then draws, until `frames` are measured. Every frame is drawn: there
+//! is no vsync to wait for. An empty cycle draws clock frames. `--regress` runs it at 60 fps.
 //!
-//! ## 3. Fresh State per Run
-//! The app, the UI context, the renderer, the audio engine, and the command buffer are
-//! static (their sizes follow `App.config`), and every (scenario, cache) run initializes
-//! them in place as the windowed host's `run` does. The device is kept per adapter and its
-//! tables are emptied with `gpu_wgpu.reset` before the setup stream is replayed again, which
-//! costs far less than a new device (measured on the step page). App state that `App.init`
-//! does not reset would leak from one scenario into the next and show as a difference
-//! between a full run and `--only`; the fix belongs in the app.
+//! ## 3. Rendering Frames
+//! `render` is `--render`: one scenario's every `Playback` frame, from frame 0, at any size,
+//! scale, and rate, as a PNG sequence or as raw RGBA on stdout for a video encoder. The frame
+//! lives in one static buffer of `bench.render_size(App)`; a size over it is refused by name
+//! before a device exists. PNGs are read as RGB and go through a `FileSink`, so no PNG-sized
+//! buffer is needed. Raw frames go to stdout in pieces of at most `raw_piece_bytes`, so
+//! `write_all`'s retry bound holds on a pipe; the encoder sets the pace. A closed pipe is an
+//! `EPIPE`, not a signal, and ends the run. The report is one line on stderr, and stdout carries
+//! only frames. Its hash is the last frame's `rgb_hash` whichever layout was read, so a render
+//! at the regress size, scale 1, and 60 fps prints the scenario's golden.
 //!
 //! ## 4. Golden Files
 //! `test/golden/<adapter slug>/<app>.txt`, one per app so parallel apps never write the same
@@ -70,27 +60,30 @@
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: frames, PNG bytes, the golden file, and the report live in static buffers
-//!   sized by the app's regress size (`bench.regress_size`).
-//! - Bounded loops: frames by the scenario's setup and `frames`, timer ticks per frame by
-//!   `bench.ticks_per_frame_max`, golden lines by `bench.scenario_cap`, paths by `path_cap`.
+//!   sized by the app's regress size (`bench.regress_size`) and render size
+//!   (`bench.render_size`).
+//! - Bounded loops: frames by the scenario's setup and `frames`, golden lines by
+//!   `bench.scenario_cap`, paths by `path_cap`, writes by `io_retry_max`.
 
 const std = @import("std");
 const assert = std.debug.assert;
-const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
 const bench = @import("../bench.zig");
-const commands = @import("../gpu/commands.zig");
+const frame_module = @import("../frame.zig");
 const gpu_wgpu = @import("gpu_wgpu.zig");
-const input = @import("../input.zig");
-const realtime = @import("../realtime.zig");
-const renderer = @import("../draw/renderer.zig");
-const ui = @import("../ui.zig");
-const audio_thread = @import("audio_thread.zig");
+const offscreen = @import("offscreen.zig");
 
 /// The display scale regress renders at, in 1/120 units.
 pub const scale_120: u32 = 120;
 
-const Clock = bench.Clock;
+/// The frame rate regress runs at.
+const regress_fps: u32 = 60;
+
+/// Most bytes of a raw frame one `write_all` takes (module guide, section 3).
+const raw_piece_bytes: usize = 1024 * 1024;
+
+/// Bytes of a PNG buffered before they reach the file.
+const png_chunk_bytes: usize = 64 * 1024;
 
 /// Longest path this host builds.
 const path_cap: u32 = 512;
@@ -301,28 +294,113 @@ pub fn run(comptime App: type, options: bench.Options) !u8 {
     return Runner(App).run(options);
 }
 
+/// Runs `--render` for `App` (module guide, section 3) and returns the exit code.
+pub fn render(comptime App: type, options: bench.Options) u8 {
+    comptime app_contract.check(App);
+    assert(options.render != null);
+    assert(options.out != null);
+    return Runner(App).render(options);
+}
+
+/// A scenario on a frame clock through `Off` (module guide, section 2).
+fn Playback(comptime Off: type) type {
+    return struct {
+        const Self = @This();
+
+        /// The app's scenario with `frames` replaced, which `bench.Replay` reads.
+        scenario: bench.Scenario,
+        fps: u32,
+        replay: bench.Replay,
+        n: u64,
+        frames_max: u64,
+
+        fn init(scenario: *const bench.Scenario, fps: u32, frames: u32) Self {
+            assert(frames >= 1);
+            assert(fps >= bench.fps_min and fps <= bench.fps_max);
+            var measured = scenario.*;
+            measured.frames = frames;
+            return .{
+                .scenario = measured,
+                .fps = fps,
+                .replay = .init(),
+                .n = 0,
+                .frames_max = setup_frames(scenario) + frames + 1,
+            };
+        }
+
+        /// Draws the next frame and returns its number, or null when the replay is done.
+        fn next(self: *Self) !?u64 {
+            const n = self.n;
+            if (self.replay.phase == .done) return null;
+            if (n > self.frames_max) return error.ReplayStuck;
+            const at = offscreen.at_frame(n, self.fps);
+            if (n != 0) {
+                if (self.replay.next(&self.scenario)) |step| {
+                    try Off.step(step, @intCast(at.time_ms));
+                }
+            }
+            try Off.frame(at);
+            _ = self.replay.presented(&self.scenario);
+            self.n += 1;
+            return n;
+        }
+
+        /// The frames a scenario's setup takes: one per step, `n` per wait of `n`.
+        fn setup_frames(scenario: *const bench.Scenario) u64 {
+            var total: u64 = 0;
+            for (scenario.setup) |step| total += if (step == .wait) step.wait else 1;
+            assert(total >= scenario.setup.len);
+            return total;
+        }
+    };
+}
+
+/// A `std.Io.Writer` over a file descriptor: a PNG reaches the file through `buffer` with no
+/// PNG-sized storage (module guide, section 3).
+const FileSink = struct {
+    fd: i32,
+    writer: std.Io.Writer,
+
+    fn init(fd: i32, buffer: []u8) FileSink {
+        assert(fd >= 0);
+        assert(buffer.len != 0);
+        return .{ .fd = fd, .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const sink: *FileSink = @alignCast(@fieldParentPtr("writer", writer));
+        assert(data.len >= 1);
+        if (!write_all(sink.fd, writer.buffered())) return error.WriteFailed;
+        writer.end = 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            if (!write_all(sink.fd, bytes)) return error.WriteFailed;
+            written += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        if (pattern.len == 0) return written;
+        for (0..splat) |_| {
+            if (!write_all(sink.fd, pattern)) return error.WriteFailed;
+            written += pattern.len;
+        }
+        return written;
+    }
+};
+
 fn Runner(comptime App: type) type {
     return struct {
-        const Context = app_contract.Context(App);
-        const Renderer = renderer.Renderer(Context.DrawContext);
+        const Off = offscreen.Offscreen(App);
         const size: [2]u32 = bench.regress_size(App);
         const rgb_bytes: usize = @as(usize, size[0]) * size[1] * 3;
         const png_bytes: usize = @intCast(bench.png_size(size[0], size[1]));
         const scenarios: []const bench.Scenario =
             if (@hasDecl(App, "scenarios")) App.scenarios else &.{};
-        const has_audio = app_contract.has_audio(App);
-        const Engine = if (has_audio) audio_thread.Engine(App.Audio) else void;
-
-        // Module guide, section 3: static, initialized in place per run.
-        var app: App = undefined;
-        var context: Context = undefined;
-        var render: Renderer = undefined;
-        var buffer: commands.CommandBuffer = undefined;
-        var device: gpu_wgpu.Gpu = undefined;
-        var engine: Engine = undefined;
-        var audio_queue: realtime.AudioQueue = undefined;
-        var wake: realtime.Wake = .init(-1);
-        var paste_buffer: [ui.cx.clipboard_cap]u8 = undefined;
+        const render_max: [2]u32 = bench.render_size(App);
+        const render_bytes: usize = @as(usize, render_max[0]) * render_max[1] * 4;
 
         var rgb_on: [rgb_bytes]u8 = undefined;
         var rgb_off: [rgb_bytes]u8 = undefined;
@@ -341,10 +419,10 @@ fn Runner(comptime App: type) type {
         var problem_lens: [2]u32 = .{ 0, 0 };
         var runs: u32 = 0;
 
-        /// One run's replay state: the clock, the frames fed audio, and the clipboard.
-        var clock: Clock = undefined;
-        var audio_frames: u64 = 0;
-        var owns_copy: bool = false;
+        /// One `--render` frame (module guide, section 3). Zero, not `undefined`, which a Debug
+        /// build writes into every binary instead of leaving to BSS.
+        var render_frame: [render_bytes]u8 = @splat(0);
+        var png_chunk: [png_chunk_bytes]u8 = undefined;
 
         comptime {
             assert(size[0] >= 1 and size[0] <= 4096);
@@ -353,8 +431,6 @@ fn Runner(comptime App: type) type {
 
         fn run(options: bench.Options) !u8 {
             const start_ns = monotonic_ns();
-            buffer.len = 0;
-            buffer.count = 0;
             const app_name = options.program;
             if (!valid_name(app_name)) {
                 std.debug.print("regress: bad program name \"{s}\"\n", .{app_name});
@@ -383,16 +459,21 @@ fn Runner(comptime App: type) type {
 
         fn run_adapter(app_name: []const u8, visit: Visit, options: bench.Options) !void {
             const slot = @backingInt(visit);
-            device = gpu_wgpu.create_headless(switch (visit) {
-                .high => .high,
-                .low => .low,
+            Off.open(.{
+                .adapter = switch (visit) {
+                    .high => .high,
+                    .low => .low,
+                },
+                .width = size[0],
+                .height = size[1],
+                .scale_120 = scale_120,
+                .fps = regress_fps,
             }) catch |err| {
                 problem(slot, "{s}: no device ({s})", .{ @tagName(visit), @errorName(err) });
                 return;
             };
-            defer gpu_wgpu.destroy(&device);
-            try gpu_wgpu.headless_target_create(&device, size[0], size[1]);
-            adapter_names[slot] = gpu_wgpu.adapter_text(&device);
+            defer Off.close();
+            adapter_names[slot] = Off.adapter_text();
             adapter_seen[slot] = true;
             const names = &adapter_names[slot];
             var slug_buffer: [128]u8 = undefined;
@@ -531,115 +612,144 @@ fn Runner(comptime App: type) type {
             return bench.rgb_hash(image.pixels) == hash;
         }
 
-        /// Renders `scenario` from fresh state (module guide, sections 2 and 3) and returns the
-        /// hash of its last frame, whose RGB rows are left in `out`.
+        /// Renders `scenario` from fresh state (module guide, section 2) and returns the hash
+        /// of its last frame, whose RGB rows are left in `out`.
         fn render_scenario(scenario: *const bench.Scenario, cache: bool, out: *[rgb_bytes]u8) !u64 {
             runs += 1;
-            gpu_wgpu.reset(&device);
-            context.init();
-            app_contract.start(App, &context);
-            render.init();
-            render.cache = cache;
-            App.init(&app, &context.draw.textures);
-            if (has_audio) {
-                audio_queue.init();
-                engine.init(&audio_queue, &wake, realtime.sample_rate);
-            }
-            buffer.reset();
-            render.setup(&buffer, &context.draw);
-            try gpu_wgpu.execute(&device, &buffer);
-            assert(render.ready);
-            clock = .init(App.config.timer_period_ms);
-            audio_frames = 0;
-            owns_copy = false;
-            var replay: bench.Replay = .init();
-            // The first frame draws everything, as a window's first configure does.
-            context.redraw();
-            try draw(0);
-            _ = replay.presented(scenario);
-            const frames_max: u64 = setup_frames(scenario) + scenario.frames + 1;
-            var n: u64 = 1;
-            while (replay.phase != .done) : (n += 1) {
-                if (n > frames_max) return error.ReplayStuck;
-                const step = replay.next(scenario);
-                if (step) |taken| try apply_step(taken, n);
-                try draw(n);
-                _ = replay.presented(scenario);
-            }
-            try gpu_wgpu.read_target(&device, out);
-            return bench.rgb_hash(out);
+            try Off.start(.{ .cache = cache });
+            var playback: Playback(Off) = .init(scenario, regress_fps, scenario.frames);
+            while (try playback.next()) |_| {}
+            const pixels = try Off.read(.rgb, out);
+            return bench.rgb_hash(pixels.bytes);
         }
 
-        /// The frames a scenario's setup takes: one per step, `n` per wait of `n`.
-        fn setup_frames(scenario: *const bench.Scenario) u64 {
-            var total: u64 = 0;
-            for (scenario.setup) |step| total += if (step == .wait) step.wait else 1;
-            assert(total >= scenario.setup.len);
-            return total;
+        /// `--render` (module guide, section 3): refuses what cannot run, then renders.
+        fn render(options: bench.Options) u8 {
+            const app_name = options.program;
+            const name = options.render.?;
+            const scenario = bench.find(scenarios, name) orelse {
+                std.debug.print("render {s}: no scenario \"{s}\"\n", .{ app_name, name });
+                return 1;
+            };
+            const logical = options.size orelse size;
+            const scale = options.scale_120 orelse scale_120;
+            const width_px = frame_module.pixel_size(logical[0], scale);
+            const height_px = frame_module.pixel_size(logical[1], scale);
+            if (width_px > render_max[0] or height_px > render_max[1]) {
+                std.debug.print("render {s}: {d}x{d} px is over App.render_size_max ({d}x{d})\n", .{
+                    app_name, width_px, height_px, render_max[0], render_max[1],
+                });
+                return 1;
+            }
+            const raw = std.mem.eql(u8, options.out.?, "-");
+            if (raw) {
+                ignore_sigpipe();
+            } else {
+                make_dirs(options.out.?);
+            }
+            const adapter: bench.Adapter = if (options.adapter == .low) .low else .high;
+            Off.open(.{
+                .adapter = adapter,
+                .width = logical[0],
+                .height = logical[1],
+                .scale_120 = scale,
+                .fps = options.fps orelse regress_fps,
+            }) catch |err| {
+                std.debug.print("render {s}: no device ({s})\n", .{ app_name, @errorName(err) });
+                return 1;
+            };
+            defer Off.close();
+            return render_frames(scenario, options, raw) catch |err| {
+                const failed = @errorName(err);
+                std.debug.print("render {s} {s}: {s}\n", .{ app_name, scenario.name, failed });
+                return 1;
+            };
         }
 
-        fn apply_step(step: bench.Step, n: u64) !void {
-            var rect: ?[4]f32 = null;
-            if (bench.step_target(step)) |target| {
-                const found = context.find(target.id) orelse return error.NoArea;
-                rect = found.rect;
+        /// Every `Playback` frame of `scenario`, written as it is read, then the report.
+        fn render_frames(scenario: *const bench.Scenario, options: bench.Options, raw: bool) !u8 {
+            const start_ns = monotonic_ns();
+            const app_name = options.program;
+            const fps = options.fps orelse regress_fps;
+            const frames = options.frames orelse scenario.frames;
+            const px = Off.size_px();
+            const layout: bench.Layout = if (raw) .rgba else .rgb;
+            const frame_len = @as(usize, px[0]) * px[1] * layout.pixel_bytes();
+            const out = render_frame[0..frame_len];
+            try Off.start(.{ .cache = options.cache });
+            var playback: Playback(Off) = .init(scenario, fps, frames);
+            var written: u64 = 0;
+            var draw_ns: u64 = 0;
+            var read_ns: u64 = 0;
+            while (true) {
+                const before_ns = monotonic_ns();
+                const n = try playback.next() orelse break;
+                const drawn_ns = monotonic_ns();
+                const pixels = try Off.read(layout, out);
+                draw_ns += drawn_ns - before_ns;
+                read_ns += monotonic_ns() - drawn_ns;
+                if (raw) {
+                    if (!write_raw(pixels.bytes)) {
+                        std.debug.print("render {s} {s}: output closed after {d} frames\n", .{
+                            app_name, scenario.name, written,
+                        });
+                        return 1;
+                    }
+                } else if (!write_frame(options.out.?, scenario.name, n, pixels)) {
+                    return 1;
+                }
+                written += 1;
             }
-            var events: [bench.event_cap]input.Event = undefined;
-            const time_ms: u32 = @intCast(Clock.frame_time_ms(n));
-            const count = bench.step_events(step, rect, time_ms, &events);
-            for (events[0..count]) |event| dispatch(event);
-            if (step == .drop) bench.replay_drop(App, &app, &context, step.drop, rect.?);
-            bench.serve_window(App, &app, &context);
+            assert(written >= 1);
+            const last = if (raw) bench.rgb_hash_rgba(out) else bench.rgb_hash(out);
+            const count: f64 = @floatFromInt(written);
+            const scale: f64 = @floatFromInt(options.scale_120 orelse scale_120);
+            std.debug.print("render {s} {s}  {d}x{d} px @{d:.2}  {d} frames at {d} fps  " ++
+                "last {x:0>16}  ({d:.1} s; {d:.2} ms draw, {d:.2} ms read a frame)\n", .{
+                app_name,
+                scenario.name,
+                px[0],
+                px[1],
+                scale / 120,
+                written,
+                fps,
+                last,
+                @as(f64, @floatFromInt(monotonic_ns() - start_ns)) / 1e9,
+                @as(f64, @floatFromInt(draw_ns)) / 1e6 / count,
+                @as(f64, @floatFromInt(read_ns)) / 1e6 / count,
+            });
+            return 0;
         }
 
-        /// One dispatch with the windowed host's clipboard rule when the app owns the
-        /// selection: a paste request pastes the app's own copy (`linux_window.zig`, 5a).
-        fn dispatch(event: input.Event) void {
-            ui.dispatch(App, &app, &context, event);
-            if (context.take_copy()) owns_copy = true;
-            if (!context.take_paste_request()) return;
-            if (!owns_copy) return;
-            const own = context.copied();
-            @memcpy(paste_buffer[0..own.len], own);
-            ui.dispatch(App, &app, &context, .{ .paste = paste_buffer[0..own.len] });
-        }
-
-        /// Frame `n` on the simulated clock (module guide, section 2), steps 2 to 5.
-        fn draw(n: u64) !void {
-            const t_ms = Clock.frame_time_ms(n);
-            var ticks: u32 = 0;
-            while (clock.due(t_ms, context.timer_on)) |at| : (ticks += 1) {
-                if (ticks == bench.ticks_per_frame_max) return error.TooManyTicks;
-                App.timer(&app, &context, at);
-            }
-            _ = ui.animate(App, &app, &context, Clock.frame_dt(n));
-            if (has_audio and context.audio_on) {
-                engine.render(realtime.blocks_for_frame(audio_frames));
-                audio_frames += 1;
-                drain_audio();
-            }
-            _ = ui.draw_frame(App, &app, &context, size[0], size[1], scale_120);
-            buffer.reset();
-            const time: animator.Time = .{ .ms = t_ms };
-            render.frame(&buffer, &context.draw, .{
-                .width_logical = size[0],
-                .height_logical = size[1],
-                .width_px = size[0],
-                .height_px = size[1],
-                .scale_120 = scale_120,
-            }, time.seconds());
-            if (buffer.len != 0) try gpu_wgpu.execute(&device, &buffer);
-        }
-
-        fn drain_audio() void {
-            var drained: u32 = 0;
-            while (drained < realtime.queue_blocks) : (drained += 1) {
-                const block = audio_queue.peek() orelse break;
-                if (context.audio_on) App.audio(&app, &context, block);
-                audio_queue.release();
-            }
-            assert(drained <= realtime.queue_blocks);
-            context.audio_dropped = audio_queue.dropped_count();
+        /// Writes `<dir>/<name>-<n>.png`. On failure it says so and returns false.
+        fn write_frame(
+            dir: [:0]const u8,
+            name: []const u8,
+            n: u64,
+            pixels: offscreen.Pixels,
+        ) bool {
+            assert(pixels.layout == .rgb);
+            var path_buffer: [path_cap]u8 = undefined;
+            const path = std.mem.printSentinel(&path_buffer, "{s}/{s}-{d:0>6}.png", .{
+                dir, name, n,
+            }, 0) catch {
+                std.debug.print("render: path too long under {s}\n", .{dir});
+                return false;
+            };
+            const fd = create_file(path) orelse {
+                std.debug.print("render: cannot write {s}\n", .{path});
+                return false;
+            };
+            defer _ = std.os.linux.close(fd);
+            var sink: FileSink = .init(fd, &png_chunk);
+            const written = blk: {
+                bench.png_write(&sink.writer, pixels.width, pixels.height, pixels.bytes) catch
+                    break :blk false;
+                sink.writer.flush() catch break :blk false;
+                break :blk true;
+            };
+            if (!written) std.debug.print("render: cannot write {s}\n", .{path});
+            return written;
         }
 
         /// Writes `<dir>/<name>-<tag>-<cache><suffix>.png` and returns its path (empty when
@@ -747,6 +857,31 @@ fn Runner(comptime App: type) type {
     };
 }
 
+/// Writes a raw frame to stdout in pieces (module guide, section 3). False on a closed pipe.
+fn write_raw(bytes: []const u8) bool {
+    assert(bytes.len != 0);
+    var done: usize = 0;
+    var pieces: usize = 0;
+    while (done < bytes.len) : (pieces += 1) {
+        assert(pieces <= bytes.len / raw_piece_bytes);
+        const take = @min(bytes.len - done, raw_piece_bytes);
+        if (!write_all(1, bytes[done..][0..take])) return false;
+        done += take;
+    }
+    assert(done == bytes.len);
+    return true;
+}
+
+/// A closed pipe becomes `EPIPE` on the next write, so the run can say so.
+fn ignore_sigpipe() void {
+    const action: std.os.linux.Sigaction = .{
+        .handler = .{ .handler = std.os.linux.SIG.IGN },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(.PIPE, &action, null);
+}
+
 /// A program name usable in paths: letters, digits, `-`, and `_`.
 fn valid_name(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
@@ -800,6 +935,13 @@ fn read_file(path: [:0]const u8, out: []u8) ?[]const u8 {
 }
 
 fn write_file(path: [:0]const u8, bytes: []const u8) bool {
+    const fd = create_file(path) orelse return false;
+    defer _ = std.os.linux.close(fd);
+    return write_all(fd, bytes);
+}
+
+/// Opens `path` for writing, empty; null when it cannot.
+fn create_file(path: [:0]const u8) ?i32 {
     const flags: std.os.linux.O = .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -807,10 +949,8 @@ fn write_file(path: [:0]const u8, bytes: []const u8) bool {
         .CLOEXEC = true,
     };
     const rc = std.os.linux.open(path, flags, 0o644);
-    if (std.os.linux.errno(rc) != .SUCCESS) return false;
-    const fd: i32 = @intCast(rc);
-    defer _ = std.os.linux.close(fd);
-    return write_all(fd, bytes);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return @intCast(rc);
 }
 
 fn write_all(fd: i32, bytes: []const u8) bool {
