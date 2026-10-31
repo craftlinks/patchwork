@@ -10,18 +10,26 @@
 //! as a stripe if a row ever blends twice; a closed stroke from `path.polygon` round a hexagon;
 //! and a shape morphing from a circle to a rounded square.
 //!
+//! Page 4 is display text as outlines (`text.place_outlines`, step 50): letters that rock and
+//! pulse each on its own transform, a paragraph written on glyph by glyph, and one word in outlines
+//! beside the atlas at 16, 64, and 512 px.
+//!
 //! ## 2. Pages
 //! Digit keys pick a page, so the two cost scenarios draw one thing over the whole window:
 //! ```text
 //! 1  shapes     everything above
 //! 2  glyph      one '&', em = window height / 1.08: 1,000 logical px in 1920 x 1080
 //! 3  curtain    a single band at the 48-segment cap over the whole window: the worst fragment
+//! 4  display    three views, which a further press of 4 steps through: title, write, sizes
 //! ```
 //!
-//! ## 3. The Morph
-//! Space runs it. The shape is four lines and four cubics with a corner radius between half its
-//! side (a circle) and a quarter of that, on the `frame` event's delta, so it rebuilds and uploads
-//! its points on every frame while it runs, and the app sleeps once it stops.
+//! ## 3. The Morph and the Clock
+//! Space runs the clock. The morph is four lines and four cubics with a corner radius between half
+//! its side (a circle) and a quarter of that, on the `frame` event's delta, so it rebuilds and
+//! uploads its points on every frame while it runs. The title's letters take their angles and
+//! scales from the same clock. The write-on has its own, restarted by Space once it has finished,
+//! and takes one glyph every 3 frames at 60 Hz. The app sleeps whenever nothing on the shown
+//! page moves: stopped, on a page with no motion, or with the paragraph written.
 //!
 //! ## 4. TigerStyle Invariants
 //! - No allocation: a `Builder` and an outline are static, and every shape is bounded by
@@ -38,6 +46,7 @@ const theme = patchwork.theme;
 const ttf = text.ttf;
 const ui = patchwork.ui;
 const fill = quads.fill;
+const Transform = quads.Transform;
 const Point = quads.Point;
 const Rect = quads.Rect;
 const Clip = quads.Clip;
@@ -65,7 +74,31 @@ const label_style: text.Style = .{ .face = .sans, .size = 12, .color = theme.dar
 const glyph_style: text.Style = .{ .face = .sans, .size = glyph_em, .color = pink };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
-const Page = enum { shapes, glyph, curtain };
+const Page = enum { shapes, glyph, curtain, display };
+
+/// The views of the display page, in the order key 4 steps through them.
+const View = enum { title, write, sizes };
+
+/// Seconds for the write-on to show one more glyph: 3 frames at 60 Hz.
+const write_glyph_s: f32 = 0.05;
+/// Glyphs on screen at once while a glyph grows in.
+const write_overlap: f32 = 2;
+/// The write-on's clock when its text is complete.
+const write_done_s: f32 = 1.0e6;
+
+const title_word = "Patchwork";
+const title_em: f32 = 200;
+const write_em: f32 = 34;
+const paragraph = "Glyphs are geometry here. Each letter is one filled shape that a program can " ++
+    "turn, scale, and fade on its own, so text can be written on, grown past any atlas, " ++
+    "or zoomed with no raster to rebuild. Pixel-snapped bitmaps stay the better choice for " ++
+    "interface text.";
+const sizes_word = "co";
+const sizes_rows = [_]struct { size: f32, y: f32 }{
+    .{ .size = 16, .y = 44 },
+    .{ .size = 64, .y = 80 },
+    .{ .size = 512, .y = 96 },
+};
 
 /// Static, so a frame's shapes are not 16 KiB of stack each, and one outline at a time.
 var shape: fill.Builder = undefined;
@@ -74,8 +107,10 @@ var outline: ttf.Outline = undefined;
 /// The vector screen. See the module guide.
 pub const App = struct {
     page: Page,
-    /// The morph's clock, in seconds, and whether it runs.
-    morph_s: f32,
+    view: View,
+    /// The clock of the morph and the title, in seconds, the write-on's, and whether they run.
+    clock_s: f32,
+    write_s: f32,
     running: bool,
 
     pub const config: patchwork.app.Config = .{
@@ -83,14 +118,14 @@ pub const App = struct {
         .timer_period_ms = 0,
         .draw = &.{
             .{ .type = quads.Box, .cap = 16 },
-            .{ .type = quads.Fill, .cap = 96 },
+            .{ .type = quads.Fill, .cap = 512 },
             .{ .type = quads.Path, .cap = 96 },
             .{ .type = quads.Glyph, .cap = 256 },
         },
         .batch_order = .registered,
         .batch_cap = 16,
         .area_cap = 2,
-        .point_cap = 16384,
+        .point_cap = 32768,
     };
 
     pub const scenarios: []const patchwork.bench.Scenario = &.{
@@ -113,36 +148,95 @@ pub const App = struct {
             .cycle = &.{.{ .wait = 1 }},
             .frames = 300,
         },
+        .{
+            .name = "title",
+            .setup = &.{
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .key = .{ .key = .other, .text = " " } },
+            },
+            .cycle = &.{},
+            .frames = 90,
+        },
+        .{
+            .name = "write",
+            .setup = &.{
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .key = .{ .key = .other, .text = " " } },
+            },
+            .cycle = &.{},
+            .frames = 240,
+        },
+        .{
+            .name = "sizes",
+            .setup = &.{
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .key = .{ .key = .other, .text = "4" } },
+                .{ .wait = 3 },
+            },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 10,
+        },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
         _ = textures;
         app.page = .shapes;
-        app.morph_s = 0;
+        app.view = .title;
+        app.clock_s = 0;
+        app.write_s = write_done_s;
         app.running = false;
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
         switch (event_value) {
             .frame => |dt_ms| {
-                if (!app.running) return;
-                app.morph_s += dt_ms / 1000;
+                if (!app.animating()) return;
+                app.clock_s += dt_ms / 1000;
+                if (app.page == .display and app.view == .write) app.write_s += dt_ms / 1000;
                 cx.redraw();
                 cx.keep_animating();
             },
             .key_down => |press| {
                 if (press.key != .other or press.typed().len != 1) return;
                 switch (press.typed()[0]) {
-                    ' ' => app.running = !app.running,
+                    ' ' => {
+                        app.running = !app.running;
+                        if (app.running and app.write_s >= write_end_s()) app.write_s = 0;
+                    },
                     '1' => app.page = .shapes,
                     '2' => app.page = .glyph,
                     '3' => app.page = .curtain,
+                    '4' => {
+                        const next: View = if (app.page != .display) .title else switch (app.view) {
+                            .title => .write,
+                            .write => .sizes,
+                            .sizes => .title,
+                        };
+                        app.page = .display;
+                        app.view = next;
+                    },
                     else => return,
                 }
                 cx.redraw();
             },
             else => {},
         }
+    }
+
+    /// True while something on the shown page moves.
+    fn animating(app: *const App) bool {
+        if (!app.running) return false;
+        return switch (app.page) {
+            .shapes => true,
+            .glyph, .curtain => false,
+            .display => switch (app.view) {
+                .title => true,
+                .write => app.write_s < write_end_s(),
+                .sizes => false,
+            },
+        };
     }
 
     pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
@@ -156,19 +250,23 @@ pub const App = struct {
         const window = cx.window;
         const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = window.width, .y1 = window.height };
         // Screen pixels per logical pixel, so chords follow the shape's size on screen.
-        const zoom = @as(f32, @floatFromInt(draw_cx.text.scale_120)) / 120 * draw_cx.view_zoom;
-        shape = .init(zoom);
+        shape = .init(draw_cx.text.device_scale());
         switch (app.page) {
             .shapes => app.draw_shapes(cx, clip),
             .glyph => draw_big_glyph(cx, clip),
             .curtain => draw_curtain(cx, clip),
+            .display => switch (app.view) {
+                .title => app.draw_title(cx, clip),
+                .write => app.draw_write(cx, clip),
+                .sizes => draw_sizes(cx, clip),
+            },
         }
     }
 
     fn draw_shapes(app: *const App, cx: *Context, clip: Clip) void {
         const draw_cx = cx.drawing();
         const band: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
-        const title = "vector: draw.Fill, space runs the morph, 1 2 3 pick a page";
+        const title = "vector: draw.Fill, space runs the morph, 1 2 3 4 pick a page";
         text.place(draw_cx, title_style, title, band, clip, left);
         const labels = [_]struct { x: f32, y: f32, name: []const u8 }{
             .{ .x = 24, .y = 240, .name = "non-zero" },
@@ -194,15 +292,97 @@ pub const App = struct {
         shape.reset();
         draw_hexagon(cx, .{ 516, 144 }, clip);
         draw_comb(cx, clip);
-        morph_at(.{ 900, 144 }, morph_amount(app.morph_s));
+        morph_at(.{ 900, 144 }, morph_amount(app.clock_s));
         _ = fill.append(draw_cx, &shape, .{ .color = violet }, clip);
         shape.reset();
         draw_curve(cx, .{ .x = 24, .y = 280, .width = 560, .height = 190 }, clip);
         draw_glyphs(cx, clip);
     }
+
+    /// "Patchwork" in outlines, each letter rocking and pulsing on its own transform about its
+    /// centre. The letters are one shape each, so a transform per letter costs one `set_transform`.
+    fn draw_title(app: *const App, cx: *Context, clip: Clip) void {
+        const draw_cx = cx.drawing();
+        const window = cx.window;
+        const header: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+        text.place(draw_cx, title_style, "title: text.Glyphs, one Transform per glyph", header, clip, left);
+        const style: text.Style = .{ .face = .sans_bold, .size = title_em, .color = pink };
+        const runs = [1]text.Run{.{ .style = style, .bytes = title_word }};
+        const rect: Rect = .{ .x = 0, .y = 0, .width = window.width, .height = window.height };
+        var glyphs: text.Glyphs = .line(&runs, rect, .{
+            .align_x = .center,
+            .align_y = .center,
+            .ellipsis = false,
+        });
+        const colors = [_][4]f32{ pink, orange, green, blue, violet };
+        while (glyphs.next()) |glyph| {
+            const phase = @as(f32, @floatFromInt(glyph.index));
+            const rock = 0.5 * @sin(app.clock_s * 3 + phase * 0.8);
+            const pulse = 1 + 0.12 * @sin(app.clock_s * 4 + phase);
+            const centre: Point = .{
+                glyph.pen[0] + 0.5 * glyph.advance,
+                glyph.pen[1] - 0.36 * title_em,
+            };
+            shape.reset();
+            shape.set_transform(.around(centre, Transform.rotation(rock).then(.scaling(pulse, pulse))));
+            if (!text.contours(&shape, glyph.style.face, glyph.glyph, glyph.style.size, glyph.pen)) continue;
+            const color = colors[glyph.index % colors.len];
+            _ = fill.append(draw_cx, &shape, .{ .color = color }, clip);
+        }
+    }
+
+    /// A wrapped paragraph written on glyph by glyph (the step page, 2.6): each glyph grows from
+    /// its pen and fades in, one more every `write_glyph_s`.
+    fn draw_write(app: *const App, cx: *Context, clip: Clip) void {
+        const draw_cx = cx.drawing();
+        const header: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+        text.place(draw_cx, title_style, "write: a glyph every 3 frames, space starts it over", header, clip, left);
+        const style: text.Style = .{ .face = .sans, .size = write_em, .color = theme.dark.colors.text };
+        const runs = [1]text.Run{.{ .style = style, .bytes = paragraph }};
+        const rect: Rect = .{ .x = 60, .y = 80, .width = cx.window.width - 120, .height = 560 };
+        var glyphs: text.Glyphs = .wrapped(&runs, rect, .{});
+        while (glyphs.next()) |glyph| {
+            const local = std.math.clamp(
+                (app.write_s / write_glyph_s - @as(f32, @floatFromInt(glyph.index))) / write_overlap,
+                0,
+                1,
+            );
+            if (local <= 0) continue;
+            shape.reset();
+            shape.set_transform(.around(glyph.pen, .scaling(local, local)));
+            if (!text.contours(&shape, glyph.style.face, glyph.glyph, glyph.style.size, glyph.pen)) continue;
+            const color = glyph.style.color;
+            const faded = .{ color[0], color[1], color[2], color[3] * local };
+            _ = fill.append(draw_cx, &shape, .{ .color = faded }, clip);
+        }
+    }
 };
 
 pub const Context = patchwork.app.Context(App);
+
+/// The clock at which the write-on has shown every glyph of `paragraph`.
+fn write_end_s() f32 {
+    return (@as(f32, @floatFromInt(paragraph.len)) + write_overlap) * write_glyph_s;
+}
+
+/// `sizes_word` as outlines and from the atlas, side by side at 16, 64, and 512 px: the atlas
+/// stretches its 160 px raster at the last, the outlines stay sharp.
+fn draw_sizes(cx: *Context, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    const header: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+    text.place(draw_cx, title_style, "sizes: outlines left, atlas right", header, clip, left);
+    const widest: text.Style = .{ .face = .sans, .size = 512, .color = pink };
+    const atlas_x = 16 + text.measure(widest, sizes_word) + 48;
+    for (sizes_rows) |row| {
+        const style: text.Style = .{ .face = .sans, .size = row.size, .color = pink };
+        const height = text.line_height(style);
+        const options: text.Options = .{ .align_x = .start, .align_y = .start, .ellipsis = false };
+        const outlines: Rect = .{ .x = 16, .y = row.y, .width = 1200, .height = height };
+        text.place_outlines(draw_cx, style, sizes_word, outlines, clip, options);
+        const atlas: Rect = .{ .x = atlas_x, .y = row.y, .width = 1200, .height = height };
+        text.place(draw_cx, .{ .face = .sans, .size = row.size, .color = blue }, sizes_word, atlas, clip, options);
+    }
+}
 
 /// The five points of a star of `star_radius` round `centre`, joined every second point, so the
 /// contour crosses itself.
@@ -420,6 +600,66 @@ test "every page's shapes fit" {
     try std.testing.expectEqual(@as(f32, 2 * fill.segments_max), curtain.point_count);
 }
 
+// Locks the display page: key 4 steps title, write, sizes, title; none of the views refuses a
+// glyph at 1x or 2x, the title is nine letters of at least one band each, and the finished
+// paragraph is one shape per inked glyph of `paragraph`.
+test "the display views fit" {
+    const app = new_app();
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expectEqual(Page.display, app.page);
+    try std.testing.expectEqual(View.title, app.view);
+    for ([_]u32{ 120, 240 }) |scale_120| {
+        const cx = &fixture.context;
+        cx.redraw();
+        assert(ui.draw_frame(App, app, cx, 1280, 720, scale_120));
+        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+        try std.testing.expect(cx.draw.items(quads.Fill).len >= title_word.len);
+    }
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expectEqual(View.write, app.view);
+    const cx = frame_at(app);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    var inked: usize = 0;
+    for (paragraph) |letter| inked += @intFromBool(letter != ' ');
+    try std.testing.expect(cx.draw.items(quads.Fill).len >= inked);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expectEqual(View.sizes, app.view);
+    _ = frame_at(app);
+    try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expectEqual(View.title, app.view);
+}
+
+// Locks the write-on: Space restarts it from nothing (no fills at its first frame), a glyph is
+// shown every 3 frames at 60 Hz, the app asks for frames until the last glyph has grown and then
+// sleeps, and the title runs on the clock until stopped.
+test "the write-on runs, finishes, and sleeps" {
+    const app = new_app();
+    for ("44") |key| send(app, .{ .key_down = input.key_press(.other, .none, false, &.{key}) });
+    try std.testing.expectEqual(View.write, app.view);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+    try std.testing.expectEqual(@as(f32, 0), app.write_s);
+    const cx = frame_at(app);
+    try std.testing.expectEqual(@as(usize, 0), cx.draw.items(quads.Fill).len);
+    var frames: u32 = 0;
+    while (ui.animate(App, app, cx, 16)) : (frames += 1) {
+        try std.testing.expect(frames < 2000);
+        if (frames == 29) {
+            _ = frame_at(app);
+            const shown = cx.draw.items(quads.Fill).len;
+            try std.testing.expect(shown >= 8 and shown <= 30);
+        }
+    }
+    try std.testing.expect(app.write_s >= write_end_s());
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expectEqual(View.title, app.view);
+    try std.testing.expect(ui.animate(App, app, cx, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+}
+
 // Locks the comb's bands, the seam the translucent golden shows: at least three, whose rects meet.
 test "the tall comb splits into at least three bands" {
     const app = new_app();
@@ -446,7 +686,7 @@ test "the morph runs on space and sleeps when stopped" {
     try std.testing.expect(!ui.animate(App, app, &fixture.context, 16));
     send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
     try std.testing.expect(ui.animate(App, app, &fixture.context, 16));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.016), app.morph_s, 1.0e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.016), app.clock_s, 1.0e-5);
     send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
     try std.testing.expect(!ui.animate(App, app, &fixture.context, 16));
 }

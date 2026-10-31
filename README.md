@@ -44,7 +44,7 @@ Every example has `run-<name>`, `wasm-<name>` and `serve-<name>` steps:
 | `column` | One scrolling view of mixed controls |
 | `live` | Code editor with syntax colors |
 | `session` | Live-coding screen, rebuilt from photos with the public API only |
-| `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph |
+| `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph; text as outlines |
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
 | `audio` | Audio meters and scope (silent natively, audible in the browser) |
 | `canvas` | Pan and zoom canvas |

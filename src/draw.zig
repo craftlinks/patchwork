@@ -214,6 +214,7 @@ pub const Glyph = types.Glyph;
 pub const Image = types.Image;
 pub const Path = types.Path;
 pub const Fill = fill.Fill;
+pub const Transform = fill.Transform;
 pub const Waveform = wave.Waveform;
 pub const Ring = wave.Ring;
 pub const Composite = fx.Composite;

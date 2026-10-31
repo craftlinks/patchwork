@@ -13,6 +13,8 @@
 //!                 cx.text.glyph(face, glyph, size_q)            (text/cache.zig)
 //!                   hit: entry      miss: rasterize within the frame budget (text/raster.zig)
 //!                 append one draw.Glyph per inked glyph with the entry's atlas UVs
+//!               text.place_outlines(cx, ...)         the same layout, a draw.Fill per glyph
+//!                 (text/layout.zig, 3b); text.Glyphs yields each glyph's pen for a caller's loop
 //!               text.icon(cx, face, codepoint, size, rect, clip, color)
 //!                 one glyph, its ink centred on rect               (text/layout.zig, 3a)
 //! ```
@@ -185,6 +187,20 @@ pub const place_runs_wrapped = layout.place_runs_wrapped;
 /// the face does not map draws nothing and is counted in the overflow report. See
 /// `text/layout.zig`, section 3a.
 pub const icon = layout.icon;
+
+/// One glyph's outline into a `draw.fill.Builder`. See `text/layout.zig`, section 3b.
+pub const contours = layout.contours;
+
+/// The codepoints of a line or a wrapped block with their unsnapped pens. Pure.
+pub const Glyphs = layout.Glyphs;
+pub const Glyph = layout.Glyph;
+
+/// `place` with each glyph a `draw.Fill` shape: display text that rotates, grows past
+/// `size_max`, and morphs. The atlas stays the default for UI text; the caller chooses.
+pub const place_outlines = layout.place_outlines;
+pub const place_runs_outlines = layout.place_runs_outlines;
+pub const place_wrapped_outlines = layout.place_wrapped_outlines;
+pub const place_runs_wrapped_outlines = layout.place_runs_wrapped_outlines;
 
 /// The face record of `face`.
 pub fn font_of(face: Face) *const ttf.Font {

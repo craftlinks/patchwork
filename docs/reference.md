@@ -1281,9 +1281,14 @@ fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call
 stroke in its hole, the region under a plotted curve with its stroke on top, a glyph from
 `ttf.load` beside the same glyph from the atlas, a translucent comb tall enough to split into
 bands over a bright bar, so a row blended twice would show, and a shape morphing from a circle
-to a rounded square on the `frame` event's delta. Space runs the morph, and 1, 2, and 3 pick a
-page: the shapes, one `&` an em of the window's height / 1.08, and a single band at the
-48-segment cap over the whole window. Scenarios `still`, `morph`, `glyph`, and `curtain`.
+to a rounded square on the `frame` event's delta. Space runs the clock, and 1, 2, 3, and 4 pick a
+page: the shapes, one `&` an em of the window's height / 1.08, a single band at the
+48-segment cap over the whole window, and display text as outlines. Pressing 4 again steps its
+three views: `title` ("Patchwork" at 200 px, each letter rocking and pulsing on its own
+`Transform`), `write` (a wrapped paragraph written on glyph by glyph, one every 3 frames, which
+Space starts over), and `sizes` (a word as outlines beside atlas text at 16, 64, and 512 px,
+where the atlas stretches its 160 px raster). Scenarios `still`, `morph`, `glyph`, `curtain`,
+`title`, `write`, and `sizes`.
 
 ## Drags Between Widgets
 
@@ -1928,14 +1933,22 @@ shape.quad_to(control, end);
 shape.cubic_to(.{ control_a, control_b }, end);
 shape.close();                                    // the next move_to or the append closes too
 shape.polygon(&points);                           // a closed contour in one call
-shape.outline(&ttf_outline, scale, pen);          // a font outline, +y down, the atlas's chords
+shape.outline(&ttf_outline, scale, pen);          // a font outline, +y down
+shape.set_transform(.around(centre, .rotation(0.3))); // between contours; points map before flattening
 const placed = draw.fill.append(cx.drawing(), &shape, .{ .color = color, .rule = .even_odd }, clip);
 ```
 
-- **Flattening.** Quadratics use the glyph rasterizer's rule (`raster.quad_chords`, 0.2 px, at
-  most 16 chords) and cubics the stroke's (`path.cubic_segments_at`), both at `zoom`, so pass the
-  display scale times `cx.view_zoom` for chords that follow the screen. A larger `zoom` gives finer
-  chords: at 2,000 px on a flat colour the 16-chord limit shows as faint facets.
+- **Flattening.** Quadratics use the glyph rasterizer's rule (`raster.quad_chords`, at most 16
+  chords) at `fill.tolerance_px` of 0.05 px, a quarter of the atlas's 0.2, and cubics the stroke's
+  (`path.cubic_segments_at`), both at `zoom`, so pass `cx.text.device_scale()` (the display scale
+  times `cx.view_zoom`) for chords that follow the screen. At 0.05 a glyph shows no facets at
+  2,000 px and none of the 1,517 glyphs of U+0021 to U+017F is refused; a bitmap's 0.2 showed them.
+- **Transforms.** `draw.Transform` is a 2 x 3 affine (`translation`, `scaling`, `rotation`,
+  `then`, `around`, `apply`; `+y` down, so a positive angle turns clockwise).
+  `Builder.transform` maps every point a call takes, control points included, before any
+  flattening, so a rotated or scaled shape takes chords for its size on screen. Set it with
+  `set_transform` between contours, never inside one; `reset` restores the identity. A scale of 0
+  collapses a shape, which then appends nothing.
 - **Bands.** A shape is cut into horizontal bands, halved until each lists at most 48 segments
   (`segments_max`), and each band is one `Fill` instance (80 bytes) whose fragment loops over
   its list. Points are 2 per segment per band it meets. Neighbouring bands share one edge, so a
@@ -2106,6 +2119,38 @@ text.place_runs_wrapped(cx.drawing(), &runs, rect, clip, .{}); // WrapOptions: s
 - **Monospace grid.** `text.Mono` (`src/text/mono.zig`) is the editor's path: `prepare`
   looks up the 94 inked ASCII glyphs once per frame, `emit` appends a glyph at a column with
   no measuring, and both share `place`'s snapping, so their records are byte for byte equal.
+
+**Text as outlines.** Atlas glyphs are bitmaps at the size they were cached for: they cannot
+rotate, a raster stops at 160 px and stretches above it, and `Style.size` stops at
+`text.size_max` (512). Display text that rotates, grows, morphs, or is written on draws each glyph
+as a `draw.Fill` shape instead, at any size. It is a second way, never a replacement: at UI sizes
+the atlas's snapped bitmaps are as sharp and cheaper, and nothing switches by itself. The draw
+context must register `draw.Fill` (a compile error names it otherwise).
+
+```zig
+// One shape per glyph, in `place`'s layout: place, place_runs, place_wrapped, place_runs_wrapped.
+text.place_outlines(cx.drawing(), style, "Patchwork", rect, clip, options);
+// Your own loop: each glyph's pen before snapping, a transform, a colour, a progress.
+var glyphs: text.Glyphs = .wrapped(&runs, rect, .{});          // or .line(&runs, rect, options)
+var shape: draw.fill.Builder = .init(cx.text.device_scale());
+while (glyphs.next()) |glyph| {                                // every codepoint, spaces too
+    shape.reset();
+    shape.set_transform(.around(glyph.pen, .scaling(local, local)));
+    if (!text.contours(&shape, glyph.style.face, glyph.glyph, glyph.style.size, glyph.pen)) continue;
+    _ = draw.fill.append(cx.drawing(), &shape, .{ .color = glyph.style.color }, clip);
+}
+```
+
+- **`text.Glyphs`** is pure: it holds no cache and never touches the draw context, so it works
+  for a time that is not this frame. A `Glyph` has the glyph id, codepoint, style, the pen and
+  baseline in logical pixels (`place`'s before snapping, so `round(pen[1] * scale)` is its
+  baseline row), the advance, the `line`, and the `index` among the codepoints yielded.
+- **One shape per glyph,** so a refused glyph (a full point pool: about 800 to 1,400 glyphs
+  fill it) is counted in `overflow_count` and the next still draws. A glyph whose box misses the
+  clip is skipped before its outline loads. A glyph costs about 0.6 microseconds on the CPU, so
+  there is no outline cache. A book page on screen is an atlas job.
+- **No hinting, kerning, or snapping,** so advances match the atlas's and rotated small text is
+  softer than bitmaps. CFF outlines are not read (`ttf.zig` reads `glyf` only).
 
 Module guides in `src/text.zig` and `src/text/*.zig` hold the algebra; the tests hold the
 worked numbers (the rasterizer is checked against a polygon-clipping reference).

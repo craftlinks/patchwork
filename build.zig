@@ -838,6 +838,10 @@ fn add_test_steps(
             .expected = "contract_faces_short.Short: `faces` must be [2]text.Face, one face per Class",
         },
         .{
+            .path = "test/contract_outlines_no_fill.zig",
+            .expected = "place_outlines needs draw.Fill in App.config.draw",
+        },
+        .{
             .path = "test/contract_scales_no_faces.zig",
             .expected = "contract_scales_no_faces.Mono: `scales` needs `faces`",
         },

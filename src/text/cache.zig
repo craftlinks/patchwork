@@ -56,7 +56,10 @@
 //! packed position, and the one-texel gutter to its right and below is zeroed, so filtering
 //! at a glyph's edge never reads a neighbour or a stale glyph from before a reset. A reset
 //! therefore clears only the table's keys (`slot_count` words), never the 1 MiB mirror:
-//! every texel a later entry references is rewritten when that entry is packed.
+//! every texel a later entry references is rewritten when that entry is packed. A glyph drawn
+//! above its raster size (past `raster.side_cap`, stretched) filters up to half a texel beyond
+//! its cell on the left and top, where a neighbour's gutter is not always the texel: `init`
+//! zeroes the mirror, so what such a glyph reads there never depends on an earlier cache.
 //!
 //! `queue_upload` queues one `Textures.write_strided` of the dirty rectangle with
 //! `bytes_per_row = atlas_side`, pointing into the mirror. The mirror must not change between
@@ -144,6 +147,7 @@ pub const Cache = struct {
     /// An empty cache at scale 1. Out-pointer init so a static cache needs no stack copy.
     pub fn init(self: *Cache) void {
         self.clear_table();
+        @memset(&self.mirror, 0);
         self.scale_120 = 120;
         self.zoom = 1;
         self.drawn_scale_120 = 0;
