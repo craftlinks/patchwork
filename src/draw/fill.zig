@@ -16,12 +16,21 @@
 //! ```
 //!
 //! ## 2. Flattening
-//! A quadratic gets `raster.quad_chords(deviation * zoom)` chords, the glyph rasterizer's rule, and
-//! a cubic gets `path.cubic_segments_at(.., zoom)`, the stroke's rule, both at even `t`, so chords
-//! follow the on-screen size inside a canvas (`cx.view_zoom`). `Builder.outline` walks a font
-//! outline as `raster.flatten` does, so a shape filled here has the chords of its atlas glyph. A
-//! contour is closed by `close`, by the next `move_to`, or by `append`. Over `segment_cap`
-//! segments the Builder sets `overflowed`, and `append` refuses the whole shape and counts it.
+//! A quadratic gets `raster.quad_chords(deviation * zoom * k)` chords, where `k` is
+//! `raster.tolerance_px / tolerance_px` (4: the rasterizer's rule at a quarter of its tolerance),
+//! and a cubic gets `path.cubic_segments_at(.., zoom)`, the stroke's rule, both at even `t`, so
+//! chords follow the on-screen size inside a canvas (`cx.view_zoom`). `Builder.outline` walks a
+//! font outline as `raster.flatten` does, with finer chords than the atlas glyph, whose 0.2 px
+//! tolerance shows facets from a few hundred pixels up. A contour is closed by `close`, by the
+//! next `move_to`, or by `append`. Over `segment_cap` segments the Builder sets `overflowed`, and
+//! `append` refuses the whole shape and counts it.
+//!
+//! ## 2a. Transforms
+//! `Builder.transform` maps every point a call takes, control points included, before any
+//! flattening. An affine map keeps a Bézier a Bézier, so the chord count follows the shape's
+//! on-screen size: a quadratic scaled by 4 takes twice the chords (the count goes with the
+//! square root of the deviation), a rotation takes the same number. The pen and the contour's
+//! start are kept transformed, and the transform changes between contours, never inside one.
 //!
 //! ## 3. Bands
 //! A fragment's cost is its segment count, so a shape is cut into horizontal bands, each listing
@@ -107,6 +116,65 @@ pub const aa_pad: f32 = path.aa_pad;
 
 /// Ranges waiting on the splitting stack: one per halving on the way down, and the band.
 const split_depth_max: u32 = 24;
+
+/// Flattening tolerance of a `Builder`, in device pixels: a quarter of `raster.tolerance_px`,
+/// which keeps chords of a glyph facet-free at 2,000 px with no shape refused.
+pub const tolerance_px: f32 = 0.05;
+
+/// A 2 x 3 affine map of the plane, `+y` down (module guide, section 2a).
+pub const Transform = struct {
+    /// `x' = a x + c y + tx`, `y' = b x + d y + ty`.
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    tx: f32,
+    ty: f32,
+
+    pub const identity: Transform = .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = 0, .ty = 0 };
+
+    pub fn translation(x: f32, y: f32) Transform {
+        return .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = x, .ty = y };
+    }
+
+    pub fn scaling(sx: f32, sy: f32) Transform {
+        return .{ .a = sx, .b = 0, .c = 0, .d = sy, .tx = 0, .ty = 0 };
+    }
+
+    /// Positive turns clockwise on screen, with `+y` down.
+    pub fn rotation(radians: f32) Transform {
+        const cosine = @cos(radians);
+        const sine = @sin(radians);
+        return .{ .a = cosine, .b = sine, .c = -sine, .d = cosine, .tx = 0, .ty = 0 };
+    }
+
+    /// `first`, then `second` on its result.
+    pub fn then(first: Transform, second: Transform) Transform {
+        return .{
+            .a = second.a * first.a + second.c * first.b,
+            .b = second.b * first.a + second.d * first.b,
+            .c = second.a * first.c + second.c * first.d,
+            .d = second.b * first.c + second.d * first.d,
+            .tx = second.a * first.tx + second.c * first.ty + second.tx,
+            .ty = second.b * first.tx + second.d * first.ty + second.ty,
+        };
+    }
+
+    /// `inner` with `pivot` held still.
+    pub fn around(pivot: Point, inner: Transform) Transform {
+        const result = translation(-pivot[0], -pivot[1]).then(inner)
+            .then(translation(pivot[0], pivot[1]));
+        assert(result.a == result.a);
+        return result;
+    }
+
+    pub fn apply(self: Transform, point: Point) Point {
+        return .{
+            self.a * point[0] + self.c * point[1] + self.tx,
+            self.b * point[0] + self.d * point[1] + self.ty,
+        };
+    }
+};
 
 /// Which regions of the winding are inside.
 pub const Rule = enum(u8) {
@@ -205,6 +273,9 @@ pub const Builder = struct {
     overflowed: bool,
     /// Screen pixels per logical pixel: `cx.view_zoom` inside a canvas, 1 elsewhere.
     zoom: f32,
+    /// Applied to every point a call takes (module guide, section 2a). `pen` and `start` are
+    /// already transformed.
+    transform: Transform,
     pen: Point,
     start: Point,
     open: bool,
@@ -216,6 +287,7 @@ pub const Builder = struct {
             .count = 0,
             .overflowed = false,
             .zoom = zoom,
+            .transform = .identity,
             .pen = .{ 0, 0 },
             .start = .{ 0, 0 },
             .open = false,
@@ -224,35 +296,47 @@ pub const Builder = struct {
         return builder;
     }
 
-    /// Empties the Builder to build again at the same zoom.
+    /// Empties the Builder to build again at the same zoom, with the identity transform.
     pub fn reset(self: *Builder) void {
         self.count = 0;
         self.overflowed = false;
         self.open = false;
+        self.transform = .identity;
         assert(self.count == 0);
+    }
+
+    /// Sets the transform for the contours that follow. Only between contours.
+    pub fn set_transform(self: *Builder, transform: Transform) void {
+        assert(!self.open);
+        assert(transform.a == transform.a and transform.d == transform.d);
+        self.transform = transform;
     }
 
     /// Begins a contour at `point`, closing the one before.
     pub fn move_to(self: *Builder, point: Point) void {
         self.close();
-        self.pen = point;
-        self.start = point;
+        const placed_point = self.transform.apply(point);
+        self.pen = placed_point;
+        self.start = placed_point;
         self.open = true;
     }
 
     pub fn line_to(self: *Builder, point: Point) void {
         assert(self.open);
-        self.add(point);
+        self.add(self.transform.apply(point));
     }
 
     /// A quadratic from the pen through `control` to `end`.
-    pub fn quad_to(self: *Builder, control: Point, end: Point) void {
+    pub fn quad_to(self: *Builder, source_control: Point, source_end: Point) void {
         assert(self.open);
+        const control = self.transform.apply(source_control);
+        const end = self.transform.apply(source_end);
         const p0 = self.pen;
         const ddx = p0[0] - 2 * control[0] + end[0];
         const ddy = p0[1] - 2 * control[1] + end[1];
         const deviation = @sqrt(ddx * ddx + ddy * ddy);
-        const chords = raster.quad_chords(deviation * self.zoom);
+        const finer = raster.tolerance_px / tolerance_px;
+        const chords = raster.quad_chords(deviation * self.zoom * finer);
         const chords_f: f32 = @floatFromInt(chords);
         var step: u32 = 1;
         while (step < chords) : (step += 1) {
@@ -273,9 +357,9 @@ pub const Builder = struct {
         const count = path.flatten_cubic_at(
             &points,
             self.pen,
-            control[0],
-            control[1],
-            end,
+            self.transform.apply(control[0]),
+            self.transform.apply(control[1]),
+            self.transform.apply(end),
             self.zoom,
         );
         assert(count >= 2);
@@ -739,7 +823,8 @@ fn comb(shape: *Builder, x: f32, y: f32, teeth: u32, pitch: f32) void {
     shape.close();
 }
 
-// Locks flattening: a straight quadratic is one chord and a tight one 16, raster's rule; a cubic
+// Locks flattening: a straight quadratic is one chord and a tight one 16, raster's rule at a
+// quarter of its tolerance (`tolerance_px`); a cubic
 // takes `path`'s count, doubled at zoom 2; `close`, the next `move_to`, and a duplicate point
 // add no empty edge, so a square is 4 edges however it is closed.
 test "contours flatten by the rasterizer's and the stroke's rules" {
@@ -752,15 +837,21 @@ test "contours flatten by the rasterizer's and the stroke's rules" {
     shape.quad_to(.{ 500, 900 }, .{ 1000, 0 });
     try testing.expectEqual(raster.segment_cap, shape.count);
     try testing.expectEqual(Point{ 1000, 0 }, shape.items()[15].b);
-    // A deviation of 40 px over 8 * 0.2: sqrt(25) = 5 chords, 10 at zoom 4.
+    // A deviation of 40 px over 8 * 0.05: sqrt(100) = 10 chords, ceil(sqrt(200)) = 15 at zoom 2,
+    // the cap of 16 at zoom 4. The rasterizer's 0.2 would take 5 and 8.
     shape.reset();
     shape.move_to(.{ 0, 0 });
     shape.quad_to(.{ 0, 10 }, .{ 0, 60 });
-    try testing.expectEqual(@as(u32, 5), shape.count);
-    const zoomed = test_builder.new(4);
+    try testing.expectEqual(@as(u32, 10), shape.count);
+    try testing.expectEqual(@as(u32, 5), raster.quad_chords(40));
+    const zoomed = test_builder.new(2);
     zoomed.move_to(.{ 0, 0 });
     zoomed.quad_to(.{ 0, 10 }, .{ 0, 60 });
-    try testing.expectEqual(@as(u32, 10), zoomed.count);
+    try testing.expectEqual(@as(u32, 15), zoomed.count);
+    const capped = test_builder.new(4);
+    capped.move_to(.{ 0, 0 });
+    capped.quad_to(.{ 0, 10 }, .{ 0, 60 });
+    try testing.expectEqual(raster.segment_cap, capped.count);
     const cubic = test_builder.new(1);
     cubic.move_to(.{ 0, 0 });
     cubic.cubic_to(.{ .{ 40, 0 }, .{ 80, 0 } }, .{ 120, 0 });
@@ -784,6 +875,99 @@ test "contours flatten by the rasterizer's and the stroke's rules" {
     square.close();
     try testing.expectEqual(@as(u32, 7), square.count);
 }
+
+fn expect_point(want: Point, got: Point) !void {
+    try testing.expectApproxEqAbs(want[0], got[0], 1.0e-5);
+    try testing.expectApproxEqAbs(want[1], got[1], 1.0e-5);
+}
+
+// Locks `Transform`: a quarter turn takes (1, 0) to (0, 1), +y down; a half turn about (10, 10)
+// takes (11, 10) to (9, 10) and holds the pivot; `then` is the second after the first, equal to
+// applying twice; a scale of 0 collapses to a line.
+test "transforms compose and hold their pivot" {
+    try expect_point(.{ 0, 1 }, Transform.rotation(0.5 * std.math.pi).apply(.{ 1, 0 }));
+    const half = Transform.around(.{ 10, 10 }, .rotation(std.math.pi));
+    try expect_point(.{ 9, 10 }, half.apply(.{ 11, 10 }));
+    try expect_point(.{ 10, 10 }, half.apply(.{ 10, 10 }));
+    const first = Transform.scaling(2, 3).then(.rotation(0.5));
+    const second = Transform.translation(4, -5);
+    const both = first.then(second);
+    for ([_]Point{ .{ 0, 0 }, .{ 1, 2 }, .{ -3, 7 } }) |point| {
+        try expect_point(second.apply(first.apply(point)), both.apply(point));
+    }
+    // Scale then translate differs from translate then scale.
+    const moved = Transform.scaling(2, 2).then(.translation(1, 1));
+    try expect_point(.{ 3, 3 }, moved.apply(.{ 1, 1 }));
+    try expect_point(.{ 4, 4 }, Transform.translation(1, 1).then(.scaling(2, 2)).apply(.{ 1, 1 }));
+    try expect_point(.{ 0, 5 }, Transform.scaling(0, 1).apply(.{ 3, 5 }));
+}
+
+// Locks `Builder.transform`: a quadratic of deviation 4 takes 4 chords at identity, 7 under a
+// scale of 4 (the count goes with the square root of the deviation) and 4 under a rotation (the
+// deviation's length is kept); a cubic's count follows the scale; a shape's coverage under a
+// transform equals the coverage of the same points transformed by hand; the transform applies
+// once through `polygon`; `reset` restores the identity and a scale of 0 appends nothing.
+test "a transform maps points before they are flattened" {
+    const shape = test_builder.new(1);
+    shape.move_to(.{ 0, 0 });
+    shape.quad_to(.{ 0, 3 }, .{ 0, 10 });
+    try testing.expectEqual(@as(u32, 4), shape.count);
+    shape.reset();
+    shape.set_transform(.scaling(4, 4));
+    shape.move_to(.{ 0, 0 });
+    shape.quad_to(.{ 0, 3 }, .{ 0, 10 });
+    try testing.expectEqual(@as(u32, 7), shape.count);
+    shape.reset();
+    try testing.expectEqual(Transform.identity, shape.transform);
+    shape.set_transform(.rotation(1));
+    shape.move_to(.{ 0, 0 });
+    shape.quad_to(.{ 0, 3 }, .{ 0, 10 });
+    try testing.expectEqual(@as(u32, 4), shape.count);
+    shape.reset();
+    shape.move_to(.{ 0, 0 });
+    shape.cubic_to(.{ .{ 40, 0 }, .{ 80, 0 } }, .{ 120, 0 });
+    const plain = shape.count;
+    shape.reset();
+    shape.set_transform(.scaling(2, 2));
+    shape.move_to(.{ 0, 0 });
+    shape.cubic_to(.{ .{ 40, 0 }, .{ 80, 0 } }, .{ 120, 0 });
+    try testing.expectEqual(2 * plain, shape.count);
+
+    const triangle = [3]Point{ .{ 3, 3 }, .{ 40, 9 }, .{ 12, 50 } };
+    const turn = Transform.around(.{ 20, 20 }, .rotation(0.7)).then(.translation(5, 6));
+    shape.reset();
+    shape.set_transform(turn);
+    shape.polygon(&triangle);
+    var by_hand: [3]Point = undefined;
+    for (&by_hand, triangle) |*out, point| out.* = turn.apply(point);
+    const other = test_builder_other.new(1);
+    other.polygon(&by_hand);
+    try testing.expectEqual(other.count, shape.count);
+    var y: f32 = 0.5;
+    while (y < 70) : (y += 3) {
+        var x: f32 = 0.5;
+        while (x < 70) : (x += 3) {
+            try testing.expectEqual(
+                coverage(other.items(), .non_zero, x, y, 1),
+                coverage(shape.items(), .non_zero, x, y, 1),
+            );
+        }
+    }
+
+    shape.reset();
+    shape.set_transform(.scaling(0, 0));
+    shape.polygon(&triangle);
+    try testing.expectEqual(@as(?Placed, null), append(new_context(), shape, .{ .color = @splat(1) }, window));
+}
+
+const test_builder_other = struct {
+    var shape: Builder = undefined;
+
+    fn new(zoom: f32) *Builder {
+        shape = .init(zoom);
+        return &shape;
+    }
+};
 
 // Locks the Builder's cap: segment 1,025 sets `overflowed`, and `append` then refuses the whole
 // shape, keeping nothing and counting once.
@@ -1090,7 +1274,8 @@ fn raster_difference(outline: *const ttf.Outline, scale: f32) !f32 {
     try testing.expect(raster.flatten(scratch, outline, scale, box));
     raster.fill(scratch, box, &test_raster.bitmap, box.width);
     const shape = &test_raster.shape;
-    shape.* = .init(1);
+    // A zoom of 1/4 cancels `tolerance_px`'s factor of 4: the rasterizer's chords.
+    shape.* = .init(0.25);
     const pen: Point = .{ -@as(f32, @floatFromInt(box.left)), @floatFromInt(box.top) };
     shape.outline(outline, scale, pen);
     // The same chords as the rasterizer, horizontal ones included.

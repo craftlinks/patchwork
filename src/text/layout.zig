@@ -80,6 +80,19 @@
 //! the grid as above. A codepoint the face does not map draws nothing, not `.notdef`, and is
 //! counted for the overflow report (`cache.miss_icon`).
 //!
+//! ## 3b. Outlines
+//! `Glyphs` is the layout of `place_runs` and `place_runs_wrapped` without the atlas: the same
+//! `line_of`, `cut_of`, `Lines`, `Block`, and `offset`, so each codepoint's pen is the one
+//! `emit_runs` and `emit_span` walk, before the baseline snaps to a device pixel:
+//! ```text
+//! pen[0]  = Pen.x                                  pen[1] = the baseline, unsnapped
+//! round(pen[1] * s) = Pen.baseline_px
+//! ```
+//! `contours` adds one glyph's outline to a `draw.fill.Builder` at `size / units_per_em`, and the
+//! `place_*_outlines` family fills each glyph as its own shape, so one refused glyph costs only
+//! itself. Neither path hints or kerns, so their advances agree. A glyph is skipped before its
+//! outline loads when its box `[x - size, x + 2 size] x [y - 2 size, y + size]` misses the clip.
+//!
 //! ## 4. TigerStyle Invariants
 //! - Loops are bounded by `text.byte_cap` bytes and `text.run_cap` runs; each `Lines.next`
 //!   consumes at least one byte, so a wrapped text has at most `byte_cap + 1` lines.
@@ -616,6 +629,289 @@ fn emit(
         .color = style.color,
     }));
     return advance;
+}
+
+/// Adds `glyph` of `face` at `size` logical px with its pen at `pen`, +y down, to `shape`. False
+/// when it adds nothing: no ink, or an outline `ttf.zig` cannot read. An outline over the
+/// loader's caps draws `.notdef`, as the atlas does. See the module guide, section 3b.
+pub fn contours(
+    shape: *draw.fill.Builder,
+    face: text.Face,
+    glyph: u16,
+    size: f32,
+    pen: draw.Point,
+) bool {
+    assert(size > 0);
+    assert(!shape.open);
+    const font = text.font_of(face);
+    assert(glyph < font.glyph_count);
+    var outline: ttf.Outline = undefined;
+    var loaded = ttf.load(font, glyph, &outline);
+    if (loaded == .replace) loaded = ttf.load(font, ttf.replacement, &outline);
+    if (loaded != .ready) return false;
+    const scale = size / @as(f32, @floatFromInt(font.units_per_em));
+    shape.outline(&outline, scale, pen);
+    return true;
+}
+
+/// One codepoint of a laid-out text (`Glyphs`). `pen` is `place`'s before snapping.
+pub const Glyph = struct {
+    glyph: u16,
+    codepoint: u21,
+    style: text.Style,
+    /// The unsnapped pen and baseline, logical px.
+    pen: [2]f32,
+    advance: f32,
+    line: u32,
+    /// The nth codepoint yielded, from 0.
+    index: u32,
+};
+
+/// The codepoints of a line or a wrapped block with their pens, in order. Pure: it holds no
+/// cache and never touches a draw context. `runs` must outlive it. See the module guide,
+/// section 3b.
+pub const Glyphs = struct {
+    runs: []const text.Run,
+    /// The wrapped lines; null for a single line.
+    lines: ?Lines,
+    block: Block,
+    /// The wrapped block's x, width, and alignment; a single line's pen starts at `x`.
+    x: f32,
+    width: f32,
+    align_x: text.Align,
+    /// The baseline of a single line; the top of the next wrapped line.
+    y: f32,
+    cut: ?Cut,
+    /// The line being walked, if any.
+    active: bool,
+    position: text.Position,
+    end: ?text.Position,
+    pen_x: f32,
+    baseline: f32,
+    line_count: u32,
+    index: u32,
+    done: bool,
+    /// Loop turns one `next` may take: every turn moves a position, a run, or a line.
+    spin_cap: u32,
+
+    /// The layout of `place_runs`.
+    pub fn line(runs: []const text.Run, rect: draw.Rect, options: text.Options) Glyphs {
+        assert(runs.len >= 1);
+        assert(runs.len <= text.run_cap);
+        const extent = line_of(runs);
+        var self = Glyphs.empty(runs);
+        var width = extent.width;
+        if (options.ellipsis and extent.width > rect.width) {
+            const cut = cut_of(runs, rect.width);
+            if (!cut.fits) {
+                self.done = true;
+                return self;
+            }
+            self.cut = cut;
+            width = cut.width;
+        }
+        self.active = true;
+        self.pen_x = rect.x + offset(options.align_x, rect.width - width);
+        self.baseline = rect.y +
+            offset(options.align_y, rect.height - extent.ascent - extent.descent) + extent.ascent;
+        return self;
+    }
+
+    /// The layout of `place_runs_wrapped`.
+    pub fn wrapped(runs: []const text.Run, rect: draw.Rect, options: text.WrapOptions) Glyphs {
+        assert(runs.len >= 1);
+        assert(runs.len <= text.run_cap);
+        const width = @max(rect.width, 0);
+        var self = Glyphs.empty(runs);
+        self.block = Block.of(runs);
+        self.lines = Lines.init(runs, width);
+        self.x = rect.x;
+        self.width = width;
+        self.align_x = options.align_x;
+        self.y = rect.y;
+        if (options.align_y != .start) {
+            const height = @as(f32, @floatFromInt(count_lines(runs, width))) *
+                self.block.line_height;
+            self.y += offset(options.align_y, rect.height - height);
+        }
+        return self;
+    }
+
+    fn empty(runs: []const text.Run) Glyphs {
+        assert(bytes_of(runs) <= text.byte_cap);
+        return .{
+            .runs = runs,
+            .lines = null,
+            .block = .{ .line_height = 0, .ascent = 0, .descent = 0 },
+            .x = 0,
+            .width = 0,
+            .align_x = .start,
+            .y = 0,
+            .cut = null,
+            .active = false,
+            .position = .{ .run = 0, .byte = 0 },
+            .end = null,
+            .pen_x = 0,
+            .baseline = 0,
+            .line_count = 0,
+            .index = 0,
+            .done = false,
+            .spin_cap = 4 * (bytes_of(runs) + text.run_cap + 2),
+        };
+    }
+
+    pub fn next(self: *Glyphs) ?Glyph {
+        if (self.done) return null;
+        var spins: u32 = 0;
+        while (true) : (spins += 1) {
+            assert(spins <= self.spin_cap);
+            if (!self.active and !self.begin_line()) {
+                self.done = true;
+                return null;
+            }
+            if (self.end) |end| {
+                if (std.meta.eql(self.position, end)) {
+                    self.finish_line();
+                    continue;
+                }
+            }
+            if (self.position.run == self.runs.len) {
+                self.finish_line();
+                continue;
+            }
+            const run = self.runs[self.position.run];
+            if (self.position.byte == run.bytes.len) {
+                self.position = .{ .run = self.position.run + 1, .byte = 0 };
+                continue;
+            }
+            if (self.cut) |cut| {
+                if (cut.run == self.position.run and cut.byte == self.position.byte) {
+                    self.cut = null;
+                    self.done = true;
+                    return self.record(run.style, ellipsis_char);
+                }
+            }
+            var index = self.position.byte;
+            const codepoint = decode(run.bytes, &index);
+            self.position.byte = index;
+            return self.record(run.style, codepoint);
+        }
+    }
+
+    /// The record of `codepoint` at the pen, which then advances.
+    fn record(self: *Glyphs, style: text.Style, codepoint: u21) Glyph {
+        const font = text.font_of(style.face);
+        const id = ttf.glyph_id(font, codepoint);
+        const advance = units_to_logical(ttf.advance(font, id), style.size, font.units_per_em);
+        const result: Glyph = .{
+            .glyph = id,
+            .codepoint = codepoint,
+            .style = style,
+            .pen = .{ self.pen_x, self.baseline },
+            .advance = advance,
+            .line = self.line_count -| 1,
+            .index = self.index,
+        };
+        self.pen_x += advance;
+        self.index += 1;
+        return result;
+    }
+
+    /// Moves to the next wrapped line; false when there is none. A single line is begun by
+    /// `line`, so it has no next.
+    fn begin_line(self: *Glyphs) bool {
+        const lines = if (self.lines) |*lines| lines else return false;
+        const wrapped_line = lines.next() orelse return false;
+        self.active = true;
+        self.position = wrapped_line.start;
+        self.end = wrapped_line.end;
+        self.pen_x = self.x + offset(self.align_x, self.width - wrapped_line.width);
+        self.baseline = self.y + self.block.baseline();
+        self.y += self.block.line_height;
+        self.line_count += 1;
+        return true;
+    }
+
+    fn finish_line(self: *Glyphs) void {
+        self.active = false;
+        if (self.lines == null) self.done = true;
+    }
+};
+
+/// Fills every glyph of `glyphs` that meets `clip` as its own shape.
+fn fill_glyphs(cx: anytype, glyphs: *Glyphs, clip: draw.Clip) void {
+    comptime {
+        const Draw = @TypeOf(cx.*);
+        if (!Draw.Registry.has(draw.Fill)) {
+            @compileError("place_outlines needs draw.Fill in App.config.draw");
+        }
+    }
+    assert(clip.x1 > clip.x0);
+    assert(clip.y1 > clip.y0);
+    var shape: draw.fill.Builder = .init(cx.text.device_scale());
+    while (glyphs.next()) |glyph| {
+        const size = glyph.style.size;
+        const x = glyph.pen[0];
+        const y = glyph.pen[1];
+        if (x - size >= clip.x1 or x + 2 * size <= clip.x0) continue;
+        if (y - 2 * size >= clip.y1 or y + size <= clip.y0) continue;
+        shape.reset();
+        if (!contours(&shape, glyph.style.face, glyph.glyph, size, glyph.pen)) continue;
+        _ = draw.fill.append(cx, &shape, .{ .color = glyph.style.color }, clip);
+    }
+}
+
+/// `place` with each glyph a `draw.Fill` shape instead of an atlas bitmap; see
+/// `place_runs_outlines`.
+pub fn place_outlines(
+    cx: anytype,
+    style: text.Style,
+    utf8: []const u8,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.Options,
+) void {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
+    place_runs_outlines(cx, &runs, rect, clip, options);
+}
+
+/// `place_runs`' layout with one `draw.Fill` shape per glyph, non-zero, in the glyph's colour.
+/// A refused glyph is counted by `fill.append` and the next one still draws. Needs `draw.Fill`
+/// in the draw context's registry. See the module guide, section 3b.
+pub fn place_runs_outlines(
+    cx: anytype,
+    runs: []const text.Run,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.Options,
+) void {
+    var glyphs = Glyphs.line(runs, rect, options);
+    fill_glyphs(cx, &glyphs, clip);
+}
+
+/// `place_wrapped` as outlines; see `place_runs_wrapped_outlines`.
+pub fn place_wrapped_outlines(
+    cx: anytype,
+    style: text.Style,
+    utf8: []const u8,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.WrapOptions,
+) void {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
+    place_runs_wrapped_outlines(cx, &runs, rect, clip, options);
+}
+
+/// `place_runs_wrapped`' layout as outlines (`place_runs_outlines`).
+pub fn place_runs_wrapped_outlines(
+    cx: anytype,
+    runs: []const text.Run,
+    rect: draw.Rect,
+    clip: draw.Clip,
+    options: text.WrapOptions,
+) void {
+    var glyphs = Glyphs.wrapped(runs, rect, options);
+    fill_glyphs(cx, &glyphs, clip);
 }
 
 /// Draws `codepoint` of `face` at `size` with its ink centred on `rect`, clipped to `clip`. See
@@ -1157,4 +1453,319 @@ test "a one-line wrapped text places like place" {
             try testing.expectEqual(want, got);
         }
     }
+}
+
+const outline_draw = [_]registry.DrawType{
+    .{ .type = types.Glyph, .cap = 64 },
+    .{ .type = draw.Fill, .cap = 256 },
+};
+
+const OutlineContext = draw.Context(&outline_draw, 4, 65536);
+
+/// A freshly initialized static context with a `Fill` and the whole point pool, at `scale_120`.
+fn outline_context(scale_120: u32) *OutlineContext {
+    const static = struct {
+        var context: OutlineContext = undefined;
+    };
+    static.context.init();
+    static.context.text.scale_120 = scale_120;
+    static.context.reset();
+    return &static.context;
+}
+
+/// Checks every record of `glyphs` against the atlas instance `place` appended for it: the
+/// instance `instance_of` builds from the record's pen and the rounded baseline. Records with
+/// no ink have no instance. The first record's pen is also checked against `first_x`.
+fn expect_pens(cx: *TestContext, glyphs: *Glyphs, scale: f32) !void {
+    const placed = cx.items(types.Glyph);
+    var at: usize = 0;
+    var previous: ?Glyph = null;
+    while (glyphs.next()) |glyph| {
+        if (previous) |before| {
+            if (before.line == glyph.line) {
+                try testing.expectEqual(before.pen[0] + before.advance, glyph.pen[0]);
+                try testing.expectEqual(before.pen[1], glyph.pen[1]);
+            }
+            try testing.expectEqual(before.index + 1, glyph.index);
+        }
+        previous = glyph;
+        const font = text.font_of(glyph.style.face);
+        const size_q = cx.text.size_key_of(glyph.style.size);
+        const face: u8 = @backingInt(glyph.style.face);
+        const entry = cx.text.glyph(face, font, glyph.glyph, size_q) orelse continue;
+        if (entry.width == 0) continue;
+        const want = instance_of(entry, size_q, glyph.pen[0], @round(glyph.pen[1] * scale), scale, .{
+            .clip = window,
+            .color = glyph.style.color,
+        });
+        try testing.expect(at < placed.len);
+        try testing.expectEqual(want, placed[at]);
+        at += 1;
+    }
+    try testing.expectEqual(placed.len, at);
+}
+
+// Locks the pens of `Glyphs.line` against `place_runs` (section 3b): over a mixed run with every
+// alignment, at scales 1, 1.25, and 2, each inked record's instance is the one `place_runs`
+// appended; the ellipsis record sits where `place_runs` puts it, and a line that cannot fit even
+// its ellipsis yields nothing.
+test "Glyphs.line walks the pens place_runs walks" {
+    const big: text.Style = .{ .face = .sans_bold, .size = 21, .color = .{ 1, 0, 0, 1 } };
+    const runs = [_]text.Run{
+        .{ .style = sans_16, .bytes = "Pens, " },
+        .{ .style = big, .bytes = "and h\u{e9}ights " },
+        .{ .style = mono_10, .bytes = "ok" },
+    };
+    const rects = [_]draw.Rect{
+        .{ .x = 3.3, .y = 7.1, .width = 400, .height = 40 },
+        .{ .x = 3.3, .y = 7.1, .width = 150, .height = 40 },
+    };
+    const alignments = [_]text.Align{ .start, .center, .end };
+    for ([_]u32{ 120, 150, 240 }) |scale_120| {
+        const scale = @as(f32, @floatFromInt(scale_120)) / 120;
+        for (rects) |rect| {
+            for (alignments) |align_x| {
+                const options: text.Options = .{
+                    .align_x = align_x,
+                    .align_y = .center,
+                    .ellipsis = true,
+                };
+                const cx = test_context(scale_120);
+                place_runs(cx, &runs, rect, window, options);
+                var glyphs: Glyphs = .line(&runs, rect, options);
+                try expect_pens(cx, &glyphs, scale);
+            }
+        }
+    }
+    const cx = test_context(120);
+    const narrow: draw.Rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 };
+    const cut: text.Options = .{ .align_x = .start, .align_y = .start, .ellipsis = true };
+    var glyphs: Glyphs = .line(&runs, narrow, cut);
+    var last: Glyph = glyphs.next().?;
+    while (glyphs.next()) |glyph| last = glyph;
+    try testing.expectEqual(ellipsis_char, last.codepoint);
+    place_runs(cx, &runs, narrow, window, cut);
+    try testing.expect(last.pen[0] < narrow.width);
+    var none: Glyphs = .line(&runs, .{ .x = 0, .y = 0, .width = 1, .height = 20 }, cut);
+    try testing.expectEqual(@as(?Glyph, null), none.next());
+}
+
+// Locks the pens of `Glyphs.wrapped` against `place_runs_wrapped` over the fox's four lines,
+// with start, center, and end alignment at scales 1 and 1.25 (baselines 11, 25, 39, 53 and 14,
+// 31, 49, 66 at the line); the `line` counts are 0 to 3; a trailing space hangs and a hard break
+// is dropped, so "ab cd " yields 5 records.
+test "Glyphs.wrapped walks the pens place_runs_wrapped walks" {
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 100 };
+    const runs = [_]text.Run{.{ .style = mono_10, .bytes = "nnn nnnnn nnnnn nnn" }};
+    for ([_]u32{ 120, 150 }) |scale_120| {
+        const scale = @as(f32, @floatFromInt(scale_120)) / 120;
+        for ([_]text.Align{ .start, .center, .end }) |align_x| {
+            for ([_]text.Align{ .start, .center, .end }) |align_y| {
+                const options: text.WrapOptions = .{ .align_x = align_x, .align_y = align_y };
+                const cx = test_context(scale_120);
+                place_runs_wrapped(cx, &runs, rect, window, options);
+                var glyphs: Glyphs = .wrapped(&runs, rect, options);
+                try expect_pens(cx, &glyphs, scale);
+            }
+        }
+    }
+    var glyphs: Glyphs = .wrapped(&runs, rect, .{});
+    var per_line: [4]u32 = @splat(0);
+    while (glyphs.next()) |glyph| per_line[glyph.line] += 1;
+    try testing.expectEqual([4]u32{ 3, 5, 5, 3 }, per_line);
+    const hang = [_]text.Run{.{ .style = mono_10, .bytes = "ab cd " }};
+    var hung: Glyphs = .wrapped(&hang, .{ .x = 0, .y = 0, .width = 500, .height = 20 }, .{});
+    var count: u32 = 0;
+    while (hung.next()) |_| count += 1;
+    try testing.expectEqual(@as(u32, 5), count);
+}
+
+// Locks the codepoints: every one is yielded, spaces too, in order, and `index` counts them; a
+// break space between lines belongs to neither ("aa bb" at 2 columns is 4 records).
+test "Glyphs yields every codepoint and counts them" {
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 500, .height = 20 };
+    const runs = [_]text.Run{
+        .{ .style = mono_10, .bytes = "a b" },
+        .{ .style = sans_16, .bytes = " c" },
+    };
+    var glyphs: Glyphs = .line(&runs, rect, .{ .align_x = .start, .align_y = .start, .ellipsis = false });
+    var seen: [8]u21 = undefined;
+    var count: u32 = 0;
+    while (glyphs.next()) |glyph| {
+        try testing.expectEqual(count, glyph.index);
+        seen[count] = glyph.codepoint;
+        count += 1;
+    }
+    try testing.expectEqualSlices(u21, &.{ 'a', ' ', 'b', ' ', 'c' }, seen[0..count]);
+    const words = [_]text.Run{.{ .style = mono_10, .bytes = "aa bb" }};
+    var wrapped: Glyphs = .wrapped(&words, .{ .x = 0, .y = 0, .width = 12, .height = 40 }, .{});
+    var lines: [4]u32 = undefined;
+    count = 0;
+    while (wrapped.next()) |glyph| : (count += 1) lines[count] = glyph.line;
+    try testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1 }, lines[0..count]);
+}
+
+// Locks the outlines against the atlas: at 64 px and scale 1, with the pen rounded to device
+// pixels as the atlas does, every pixel of each glyph's box in "Rag&g" is covered within 2/255
+// of the cached bitmap. The Builder's zoom of 1/4 cancels `fill.tolerance_px`'s factor of 4, so
+// the chords are the rasterizer's and only the pens can differ.
+test "outline glyphs cover what the atlas bitmap covers" {
+    const cx = test_context(120);
+    const style: text.Style = .{ .face = .sans, .size = 64, .color = .{ 1, 1, 1, 1 } };
+    const rect: draw.Rect = .{ .x = 5.4, .y = 3.2, .width = 600, .height = 90 };
+    const runs = [_]text.Run{.{ .style = style, .bytes = "Rag&g" }};
+    var glyphs: Glyphs = .line(&runs, rect, .{ .align_x = .start, .align_y = .center, .ellipsis = false });
+    const shape = &test_shape;
+    while (glyphs.next()) |glyph| {
+        const font = text.font_of(glyph.style.face);
+        const size_q = cx.text.size_key_of(glyph.style.size);
+        const entry = cx.text.glyph(0, font, glyph.glyph, size_q).?;
+        const pen: draw.Point = .{ @round(glyph.pen[0]), @round(glyph.pen[1]) };
+        shape.* = .init(0.25);
+        try testing.expect(contours(shape, glyph.style.face, glyph.glyph, 64, pen));
+        var worst: f32 = 0;
+        for (0..entry.height) |row| {
+            for (0..entry.width) |column| {
+                const texel = cx.text.mirror[(entry.y + row) * cache.atlas_side + entry.x + column];
+                const x = pen[0] + @as(f32, @floatFromInt(entry.left)) + @as(f32, @floatFromInt(column)) + 0.5;
+                const y = pen[1] - @as(f32, @floatFromInt(entry.top)) + @as(f32, @floatFromInt(row)) + 0.5;
+                const got = draw.fill.coverage(shape.items(), .non_zero, x, y, 1);
+                worst = @max(worst, @abs(got - @as(f32, @floatFromInt(texel)) / 255));
+            }
+        }
+        try testing.expect(worst <= 2.0 / 255.0);
+    }
+}
+
+var test_shape: draw.fill.Builder = undefined;
+
+// Locks `contours`: a space has no ink and returns false; a codepoint the face does not map
+// (U+0416 is outside the subset) draws `.notdef`'s box; a size of 2,000 is accepted, past
+// `text.size_max`; and the glyph lands with its pen at the left of its advance, +y down.
+test "contours add one glyph's outline" {
+    const shape = &test_shape;
+    shape.* = .init(1);
+    const font = text.font_of(.sans);
+    try testing.expect(!contours(shape, .sans, ttf.glyph_id(font, ' '), 16, .{ 0, 0 }));
+    try testing.expectEqual(@as(u32, 0), shape.count);
+    try testing.expect(contours(shape, .sans, ttf.glyph_id(font, 0x0416), 16, .{ 0, 0 }));
+    const notdef = shape.count;
+    try testing.expect(notdef >= 4);
+    shape.reset();
+    try testing.expect(contours(shape, .sans, ttf.replacement, 16, .{ 0, 0 }));
+    try testing.expectEqual(notdef, shape.count);
+    shape.reset();
+    try testing.expect(contours(shape, .sans, ttf.glyph_id(font, 'H'), 2000, .{ 100, 1500 }));
+    var low: f32 = 1.0e9;
+    var high: f32 = -1.0e9;
+    for (shape.items()) |edge| {
+        low = @min(low, edge.a[1]);
+        high = @max(high, edge.a[1]);
+    }
+    // H is a cap height tall: 0.714 of an em, standing on the baseline.
+    try testing.expectApproxEqAbs(@as(f32, 1500), high, 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 1500 - 1429), low, 2);
+}
+
+// Locks the tolerance bound: every glyph from U+0021 to U+007E of the embedded faces is
+// accepted, in one band plan, at 16, 64, 512, and 2,000 px. (The step page measures U+017F.)
+test "every embedded glyph fits at tolerance_px" {
+    const shape = &test_shape;
+    for (&text.fonts, 0..) |*font, face_index| {
+        const face: text.Face = @fromBackingInt(@as(u8, @intCast(face_index)));
+        var code: u21 = 0x21;
+        while (code < 0x7F) : (code += 1) {
+            const id = ttf.glyph_id(font, code);
+            if (id == 0) continue;
+            for ([_]f32{ 16, 64, 512, 2000 }) |size| {
+                shape.* = .init(1);
+                if (!contours(shape, face, id, size, .{ 0, 0 })) continue;
+                try testing.expect(!shape.overflowed);
+                try testing.expect(draw.fill.plan_bands(shape.items()) != null);
+            }
+        }
+    }
+}
+
+/// Points `place_outlines` made.
+fn points_of(cx: *OutlineContext) u32 {
+    return cx.point_count;
+}
+
+// Locks the clip box: a glyph whose box misses the clip costs no point (the same word placed
+// wholly right of a clip that ends 60 px left of it appends nothing), a word half in is drawn whole, and the points of a
+// word are the sum of its glyphs'.
+test "place_outlines skips glyphs outside the clip" {
+    const style: text.Style = .{ .face = .sans, .size = 32, .color = .{ 1, 0.5, 0, 1 } };
+    const rect: draw.Rect = .{ .x = 10, .y = 10, .width = 600, .height = 40 };
+    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
+    const cx = outline_context(120);
+    place_outlines(cx, style, "Clip", rect, window, options);
+    const whole = points_of(cx);
+    try testing.expect(whole > 0);
+    try testing.expectEqual(@as(u32, 0), cx.overflow_count);
+    const instances = cx.items(draw.Fill).len;
+    var sum: u32 = 0;
+    for ("Clip") |letter| {
+        const one = outline_context(120);
+        const font = text.font_of(.sans);
+        var shape: draw.fill.Builder = .init(1);
+        try testing.expect(contours(&shape, .sans, ttf.glyph_id(font, letter), 32, .{ 10, 40 }));
+        _ = draw.fill.append(one, &shape, .{ .color = style.color }, window);
+        sum += points_of(one);
+    }
+    try testing.expectEqual(sum, whole);
+    const far = outline_context(120);
+    const left_of: draw.Clip = .{ .x0 = -200, .y0 = 0, .x1 = -60, .y1 = 720 };
+    place_outlines(far, style, "Clip", rect, left_of, options);
+    try testing.expectEqual(@as(u32, 0), points_of(far));
+    const half = outline_context(120);
+    const middle: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 12, .y1 = 720 };
+    place_outlines(half, style, "Clip", rect, middle, options);
+    try testing.expect(points_of(half) > 0 and points_of(half) < whole);
+    try testing.expect(half.items(draw.Fill).len <= instances);
+}
+
+// Locks a refusal per glyph: at 16 px "i" takes 20 points and "W" 44, so a pool of 60 holds both
+// i's but not the W after the first: "iWi" draws the i's and counts the W once.
+test "place_outlines keeps the glyphs around a refused one" {
+    const Small = draw.Context(&outline_draw, 4, 60);
+    const static = struct {
+        var context: Small = undefined;
+    };
+    static.context.init();
+    static.context.reset();
+    const cx = &static.context;
+    const style: text.Style = .{ .face = .sans, .size = 16, .color = .{ 1, 1, 1, 1 } };
+    place_outlines(cx, style, "iWi", .{ .x = 0, .y = 0, .width = 200, .height = 30 }, window, .{
+        .align_x = .start,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+    try testing.expectEqual(@as(u32, 1), cx.overflow_count);
+    const bands = cx.items(draw.Fill);
+    try testing.expect(bands.len >= 2);
+    try testing.expect(bands[0].rect[0] < bands[bands.len - 1].rect[0]);
+}
+
+// Locks the wrapped family: the same lines as `place_wrapped_outlines` draw, so a wrapped
+// paragraph's shapes span as many lines as the layout has and none is refused.
+test "place_wrapped_outlines draws every line" {
+    const cx = outline_context(120);
+    const style: text.Style = .{ .face = .sans, .size = 20, .color = .{ 1, 1, 1, 1 } };
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 120, .height = 300 };
+    const utf8 = "Outlines wrap like the atlas does";
+    place_wrapped_outlines(cx, style, utf8, rect, window, .{});
+    try testing.expectEqual(@as(u32, 0), cx.overflow_count);
+    var tops: [8]f32 = undefined;
+    var lines: u32 = 0;
+    for (cx.items(draw.Fill)) |band| {
+        var known = false;
+        for (tops[0..lines]) |top| known = known or @abs(top - band.rect[1]) < 20;
+        if (!known) {
+            tops[lines] = band.rect[1];
+            lines += 1;
+        }
+    }
+    try testing.expectEqual(count_lines(&.{.{ .style = style, .bytes = utf8 }}, 120), lines);
 }

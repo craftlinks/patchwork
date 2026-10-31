@@ -4,6 +4,9 @@
 # size: 1280x720 @120
 scenario  hash
 curtain   b759d5c52295af08
-glyph     208fe4402434e0ae
-morph     13edb08ba1946f51
-still     460ed2307224330f
+glyph     91fbf1919d3d9d64
+morph     1d61a0ca72ccf2fa
+sizes     79b34c90bcbc9a4d
+still     db078e4479769fba
+title     05033bcf3321f2cb
+write     8d79d9e0996e9cff
