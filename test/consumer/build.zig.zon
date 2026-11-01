@@ -1,0 +1,20 @@
+.{
+    .name = .consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x705b37278e026e4c,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .patchwork = .{ .path = "../.." },
+        .pure = .{ .path = "peers/pure" },
+        .linked = .{ .path = "peers/linked" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "app.zig",
+        "tool.zig",
+        "song.txt",
+        "peers",
+        "test",
+    },
+}

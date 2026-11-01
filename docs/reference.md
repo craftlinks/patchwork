@@ -38,6 +38,7 @@ pub const App = struct {
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 | `scenarios` (optional) | `[]const bench.Scenario` | Scripted runs for `--bench` (see Bench Mode). |
+| `args` (optional, native) | `fn (*App, []const [:0]const u8) void` | Receives the arguments the host does not know, once, after `init` (see Use Patchwork From Another Project). |
 | `Audio` (optional) | a type with `init(*Audio, u32)` and `render(*Audio, *realtime.Block)` | An audio source the host runs off the UI thread (see Audio Data). |
 | `audio` (with `Audio`) | `fn (*App, *Context(App), *const realtime.Block) void` | Receives every block of the source, in order, on the UI thread. |
 
@@ -109,6 +110,7 @@ one button at most 400 ms and 4 logical pixels apart count up (`Press.clicks`).
 patchwork/
 ├── src/                        # Core library module ("patchwork")
 │   ├── root.zig                # Library entry point; re-exports modules and host
+│   ├── imports.zig             # The rules for an app's or a tool's import lists (build.zig imports it)
 │   ├── app.zig                 # App contract definitions and comptime check
 │   ├── ui.zig                  # UI namespace: dispatch, animate, draw_frame, re-exports
 │   ├── ui/turtle.zig           # Pure layout math: Walk, Size, Layout, Flow, fit, alignment
@@ -280,8 +282,18 @@ patchwork/
     ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
     ├── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
     ├── contract_skin_missing.zig # Test verifying that a skin without `knob` fails, naming it
-    └── contract_overlays_none.zig # Test verifying that `ui.overlays` of a target without
-                                   # any `draw_overlay` fails, naming it
+    ├── contract_overlays_none.zig # Test verifying that `ui.overlays` of a target without
+    │                              # any `draw_overlay` fails, naming it
+    ├── contract_args_mistyped.zig # Test verifying that an `args` of the wrong type fails
+    └── consumer/               # A package outside this build (`zig build test-consumer`)
+        ├── build.zig, build.zig.zon # `addApp` and `addTool` through a `.path` dependency
+        ├── app.zig             # Imports both peers, declares `args` and a still scenario
+        ├── tool.zig            # Its own main over Offscreen: a frame at a time it is given
+        ├── song.txt            # The file the app is named on the command line
+        ├── test/golden/        # The consumer's own goldens
+        └── peers/
+            ├── pure/           # No dependencies: one target-less module
+            └── linked/         # Links libxkbcommon natively, nothing on wasm
 ```
 
 ## Build Steps
@@ -365,13 +377,16 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
                           # knob skin without `knob`, `ui.overlays` of a target
                           # with no `draw_overlay`, an editor language without
                           # `next`, `draw.covered_glyphs` without a `Box`, too few `faces`
-                          # in an editor language, and `scales` without `faces`
+                          # in an editor language, `scales` without `faces`, and an
+                          # `args` of the wrong type
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
 zig build regress -Doptimize=ReleaseFast   # Every example's scenarios headless on both GPUs,
                           # cache on and off, against test/golden (needs a GPU; see Regression)
 zig build regress -Doptimize=ReleaseFast -- --bless   # Rewrite the goldens from this run
+zig build test-consumer   # test/consumer, a package outside this build: native, wasm, its tests
+                          # and regress, its tool, and an argument (needs a GPU)
 ./zig-out/bin/gallery --render still --out frames     # A scenario's frames as PNGs
 python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
 
@@ -476,6 +491,11 @@ Steps. `steps.install` puts `<name>` in the consumer's `<prefix>/bin` and
 `libwgpu_native.so` in `<prefix>/lib`; `steps.run` depends on both and runs the installed executable. Keep the two
 directories together when shipping the native build.
 
+`AppSteps` also carries `exe` (the native executable), `library` and `app` (the native
+`patchwork` and app modules), and `wgpu_lib` (the directory holding `libwgpu_native.so`), for a
+`build.zig` that needs more than the steps. Regress works from a consumer's tree: `steps.regress`
+runs from its build root, and its goldens are its own `test/golden/<adapter>/<name>.txt`.
+
 ### 3. `src/app.zig`
 
 The consumer's app root satisfies the contract:
@@ -554,6 +574,101 @@ comptime {
     patchwork.app.check(App);
 }
 ```
+
+### 4. Other Packages
+
+`test/consumer` is a working package with everything below. A peer with no system library, such
+as Weft, is one target-less module and goes in `imports`. A peer that links one, such as Thrum,
+needs a known target, because `linkSystemLibrary` panics at configure time on a module without one.
+It is built once per target and goes in the two per-target lists under one name:
+
+```zig
+const weft = b.dependency("weft", .{}).module("weft");
+const thrum = b.dependency("thrum", .{ .target = target }).module("thrum");
+const wasm = b.resolveTargetQuery(patchwork.wasm_query);
+const thrum_wasm = b.dependency("thrum", .{ .target = wasm }).module("thrum");
+const steps = patchwork.addApp(b, dep.builder, .{
+    .name = "play",
+    .root_source_file = b.path("app.zig"),
+    .target = target,
+    .optimize = optimize,
+    .imports = &.{.{ .name = "weft", .module = weft }},
+    .native_imports = &.{.{ .name = "thrum", .module = thrum }},
+    .wasm_imports = &.{.{ .name = "thrum", .module = thrum_wasm }},
+});
+```
+
+`patchwork.wasm_query` is the query `addApp` uses, so the peer and the app cannot disagree.
+
+`addApp` panics at configure time, naming the app and the import, on the name `patchwork`, on a
+name that appears twice for one target (a name in `imports` and in a per-target list counts), and
+on a name in only one per-target list. `@import("thrum")` is in a file that compiles for both
+targets, so it must resolve on both: a native-only branch belongs in the peer.
+
+### 5. A Tool
+
+`patchwork.addTool` builds an executable with a `main` of its own over `Offscreen(App)` (see
+Rendering Frames), for work with no window:
+
+```zig
+const tool = patchwork.addTool(b, .{
+    .name = "thumbnail",
+    .root_source_file = b.path("tool.zig"),
+    .target = target,
+    .optimize = optimize,
+    .app = steps,
+    .imports = &.{.{ .name = "weft", .module = weft }},
+});
+b.installArtifact(tool);
+```
+
+The file imports `patchwork` and `app`, the same modules the app builds with, so the names
+`patchwork` and `app` are refused in `imports`. The tool links libc and `libwgpu_native.so` and
+finds the library through `$ORIGIN/../lib`; its step depends on `steps.install`, which puts the
+library there. It does not link Wayland or xkbcommon, because Zig analyzes only what the tool
+references, so it runs with no display. A peer in its graph links what that peer asks for. A tool
+that also opens a window is out of scope: that is `addApp`'s executable.
+
+### 6. Command-Line Arguments
+
+An app may declare `pub fn args(app: *App, arguments: []const [:0]const u8) void`, native only:
+
+```bash
+./zig-out/bin/play song.txt                   # arguments = song.txt
+./zig-out/bin/play --adapter low song.txt     # the host takes low, the app song.txt
+./zig-out/bin/play -- --strange-name          # after --, even a dash is the app's
+```
+
+- **The split.** The host reads its own options up to a bare argument or `--`, which is dropped.
+  The rest are the app's, even a host option. A host option's value is taken with its option, and
+  an option the host does not know before the split stays `UnknownArgument`. At most 16 arguments
+  in all.
+- **Refused.** An app that does not declare `args` and is given any exits with `UnknownArgument`,
+  so a mistyped command still fails loudly.
+- **Timing.** The window host calls it once, right after `init`, with a slice that may be empty.
+  That is before it connects to a display, so `--version` can print and exit there. The strings
+  live as long as the process. `--check`, `--bench`, `--regress`, and `--render` do not call it,
+  so a golden can never depend on a command line. The browser never calls it either, and the
+  function body compiles only natively, so it may use the file system.
+- **Opening a file.** `Io` is passed through `main`, which the host owns. `args` needs none of
+  it: a single-threaded `Io` is a local with no allocator and nothing to tear down, and blocking
+  there is fine, since no frame has run.
+
+```zig
+var file_bytes: [1 << 20]u8 = undefined;
+
+pub fn args(app: *App, arguments: []const [:0]const u8) void {
+    if (arguments.len == 0) return;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const dir = std.Io.Dir.cwd();
+    app.song = dir.readFile(threaded.io(), arguments[0], &file_bytes) catch null;
+}
+```
+
+A file too long for the buffer comes back cut to it. A large static buffer costs Debug builds
+dearly, because static undefined memory is written out per host: a 128 MiB slab in `App` gave a
+981 MiB Debug executable against 71 MiB, and 6 MiB either way in ReleaseFast. Use ReleaseFast or
+ReleaseSmall for an app with large slabs.
 
 ## Layout While Drawing
 
@@ -1514,6 +1629,7 @@ it runs, no GPU feature is requested, and the frame path is unchanged.
 ```text
 <app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
       [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
+      [--] [arguments for an app that declares `args`]
 <app> --render <scenario> [--size WxH] [--scale S] [--fps N] [--frames N]
       [--adapter low|high] [--no-cache] --out <dir>|-
 zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
@@ -1657,6 +1773,30 @@ const pixels = try Off.read(.rgba, out);     // out.len == width_px * height_px 
 ticks fire only as time passes the next multiple of the period, and the app is never rewound, so
 a caller that scrubs keeps its state outside the app timer. `read` is separate because a caller
 may draw many frames and read one; it blocks until the GPU has caught up.
+
+## Time for a Transport
+
+A transport, a timeline that plays and stops, follows frames, not `timer_period_ms`: period 0,
+advance `t` from the `.frame` event, and call `cx.keep_animating()` while playing, as
+`examples/vector` does. It sleeps when stopped, and it is the only clock a wasm app has.
+
+```zig
+.frame => |dt_ms| {
+    if (!app.playing) return;
+    app.t_ms += dt_ms;
+    cx.redraw();
+    cx.keep_animating();
+},
+```
+
+Pressing play must itself start the frames: the event that sets `playing` calls `cx.redraw()`, and
+the next `.frame` keeps them coming.
+
+- Deltas are whole milliseconds and clamp at `animator.dt_max_ms` (100), so a stall loses time.
+  That suits motion.
+- It does not suit anything locked to sound: there, `t` comes from the sample clock.
+- A tool over `Offscreen` sets the app's time itself: `Off.app()`, `Off.context().redraw()`, then
+  `frame`.
 
 ## GPU Command Stream
 

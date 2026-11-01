@@ -62,6 +62,15 @@
 //! (`ui/cx.zig`, section 5b). `validate` refuses an empty list, more than `event_cap` fingers,
 //! and an id of `input.contact_cap` or more.
 //!
+//! ## 2e. The App's Arguments
+//! `parse_args` reads the host's options up to the first argument that is not one: a bare argument
+//! or `--`, which is dropped, and the rest are `Options.app_args`. A host option's value is taken
+//! with its option, so `--adapter low song.txt` gives the host `low` and the app `song.txt`, and
+//! anything starting with `-` before the split is the host's to know or refuse. `parse_for` refuses
+//! `app_args` for an app with no `args` declaration, so a mistyped command still fails. Only a
+//! normal window run hands them over (`src/app.zig`, section 4d): a scenario never sees them, so a
+//! golden cannot depend on a command line.
+//!
 //! ## 2a. Headless Replay
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
 //! no GPU: the app draws a frame, the next step's events are dispatched, and so on. App tests
@@ -889,6 +898,9 @@ pub const Options = struct {
     /// The program's file name without its directory, set by the native entry point: the
     /// golden file's name (`host/headless.zig`).
     program: []const u8,
+    /// What the host's options left: the app's arguments (section 2e), a slice of `parse_args`'s
+    /// `args`.
+    app_args: []const [:0]const u8,
 
     pub const off: Options = .{
         .bench = false,
@@ -911,12 +923,14 @@ pub const Options = struct {
         .fps = null,
         .out = null,
         .program = "",
+        .app_args = &.{},
     };
 };
 
 pub const usage =
     \\usage: <app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]
     \\       [--bench [scenario] [--frames N] [--dump out.ppm] [--csv out.csv]]
+    \\       [--] [arguments for an app that declares `args`]
     \\       <app> --regress [--adapter high|low|both] [--bless] [--only scenario] [--keep]
     \\       <app> --render <scenario> [--size WxH] [--scale S] [--fps N] [--frames N]
     \\       [--adapter low|high] [--no-cache] --out <dir>|-
@@ -936,13 +950,20 @@ pub const ParseError = error{
 /// `--no-cache`, `--check`, `--regress`, `--bless`, and `--keep` take none, and every other
 /// option takes one value. `--adapter both` is accepted only with `--regress`. `--render`
 /// needs `--out` and refuses another mode, and only it takes `--size`, `--scale`, `--fps`,
-/// `--out`, or `--frames` over `sample_cap`.
+/// `--out`, or `--frames` over `sample_cap`. A bare argument or `--` ends the host's options and
+/// the rest are `app_args` (section 2e).
 pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
     assert(args.len <= arg_cap);
     var options: Options = .off;
     var index: u32 = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
+        if (ends_host_options(arg)) {
+            const first = if (std.mem.eql(u8, arg, "--")) index + 1 else index;
+            options.app_args = args[first..];
+            index = @intCast(args.len);
+            break;
+        }
         if (std.mem.eql(u8, arg, "--bench")) {
             options.bench = true;
             if (index + 1 < args.len) {
@@ -1026,6 +1047,21 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
         if (frames > sample_cap) return error.BadNumber;
     }
     return options;
+}
+
+/// `parse_args` for an app: `error.UnknownArgument` for arguments an app with no `args`
+/// declaration could not receive (section 2e).
+pub fn parse_for(comptime App: type, args: []const [:0]const u8) ParseError!Options {
+    const options = try parse_args(args);
+    if (options.app_args.len != 0 and !@hasDecl(App, "args")) return error.UnknownArgument;
+    assert(options.app_args.len <= arg_cap);
+    return options;
+}
+
+/// `--`, or an argument that is no option: `song.txt`, the empty string, or `-`.
+fn ends_host_options(arg: []const u8) bool {
+    if (std.mem.eql(u8, arg, "--")) return true;
+    return arg.len < 2 or arg[0] != '-';
 }
 
 /// `1920x1080` -> the size, each side at least 1.
@@ -1746,7 +1782,8 @@ test "arguments parse into options and reject mistakes" {
     try testing.expectError(error.MissingValue, parse_args(&.{"--frames"}));
     try testing.expectError(error.BadNumber, parse_args(&.{ "--frames", "0" }));
     try testing.expectError(error.BadAdapter, parse_args(&.{ "--adapter", "fast" }));
-    try testing.expectError(error.UnknownArgument, parse_args(&.{"stray"}));
+    try testing.expectError(error.UnknownArgument, parse_args(&.{"--stray"}));
+    try testing.expectError(error.UnknownArgument, parse_args(&.{ "--stray", "value" }));
     const decorated = try parse_args(&.{ "--decorations", "client" });
     try testing.expectEqual(@as(?input.Decorations, .client), decorated.decorations);
     try testing.expectEqual(@as(?input.Decorations, null), (try parse_args(&.{})).decorations);
@@ -1887,6 +1924,50 @@ test "frames hash with xxhash64 seed 0" {
 // `--render` and `sample_cap` without; `--render` with `--regress`, `--bench`, `--check`,
 // `--adapter both`, or no `--out` refused; its options refused alone; and the longest line, 15
 // arguments, accepted.
+// Locks the split (section 2e): a bare argument ends the host's options and stays, `--` ends them
+// and is dropped, a host option's value is never the app's, and everything after the split is the
+// app's, even a host option.
+test "the app's arguments follow the host's" {
+    const bare = try parse_args(&.{ "song.txt", "two" });
+    try testing.expectEqual(@as(usize, 2), bare.app_args.len);
+    try testing.expectEqualStrings("song.txt", bare.app_args[0]);
+    try testing.expectEqualStrings("ab", (try parse_args(&.{"ab"})).app_args[0]);
+    try testing.expectEqualStrings("-", (try parse_args(&.{"-"})).app_args[0]);
+    const dashes = try parse_args(&.{ "--", "--adapter" });
+    try testing.expectEqual(@as(usize, 1), dashes.app_args.len);
+    try testing.expectEqualStrings("--adapter", dashes.app_args[0]);
+    try testing.expectEqual(Adapter.default, dashes.adapter);
+    try testing.expectEqual(@as(usize, 0), (try parse_args(&.{"--"})).app_args.len);
+    try testing.expectEqual(@as(usize, 0), (try parse_args(&.{})).app_args.len);
+    const adapter = try parse_args(&.{ "--adapter", "low", "song.txt" });
+    try testing.expectEqual(Adapter.low, adapter.adapter);
+    try testing.expectEqualStrings("song.txt", adapter.app_args[0]);
+    const scenario = try parse_args(&.{ "--bench", "still", "song.txt" });
+    try testing.expectEqualStrings("still", scenario.scenario.?);
+    try testing.expectEqualStrings("song.txt", scenario.app_args[0]);
+    const after = try parse_args(&.{ "song.txt", "--adapter", "low" });
+    try testing.expectEqual(Adapter.default, after.adapter);
+    try testing.expectEqual(@as(usize, 3), after.app_args.len);
+}
+
+// Locks what the split leaves refused: an unknown option before it, and any argument for an app
+// that does not declare `args`, while `parse_for` hands them to one that does.
+test "arguments nobody takes are refused" {
+    const Plain = struct {};
+    const Takes = struct {
+        pub fn args() void {}
+    };
+    const stray: []const [:0]const u8 = &.{"stray"};
+    try testing.expectError(error.UnknownArgument, parse_args(&.{ "--stray", "song.txt" }));
+    try testing.expectError(error.UnknownArgument, parse_args(&.{ "-x", "song.txt" }));
+    try testing.expectError(error.UnknownArgument, parse_for(Plain, stray));
+    try testing.expectError(error.UnknownArgument, parse_for(Plain, &.{ "--", "stray" }));
+    try testing.expectEqual(@as(usize, 1), (try parse_for(Takes, stray)).app_args.len);
+    try testing.expectEqual(@as(usize, 0), (try parse_for(Plain, &.{"--"})).app_args.len);
+    const host = try parse_for(Plain, &.{ "--adapter", "high" });
+    try testing.expectEqual(Adapter.high, host.adapter);
+}
+
 test "render arguments parse" {
     const longest = [_][:0]const u8{
         "--render", "scope", "--size",    "1920x1080", "--scale",    "2",     "--fps", "30",

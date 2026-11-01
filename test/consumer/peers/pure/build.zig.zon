@@ -1,0 +1,10 @@
+.{
+    .name = .pure,
+    .version = "0.0.0",
+    .fingerprint = 0x38905b98c456dfdb,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "pure.zig",
+    },
+}

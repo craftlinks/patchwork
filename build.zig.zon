@@ -1,6 +1,6 @@
 .{
     .name = .patchwork,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x47e4758290adb498,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

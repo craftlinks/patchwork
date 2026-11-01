@@ -1,0 +1,10 @@
+.{
+    .name = .linked,
+    .version = "0.0.0",
+    .fingerprint = 0x97f8e5ec58e6d519,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "linked.zig",
+    },
+}
