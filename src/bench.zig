@@ -53,6 +53,15 @@
 //! the other requests, so a run never moves, resizes, or closes its window and every host
 //! shows the same picture.
 //!
+//! ## 2d. Fingers
+//! A `touch` step lists `Finger`s, each a `down`, `move`, `up`, or `cancel` of a contact id at an
+//! absolute point, and `step_events` turns them into `touch_down`, `touch_move`, `touch_up`, and
+//! `touch_cancel` events in order, so a ten-finger chord is one step and one frame. The serial of a
+//! `down` is the finger's id. `step_target` is null, so the hosts need no rect and the replay is
+//! the same everywhere: `ui.dispatch` translates the events as it does for a panel
+//! (`ui/cx.zig`, section 5b). `validate` refuses an empty list, more than `event_cap` fingers,
+//! and an id of `input.contact_cap` or more.
+//!
 //! ## 2a. Headless Replay
 //! `replay_headless` runs a scenario against an app and a static UI context with no host and
 //! no GPU: the app draws a frame, the next step's events are dispatched, and so on. App tests
@@ -129,9 +138,10 @@ pub const sample_cap: u32 = 4096;
 /// Most command-line arguments the native host reads.
 pub const arg_cap: u32 = 16;
 
-/// Most events one step dispatches: move, press, release, leave (a click), or move, press,
-/// move, release (a drag).
-pub const event_cap: u32 = 4;
+/// Most events one step dispatches: move, press, release, leave (a click), move, press, move,
+/// release (a drag), or one touch event per finger of a chord (`input.contact_cap` fingers
+/// would be more than a panel has: a step names at most ten).
+pub const event_cap: u32 = 10;
 
 /// Largest file a `drop` step carries: 64 chunks.
 pub const drop_file_max: u64 = 64 * drop.chunk_cap;
@@ -229,6 +239,16 @@ pub const DropFiles = struct {
     files: []const File,
 };
 
+/// One finger's part of a `touch` step: what it does at `(x, y)`, absolute logical pixels.
+/// `up` and `cancel` ignore the position. `id` is the contact's host id (below
+/// `input.contact_cap`).
+pub const Finger = struct {
+    id: u8,
+    phase: enum(u8) { down, move, up, cancel },
+    x: f32 = 0,
+    y: f32 = 0,
+};
+
 /// One scripted action. Each step presents one frame (module guide, section 2).
 pub const Step = union(enum) {
     key: Press,
@@ -254,6 +274,10 @@ pub const Step = union(enum) {
     drop_hover: Target,
     /// Files dragged to the target's centre and dropped; accepted ones are delivered.
     drop: DropFiles,
+    /// Every listed finger does its part in one frame, in order, so a chord lands in one frame
+    /// (module guide, section 2d). Positions are absolute: a step has one target and a chord
+    /// several, and apps place views at fixed positions anyway.
+    touch: []const Finger,
 };
 
 pub const Scenario = struct {
@@ -285,7 +309,8 @@ pub fn validate(comptime scenarios: []const Scenario) ?[]const u8 {
         if (scenario.setup.len > steps_max) return "App.scenarios." ++ name ++ ": setup too long";
         if (scenario.cycle.len > steps_max) return "App.scenarios." ++ name ++ ": cycle too long";
         if (steps_invalid(scenario.setup) or steps_invalid(scenario.cycle)) {
-            return "App.scenarios." ++ name ++ ": a key types more than 4 bytes or a wait is 0";
+            return "App.scenarios." ++ name ++ ": a key types more than 4 bytes, a wait is 0, " ++
+                "or a touch has no finger, more than 10, or an id of 16 or more";
         }
         if (drag_still(scenario.setup) or drag_still(scenario.cycle)) {
             return "App.scenarios." ++ name ++ ": a drag moves by 0";
@@ -310,6 +335,10 @@ fn steps_invalid(steps: []const Step) bool {
             .wait => |frames| if (frames == 0) return true,
             .click, .click_at, .right_click, .wheel, .hover, .drag, .hold, .release => {},
             .drop_hover, .drop => {},
+            .touch => |fingers| {
+                if (fingers.len == 0 or fingers.len > event_cap) return true;
+                for (fingers) |finger| if (finger.id >= input.contact_cap) return true;
+            },
         }
     }
     return false;
@@ -514,6 +543,26 @@ pub fn step_events(step: Step, rect: ?[4]f32, time_ms: u32, out: *[event_cap]inp
             out[1] = .{ .pointer_up = up };
             return 2;
         },
+        .touch => |fingers| {
+            assert(fingers.len >= 1 and fingers.len <= event_cap);
+            for (fingers, 0..) |finger, slot| {
+                assert(finger.id < input.contact_cap);
+                const touch: input.Touch = .{
+                    .id = finger.id,
+                    .x = finger.x,
+                    .y = finger.y,
+                    .time_ms = time_ms,
+                    .serial = finger.id,
+                };
+                out[slot] = switch (finger.phase) {
+                    .down => .{ .touch_down = touch },
+                    .move => .{ .touch_move = touch },
+                    .up => .{ .touch_up = .{ .id = finger.id, .time_ms = time_ms } },
+                    .cancel => .{ .touch_cancel = finger.id },
+                };
+            }
+            return @intCast(fingers.len);
+        },
         .hold => |hold| {
             assert(hold.dx != 0 or hold.dy != 0);
             const r = rect.?;
@@ -548,7 +597,7 @@ pub fn step_target(step: Step) ?Target {
         .drag, .hold => |drag| drag.target,
         .drop_hover => |target| target,
         .drop => |files| files.target,
-        .key, .wait => null,
+        .key, .wait, .touch => null,
     };
 }
 
@@ -1518,6 +1567,41 @@ test "replay runs setup once, cycles while measuring, and stops after frames" {
     try testing.expect(!replay.presented(s));
 }
 
+// Locks the finger step (section 2d): a chord of three fingers is three events in order with the
+// ids as serials and the step's time, a lift and a cancel carry no point, a step has no target,
+// and `validate` refuses an empty list, 11 fingers, and an id of 16.
+test "a touch step is one event per finger" {
+    var out: [event_cap]input.Event = undefined;
+    const chord: Step = .{ .touch = &.{
+        .{ .id = 0, .phase = .down, .x = 10, .y = 20 },
+        .{ .id = 3, .phase = .move, .x = 30, .y = 40 },
+        .{ .id = 7, .phase = .up },
+        .{ .id = 2, .phase = .cancel },
+    } };
+    try testing.expectEqual(@as(u32, 4), step_events(chord, null, 9, &out));
+    try testing.expectEqual(input.Touch{ .id = 0, .x = 10, .y = 20, .time_ms = 9, .serial = 0 }, out[0].touch_down);
+    try testing.expectEqual(input.Touch{ .id = 3, .x = 30, .y = 40, .time_ms = 9, .serial = 3 }, out[1].touch_move);
+    try testing.expectEqual(input.TouchEnd{ .id = 7, .time_ms = 9 }, out[2].touch_up);
+    try testing.expectEqual(@as(?u32, 2), out[3].touch_cancel);
+    try testing.expectEqual(@as(?Target, null), step_target(chord));
+    const ten: [10]Finger = @splat(.{ .id = 1, .phase = .move });
+    const eleven: [11]Finger = @splat(.{ .id = 1, .phase = .move });
+    try testing.expectEqual(@as(u32, 10), step_events(.{ .touch = &ten }, null, 0, &out));
+    const ok: Scenario = .{ .name = "a", .setup = &.{chord}, .cycle = &.{}, .frames = 1 };
+    const none: Scenario = .{ .name = "a", .setup = &.{.{ .touch = &.{} }}, .cycle = &.{}, .frames = 1 };
+    const many: Scenario = .{ .name = "a", .setup = &.{.{ .touch = &eleven }}, .cycle = &.{}, .frames = 1 };
+    const wild: Scenario = .{
+        .name = "a",
+        .setup = &.{.{ .touch = &.{.{ .id = 16, .phase = .down }} }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+    try testing.expectEqual(@as(?[]const u8, null), comptime validate(&.{ok}));
+    try testing.expect(comptime validate(&.{none}) != null);
+    try testing.expect(comptime validate(&.{many}) != null);
+    try testing.expect(comptime validate(&.{wild}) != null);
+}
+
 // Locks the empty-cycle case: after the setup, frames the app presents are measured and no
 // step is returned.
 test "an empty cycle measures the app's own frames" {
@@ -1993,7 +2077,7 @@ test "the simulated clock fires timers at multiples of their period" {
 }
 
 comptime {
-    assert(event_cap == 4);
+    assert(event_cap == 10);
     assert(ticks_per_frame_max >= 1000 / fps_min);
     assert(blocks_per_frame_max <= realtime.queue_blocks);
     assert(render_frames_max > sample_cap);

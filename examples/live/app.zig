@@ -384,7 +384,7 @@ pub const App = struct {
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
         app.close_wheel(cx, event_value);
-        if (app.grip.kind == .drag and cx.capture != app.grip.id) app.release(cx);
+        if (app.grip.kind == .drag and !cx.holds(app.grip.id)) app.release(cx);
         switch (event_value) {
             .key_down => |press| {
                 if (app.grip.kind == .drag) return;

@@ -167,6 +167,7 @@ pub const tabs_flags: ui.Flags = .{
     .focusable = true,
     .tab = false,
     .cursor = .default,
+    .primary_only = true,
 };
 
 /// The default tabs: `TabsOf(skins.Default)`.
@@ -544,8 +545,8 @@ pub fn TabsOf(comptime Skin: type) type {
                     .close = close,
                     .close_hovered = self.hover_close != null and self.hover_close.? == at,
                 }) orelse continue;
-                cx.area(self.tab_id(at), shape.rect, shape.radius, ui.cx.plain);
-                if (close) |button| cx.area(self.close_id(at), button, 4, ui.cx.plain);
+                cx.area(self.tab_id(at), shape.rect, shape.radius, ui.cx.primary_flag);
+                if (close) |button| cx.area(self.close_id(at), button, 4, ui.cx.primary_flag);
             }
             self.draw_ghost(cx);
         }

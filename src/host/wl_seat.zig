@@ -57,6 +57,20 @@
 //! - The cursor is set through `wp_cursor_shape_v1` (`wp_cursor_shape.zig`) with the serial of
 //!   the latest `enter`.
 //!
+//! ## 5a. Touch
+//! `wl_touch` (capability bit 4) delivers fingers in order, each with a compositor id, unique
+//! only while the finger is down. The listener has the seven events of version 8:
+//! ```text
+//! down(serial, time, surface, id, x, y)   queue .touch_down, the serial kept for a window move
+//! up(serial, time, id)                    queue .touch_up (it carries no position)
+//! motion(time, id, x, y)                  queue .touch_move; the queue keeps one per id
+//! frame                                   no-op: events stay in order, so groups are kept
+//! cancel                                  queue .touch_cancel = null: the compositor took them all
+//! shape, orientation                      no-ops: there is no pressure or contact size in the UI
+//! ```
+//! Positions are `wl_fixed_t` surface-local logical pixels, like the pointer's. Nothing here arms
+//! a timer, so touch moves only reach the queue and an idle app sleeps.
+//!
 //! ## 6. TigerStyle Invariants
 //! - No runtime allocation; proxies belong to libwayland.
 //! - Every listener registration return code and proxy pointer is asserted.
@@ -68,9 +82,10 @@ const xdg = @import("xdg_shell.zig");
 /// Highest `wl_seat` version the host binds; the listener tables have its events.
 pub const seat_version_max: u32 = 8;
 
-/// Bits of `wl_seat.capability`. Touch is ignored.
+/// Bits of `wl_seat.capability`.
 pub const pointer_capability: u32 = 1;
 pub const keyboard_capability: u32 = 2;
+pub const touch_capability: u32 = 4;
 
 /// Linux input event codes from `<linux/input-event-codes.h>`, which `wl_pointer.button`
 /// reports.
@@ -96,6 +111,7 @@ const marshal_flag_destroy: u32 = 1;
 pub const WlSeat = opaque {};
 pub const WlPointer = opaque {};
 pub const WlKeyboard = opaque {};
+pub const WlTouch = opaque {};
 
 const WlProxy = xdg.WlProxy;
 const WlInterface = xdg.WlInterface;
@@ -103,6 +119,7 @@ const WlInterface = xdg.WlInterface;
 pub extern const wl_seat_interface: WlInterface;
 pub extern const wl_pointer_interface: WlInterface;
 pub extern const wl_keyboard_interface: WlInterface;
+pub extern const wl_touch_interface: WlInterface;
 
 extern fn wl_proxy_marshal_flags(
     proxy: ?*WlProxy,
@@ -253,6 +270,57 @@ pub const KeyboardListener = extern struct {
     ) callconv(.c) void,
 };
 
+/// Listener table for `wl_touch` at `seat_version_max`: one slot per event, in opcode order.
+pub const TouchListener = extern struct {
+    /// 0: a finger landed at surface-local `(x, y)`; the serial starts a window move.
+    down: *const fn (
+        data: ?*anyopaque,
+        touch: ?*WlTouch,
+        serial: u32,
+        time: u32,
+        surface: ?*xdg.WlSurface,
+        id: i32,
+        x: i32,
+        y: i32,
+    ) callconv(.c) void,
+    /// 1: a finger lifted.
+    up: *const fn (
+        data: ?*anyopaque,
+        touch: ?*WlTouch,
+        serial: u32,
+        time: u32,
+        id: i32,
+    ) callconv(.c) void,
+    /// 2: a finger moved to surface-local `(x, y)`.
+    motion: *const fn (
+        data: ?*anyopaque,
+        touch: ?*WlTouch,
+        time: u32,
+        id: i32,
+        x: i32,
+        y: i32,
+    ) callconv(.c) void,
+    /// 3: end of a group of events.
+    frame: *const fn (data: ?*anyopaque, touch: ?*WlTouch) callconv(.c) void,
+    /// 4: the compositor took every finger.
+    cancel: *const fn (data: ?*anyopaque, touch: ?*WlTouch) callconv(.c) void,
+    /// 5 (v6): the contact ellipse of a finger.
+    shape: *const fn (
+        data: ?*anyopaque,
+        touch: ?*WlTouch,
+        id: i32,
+        major: i32,
+        minor: i32,
+    ) callconv(.c) void,
+    /// 6 (v6): the contact ellipse's orientation.
+    orientation: *const fn (
+        data: ?*anyopaque,
+        touch: ?*WlTouch,
+        id: i32,
+        orientation: i32,
+    ) callconv(.c) void,
+};
+
 /// The version to bind for an advertised `wl_seat` version.
 pub fn bind_version(advertised: u32) u32 {
     assert(advertised >= 1);
@@ -269,6 +337,11 @@ pub fn get_pointer(seat: *WlSeat) *WlPointer {
 /// Issues `wl_seat.get_keyboard` (request 1) and returns the new keyboard proxy.
 pub fn get_keyboard(seat: *WlSeat) *WlKeyboard {
     return @ptrCast(get_device(seat, 1, &wl_keyboard_interface));
+}
+
+/// Issues `wl_seat.get_touch` (request 2) and returns the new touch proxy.
+pub fn get_touch(seat: *WlSeat) *WlTouch {
+    return @ptrCast(get_device(seat, 2, &wl_touch_interface));
 }
 
 fn get_device(seat: *WlSeat, opcode: u32, interface: *const WlInterface) *WlProxy {
@@ -296,6 +369,11 @@ pub fn release_pointer(pointer: *WlPointer) void {
 /// Releases a keyboard: `wl_keyboard.release` (request 0) from version 3, else the client side.
 pub fn release_keyboard(keyboard: *WlKeyboard) void {
     release(@ptrCast(keyboard), 0);
+}
+
+/// Releases a touch: `wl_touch.release` (request 0) from version 3, else the client side.
+pub fn release_touch(touch: *WlTouch) void {
+    release(@ptrCast(touch), 0);
 }
 
 fn release(proxy: *WlProxy, opcode: u32) void {
@@ -334,6 +412,12 @@ pub fn add_keyboard_listener(
     assert(rc == 0);
 }
 
+/// Installs `listener` on `touch`. `listener` must outlive the proxy.
+pub fn add_touch_listener(touch: *WlTouch, listener: *const TouchListener, data: *anyopaque) void {
+    const rc = wl_proxy_add_listener(@ptrCast(touch), listener, data);
+    assert(rc == 0);
+}
+
 comptime {
     // libwayland indexes listeners by opcode, so slot counts must equal the event counts of
     // `seat_version_max`. The remaining asserts pin protocol-defined constants.
@@ -341,6 +425,9 @@ comptime {
     assert(@typeInfo(SeatListener).@"struct".field_names.len == 2);
     assert(@typeInfo(PointerListener).@"struct".field_names.len == 10);
     assert(@typeInfo(KeyboardListener).@"struct".field_names.len == 6);
+    assert(@typeInfo(TouchListener).@"struct".field_names.len == 7);
+    assert(@sizeOf(TouchListener) == 7 * @sizeOf(*const anyopaque));
+    assert(touch_capability == 4);
     assert(@sizeOf(SeatListener) == 2 * @sizeOf(*const anyopaque));
     assert(@sizeOf(PointerListener) == 10 * @sizeOf(*const anyopaque));
     assert(@sizeOf(KeyboardListener) == 6 * @sizeOf(*const anyopaque));

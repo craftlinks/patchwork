@@ -48,6 +48,7 @@ pub const dropdown_flags: ui.Flags = .{
     .focusable = true,
     .tab = false,
     .cursor = .default,
+    .primary_only = true,
 };
 
 /// The default dropdown: `DropdownOf(skins.Default)`.

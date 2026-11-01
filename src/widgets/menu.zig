@@ -317,7 +317,7 @@ pub fn MenuOf(comptime Skin: type) type {
                     .width = rect.width,
                     .height = menu_row_h,
                 };
-                cx.area(self.id.derive(row), row_rect, 0, ui.cx.plain);
+                cx.area(self.id.derive(row), row_rect, 0, ui.cx.primary_flag);
                 Skin.menu_row(cx, .{
                     .rect = row_rect,
                     .clip = clip,

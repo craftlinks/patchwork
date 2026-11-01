@@ -116,6 +116,7 @@ patchwork/
 │   ├── ui/cx.zig               # UI Context: draw context, turtle stack, areas, hover, capture
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
 │   ├── ui/canvas.zig           # Pan/zoom canvases: CanvasState, the zoom ladder, wheel and drag
+│   ├── ui/gestures.zig         # Per-target recognizer: tap, drag, long-press, pinch, two-finger
 │   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
 │   ├── ui/popup.zig            # Popup placement: place (side, flip, clamp, cut), Anchor
 │   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
@@ -350,6 +351,11 @@ zig build serve-session   # Serve it on localhost (prints the address)
 zig build run-vector      # Build and run the filled shapes natively
 zig build wasm-vector     # Compile it to zig-out/bin/vector.wasm
 zig build serve-vector    # Serve it on localhost (prints the address)
+
+# Examples (Touch)
+zig build run-touch       # Build and run the multi-touch pads and sliders natively
+zig build wasm-touch      # Compile it to zig-out/bin/touch.wasm
+zig build serve-touch     # Serve it on localhost (prints the address)
 
 # Validation
 zig build test            # Run unit tests across the library and the twelve examples
@@ -1290,6 +1296,79 @@ Space starts over), and `sizes` (a word as outlines beside atlas text at 16, 64,
 where the atlas stretches its 160 px raster). Scenarios `still`, `morph`, `glyph`, `curtain`,
 `title`, `write`, and `sizes`.
 
+### 13. Touch (`examples/touch/app.zig`)
+
+Several fingers at once, each under its own pointer state: eight pads that light while held, two
+`Slider`s moved by two fingers, a `Knob`, and a gesture box whose square a drag moves, a pinch
+scales, a two-finger pan moves, a two-finger tap resets, and a long-press turns orange. A HUD shows
+the live, most, and refused contacts. The mouse works on all of it, because the app never sees a
+touch event. Scenarios `still`, `sliders` (two fingers land on two sliders and move), `chord` (ten
+fingers in one step), `pinch`, `two-tap`, `long-press`, and `cancel` (the system takes one finger).
+
+## Touch
+
+A finger is a contact, and the app reads it as the pointer events it already handles
+(`src/ui/cx.zig` section 5b, `src/input.zig` section 9). A widget that works for a mouse works under
+each finger with no change, and two sliders move at once:
+
+```zig
+// Nothing to write: `cx.hit(id, event)` answers for the finger whose event is being dispatched.
+// To ask which finger, or whether one holds a widget:
+if (cx.touch()) |finger| {
+    // finger.id, .primary, .phase (.down .move .up .cancel), .x, .y, .origin, .target, .joined
+}
+const busy = cx.holds(grip_id);           // the mouse or any finger holds it, in any phase
+const live = cx.contacts_live();          // fingers down now; contacts_most, contacts_refused
+```
+
+- **Contacts.** `touch_down` claims one of 16 slots (`input.contact_cap`), each with its own
+  pointer state (`hot`, `hover`, `capture`, the press flags), swapped into the context for the
+  dispatch of that finger's events. A 17th finger is counted in `contacts_refused` and its later
+  events do nothing. A `touch_down` of an id still down cancels that contact first, so a lost lift
+  cannot outlast the next press, and `touch_cancel` with no id cancels every contact. Moves coalesce
+  per contact in the event queue, so ten fingers hold ten slots.
+- **Primary.** The first finger down, with none other live, is primary (the Pointer Events rule).
+  Only it moves focus, presses a window area, or begins a drag between widgets; a second finger on
+  a pad leaves a menu open and a field focused.
+- **Joined and `primary_only`.** A finger pressing an area another pointer holds does not capture it:
+  widgets see nothing, and `touch().target` and `joined` say what it landed on. A widget of several
+  ids that shares press state (tabs, column headers, list and tree rows, menus, dropdowns, text
+  fields, the editor, window chrome) flags its areas `ui.cx.primary_flag` or `Flags.primary_only`, so
+  a second finger treats them as absent.
+- **Hover** of a finger is what it pressed, down to its lift. A double tap counts two contacts
+  within 400 ms and 12 px.
+- **Hosts.** Natively `wl_touch` (seat capability 4) queues `touch_down`, `touch_move`, `touch_up`,
+  and `touch_cancel`; the compositor's cancel ends every finger. In the browser the canvas has
+  `touch-action: none`, every finger takes pointer capture, and `pointerType` `"touch"` goes through
+  `wasm.touch_*`. Hyprland needs the digitizer mapped to its output or no touch event arrives
+  (`hyprctl eval 'hl.config({ input = { touchdevice = { output = "HDMI-A-3" } } })'`).
+- **Scenarios.** `bench.Step.touch` lists `Finger`s (`down`, `move`, `up`, `cancel` at absolute
+  points), all in one frame, so a chord is one step.
+
+### Gestures
+
+`ui.gestures.Recognizer` is a pure value a widget or app opts into, one per target. It reports tap,
+drag, long-press, pinch, two-finger tap, and two-finger pan by a fixed conflict table (a move past
+12 px beats a tap and a long-press, a second finger within 80 ms makes the two-finger set, and so
+on):
+
+```zig
+var rec: ui.gestures.Recognizer = .init(.all, .{});     // Mask, Thresholds
+// event: one gesture per call; a pinch and a pan on one move are one `two_finger`.
+switch (rec.handle(cx, box_id, event)) {
+    .tap, .long_press, .two_finger_tap => |spot| {},
+    .drag => |drag| {},                                  // .phase .began .changed .ended .cancelled
+    .two_finger => |two| {},                             // .scale, .pinching, .panning, .dx, .dy
+    .none => {},
+}
+```
+
+It tracks at most two contacts on its target and uses only those whose press landed on it, so two
+fingers on different areas never pinch. With a mouse it runs the one-finger set from the left
+button. A long-press counts `.frame` deltas and keeps the app animating only while one is pending,
+so the app sleeps after at most 400 ms. Thresholds are in `ui.gestures.Thresholds`, and `feed` and
+`tick` are pure for tests.
+
 ## Drags Between Widgets
 
 A widget that holds a press may turn it into a drag that another widget receives: a tab
@@ -1446,7 +1525,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   `right_click` (a right press and release at a point, for a context menu), `wheel`, `hover` (a move to a point that stays, so hover animations settle), `drag` (press,
   move by a delta, release; a zero delta is refused), `hold` (press, then move by a delta twice
   and stay pressed, so a drag between widgets shows in flight), `release` (move to a point and
-  release there, ending a hold a frame later), and `wait`. Each step runs when the host is idle and presents one frame; an empty
+  release there, ending a hold a frame later), `touch` (fingers going down, moving, lifting, or
+  cancelled at absolute points, all in one frame), and `wait`. Each step runs when the host is idle and presents one frame; an empty
   cycle measures the frames the app presents itself (a timer). `app.check` validates the
   list, and `bench.replay_headless` replays one in app tests without a GPU. `--bench` without
   a name lists the scenarios. `bench.replay_headless_paced` spaces the steps by a given
@@ -2237,7 +2317,7 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
   integer `wl_surface.preferred_buffer_scale` is used (`scale_120 = factor * 120`). The active
   mode is logged once at startup. Pointer coordinates are logical in both modes.
 - Input: `wl_seat` is bound at `min(advertised, 8)`. All three buttons and both wheel axes
-  are forwarded. Keys go through libxkbcommon (the compositor's keymap, modifiers, and the
+  are forwarded, and `wl_touch` fingers become contacts (see Touch). Keys go through libxkbcommon (the compositor's keymap, modifiers, and the
   locale's compose table for dead keys), and repeat follows `wl_keyboard.repeat_info` (25 Hz
   after 600 ms when the seat is too old to send it). Keyboard enter and leave are
   `window_focus`. The cursor is set with `wp_cursor_shape_v1` when the shape changes or the
@@ -2278,6 +2358,9 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   is the same logical size at every device pixel ratio.
 - `start()` submits the renderer's setup stream; `shell.js` runs each setup op in a
   `pushErrorScope("validation")` and reports a failure with its op index and name.
+- Touch: the canvas has `touch-action: none` and every finger takes pointer capture; events with
+  `pointerType` `"touch"` call `wasm.touch_down`, `touch_move`, and `touch_up` with the DOM
+  `pointerId` and `touch_cancel` on `pointercancel`, while pens stay on the mouse path (see Touch).
 - Keyboard and clipboard: the canvas is focusable (`tabindex="0"`); `keydown` and `keyup`
   pass `event.key` as UTF-8 through the Wasm input buffer, and Zig names the key, so
   `shell.js` maps no keys. `preventDefault` runs only when Zig reports the key consumed

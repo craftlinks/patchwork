@@ -26,6 +26,7 @@
 //! ui/cx.zig       Context: draw context + turtle stack + areas + pointer, hover, capture
 //! ui/view.zig     ViewState, scrollbar geometry, List
 //! ui/canvas.zig   CanvasState, the zoom ladder, wheel and drag
+//! ui/gestures.zig tap, drag, long-press, pinch, and two-finger recognizers per target
 //! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words,
 //!                 and paste sanitizing for one line and the code editor's multi-line text
 //! ```
@@ -78,6 +79,7 @@ pub const turtle = @import("ui/turtle.zig");
 pub const areas = @import("ui/areas.zig");
 pub const view = @import("ui/view.zig");
 pub const canvas = @import("ui/canvas.zig");
+pub const gestures = @import("ui/gestures.zig");
 pub const cx = @import("ui/cx.zig");
 pub const edit = @import("ui/edit.zig");
 pub const popup = @import("ui/popup.zig");
@@ -264,9 +266,46 @@ fn route_each(context: anytype, event: input.Event, widgets: anytype) u32 {
 /// Resolves `event` once and lets the app route it. See the module guide, section 3.
 pub fn dispatch(comptime App: type, app: *App, context: anytype, event: input.Event) void {
     assert(context.phase == .idle);
+    switch (event) {
+        .touch_down, .touch_move, .touch_up, .touch_cancel => {
+            dispatch_touch(App, app, context, event);
+            return;
+        },
+        else => {},
+    }
     context.event_begin(event);
     App.event(app, context, event);
     context.event_end();
+    assert(context.phase == .idle);
+}
+
+/// Dispatches a touch event as the pointer events it means, with the contact's state loaded
+/// (`ui/cx.zig`, section 5b). A `touch_down` of an id still down first cancels that contact, and
+/// `touch_cancel` of `null` cancels every contact.
+fn dispatch_touch(comptime App: type, app: *App, context: anytype, event: input.Event) void {
+    switch (event) {
+        .touch_down => |down| {
+            if (context.touch_live(down.id)) {
+                dispatch_touch(App, app, context, .{ .touch_cancel = down.id });
+            }
+        },
+        .touch_cancel => |named| if (named == null) {
+            var ids: [input.contact_cap]u32 = undefined;
+            const count = context.touch_ids(&ids);
+            for (ids[0..count]) |contact_id| {
+                dispatch_touch(App, app, context, .{ .touch_cancel = contact_id });
+            }
+            return;
+        },
+        else => {},
+    }
+    const plan = context.touch_begin(event) orelse return;
+    for (plan.events[0..plan.count]) |pointer_event| {
+        context.event_begin(pointer_event);
+        App.event(app, context, pointer_event);
+        context.event_end();
+    }
+    context.touch_end();
     assert(context.phase == .idle);
 }
 
@@ -306,6 +345,7 @@ test {
     _ = areas;
     _ = view;
     _ = canvas;
+    _ = gestures;
     _ = cx;
     _ = edit;
     _ = popup;

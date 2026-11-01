@@ -316,6 +316,7 @@ pub const State = struct {
     /// The seat's pointer and keyboard proxies, while the seat has them.
     pointer_proxy: ?*wl_seat.WlPointer,
     keyboard_proxy: ?*wl_seat.WlKeyboard,
+    touch_proxy: ?*wl_seat.WlTouch,
     /// The keymap, modifier state, and compose state (`xkb.zig`).
     keyboard: xkb.Keyboard,
     /// The repeating key and the repeat timerfd it arms (section 5a).
@@ -528,6 +529,16 @@ const keyboard_listener: wl_seat.KeyboardListener = .{
     .repeat_info = keyboard_repeat_info,
 };
 
+const touch_listener: wl_seat.TouchListener = .{
+    .down = touch_down,
+    .up = touch_up,
+    .motion = touch_motion,
+    .frame = touch_frame,
+    .cancel = touch_cancel,
+    .shape = touch_shape,
+    .orientation = touch_orientation,
+};
+
 /// Largest keymap the host maps; real keymaps are under 100 KiB.
 const keymap_size_max: u32 = 4 * 1024 * 1024;
 
@@ -673,6 +684,7 @@ fn initial_state() State {
         .seat = null,
         .pointer_proxy = null,
         .keyboard_proxy = null,
+        .touch_proxy = null,
         .keyboard = undefined,
         .repeat = input.Repeat.init(),
         .repeat_fd = no_timer_fd,
@@ -2473,8 +2485,132 @@ fn seat_capabilities(
             keyboard_lost(state);
         }
     }
+    const has_touch = (capabilities & wl_seat.touch_capability) != 0;
+    if (has_touch and state.touch_proxy == null) {
+        const touch = wl_seat.get_touch(live);
+        wl_seat.add_touch_listener(touch, &touch_listener, state);
+        state.touch_proxy = touch;
+    }
+    if (!has_touch) {
+        if (state.touch_proxy) |touch| {
+            wl_seat.release_touch(touch);
+            state.touch_proxy = null;
+            // Every finger is gone with the device.
+            state.queue.push(.{ .touch_cancel = null });
+        }
+    }
     if (has_pointer) assert(state.pointer_proxy != null);
     if (has_keyboard) assert(state.keyboard_proxy != null);
+    if (has_touch) assert(state.touch_proxy != null);
+}
+
+/// C ABI callback for `wl_touch.down` (opcode 0). Queues the finger with the `down` serial,
+/// which `xdg_toplevel.move` accepts, and remembers it as the latest input serial.
+fn touch_down(
+    data: ?*anyopaque,
+    touch: ?*wl_seat.WlTouch,
+    serial: u32,
+    time: u32,
+    surface: ?*xdg.WlSurface,
+    id: i32,
+    x: i32,
+    y: i32,
+) callconv(.c) void {
+    _ = touch;
+    _ = surface;
+    if (id < 0) return;
+    const state = state_of(data);
+    state.input_serial = serial;
+    state.queue.push(.{ .touch_down = .{
+        .id = @intCast(id),
+        .x = input.fixed_to_logical(x),
+        .y = input.fixed_to_logical(y),
+        .time_ms = time,
+        .serial = serial,
+    } });
+    assert(state.queue.count >= 1);
+}
+
+/// C ABI callback for `wl_touch.up` (opcode 1). The lift has no position; the context keeps the
+/// finger's last one.
+fn touch_up(
+    data: ?*anyopaque,
+    touch: ?*wl_seat.WlTouch,
+    serial: u32,
+    time: u32,
+    id: i32,
+) callconv(.c) void {
+    _ = touch;
+    _ = serial;
+    if (id < 0) return;
+    const state = state_of(data);
+    state.queue.push(.{ .touch_up = .{ .id = @intCast(id), .time_ms = time } });
+    assert(state.queue.count >= 1);
+}
+
+/// C ABI callback for `wl_touch.motion` (opcode 2). The queue keeps the newest sample of each
+/// finger (`input.zig`, section 9).
+fn touch_motion(
+    data: ?*anyopaque,
+    touch: ?*wl_seat.WlTouch,
+    time: u32,
+    id: i32,
+    x: i32,
+    y: i32,
+) callconv(.c) void {
+    _ = touch;
+    if (id < 0) return;
+    const state = state_of(data);
+    state.queue.push(.{ .touch_move = .{
+        .id = @intCast(id),
+        .x = input.fixed_to_logical(x),
+        .y = input.fixed_to_logical(y),
+        .time_ms = time,
+    } });
+    assert(state.queue.count >= 1);
+}
+
+/// `wl_touch.frame` (opcode 3): events stay in order in the queue, so groups are kept.
+fn touch_frame(data: ?*anyopaque, touch: ?*wl_seat.WlTouch) callconv(.c) void {
+    _ = data;
+    _ = touch;
+}
+
+/// C ABI callback for `wl_touch.cancel` (opcode 4): the compositor took every finger, for a
+/// gesture of its own. It names none, so every contact ends without a click.
+fn touch_cancel(data: ?*anyopaque, touch: ?*wl_seat.WlTouch) callconv(.c) void {
+    _ = touch;
+    const state = state_of(data);
+    state.queue.push(.{ .touch_cancel = null });
+    assert(state.queue.count >= 1);
+}
+
+/// `wl_touch.shape` (opcode 5, version 6): unused.
+fn touch_shape(
+    data: ?*anyopaque,
+    touch: ?*wl_seat.WlTouch,
+    id: i32,
+    major: i32,
+    minor: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = touch;
+    _ = id;
+    _ = major;
+    _ = minor;
+}
+
+/// `wl_touch.orientation` (opcode 6, version 6): unused.
+fn touch_orientation(
+    data: ?*anyopaque,
+    touch: ?*wl_seat.WlTouch,
+    id: i32,
+    orientation: i32,
+) callconv(.c) void {
+    _ = data;
+    _ = touch;
+    _ = id;
+    _ = orientation;
 }
 
 /// `wl_seat.name` (opcode 1, version 2): unused.

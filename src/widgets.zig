@@ -391,6 +391,7 @@ test {
     _ = splitter;
     _ = tabs;
     _ = list_box;
+    _ = @import("widgets/second_finger.zig");
     _ = dock;
     _ = number_box;
     _ = tree_view;
