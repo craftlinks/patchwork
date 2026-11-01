@@ -52,6 +52,7 @@
 //!   frame for (`bench.render_size`; 3840 x 2160 without it). `check` requires 1 to 8192 for
 //!   each side and at least the regress size, so a render at that size always fits.
 //! - Optional, together: `pub const Audio` and `pub fn audio` (section 4a).
+//! - Optional, native only: `pub fn args`, the command line the host leaves (section 4d).
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
@@ -115,6 +116,18 @@
 //! `client` asks nothing, so the window manager leaves the frame to the app. The app reads
 //! `window_state()` to know whether to draw its own (`widgets.WindowButtons` draws nothing
 //! under `server`). Headless and the browser report `client` (`input.zig`, section 7).
+//!
+//! ## 4d. The Optional Arguments
+//! ```text
+//! pub fn args(app: *App, arguments: []const [:0]const u8) void
+//! ```
+//! `bench.parse_args` splits the command line (`bench.zig`, section 2e) and the native window host
+//! calls `args` once with the app's share, which may be empty, right after `init` and before it
+//! connects to a display, so an app may print and exit there. The slices live as long as the
+//! process. `--check`, `--bench`, `--regress`, and `--render` do not call it, so nothing a scenario
+//! draws depends on a command line, and the browser never does: its body compiles only natively.
+//! An app without `args` that is given any is refused with `UnknownArgument`. `check` checks the
+//! signature.
 //!
 //! ## 5. TigerStyle Invariants
 //! The contract is checked at compile time and costs nothing at run time. The app owns all
@@ -180,6 +193,11 @@ pub fn start(comptime App: type, cx: *Context(App)) void {
     cx.draw.batch_order = App.config.batch_order;
     if (App.config.timer_period_ms == 0) assert(!cx.timer_on);
     assert(!cx.audio_on);
+}
+
+/// Whether `App` takes the host's leftover arguments (section 4d).
+pub fn has_args(comptime App: type) bool {
+    return @hasDecl(App, "args");
 }
 
 /// The step 30 name of `start`, which it now is.
@@ -273,6 +291,14 @@ pub fn conformance(comptime App: type) ?[]const u8 {
         const regress_size = bench.regress_size(App);
         if (render_size[0] < regress_size[0] or render_size[1] < regress_size[1]) {
             return "App.render_size_max must be at least App.regress_size";
+        }
+    }
+    if (has_args(App)) {
+        const signature = fn (*App, []const [:0]const u8) void;
+        const found = @TypeOf(App.args);
+        if (found != signature) {
+            return "App.args must have type `" ++ @typeName(signature) ++ "`, found `" ++
+                @typeName(found) ++ "`";
         }
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
@@ -553,6 +579,22 @@ const FitRender = struct {
     pub const render_size_max: [2]u32 = .{ 1280, 720 };
 };
 
+const WrongArgs = struct {
+    pub const config: Config = .{ .title = "wrong", .timer_period_ms = 0, .draw = &test_draw };
+    pub fn args(app: *WrongArgs, arguments: []const []const u8) void {
+        _ = app;
+        _ = arguments;
+    }
+};
+
+const FitArgs = struct {
+    pub const config: Config = .{ .title = "fit", .timer_period_ms = 0, .draw = &test_draw };
+    pub fn args(app: *FitArgs, arguments: []const [:0]const u8) void {
+        _ = app;
+        _ = arguments;
+    }
+};
+
 const OldEvent = struct {
     pub const config: Config = .{ .title = "old", .timer_period_ms = 0, .draw = &test_draw };
     pub fn init(app: *OldEvent, textures: *quads.Textures) void {
@@ -663,6 +705,20 @@ test "a render size out of range is rejected" {
     );
     const next = comptime conformance(FitRender).?;
     try std.testing.expectEqualStrings("App is missing `pub fn init`", next);
+}
+
+// Locks the optional arguments (section 4d): a slice of unterminated strings is refused by name
+// with both types, the right signature passes the check (the next problem reported is the missing
+// `init`), and an app without the declaration passes (`GoodApp`).
+test "an args of the wrong type is rejected by name" {
+    const wrong = comptime conformance(WrongArgs).?;
+    try std.testing.expect(std.mem.startsWith(u8, wrong, "App.args must have type `fn ("));
+    try std.testing.expect(std.mem.find(u8, wrong, "[]const [:0]const u8") != null);
+    try std.testing.expect(std.mem.find(u8, wrong, "found `fn (") != null);
+    const next = comptime conformance(FitArgs).?;
+    try std.testing.expectEqualStrings("App is missing `pub fn init`", next);
+    try std.testing.expect(has_args(FitArgs));
+    try std.testing.expect(!has_args(GoodApp));
 }
 
 // Locks the draw configuration rejections: a type that breaks the convention is named, and

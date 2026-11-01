@@ -82,8 +82,12 @@ The smallest complete example to copy from is
 
 To use Patchwork from your own project, add it to `build.zig.zon` and call
 `patchwork.addApp(b, dep.builder, .{ .name, .root_source_file, .target, .optimize })` in your
-`build.zig`. It returns the `run`, `wasm`, `serve`, `bench`, `tests` and `install` steps. The
-full snippet is in [docs/reference.md](docs/reference.md#use-patchwork-from-another-project).
+`build.zig`. It returns the `run`, `wasm`, `serve`, `bench`, `check`, `regress`, `tests` and
+`install` steps, plus the executable, its modules and the wgpu directory. `imports`,
+`native_imports` and `wasm_imports` add other packages, `patchwork.addTool` builds a tool with its
+own `main`, and an app that declares `args` receives the arguments the host does not know. The
+full snippet is in [docs/reference.md](docs/reference.md#use-patchwork-from-another-project), and
+[test/consumer](test/consumer) is a working package.
 
 ## Commands
 
@@ -92,11 +96,13 @@ zig build test                  # unit tests: library and all examples (no GPU n
 zig build test-contract         # the app contract rejects malformed apps at compile time
 zig build check                 # compile every shader and pipeline headless (needs a GPU)
 zig build regress -Doptimize=ReleaseFast   # headless frame hashes against test/golden (GPU)
+zig build test-consumer         # build and run test/consumer as another project would (GPU)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
 ./zig-out/bin/fx --render scope --size 1920x1080 --scale 2 --out -   # raw RGBA for ffmpeg
 ```
 
 Native flags: `<app> [--adapter low|high] [--no-cache] [--check] [--decorations client|server]`.
+A bare argument or `--` ends them, and the rest go to an app that declares `args`.
 `-Dwgpu-lib-dir=<dir>` links a local `wgpu-native` build instead of the fetched one.
 
 ## Layout
@@ -107,6 +113,7 @@ src/host/       platform hosts: Wayland + wgpu-native (native_main), browser (we
 web/            browser shell: shell.js, worklet.js, index.html
 examples/       twelve apps
 test/golden/    frame hashes per adapter
+test/consumer/  a package outside this build: two peers, a tool, its own goldens
 tools/          frame comparison, font subsetting
 docs/           reference manual
 ```

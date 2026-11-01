@@ -7,14 +7,15 @@
 //! The command line selects the adapter, bench mode, the windowless shader check (`--check`,
 //! which returns before any Wayland connection), and the windowless scenario runs
 //! (`--regress` and `--render`, `host/headless.zig`, entered here before the window host);
-//! `bench.zig`, `bench.usage`.
+//! `bench.zig`, `bench.usage`. What the host's options leave goes to `App.args`, when the app
+//! declares it and the run has a window (`app.zig`, section 4d).
 
 const std = @import("std");
 const patchwork = @import("patchwork");
 const app = @import("app");
 const bench = patchwork.bench;
 
-/// Reads the options after the program name (`bench.parse_args`) and runs the app.
+/// Reads the options after the program name (`bench.parse_for`) and runs the app.
 pub fn main(init: std.process.Init.Minimal) !void {
     var storage: [bench.arg_cap][:0]const u8 = undefined;
     var count: u32 = 0;
@@ -25,7 +26,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         storage[count] = arg;
         count += 1;
     }
-    var options = bench.parse_args(storage[0..count]) catch |err| {
+    var options = bench.parse_for(app.App, storage[0..count]) catch |err| {
         std.debug.print("{s}: {s}\n{s}", .{ app.App.config.title, @errorName(err), bench.usage });
         return err;
     };

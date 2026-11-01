@@ -78,8 +78,9 @@
 //!   app that declares `Audio` without `audio`, a theme color out of range, a knob whose
 //!   skin lacks `knob`, overlays on a type without an overlay field, an editor whose
 //!   language lacks `next`, the batch audit without a `Box`, an editor language with too few
-//!   `faces` or `scales` without them, and passes only if the compiler rejects each with its
-//!   expected message.
+//!   `faces` or `scales` without them, an `args` of the wrong type, and passes only if the
+//!   compiler rejects each with its expected message.
+//! - `zig build test-consumer` in this repo builds and runs `test/consumer` (section 9).
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with a name suffix for every example but the first.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
@@ -98,9 +99,40 @@
 //! The tool's runs are cached, so a build with unchanged faces and ranges runs it zero times.
 //! `addApp` checks the app's face list first (`subset.check_faces`) and panics naming the
 //! face and the problem.
+//!
+//! ## 7. Other Packages
+//! An app imports more than `patchwork` through three lists of `Import`:
+//!
+//! ```text
+//!   imports         both app modules: a peer with no system library, one target-less module
+//!   native_imports  the native app module and its tests
+//!   wasm_imports    the wasm app module
+//! ```
+//!
+//! A module that links a system library needs a known target (`linkSystemLibrary` panics at
+//! configure time on one without), so such a peer is built once per target and goes in the two
+//! per-target lists under one name. A consumer resolves `wasm_query` for that build, the query
+//! `addApp` uses itself, so the two cannot disagree. `addApp` hands each `add_app_module` the list
+//! for its target, and `check_imports` panics at configure time, naming the app and the import, on
+//! a list that breaks the rules in `src/imports.zig`.
+//!
+//! ## 8. Tools
+//! `addTool` builds an executable from a `main` of the consumer's own, for work that has no window:
+//! a frame at a time it picks, from `Offscreen(App)` (`src/host/offscreen.zig`). It shares the
+//! `patchwork` and app modules `addApp` returned, so the tool and the app agree on every type, and
+//! links `libwgpu_native.so` as `add_native` does. It does not link `libwayland-client` or
+//! `libxkbcommon`: Zig analyzes only what the tool references. A peer in its graph still links what
+//! that peer asks for. A tool that opens a window is `addApp`'s executable, not this.
+//!
+//! ## 9. The Boundary, Tested
+//! `test/consumer` is a package of its own, with `.patchwork = .{ .path = "../.." }`, so it sees
+//! this file only as a consumer does. `test-consumer` runs `zig build` there for `install`, `wasm`,
+//! `test`, and `regress`, one after another, then the tool at a chosen time on each adapter and
+//! the app with an argument. It needs a GPU, so it is not part of `test`.
 
 const std = @import("std");
 const subset = @import("src/text/subset.zig");
+const imports = @import("src/imports.zig");
 const gallery_icons = @import("examples/gallery/icons.zig");
 const session_faces = @import("examples/session/faces.zig");
 
@@ -121,6 +153,13 @@ pub const FontOption = struct {
     ranges: ?[]const [2]u21 = null,
 };
 
+/// The target of every wasm artifact. A consumer resolves it for a peer it builds per target, so
+/// the peer and `addApp` cannot disagree (section 7).
+pub const wasm_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .freestanding };
+
+/// A module an app or a tool imports by `name` (section 7).
+pub const Import = struct { name: []const u8, module: *std.Build.Module };
+
 /// Options for `addApp`. `target` applies to the native executable and the tests, and
 /// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
 pub const AppOptions = struct {
@@ -138,6 +177,12 @@ pub const AppOptions = struct {
     /// Faces the app adds, at most `app_face_max`: `text.Face` tags after the library's three
     /// (section 6).
     fonts: []const FontOption = &.{},
+    /// Modules for both targets: a peer with no system library, usually target-less (section 7).
+    imports: []const Import = &.{},
+    /// Modules for the native app module and its tests. A name here must be in `wasm_imports`.
+    native_imports: []const Import = &.{},
+    /// Modules for the wasm app module. A name here must be in `native_imports`.
+    wasm_imports: []const Import = &.{},
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -163,6 +208,28 @@ pub const AppSteps = struct {
     regress: *std.Build.Step,
     /// Runs the app's own unit tests.
     tests: *std.Build.Step,
+    /// The native executable.
+    exe: *std.Build.Step.Compile,
+    /// The native `patchwork` module.
+    library: *std.Build.Module,
+    /// The native app module.
+    app: *std.Build.Module,
+    /// The directory holding `libwgpu_native.so`.
+    wgpu_lib: std.Build.LazyPath,
+};
+
+/// Options for `addTool`.
+pub const ToolOptions = struct {
+    /// Executable base name.
+    name: []const u8,
+    /// The file that declares `main`.
+    root_source_file: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    /// The app the tool renders, from `addApp`.
+    app: AppSteps,
+    /// Modules beside `patchwork` and `app`.
+    imports: []const Import = &.{},
 };
 
 /// Adds the native, wasm, serve, and test targets for one app. `patchwork_builder` is the
@@ -172,14 +239,16 @@ pub fn addApp(
     patchwork_builder: *std.Build,
     options: AppOptions,
 ) AppSteps {
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_target = b.resolveTargetQuery(wasm_query);
     check_fonts(options);
+    check_imports(options);
     const fonts = add_font_module(patchwork_builder, options.font_ranges, options.fonts);
     const optimize = options.optimize;
     const native_library = add_library_module(patchwork_builder, options.target, optimize, fonts);
     const wasm_library = add_library_module(patchwork_builder, wasm_target, optimize, fonts);
-    const native_app = add_app_module(b, options, options.target, native_library);
-    const wasm_app = add_app_module(b, options, wasm_target, wasm_library);
+    const native_imports = options.native_imports;
+    const native_app = add_app_module(b, options, options.target, native_library, native_imports);
+    const wasm_app = add_app_module(b, options, wasm_target, wasm_library, options.wasm_imports);
 
     const wgpu_lib = wgpu_lib_path(patchwork_builder, options);
     const exe = add_native(b, patchwork_builder, options, wgpu_lib, .{
@@ -207,7 +276,35 @@ pub fn addApp(
         .wasm = &wasm_install.step,
         .serve = add_serve(b, patchwork_builder, options, wasm, &wasm_install.step),
         .tests = &b.addRunArtifact(tests).step,
+        .exe = exe,
+        .library = native_library,
+        .app = native_app,
+        .wgpu_lib = wgpu_lib,
     };
+}
+
+/// Adds an executable with its own `main` over `Offscreen(App)` (section 8). It imports
+/// `patchwork` and `app` from `options.app` and links only libc and `libwgpu_native.so`. The
+/// caller installs the result; its step depends on `options.app.install`, so the library is in
+/// place.
+pub fn addTool(b: *std.Build, options: ToolOptions) *std.Build.Step.Compile {
+    const reserved: []const []const u8 = &.{ "patchwork", "app" };
+    if (imports.check(Import, reserved, options.imports, &.{}, &.{})) |found| {
+        panic_import("addTool", options.name, found);
+    }
+    const root = b.createModule(.{
+        .root_source_file = options.root_source_file,
+        .target = options.target,
+        .optimize = options.optimize,
+        .link_libc = true,
+    });
+    root.addImport("patchwork", options.app.library);
+    root.addImport("app", options.app.app);
+    for (options.imports) |entry| root.addImport(entry.name, entry.module);
+    const exe = b.addExecutable(.{ .name = options.name, .root_module = root });
+    link_wgpu(exe, options.app.wgpu_lib);
+    exe.step.dependOn(options.app.install);
+    return exe;
 }
 
 /// The two modules a host root imports.
@@ -266,6 +363,27 @@ fn check_fonts(options: AppOptions) void {
         found.index,
         name,
         subset.problem_text(found.problem),
+    });
+}
+
+/// Panics, naming the app and the import, when its lists break `imports.check` (section 7).
+/// Configure time, so a bad list never reaches the compiler.
+fn check_imports(options: AppOptions) void {
+    const reserved: []const []const u8 = &.{"patchwork"};
+    const native = options.native_imports;
+    const wasm = options.wasm_imports;
+    const found = imports.check(Import, reserved, options.imports, native, wasm) orelse return;
+    panic_import("addApp", options.name, found);
+}
+
+fn panic_import(what: []const u8, name: []const u8, found: imports.Found) noreturn {
+    std.debug.panic("{s} {s}: {s}[{d}] '{s}': {s}", .{
+        what,
+        name,
+        @tagName(found.list),
+        found.index,
+        found.name,
+        imports.problem_text(found.problem),
     });
 }
 
@@ -396,12 +514,14 @@ fn ranges_source(b: *std.Build, ranges: ?[]const [2]u21) []const u8 {
     return b.fmt("&.{{{s} }}", .{list});
 }
 
-/// The consumer's app file, compiled against the library module of the same target.
+/// The consumer's app file, compiled against the library module of the same target, with
+/// `options.imports` and `target_imports`, the list for that target (section 7).
 fn add_app_module(
     b: *std.Build,
     options: AppOptions,
     target: std.Build.ResolvedTarget,
     library: *std.Build.Module,
+    target_imports: []const Import,
 ) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = options.root_source_file,
@@ -409,6 +529,8 @@ fn add_app_module(
         .optimize = options.optimize,
     });
     module.addImport("patchwork", library);
+    for (options.imports) |entry| module.addImport(entry.name, entry.module);
+    for (target_imports) |entry| module.addImport(entry.name, entry.module);
     return module;
 }
 
@@ -472,9 +594,7 @@ fn add_native(
     root.addImport("patchwork", modules.library);
     root.addImport("app", modules.app);
     const exe = b.addExecutable(.{ .name = options.name, .root_module = root });
-    exe.root_module.addLibraryPath(lib_path);
-    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
-    exe.each_lib_rpath = false;
+    link_wgpu(exe, lib_path);
     exe.root_module.linkSystemLibrary("wayland-client", .{
         .needed = true,
         .weak = false,
@@ -483,6 +603,14 @@ fn add_native(
         .search_strategy = .paths_first,
     });
     link_xkbcommon(exe.root_module);
+    return exe;
+}
+
+/// Links `libwgpu_native.so` from `lib_path`, with RUNPATH `$ORIGIN/../lib` (section 4).
+fn link_wgpu(exe: *std.Build.Step.Compile, lib_path: std.Build.LazyPath) void {
+    exe.root_module.addLibraryPath(lib_path);
+    exe.root_module.addRPathSpecial("$ORIGIN/../lib");
+    exe.each_lib_rpath = false;
     exe.root_module.linkSystemLibrary("wgpu_native", .{
         .needed = true,
         .weak = false,
@@ -490,7 +618,6 @@ fn add_native(
         .preferred_link_mode = .dynamic,
         .search_strategy = .paths_first,
     });
-    return exe;
 }
 
 /// Links `libxkbcommon.so` dynamically through pkg-config: native keyboard input
@@ -518,7 +645,7 @@ fn add_wasm(
 ) *std.Build.Step.Compile {
     const root = b.createModule(.{
         .root_source_file = patchwork_builder.path("src/host/web_main.zig"),
-        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+        .target = b.resolveTargetQuery(wasm_query),
         .optimize = options.optimize,
     });
     root.addImport("patchwork", modules.library);
@@ -705,6 +832,42 @@ pub fn build(b: *std.Build) void {
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
     add_compare_step(b, library);
+    add_consumer_step(b, optimize);
+}
+
+/// `test-consumer`: `test/consumer`, a package outside this build graph, through its own `zig
+/// build`, one step after another (section 9). It needs a GPU, so it is not part of `test`.
+fn add_consumer_step(b: *std.Build, optimize: std.lang.Optimize) void {
+    const step = b.step("test-consumer", "Build and run test/consumer as another project would");
+    const mode = b.fmt("-Doptimize={s}", .{@tagName(optimize)});
+    const zig = b.graph.zig_exe;
+    var last: ?*std.Build.Step = null;
+    for ([_][]const u8{ "install", "wasm", "test", "regress" }) |name| {
+        const run = add_consumer_run(b, &.{ zig, "build", name, mode }, &last);
+        run.stdio = .inherit;
+    }
+    for ([_][]const u8{ "high", "low" }) |adapter| {
+        const argv = [_][]const u8{ "zig-out/bin/consumer-tool", "1500", adapter };
+        const run = add_consumer_run(b, &argv, &last);
+        run.expectStdErrMatch("t=1500 ms, 640x360, bar 150 px, keysym 0x71");
+    }
+    const file = add_consumer_run(b, &.{ "zig-out/bin/consumer", "song.txt", "--print" }, &last);
+    file.expectStdErrMatch("consumer: song.txt: 22 bytes");
+    step.dependOn(last.?);
+}
+
+/// One command in `test/consumer`, after `last`, which it replaces.
+fn add_consumer_run(
+    b: *std.Build,
+    argv: []const []const u8,
+    last: *?*std.Build.Step,
+) *std.Build.Step.Run {
+    const run = b.addSystemCommand(argv);
+    run.setCwd(b.path("test/consumer"));
+    run.has_side_effects = true;
+    if (last.*) |previous| run.step.dependOn(previous);
+    last.* = &run.step;
+    return run;
 }
 
 /// `check`: every example's windowless shader and pipeline check, with the arguments after
@@ -849,6 +1012,12 @@ fn add_test_steps(
         .{
             .path = "test/contract_outlines_no_fill.zig",
             .expected = "place_outlines needs draw.Fill in App.config.draw",
+        },
+        .{
+            .path = "test/contract_args_mistyped.zig",
+            .expected = "App.args must have type `fn (*contract_args_mistyped.Mistyped, " ++
+                "[]const [:0]const u8) void`, found `fn (*contract_args_mistyped.Mistyped, " ++
+                "[]const []const u8) void`",
         },
         .{
             .path = "test/contract_scales_no_faces.zig",

@@ -583,7 +583,8 @@ comptime {
 /// Orchestrates the entire Wayland application lifecycle for one app type:
 /// 1. Checks the app contract at compile time and initializes `App`. With `--check` it
 ///    records the setup stream, replays it on a device with no window, and returns
-///    (`Host(App).check`).
+///    (`Host(App).check`). Otherwise, unless a scenario runs, it calls `App.args` once when the
+///    app declares it (`app.zig`, section 4d), before any display connection.
 /// 2. Connects to the Wayland display socket and binds core globals
 ///    (`wl_compositor`, `xdg_wm_base`).
 /// 3. Creates the surface and desktop window (`xdg_surface`, `xdg_toplevel`), titled with
@@ -611,6 +612,11 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     if (options.check) return AppHost.check(&state, options.adapter);
+    if (comptime app_contract.has_args(App)) {
+        if (!options.bench) App.args(&AppHost.app_static, options.app_args);
+    } else {
+        assert(options.app_args.len == 0);
+    }
     try init_input(&state);
     defer _ = std.os.linux.close(state.repeat_fd);
     try connect(&state);

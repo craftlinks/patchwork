@@ -75,6 +75,8 @@ test {
     _ = bench;
     _ = realtime;
     _ = drop;
+    // `build.zig` imports it by path; nothing in the library does.
+    _ = @import("imports.zig");
     _ = host.wp_presentation;
     _ = host.wp_fractional_scale;
     _ = host.wl_seat;
