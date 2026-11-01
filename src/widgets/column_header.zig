@@ -68,6 +68,7 @@ pub const divider_flags: ui.Flags = .{
     .focusable = false,
     .tab = false,
     .cursor = .ew_resize,
+    .primary_only = true,
 };
 
 /// One column: its label, its width, and the narrowest it resizes to.
@@ -194,7 +195,7 @@ pub fn ColumnHeaderOf(comptime Skin: type) type {
                     .sorted = sorted,
                     .hovered = self.hovered != null and self.hovered.? == index,
                 }) orelse continue;
-                cx.area(self.cell_id(index), shape.rect, shape.radius, ui.cx.plain);
+                cx.area(self.cell_id(index), shape.rect, shape.radius, ui.cx.primary_flag);
             }
             for (0..self.count - 1) |at| {
                 const index: u32 = @intCast(at);

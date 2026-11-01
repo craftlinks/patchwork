@@ -181,7 +181,7 @@ pub fn ListBoxOf(comptime Skin: type) type {
                 const rect = cx.walk(ui.sized(.fill, .{ .fixed = self.row_h }));
                 const clip = cx.visible(rect) orelse continue;
                 const id = self.row_id(index);
-                cx.area(id, rect, 0, ui.cx.plain);
+                cx.area(id, rect, 0, ui.cx.primary_flag);
                 const row: Row = .{
                     .index = index,
                     .rect = rect,

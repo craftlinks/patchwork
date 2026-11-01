@@ -230,6 +230,10 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.pointer_up, .{ .name = "pointer_up" });
     @export(&Web.pointer_wheel, .{ .name = "pointer_wheel" });
     @export(&Web.pointer_leave, .{ .name = "pointer_leave" });
+    @export(&Web.touch_down, .{ .name = "touch_down" });
+    @export(&Web.touch_move, .{ .name = "touch_move" });
+    @export(&Web.touch_up, .{ .name = "touch_up" });
+    @export(&Web.touch_cancel, .{ .name = "touch_cancel" });
     @export(&Web.input_ptr, .{ .name = "input_ptr" });
     @export(&Web.input_capacity, .{ .name = "input_cap" });
     @export(&Web.key_down, .{ .name = "key_down" });
@@ -415,6 +419,33 @@ fn WebApp(comptime App: type) type {
             assert(state.frame.running);
             assert(x == x);
             return note_event(.{ .pointer_up = button_sample(x, y, button, mods, time_ms) });
+        }
+
+        /// A finger (`pointerType` touch) landed at CSS-pixel `(x, y)`. `id` is the DOM
+        /// `pointerId`, unique while the finger is down. Returns the dirty flag.
+        fn touch_down(id: u32, x: f32, y: f32, time_ms: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(x == x);
+            return note_event(.{ .touch_down = .{ .id = id, .x = x, .y = y, .time_ms = time_ms } });
+        }
+
+        /// A finger moved to CSS-pixel `(x, y)`.
+        fn touch_move(id: u32, x: f32, y: f32, time_ms: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            assert(x == x);
+            return note_event(.{ .touch_move = .{ .id = id, .x = x, .y = y, .time_ms = time_ms } });
+        }
+
+        /// A finger lifted.
+        fn touch_up(id: u32, time_ms: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            return note_event(.{ .touch_up = .{ .id = id, .time_ms = time_ms } });
+        }
+
+        /// The browser cancelled a finger (`pointercancel`).
+        fn touch_cancel(id: u32) callconv(.c) u32 {
+            assert(state.frame.running);
+            return note_event(.{ .touch_cancel = id });
         }
 
         fn button_sample(x: f32, y: f32, button: u32, mods: u32, time_ms: u32) input.Button {

@@ -27,6 +27,9 @@
 //!   while the host dispatches it, so the hosts call `ui.dispatch` directly (asserted). The
 //!   same holds for `drop` and `file` (section 6).
 //! - A `drop_over` pushed directly after a `drop_over` replaces it, like a move.
+//! - A `touch_move` replaces an earlier `touch_move` of the same contact when only `touch_move`s
+//!   lie between them, a scan bounded by `contact_cap` back from the tail (section 9). Ten
+//!   fingers interleave, so merging with the tail alone would never find a pair.
 //!
 //! ### Native vs. Web
 //! Native Wayland callbacks only push to the queue; the window loop pops events in order
@@ -97,6 +100,15 @@
 //! activated, client-decorated window that can do everything. `Button.serial` carries the
 //! press's `wl_pointer.button` serial, which `xdg_toplevel.move` and `resize` require.
 //!
+//! ## 9. Touch
+//! A finger is a contact with a host-given `id`, unique only while it is down. `touch_down`,
+//! `touch_move`, `touch_up`, and `touch_cancel` are the hosts' facts; `ui.dispatch` turns them
+//! into the pointer events widgets already read (`ui/cx.zig`, section 5b), so no widget sees a
+//! touch event. `touch_up` carries no position (`wl_touch.up` has none): the contact's last
+//! position stands. `touch_cancel` with `null` cancels every contact, as `wl_touch.cancel` names
+//! none. A full queue can still drop an up or a cancel; the context frees a live id on the next
+//! down of that id, so a stale contact never outlasts the next press.
+//!
 //! ## 8. TigerStyle Invariants
 //! - Capacity is fixed by `queue_cap`; there is no allocation.
 //! - `push`, `pop`, and `index_at` are O(1); the key maps are O(1) switches or O(name) compares.
@@ -113,6 +125,14 @@ pub const queue_cap: u32 = 64;
 pub const click_interval_ms: u32 = 400;
 /// Largest travel on either axis between two presses of one click sequence, in logical px.
 pub const click_slop_px: f32 = 4;
+
+/// Contacts the context tracks at once: a 10-point panel plus slack. The queue's touch
+/// coalescing scan is this long (section 9).
+pub const contact_cap: u32 = 16;
+
+/// Largest travel on either axis between two taps of one click sequence by finger, in logical
+/// px: a finger lands less precisely than a mouse.
+pub const touch_click_slop_px: f32 = 12;
 
 /// Key repeat when the seat never sent `repeat_info`: repeats per second, and the hold time
 /// before the first repeat.
@@ -170,6 +190,22 @@ pub const Button = struct {
     /// The `wl_pointer.button` serial natively, 0 elsewhere: a window move or resize the press
     /// asks for must carry it (section 7).
     serial: u32 = 0,
+};
+
+/// A finger at `(x, y)`. `id` is unique among the contacts down; `serial` is the
+/// `wl_touch.down` serial natively (a window move needs it), 0 elsewhere.
+pub const Touch = struct {
+    id: u32,
+    x: f32,
+    y: f32,
+    time_ms: u32,
+    serial: u32 = 0,
+};
+
+/// A finger lifted: `wl_touch.up` has no position, so the contact's last one stands.
+pub const TouchEnd = struct {
+    id: u32,
+    time_ms: u32,
 };
 
 /// Who draws the window's title bar and frame.
@@ -389,6 +425,12 @@ pub const Event = union(enum) {
     close_requested,
     /// The window's state changed (section 7).
     window_state: WindowState,
+    /// A finger landed, moved, lifted, or was taken by the system (section 9). `null` cancels
+    /// every contact.
+    touch_down: Touch,
+    touch_move: Touch,
+    touch_up: TouchEnd,
+    touch_cancel: ?u32,
 
     /// True for the events whose payload points into host storage: they never enter the queue.
     pub fn borrowed(self: Event) bool {
@@ -461,13 +503,20 @@ pub const Clicks = struct {
 
 /// The sequence after `down`: one more press when it continues `previous`, else 1.
 pub fn count_click(previous: Clicks, down: Button) Clicks {
+    return count_click_within(previous, down, click_slop_px);
+}
+
+/// `count_click` with `slop` logical px of travel allowed on each axis: a finger passes
+/// `touch_click_slop_px`.
+pub fn count_click_within(previous: Clicks, down: Button, slop: f32) Clicks {
     assert(down.x == down.x);
     assert(down.y == down.y);
+    assert(slop >= 0);
     var count: u8 = 1;
     if (previous.count >= 1 and previous.button == down.button) {
         const elapsed = down.time_ms -% previous.time_ms;
-        const near_x = @abs(down.x - previous.x) <= click_slop_px;
-        const near_y = @abs(down.y - previous.y) <= click_slop_px;
+        const near_x = @abs(down.x - previous.x) <= slop;
+        const near_y = @abs(down.y - previous.y) <= slop;
         if (elapsed <= click_interval_ms and near_x and near_y) count = previous.count +| 1;
     }
     const next: Clicks = .{
@@ -589,6 +638,7 @@ fn coalesce(self: *EventQueue, event: Event) bool {
             return true;
         }
     }
+    if (event == .touch_move) return coalesce_touch(self, event.touch_move);
     if (event == .wheel) {
         if (self.items[last] == .wheel) {
             const previous = self.items[last].wheel;
@@ -599,6 +649,23 @@ fn coalesce(self: *EventQueue, event: Event) bool {
                 .dy = previous.dy + event.wheel.dy,
             } };
             assert(self.items[last] == .wheel);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Replaces the latest `touch_move` of `touch.id` when only `touch_move`s of other contacts lie
+/// between it and the tail, looking back at most `contact_cap` events (section 9).
+fn coalesce_touch(self: *EventQueue, touch: Touch) bool {
+    assert(self.count >= 1);
+    const reach = @min(self.count, contact_cap);
+    var back: u32 = 0;
+    while (back < reach) : (back += 1) {
+        const index = self.index_at(self.count - 1 - back);
+        if (self.items[index] != .touch_move) return false;
+        if (self.items[index].touch_move.id == touch.id) {
+            self.items[index] = .{ .touch_move = touch };
             return true;
         }
     }
@@ -877,6 +944,8 @@ comptime {
     assert(@sizeOf(Button) == 20);
     assert(@sizeOf(WindowState) == 2);
     assert(@sizeOf(Wheel) == 16);
+    assert(contact_cap == 16);
+    assert(touch_click_slop_px > click_slop_px);
     assert(@sizeOf(KeyPress) == 8);
     assert(@sizeOf(Mods) == 1);
     assert(@sizeOf(Event) <= 24);
@@ -1094,4 +1163,71 @@ test "repeat arms on a repeating press and disarms on its release" {
     _ = repeat.press(31, true);
     try testing.expect(repeat.configure(0, 250) == .disarm);
     try testing.expect(repeat.press(31, true) == .disarm);
+}
+
+fn move_of(id: u32, x: f32) Event {
+    return .{ .touch_move = .{ .id = id, .x = x, .y = 0, .time_ms = 0 } };
+}
+
+// Locks per-contact coalescing (section 9): ten fingers moving in turn, three rounds in one
+// wake, leave ten queued moves holding the newest position of each; a move never crosses a down,
+// an up, a cancel, or another kind of event, so a move, an up, and a move of one id stay three.
+test "touch moves coalesce per contact and never cross another event" {
+    var queue = EventQueue.init();
+    var round: u32 = 0;
+    while (round < 3) : (round += 1) {
+        var id: u32 = 0;
+        while (id < 10) : (id += 1) {
+            queue.push(move_of(id, @floatFromInt(round)));
+        }
+    }
+    try testing.expectEqual(@as(u32, 10), queue.count);
+    var id: u32 = 0;
+    while (id < 10) : (id += 1) {
+        const event = queue.pop().?;
+        try testing.expectEqual(id, event.touch_move.id);
+        try testing.expectEqual(@as(f32, 2), event.touch_move.x);
+    }
+    queue.push(move_of(1, 1));
+    queue.push(.{ .touch_up = .{ .id = 1, .time_ms = 0 } });
+    queue.push(move_of(1, 2));
+    try testing.expectEqual(@as(u32, 3), queue.count);
+    queue = EventQueue.init();
+    queue.push(move_of(1, 1));
+    queue.push(.{ .touch_down = .{ .id = 2, .x = 0, .y = 0, .time_ms = 0 } });
+    queue.push(move_of(1, 2));
+    queue.push(.{ .touch_cancel = null });
+    queue.push(move_of(1, 3));
+    queue.push(.pointer_leave);
+    queue.push(move_of(1, 4));
+    try testing.expectEqual(@as(u32, 7), queue.count);
+}
+
+// Locks the scan's reach: a move of id 0 more than `contact_cap` moves back is not found, so
+// the queue holds both, and ten fingers for 1,000 rounds drop nothing.
+test "ten fingers for a thousand rounds drop nothing" {
+    var queue = EventQueue.init();
+    var round: u32 = 0;
+    while (round < 1000) : (round += 1) {
+        var id: u32 = 0;
+        while (id < 10) : (id += 1) queue.push(move_of(id, @floatFromInt(round)));
+        try testing.expectEqual(@as(u32, 10), queue.count);
+        while (queue.pop()) |_| {}
+    }
+    try testing.expectEqual(@as(u32, 0), queue.dropped);
+    var wide = EventQueue.init();
+    var id: u32 = 0;
+    while (id < contact_cap + 1) : (id += 1) wide.push(move_of(id, 0));
+    wide.push(move_of(0, 1));
+    try testing.expectEqual(contact_cap + 2, wide.count);
+}
+
+// Locks the finger's click slop: a tap 10 px from the last at 100 ms continues the count with
+// `touch_click_slop_px` and not with the mouse's.
+test "count_click_within takes the slop it is given" {
+    const first: Button = .{ .x = 0, .y = 0, .time_ms = 0, .button = .left, .mods = .none };
+    const second: Button = .{ .x = 10, .y = 0, .time_ms = 100, .button = .left, .mods = .none };
+    const one = count_click(.none, first);
+    try testing.expectEqual(@as(u8, 1), count_click(one, second).count);
+    try testing.expectEqual(@as(u8, 2), count_click_within(one, second, touch_click_slop_px).count);
 }

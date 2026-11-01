@@ -260,7 +260,7 @@ pub fn TreeViewOf(comptime Skin: type, comptime capacity: u32) type {
                         .turn = if (state.expanded) 1 else 0,
                         .hovered = cx.hovered() == id,
                     });
-                    cx.area(id, cell, 0, ui.cx.plain);
+                    cx.area(id, cell, 0, ui.cx.primary_flag);
                 }
             }
             const start = cell.x + tree_chevron_w + tree_pad;

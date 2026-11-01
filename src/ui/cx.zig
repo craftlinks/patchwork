@@ -117,6 +117,34 @@
 //! it is dropped; a bench run simulates it (`bench.serve_window`). `window_state` events store
 //! the window's state, which `window_state()` reports in any phase, and owe a draw.
 //!
+//! ## 5b. Touch
+//! A finger is a contact: `touch_down` claims one of `input.contact_cap` slots, which holds its
+//! own pointer state (`PointerSlot`: pointer, hot, hover, capture, the press flags). The mouse's
+//! state is the context's own fields, and a contact's is swapped in for the dispatch of its
+//! events, so while a finger's event runs `self.capture` is that finger's and between dispatches
+//! it is the mouse's. `ui.dispatch` turns a touch event into the pointer events widgets already
+//! read, so `hit` and every widget work under each finger unchanged:
+//! ```text
+//! touch_down    pointer_down (left, the contact's serial)
+//! touch_move    pointer_move
+//! touch_up      pointer_up, then pointer_leave (the leave ends hover, as a bench click does)
+//! touch_cancel  pointer_leave: the capture gets up { inside = false }, so no click
+//! ```
+//! - **Primary.** A contact is primary when it lands with no other contact live (the Pointer
+//!   Events rule). Only it moves focus, presses a window area, and begins a drag between widgets.
+//! - **Joined.** A press on an area the mouse or another contact holds does not capture it: the
+//!   contact's `capture` stays `.none`, `hot` and `hover` are cleared, so widgets answer `none`,
+//!   and `target` records the area for `touch()`. `Flags.primary_only` makes the area absent to
+//!   any contact but the primary (`target` is then `.none`).
+//! - **Hover** of a finger is what it pressed, down to its lift: a finger that holds nothing
+//!   resolves nothing on a move.
+//! - **Clicks** of fingers share `touch_clicks` with `input.touch_click_slop_px`, so a double
+//!   tap, two contacts, counts 2.
+//! - **Safety.** A `touch_down` of an id still live first cancels that contact (a lost up
+//!   cannot outlast the next press); a contact over `contact_cap` is counted in
+//!   `contacts_refused` and its later events do nothing. No contact is loaded outside
+//!   `touch_begin` and `touch_end`: `end_frame` and the mouse's events run on the mouse's state.
+//!
 //! ## 6. Hover After a Redraw
 //! Areas are single-buffered: drawing never interleaves with events. After a draw moved
 //! things, `end_frame` re-resolves the stored pointer; if the hot id changed and nothing is
@@ -252,6 +280,100 @@ pub const CanvasState = canvas.CanvasState;
 
 /// Bytes `copy` keeps for the host to offer: one paste-sized buffer per context.
 pub const clipboard_cap: u32 = 65536;
+
+/// Every field of the context that means "the pointer": the mouse's are the context's own, a
+/// contact's live here and are swapped in for its dispatch (module guide, section 5b). A field
+/// added here must exist on the context with the same type: `swap_slot` reads it by name.
+const PointerSlot = struct {
+    pointer: input.Pointer,
+    hot: Id,
+    hot_rect: Rect,
+    hot_focusable: bool,
+    hot_cursor: Cursor,
+    hot_window: areas.WindowPart,
+    hot_primary_only: bool,
+    wheel: Id,
+    hover: Id,
+    hover_prev: Id,
+    capture: Id,
+    capture_rect: Rect,
+    capture_cursor: Cursor,
+    pressed: bool,
+    ending_capture: bool,
+
+    fn fresh(window: Rect) PointerSlot {
+        return .{
+            .pointer = input.Pointer.init(),
+            .hot = .none,
+            .hot_rect = window,
+            .hot_focusable = false,
+            .hot_cursor = .default,
+            .hot_window = .none,
+            .hot_primary_only = false,
+            .wheel = .none,
+            .hover = .none,
+            .hover_prev = .none,
+            .capture = .none,
+            .capture_rect = window,
+            .capture_cursor = .default,
+            .pressed = false,
+            .ending_capture = false,
+        };
+    }
+};
+
+/// One finger (module guide, section 5b).
+const Contact = struct {
+    /// The host's id, unique among the contacts down.
+    id: u32,
+    live: bool,
+    primary: bool,
+    joined: bool,
+    origin: [2]f32,
+    down_ms: u32,
+    /// The area under the press, held or not: a gesture's target.
+    target: Id,
+    slot: PointerSlot,
+};
+
+/// Which part of a touch the event being dispatched is.
+pub const TouchPhase = enum(u8) { down, move, up, cancel };
+
+/// The finger whose event is being dispatched, from `cx.touch()`.
+pub const TouchInfo = struct {
+    id: u32,
+    primary: bool,
+    phase: TouchPhase,
+    x: f32,
+    y: f32,
+    origin: [2]f32,
+    down_ms: u32,
+    /// The area under the press (`.none` when there was none, or `primary_only` hid it).
+    target: Id,
+    /// The target was held by the mouse or another contact when this one landed.
+    joined: bool,
+    /// The time of this event: the host's stamp.
+    time_ms: u32,
+};
+
+/// The pointer events a touch event means (module guide, section 5b): one, or two for a lift.
+pub const TouchPlan = struct {
+    events: [2]input.Event,
+    count: u32,
+};
+
+fn idle_contact(window: Rect) Contact {
+    return .{
+        .id = 0,
+        .live = false,
+        .primary = false,
+        .joined = false,
+        .origin = .{ 0, 0 },
+        .down_ms = 0,
+        .target = .none,
+        .slot = .fresh(window),
+    };
+}
 
 /// What the context is doing; see the module guide, section 2.
 pub const Phase = enum(u8) {
@@ -393,6 +515,15 @@ const DragEnding = enum(u8) {
 
 /// No hover, press, or wheel interest beyond the default.
 pub const plain: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default };
+/// A press by a contact other than the primary one treats the area as absent: for a widget of
+/// several ids that shares press state (module guide, section 5b).
+pub const primary_flag: Flags = .{
+    .wheel = false,
+    .focusable = false,
+    .tab = false,
+    .cursor = .default,
+    .primary_only = true,
+};
 /// Takes wheel input.
 pub const wheel_flag: Flags = .{
     .wheel = true,
@@ -499,8 +630,23 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         pressed: bool,
         /// True during the left release that ends the capture.
         ending_capture: bool,
+        /// The hot area's `Flags.primary_only` (section 5b).
+        hot_primary_only: bool,
         /// The click sequence of the last press (`input.count_click`).
         clicks: input.Clicks,
+        /// The fingers (section 5b): the table, the contact whose state is loaded while its
+        /// events dispatch, what it is doing, the click sequence of fingers (swapped with
+        /// `clicks` while one is loaded), and the counts a HUD shows.
+        contacts: [input.contact_cap]Contact,
+        contacts_live_count: u32,
+        contacts_most: u32,
+        contacts_refused: u32,
+        touch_clicks: input.Clicks,
+        touch_loaded: ?u32,
+        touch_phase: TouchPhase,
+        touch_time_ms: u32,
+        /// The loaded contact holds nothing, so its moves and lifts resolve nothing.
+        touch_quiet: bool,
         /// Keyboard focus and the focus when the current event began (section 7).
         focus: Id,
         focus_prev: Id,
@@ -534,6 +680,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         drag_prev: Id,
         drag_rect: Rect,
         drag_ending: DragEnding,
+        /// The contact that began the session, or null for the mouse, and the pointer's last
+        /// place in it (section 7b).
+        drag_owner: ?u32,
+        drag_x: f32,
+        drag_y: f32,
         /// The id that accepted the running transfer, and the host's requests (section 7a).
         files_receiver: Id,
         files_accept: ?u16,
@@ -591,6 +742,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.hot_focusable = false;
             self.hot_cursor = .default;
             self.hot_window = .none;
+            self.hot_primary_only = false;
             self.wheel = .none;
             self.hover = .none;
             self.hover_prev = .none;
@@ -600,6 +752,18 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.pressed = false;
             self.ending_capture = false;
             self.clicks = .none;
+            for (&self.contacts) |*contact| contact.* = idle_contact(self.window);
+            self.contacts_live_count = 0;
+            self.contacts_most = 0;
+            self.contacts_refused = 0;
+            self.touch_clicks = .none;
+            self.touch_loaded = null;
+            self.touch_phase = .move;
+            self.touch_time_ms = 0;
+            self.touch_quiet = false;
+            self.drag_owner = null;
+            self.drag_x = 0;
+            self.drag_y = 0;
             self.focus = .none;
             self.focus_prev = .none;
             self.focus_rect = self.window;
@@ -808,6 +972,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             if (self.focus != .none) {
                 if (self.find(self.focus)) |focused_area| {
                     self.focus_rect = rect_of(focused_area.rect);
+                }
+            }
+            assert(self.touch_loaded == null);
+            for (&self.contacts) |*contact| {
+                if (!contact.live or contact.slot.capture == .none) continue;
+                if (self.find(contact.slot.capture)) |area_held| {
+                    contact.slot.capture_rect = rect_of(area_held.rect);
                 }
             }
             if (self.capture != .none) {
@@ -1177,7 +1348,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     }
                 };
             }
-            self.area(self.popup_backdrop(id), self.window, 0, plain);
+            self.area(self.popup_backdrop(id), self.window, 0, primary_flag);
             self.popup_open = .{ .id = id, .layer_before = before };
             self.popup_count += 1;
             self.popup_met = id;
@@ -1324,6 +1495,201 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             return self.areas[0..self.area_count];
         }
 
+        // ---------------------------------------------------------------- touch
+
+        /// Exchanges the context's pointer state with `slot`'s (section 5b).
+        fn swap_slot(self: *Self, slot: *PointerSlot) void {
+            inline for (@typeInfo(PointerSlot).@"struct".field_names) |name| {
+                std.mem.swap(
+                    @TypeOf(@field(slot, name)),
+                    &@field(self, name),
+                    &@field(slot, name),
+                );
+            }
+            std.mem.swap(input.Clicks, &self.clicks, &self.touch_clicks);
+        }
+
+        /// The index of the live contact with host id `id`.
+        fn contact_of(self: *const Self, id: u32) ?u32 {
+            for (&self.contacts, 0..) |*contact, index| {
+                if (contact.live and contact.id == id) return @intCast(index);
+            }
+            return null;
+        }
+
+        /// True when contact `id` is down (so a repeated down must cancel it first).
+        pub fn touch_live(self: *const Self, id: u32) bool {
+            return self.contact_of(id) != null;
+        }
+
+        /// Contacts down now.
+        pub fn contacts_live(self: *const Self) u32 {
+            assert(self.contacts_live_count <= input.contact_cap);
+            return self.contacts_live_count;
+        }
+
+        /// The ids of the live contacts, in table order, into `out`; how many there are.
+        pub fn touch_ids(self: *const Self, out: *[input.contact_cap]u32) u32 {
+            var count: u32 = 0;
+            for (&self.contacts) |*contact| {
+                if (!contact.live) continue;
+                out[count] = contact.id;
+                count += 1;
+            }
+            return count;
+        }
+
+        /// The finger whose event is being dispatched, or null for the mouse and for any other
+        /// event (section 5b).
+        pub fn touch(self: *const Self) ?TouchInfo {
+            const index = self.touch_loaded orelse return null;
+            const contact = &self.contacts[index];
+            assert(contact.live);
+            return .{
+                .id = contact.id,
+                .primary = contact.primary,
+                .phase = self.touch_phase,
+                .x = self.pointer.x,
+                .y = self.pointer.y,
+                .origin = contact.origin,
+                .down_ms = contact.down_ms,
+                .target = contact.target,
+                .joined = contact.joined,
+                .time_ms = self.touch_time_ms,
+            };
+        }
+
+        /// The capture of the mouse, whichever state is loaded.
+        fn mouse_capture(self: *const Self) Id {
+            if (self.touch_loaded) |index| return self.contacts[index].slot.capture;
+            return self.capture;
+        }
+
+        /// True when the mouse or a contact other than the one loaded holds `id`.
+        fn held_elsewhere(self: *const Self, id: Id) bool {
+            assert(id != .none);
+            if (self.mouse_capture() == id) return true;
+            for (&self.contacts, 0..) |*contact, index| {
+                if (!contact.live) continue;
+                if (self.touch_loaded) |loaded| if (loaded == index) continue;
+                if (contact.slot.capture == id) return true;
+            }
+            return false;
+        }
+
+        /// True when the mouse or any contact holds `id` (a capture), in any phase.
+        pub fn holds(self: *const Self, id: Id) bool {
+            assert(id != .none);
+            if (self.touch_loaded != null and self.capture == id) return true;
+            return self.held_elsewhere(id) or self.capture == id;
+        }
+
+        /// Starts a touch dispatch: finds or claims the contact `event` is for, loads its
+        /// pointer state, and returns the pointer events it means (section 5b), or null when
+        /// the event is for no contact (an unknown id, a 17th finger, a cancel of nothing).
+        /// `touch_end` must follow the dispatch of the events. Idle phase.
+        pub fn touch_begin(self: *Self, event: input.Event) ?TouchPlan {
+            assert(self.phase == .idle);
+            assert(self.touch_loaded == null);
+            var plan: TouchPlan = .{ .events = undefined, .count = 0 };
+            var index: u32 = 0;
+            switch (event) {
+                .touch_down => |down| {
+                    assert(self.contact_of(down.id) == null);
+                    index = self.claim(down) orelse return null;
+                    self.touch_phase = .down;
+                    self.touch_time_ms = down.time_ms;
+                    plan.events[0] = .{ .pointer_down = .{
+                        .x = down.x,
+                        .y = down.y,
+                        .time_ms = down.time_ms,
+                        .button = .left,
+                        .mods = self.mods,
+                        .serial = down.serial,
+                    } };
+                    plan.count = 1;
+                },
+                .touch_move => |move| {
+                    index = self.contact_of(move.id) orelse return null;
+                    self.touch_phase = .move;
+                    self.touch_time_ms = move.time_ms;
+                    plan.events[0] = .{ .pointer_move = .{ .x = move.x, .y = move.y } };
+                    plan.count = 1;
+                },
+                .touch_up => |up| {
+                    index = self.contact_of(up.id) orelse return null;
+                    const last = self.contacts[index].slot.pointer;
+                    self.touch_phase = .up;
+                    self.touch_time_ms = up.time_ms;
+                    plan.events[0] = .{ .pointer_up = .{
+                        .x = last.x,
+                        .y = last.y,
+                        .time_ms = up.time_ms,
+                        .button = .left,
+                        .mods = self.mods,
+                    } };
+                    plan.events[1] = .pointer_leave;
+                    plan.count = 2;
+                },
+                .touch_cancel => |named| {
+                    index = self.contact_of(named orelse return null) orelse return null;
+                    self.touch_phase = .cancel;
+                    plan.events[0] = .pointer_leave;
+                    plan.count = 1;
+                },
+                else => unreachable,
+            }
+            self.swap_slot(&self.contacts[index].slot);
+            self.touch_loaded = index;
+            // A finger that holds nothing resolves nothing on a move or a lift.
+            self.touch_quiet = self.touch_phase != .down and self.capture == .none;
+            assert(self.contacts[index].live);
+            assert(plan.count >= 1);
+            return plan;
+        }
+
+        /// Ends a touch dispatch: the mouse's state is back, and a lifted or cancelled contact
+        /// is free (section 5b).
+        pub fn touch_end(self: *Self) void {
+            assert(self.phase == .idle);
+            const index = self.touch_loaded orelse unreachable;
+            self.swap_slot(&self.contacts[index].slot);
+            self.touch_loaded = null;
+            self.touch_quiet = false;
+            if (self.touch_phase == .up or self.touch_phase == .cancel) {
+                const contact = &self.contacts[index];
+                assert(contact.live);
+                assert(contact.slot.capture == .none);
+                contact.live = false;
+                contact.target = .none;
+                self.contacts_live_count -= 1;
+                if (self.drag_owner) |owner| assert(owner != index or self.drag_source == .none);
+            }
+            assert(self.touch_loaded == null);
+        }
+
+        /// Takes the first free contact for `down`, primary when no other is live.
+        fn claim(self: *Self, down: input.Touch) ?u32 {
+            for (&self.contacts, 0..) |*contact, index| {
+                if (contact.live) continue;
+                contact.* = .{
+                    .id = down.id,
+                    .live = true,
+                    .primary = self.contacts_live_count == 0,
+                    .joined = false,
+                    .origin = .{ down.x, down.y },
+                    .down_ms = down.time_ms,
+                    .target = .none,
+                    .slot = .fresh(self.window),
+                };
+                self.contacts_live_count += 1;
+                self.contacts_most = @max(self.contacts_most, self.contacts_live_count);
+                return @intCast(index);
+            }
+            self.contacts_refused += 1;
+            return null;
+        }
+
         // --------------------------------------------------------------- events
 
         /// Starts dispatching `event`: stores the pointer and resolves the hot area and the
@@ -1341,6 +1707,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.ending_capture = false;
             self.escaping = false;
             switch (event) {
+                // Touch events are translated before they get here (section 5b).
+                .touch_down, .touch_move, .touch_up, .touch_cancel => unreachable,
                 .frame, .paste, .file => {},
                 .drop_over => |point| self.drop_at(point.x, point.y),
                 .drop_leave => self.drop_target = .none,
@@ -1355,6 +1723,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     self.hot_focusable = false;
                     self.hot_cursor = .default;
                     self.hot_window = .none;
+                    self.hot_primary_only = false;
                     self.wheel = .none;
                     self.hover = .none;
                 },
@@ -1387,19 +1756,37 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                     self.dirty = true;
                 },
             }
-            if (self.drag_source != .none) self.drag_event(event);
+            if (self.drag_source != .none and self.drag_sees(event)) self.drag_event(event);
             assert(self.phase == .event);
+        }
+
+        /// True when `event` is the drag session's to answer: any event but a pointer's, and a
+        /// pointer's only from the pointer that began it (section 7b).
+        fn drag_sees(self: *const Self, event: input.Event) bool {
+            return switch (event) {
+                .pointer_move, .pointer_down, .pointer_up, .pointer_leave, .wheel => {
+                    return self.touch_loaded == self.drag_owner;
+                },
+                else => true,
+            };
         }
 
         /// A session's part of `event_begin` (section 7b): pointer events owe a draw, a left
         /// release ends the session over its target, and a leave or Escape cancels it.
         fn drag_event(self: *Self, event: input.Event) void {
             assert(self.drag_source != .none);
-            assert(self.capture != .none);
             switch (event) {
-                .pointer_move, .pointer_down, .wheel => self.dirty = true,
-                .pointer_up => |up| {
+                .pointer_move, .pointer_down, .wheel => {
+                    assert(self.capture != .none);
                     self.dirty = true;
+                    self.drag_x = self.pointer.x;
+                    self.drag_y = self.pointer.y;
+                },
+                .pointer_up => |up| {
+                    assert(self.capture != .none);
+                    self.dirty = true;
+                    self.drag_x = self.pointer.x;
+                    self.drag_y = self.pointer.y;
                     if (up.button == .left) self.drag_ending = .released;
                 },
                 .pointer_leave => {
@@ -1434,7 +1821,9 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 self.drag_target = .none;
                 self.drag_ending = .none;
             }
-            if (self.drag_source != .none) assert(self.capture != .none);
+            if (self.drag_source != .none and self.touch_loaded == self.drag_owner) {
+                assert(self.capture != .none);
+            }
             if (self.escaping) self.focus = .none;
             self.phase = .idle;
             assert(self.phase == .idle);
@@ -1449,6 +1838,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 .frame, .key_down, .key_up, .paste, .window_focus => return .none,
                 .drop_over, .drop_leave, .drop, .file => return .none,
                 .close_requested, .window_state => return .none,
+                // Translated to pointer events before `event_begin` (section 5b).
+                .touch_down, .touch_move, .touch_up, .touch_cancel => return .none,
                 .pointer_move => |point| {
                     if (self.capture != .none) return self.drag_of(id, point.x, point.y);
                     return self.hover_change(id);
@@ -1594,6 +1985,13 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(source != .none);
             assert(source == self.capture);
             assert(self.drag_source == .none);
+            // Only the mouse and the primary contact begin one (section 7b).
+            if (self.touch_loaded) |index| {
+                if (!self.contacts[index].primary) return;
+            }
+            self.drag_owner = self.touch_loaded;
+            self.drag_x = self.pointer.x;
+            self.drag_y = self.pointer.y;
             self.drag_source = source;
             self.drag_payload = payload;
             self.drag_target = .none;
@@ -1606,12 +2004,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// The drag between widgets in flight, or null (section 7b). Any phase.
         pub fn dragging(self: *const Self) ?Dragging {
             if (self.drag_source == .none) return null;
-            assert(self.capture != .none or self.phase == .event);
             return .{
                 .source = self.drag_source,
                 .payload = self.drag_payload,
-                .x = self.pointer.x,
-                .y = self.pointer.y,
+                .x = self.drag_x,
+                .y = self.drag_y,
                 .target = self.drag_target,
             };
         }
@@ -1629,9 +2026,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(id != .none);
             assert(@as(std.meta.Tag(input.Event), event) == self.event_tag);
             if (self.drag_source == .none) return .none;
+            if (!self.drag_sees(event)) return .none;
             const over: DragOver = .{
-                .x = self.pointer.x,
-                .y = self.pointer.y,
+                .x = self.drag_x,
+                .y = self.drag_y,
                 .rect = self.drag_rect,
                 .payload = self.drag_payload,
                 .source = self.drag_source,
@@ -1714,12 +2112,15 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(x == x);
             assert(y == y);
             self.pointer.move(x, y);
+            // A finger that holds nothing resolves nothing (section 5b).
+            if (self.touch_quiet) return;
             const live = self.areas[0..self.area_count];
             const found = areas.resolve(live, self.draw.point_items(), x, y);
             self.hot = .none;
             self.hot_focusable = false;
             self.hot_cursor = .default;
             self.hot_window = .none;
+            self.hot_primary_only = false;
             self.wheel = .none;
             if (found.hot) |index| {
                 const hot_area = &self.areas[index];
@@ -1728,9 +2129,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 self.hot_focusable = hot_area.flags.focusable;
                 self.hot_cursor = hot_area.flags.cursor;
                 self.hot_window = hot_area.flags.window;
+                self.hot_primary_only = hot_area.flags.primary_only;
             }
             if (found.wheel) |index| self.wheel = self.areas[index].id;
-            if (self.drag_source != .none) {
+            if (self.drag_source != .none and self.touch_loaded == self.drag_owner) {
                 self.drag_target = .none;
                 if (found.drag) |index| {
                     self.drag_target = self.areas[index].id;
@@ -1745,7 +2147,11 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// to it when it is focusable, or clears focus (section 7).
         fn press_at(self: *Self, down: input.Button) void {
             self.mods = down.mods;
-            self.clicks = input.count_click(self.clicks, down);
+            const slop: f32 = if (self.touch_loaded != null)
+                input.touch_click_slop_px
+            else
+                input.click_slop_px;
+            self.clicks = input.count_click_within(self.clicks, down, slop);
             if (down.button != .left) {
                 self.point_at(down.x, down.y, false);
                 if (down.button == .right and self.capture == .none) _ = self.window_press(down);
@@ -1754,7 +2160,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.pointer.button(true);
             self.point_at(down.x, down.y, false);
             if (self.capture != .none) return;
-            if (self.window_press(down)) {
+            var primary = true;
+            if (self.touch_loaded) |index| {
+                if (self.touch_press_hidden(index)) return;
+                primary = self.contacts[index].primary;
+            }
+            if (primary and self.window_press(down)) {
                 // The window manager takes the pointer: no capture, as for an unfocusable press.
                 self.focus = .none;
                 return;
@@ -1765,9 +2176,33 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 self.capture_cursor = self.hot_cursor;
                 self.pressed = true;
             }
-            self.focus = if (self.hot_focusable) self.hot else .none;
-            if (self.focus != .none) self.focus_rect = self.hot_rect;
+            // Only the primary contact moves focus: a second finger on a pad leaves a field alone.
+            if (primary) {
+                self.focus = if (self.hot_focusable) self.hot else .none;
+                if (self.focus != .none) self.focus_rect = self.hot_rect;
+            }
             assert(self.clicks.count >= 1);
+        }
+
+        /// A contact's press on the hot area (section 5b): records the contact's target, and
+        /// when the area is `primary_only` for a non-primary contact, or another pointer holds
+        /// it, clears what the press resolved so widgets see nothing. True when it did.
+        fn touch_press_hidden(self: *Self, index: u32) bool {
+            const contact = &self.contacts[index];
+            assert(contact.live);
+            const absent = self.hot_primary_only and !contact.primary;
+            contact.target = if (absent) .none else self.hot;
+            const joined = !absent and self.hot != .none and self.held_elsewhere(self.hot);
+            contact.joined = joined;
+            if (!absent and !joined) return false;
+            self.hot = .none;
+            self.hot_focusable = false;
+            self.hot_cursor = .default;
+            self.hot_window = .none;
+            self.hot_primary_only = false;
+            self.wheel = .none;
+            self.hover = .none;
+            return true;
         }
 
         /// A press on a window area: the request it makes (section 5a), and true when it made
@@ -3268,4 +3703,384 @@ test "a drag reads grabbing, reports its target, and a popup blocks it" {
     _ = send_drag(context, button_event(150, 50, .left, false), &out);
     try testing.expectEqual(DragEnd{ .target = .none, .cancelled = false }, out[0].ended);
     try testing.expectEqual(DragHit.none, out[1]);
+}
+
+// ------------------------------------------------------------------------------- touch tests
+
+const pad_count: u32 = 12;
+
+fn pad(index: u32) Id {
+    return areas.id("pad", index);
+}
+
+/// Twelve pads in a row, 30 px wide at x = 35 * index and 30 tall, and a focusable field below.
+fn draw_pads(context: *TestContext, flags: Flags) void {
+    context.begin_frame(600, 300, 120);
+    var index: u32 = 0;
+    while (index < pad_count) : (index += 1) {
+        const x: f32 = @floatFromInt(index * 35);
+        context.area(pad(index), rect_at(x, 0, 30, 30), 0, flags);
+    }
+    context.area(areas.id("field", 0), rect_at(0, 100, 80, 20), 0, focusable_text);
+    _ = context.end_frame();
+}
+
+fn touch_down(id: u32, x: f32, y: f32) input.Event {
+    return .{ .touch_down = .{ .id = id, .x = x, .y = y, .time_ms = 0, .serial = id + 100 } };
+}
+
+fn touch_move(id: u32, x: f32, y: f32) input.Event {
+    return .{ .touch_move = .{ .id = id, .x = x, .y = y, .time_ms = 0 } };
+}
+
+fn touch_up(id: u32) input.Event {
+    return .{ .touch_up = .{ .id = id, .time_ms = 0 } };
+}
+
+/// What `touch` made of each pointer event of a touch event: its hits for pad 0 to 11 in
+/// `hits[event][pad]`, and how many pointer events there were. Null when the event was for no
+/// contact.
+const TouchResult = struct {
+    hits: [2][pad_count]Hit,
+    count: u32,
+};
+
+/// Dispatches `event` as `ui.dispatch` does and records every pad's hit.
+fn touch(context: *TestContext, event: input.Event) ?TouchResult {
+    // A down of an id still live cancels it first, as `ui.dispatch` does.
+    if (event == .touch_down and context.touch_live(event.touch_down.id)) {
+        _ = touch(context, .{ .touch_cancel = event.touch_down.id });
+    }
+    if (event == .touch_cancel and event.touch_cancel == null) {
+        var ids: [input.contact_cap]u32 = undefined;
+        const count = context.touch_ids(&ids);
+        for (ids[0..count]) |contact_id| _ = touch(context, .{ .touch_cancel = contact_id });
+        return null;
+    }
+    const plan = context.touch_begin(event) orelse return null;
+    var result: TouchResult = .{ .hits = undefined, .count = plan.count };
+    for (plan.events[0..plan.count], 0..) |pointer_event, slot| {
+        context.event_begin(pointer_event);
+        for (&result.hits[slot], 0..) |*out, index| {
+            out.* = context.hit(pad(@intCast(index)), pointer_event);
+        }
+        context.event_end();
+    }
+    context.touch_end();
+    return result;
+}
+
+fn mouse_state(context: *const TestContext) PointerSlot {
+    var state: PointerSlot = undefined;
+    inline for (@typeInfo(PointerSlot).@"struct".field_names) |name| {
+        @field(state, name) = @field(context, name);
+    }
+    return state;
+}
+
+// Locks a chord: ten fingers on ten pads claim ten contacts, the first primary, each pad gets
+// its own down, all ten are captured at once, each lifts with an up inside, and the table is
+// empty again with the most seen recorded.
+test "ten fingers claim ten contacts and free them" {
+    const context = new_context();
+    draw_pads(context, plain);
+    var finger: u32 = 0;
+    while (finger < 10) : (finger += 1) {
+        const x: f32 = @floatFromInt(finger * 35 + 10);
+        const result = touch(context, touch_down(finger, x, 10)).?;
+        try testing.expect(result.hits[0][finger] == .down);
+        try testing.expectEqual(finger + 1, context.contacts_live());
+    }
+    try testing.expectEqual(@as(u32, 10), context.contacts_most);
+    for (context.contacts[0..10], 0..) |contact, index| {
+        try testing.expectEqual(pad(@intCast(index)), contact.slot.capture);
+        try testing.expectEqual(index == 0, contact.primary);
+    }
+    finger = 0;
+    while (finger < 10) : (finger += 1) {
+        const x: f32 = @floatFromInt(finger * 35 + 12);
+        const moved = touch(context, touch_move(finger, x, 12)).?;
+        try testing.expect(moved.hits[0][finger] == .drag);
+        const lifted = touch(context, touch_up(finger)).?;
+        try testing.expect(lifted.hits[0][finger].up.inside);
+        try testing.expect(lifted.hits[1][finger] == .hover_out);
+    }
+    try testing.expectEqual(@as(u32, 0), context.contacts_live());
+    try testing.expectEqual(@as(u32, 0), context.contacts_refused);
+}
+
+// Locks the table's cap: a 17th contact is counted and its later events do nothing, the others
+// are untouched, and a freed slot takes the next finger.
+test "a seventeenth contact is refused and counted" {
+    const context = new_context();
+    draw_pads(context, plain);
+    var finger: u32 = 0;
+    while (finger < input.contact_cap) : (finger += 1) {
+        const x: f32 = @floatFromInt(finger % 12 * 35 + 10);
+        _ = touch(context, touch_down(finger, x, 10)).?;
+    }
+    try testing.expectEqual(input.contact_cap, context.contacts_live());
+    try testing.expectEqual(@as(?TouchResult, null), touch(context, touch_down(99, 10, 10)));
+    try testing.expectEqual(@as(u32, 1), context.contacts_refused);
+    try testing.expectEqual(@as(?TouchResult, null), touch(context, touch_move(99, 20, 10)));
+    try testing.expectEqual(@as(?TouchResult, null), touch(context, touch_up(99)));
+    try testing.expectEqual(input.contact_cap, context.contacts_live());
+    _ = touch(context, touch_up(3)).?;
+    try testing.expect(touch(context, touch_down(98, 150, 10)) != null);
+    try testing.expectEqual(input.contact_cap, context.contacts_live());
+}
+
+// Locks a repeated down: id 4 still down (its up was dropped) is cancelled by the next down of
+// 4, which gets a fresh contact on another pad, so one contact holds id 4 and the old pad's
+// capture is gone.
+test "a down of a live id cancels the stale contact" {
+    const context = new_context();
+    draw_pads(context, plain);
+    _ = touch(context, touch_down(4, 10, 10)).?;
+    try testing.expectEqual(pad(0), context.contacts[0].slot.capture);
+    const result = touch(context, touch_down(4, 45, 10)).?;
+    try testing.expect(result.hits[0][1] == .down);
+    try testing.expectEqual(@as(u32, 1), context.contacts_live());
+    try testing.expect(!context.holds(pad(0)));
+    try testing.expect(context.holds(pad(1)));
+}
+
+// Locks capture: a finger that moves off its pad keeps it (a drag, then an up with inside =
+// false), and nothing else sees the move; another pad gets nothing.
+test "a finger keeps its pad when it leaves it" {
+    const context = new_context();
+    draw_pads(context, plain);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    const moved = touch(context, touch_move(0, 200, 200)).?;
+    try testing.expect(moved.hits[0][0] == .drag);
+    for (moved.hits[0][1..]) |other| try testing.expect(other == .none);
+    const lifted = touch(context, touch_up(0)).?;
+    try testing.expect(!lifted.hits[0][0].up.inside);
+    try testing.expectEqual(@as(u32, 2), lifted.count);
+    try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks cancel: the leave gives the capture up { inside = false } and no other hit, `null`
+// cancels every contact, and a cancel of an unknown id is ignored.
+test "cancel ends a press without a click" {
+    const context = new_context();
+    draw_pads(context, plain);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    _ = touch(context, touch_down(1, 45, 10)).?;
+    const one = touch(context, .{ .touch_cancel = 0 }).?;
+    try testing.expect(!one.hits[0][0].up.inside);
+    try testing.expectEqual(@as(u32, 1), one.count);
+    try testing.expectEqual(@as(u32, 1), context.contacts_live());
+    try testing.expectEqual(@as(?TouchResult, null), touch(context, .{ .touch_cancel = 77 }));
+    _ = touch(context, .{ .touch_cancel = null });
+    try testing.expectEqual(@as(u32, 0), context.contacts_live());
+    try testing.expect(!context.holds(pad(1)));
+}
+
+// Locks the primary rules: the first finger is primary and a second is not; lifting the first
+// leaves a later finger non-primary while another is down; a finger that lands alone after every
+// lift is primary again; and only the primary moves focus.
+test "only the first contact is primary and moves focus" {
+    const context = new_context();
+    draw_pads(context, plain);
+    context.focus = pad(5);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    try testing.expect(context.contacts[0].primary);
+    try testing.expectEqual(Id.none, context.focus);
+    context.focus = areas.id("field", 0);
+    _ = touch(context, touch_down(1, 45, 10)).?;
+    try testing.expect(!context.contacts[1].primary);
+    try testing.expectEqual(areas.id("field", 0), context.focus);
+    _ = touch(context, touch_up(0)).?;
+    _ = touch(context, touch_down(2, 80, 10)).?;
+    try testing.expect(!context.contacts[0].primary);
+    _ = touch(context, touch_up(1)).?;
+    _ = touch(context, touch_up(2)).?;
+    _ = touch(context, touch_down(3, 10, 10)).?;
+    try testing.expect(context.contacts[0].primary);
+}
+
+// Locks a second finger on a held area: its press is not a down for the pad, the contact holds
+// nothing, hot and hover are cleared, `target` still names the pad and `joined` is true, and
+// its moves and lift resolve nothing; the first finger still owns the pad.
+test "a second finger on a held pad is joined and sees nothing" {
+    const context = new_context();
+    draw_pads(context, plain);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    const second = touch(context, touch_down(1, 20, 20)).?;
+    for (second.hits[0]) |value| try testing.expect(value == .none);
+    try testing.expectEqual(Id.none, context.contacts[1].slot.capture);
+    try testing.expectEqual(pad(0), context.contacts[1].target);
+    try testing.expect(context.contacts[1].joined);
+    try testing.expectEqual(Id.none, context.contacts[1].slot.hover);
+    const moved = touch(context, touch_move(1, 22, 22)).?;
+    for (moved.hits[0]) |value| try testing.expect(value == .none);
+    const lifted = touch(context, touch_up(1)).?;
+    for (lifted.hits[0]) |value| try testing.expect(value == .none);
+    try testing.expectEqual(pad(0), context.contacts[0].slot.capture);
+    const first = touch(context, touch_move(0, 12, 12)).?;
+    try testing.expect(first.hits[0][0] == .drag);
+}
+
+// Locks `primary_only`: a non-primary contact's press on such an area gives widgets nothing and
+// leaves `target` at `.none`; the primary contact, and the mouse, press it as ever.
+test "primary_only hides an area from a second finger" {
+    const context = new_context();
+    var flags = plain;
+    flags.primary_only = true;
+    draw_pads(context, flags);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    const second = touch(context, touch_down(1, 45, 10)).?;
+    for (second.hits[0]) |value| try testing.expect(value == .none);
+    try testing.expectEqual(Id.none, context.contacts[1].target);
+    try testing.expect(!context.contacts[1].joined);
+    try testing.expectEqual(pad(0), context.contacts[0].slot.capture);
+    var out: [1]Hit = undefined;
+    send(context, button_event(80, 10, .left, true), &.{pad(2)}, &out);
+    try testing.expect(out[0] == .down);
+}
+
+// Locks the mouse beside the fingers: with two fingers down and moving, the mouse's own state
+// (pointer, hot, hover, capture, press flags) is exactly what it was before them, and a mouse
+// press on a third pad works in between.
+test "the mouse's pointer state is the same after any touch dispatch" {
+    const context = new_context();
+    draw_pads(context, plain);
+    var out: [1]Hit = undefined;
+    send(context, move_to(100, 10), &.{pad(2)}, &out);
+    const before = mouse_state(context);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    _ = touch(context, touch_down(1, 45, 10)).?;
+    _ = touch(context, touch_move(0, 15, 12)).?;
+    try testing.expectEqual(before, mouse_state(context));
+    send(context, button_event(100, 10, .left, true), &.{pad(2)}, &out);
+    try testing.expect(out[0] == .down);
+    try testing.expectEqual(pad(2), context.capture);
+    _ = touch(context, touch_move(1, 50, 12)).?;
+    try testing.expectEqual(pad(2), context.capture);
+    try testing.expect(context.holds(pad(0)) and context.holds(pad(1)) and context.holds(pad(2)));
+    send(context, button_event(100, 10, .left, false), &.{pad(2)}, &out);
+    try testing.expect(out[0].up.inside);
+    try testing.expectEqual(pad(0), context.contacts[0].slot.capture);
+    try testing.expect(context.touch() == null);
+}
+
+// Locks a press on the mouse's pad: a finger landing on the area the mouse holds is joined.
+test "a finger on the mouse's pad is joined" {
+    const context = new_context();
+    draw_pads(context, plain);
+    var out: [1]Hit = undefined;
+    send(context, button_event(10, 10, .left, true), &.{pad(0)}, &out);
+    const result = touch(context, touch_down(0, 12, 12)).?;
+    for (result.hits[0]) |value| try testing.expect(value == .none);
+    try testing.expect(context.contacts[0].joined);
+    try testing.expectEqual(pad(0), context.capture);
+}
+
+// Locks double taps: two contacts within 400 ms and 12 px count 2, a third within it 3, one
+// farther than 12 px restarts at 1, and the mouse's slop of 4 px does not apply.
+test "taps count with the finger slop" {
+    const context = new_context();
+    draw_pads(context, plain);
+    var now: u32 = 1000;
+    var counts: [4]u8 = undefined;
+    const xs = [_]f32{ 10, 20, 28, 45 };
+    for (xs, &counts, 0..) |x, *count, id| {
+        const plan = touch(context, .{ .touch_down = .{
+            .id = @intCast(id),
+            .x = x,
+            .y = 10,
+            .time_ms = now,
+        } });
+        _ = plan.?;
+        count.* = context.touch_clicks.count;
+        _ = touch(context, touch_up(@intCast(id))).?;
+        now += 100;
+    }
+    try testing.expectEqual([4]u8{ 1, 2, 3, 1 }, counts);
+}
+
+// Locks `touch()`: during a finger's dispatch it names the contact, its phase, origin, and
+// target; outside one it is null.
+test "touch names the finger during its dispatch" {
+    const context = new_context();
+    draw_pads(context, plain);
+    try testing.expect(context.touch() == null);
+    const plan = context.touch_begin(touch_down(7, 40, 10)).?;
+    context.event_begin(plan.events[0]);
+    const info = context.touch().?;
+    try testing.expectEqual(@as(u32, 7), info.id);
+    try testing.expect(info.primary);
+    try testing.expectEqual(TouchPhase.down, info.phase);
+    try testing.expectEqual(pad(1), info.target);
+    try testing.expectEqual([2]f32{ 40, 10 }, info.origin);
+    context.event_end();
+    context.touch_end();
+    try testing.expect(context.touch() == null);
+}
+
+// Locks a layout change: a scroll that moves the held pad moves the contact's capture rect at
+// `end_frame`, as for the mouse's.
+test "end_frame refreshes every contact's capture rect" {
+    const context = new_context();
+    draw_pads(context, plain);
+    _ = touch(context, touch_down(0, 10, 10)).?;
+    context.begin_frame(600, 300, 120);
+    context.area(pad(0), rect_at(0, 50, 30, 30), 0, plain);
+    _ = context.end_frame();
+    try testing.expectEqual(@as(f32, 50), context.contacts[0].slot.capture_rect.y);
+}
+
+/// A drag session of source `pad(0)` begun by a finger: the press on pad 0, then a move that
+/// the widget answers with `drag_begin`.
+fn finger_drag(context: *TestContext, id: u32) !void {
+    _ = touch(context, touch_down(id, 10, 10)).?;
+    const plan = context.touch_begin(touch_move(id, 20, 10)).?;
+    context.event_begin(plan.events[0]);
+    context.drag_begin(pad(0), 5);
+    context.event_end();
+    context.touch_end();
+}
+
+// Locks the drag session's owner (section 7b): a drag begun by the primary finger runs, other
+// fingers' events during it change nothing and trip no assert, the mouse can press elsewhere,
+// and the primary's lift ends it; a non-primary finger's `drag_begin` does nothing.
+test "a drag between widgets belongs to the primary contact" {
+    const context = new_context();
+    draw_pads(context, drag_target_flag);
+    try finger_drag(context, 0);
+    try testing.expectEqual(pad(0), context.dragging().?.source);
+    try testing.expectEqual(@as(?u32, 0), context.drag_owner);
+    _ = touch(context, touch_down(1, 80, 10)).?;
+    _ = touch(context, touch_move(1, 85, 10)).?;
+    try testing.expectEqual(pad(0), context.dragging().?.source);
+    var out: [1]Hit = undefined;
+    send(context, button_event(150, 10, .left, true), &.{pad(4)}, &out);
+    try testing.expect(out[0] == .down);
+    try testing.expectEqual(pad(0), context.dragging().?.source);
+    _ = touch(context, touch_move(0, 115, 10)).?;
+    try testing.expectEqual(pad(3), context.dragging().?.target);
+    _ = touch(context, touch_up(0)).?;
+    try testing.expect(context.dragging() == null);
+    _ = touch(context, touch_up(1)).?;
+    send(context, button_event(150, 10, .left, false), &.{pad(4)}, &out);
+    // A second finger cannot begin one.
+    _ = touch(context, touch_down(2, 10, 10)).?;
+    _ = touch(context, touch_down(3, 45, 10)).?;
+    const plan = context.touch_begin(touch_move(3, 50, 10)).?;
+    context.event_begin(plan.events[0]);
+    context.drag_begin(pad(1), 9);
+    context.event_end();
+    context.touch_end();
+    try testing.expect(context.dragging() == null);
+}
+
+// Locks the swap's completeness: every field of `PointerSlot` exists on the context with the
+// same type, so a field renamed on one side fails to compile, and the slot fields are the
+// pointer's: no field of the mouse's pointer state sits outside it.
+test "PointerSlot names context fields of the same types" {
+    inline for (@typeInfo(PointerSlot).@"struct".field_names) |name| {
+        try testing.expect(@hasField(TestContext, name));
+    }
+    try testing.expectEqual(@as(usize, 15), @typeInfo(PointerSlot).@"struct".field_names.len);
 }

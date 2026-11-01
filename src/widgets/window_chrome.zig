@@ -56,6 +56,7 @@ pub const window_drag_flags: ui.Flags = .{
     .tab = false,
     .cursor = .default,
     .window = .drag,
+    .primary_only = true,
 };
 
 /// The window buttons' areas: the default cursor, not focusable.
@@ -64,6 +65,7 @@ pub const window_button_flags: ui.Flags = .{
     .focusable = false,
     .tab = false,
     .cursor = .default,
+    .primary_only = true,
 };
 
 /// One of the window buttons, in drawing order.
@@ -113,6 +115,7 @@ pub fn window_edges(cx: anytype, id: Id) void {
             .tab = false,
             .cursor = cursor_of(part),
             .window = part,
+            .primary_only = true,
         };
         cx.area(id.derive(@backingInt(part)), rect, 0, flags);
     }

@@ -63,6 +63,14 @@
 // takes pointer capture, and the context menu is suppressed on the canvas so a right press
 // reaches the app.
 //
+// A finger (`pointerType` "touch") has its own path: `touch-action: none` on the canvas keeps the
+// browser from taking the gesture, every finger takes pointer capture (so a finger dragged off
+// the canvas keeps its control), and `pointerdown`, `pointermove`, and `pointerup` call
+// `wasm.touch_down`, `touch_move`, and `touch_up` with the DOM `pointerId`; `pointercancel` calls
+// `touch_cancel(id)`, and `pointerleave` of a finger does nothing because it follows every lift.
+// Pens stay on the mouse path. Wasm turns a finger into the pointer events the widgets already
+// read (`ui/cx.zig`, section 5b), so one canvas serves a mouse and ten fingers.
+//
 // ## 7. Keyboard, Clipboard, and Cursor
 // This file maps no keys. The canvas is focusable (`tabindex="0"`); `keydown` and `keyup`
 // write `event.key` as UTF-8 into the Wasm input buffer and call `key_down` or `key_up`, and
@@ -899,6 +907,11 @@ function write_input(text) {
  * @param {PointerEvent} event
  */
 function on_pointer_move(event) {
+    if (event.pointerType === "touch") {
+        const time = Math.floor(event.timeStamp) >>> 0;
+        after_input(wasm.touch_move(event.pointerId, event.offsetX, event.offsetY, time));
+        return;
+    }
     after_input(wasm.pointer_move(event.offsetX, event.offsetY));
 }
 
@@ -907,10 +920,15 @@ function on_pointer_move(event) {
  * @param {PointerEvent} event
  */
 function on_pointer_down(event) {
+    const time = Math.floor(event.timeStamp) >>> 0;
+    if (event.pointerType === "touch") {
+        canvas.setPointerCapture(event.pointerId);
+        after_input(wasm.touch_down(event.pointerId, event.offsetX, event.offsetY, time));
+        return;
+    }
     if (event.button === 0) {
         canvas.setPointerCapture(event.pointerId);
     }
-    const time = Math.floor(event.timeStamp) >>> 0;
     const x = event.offsetX;
     const y = event.offsetY;
     after_input(wasm.pointer_down(x, y, event.button, mods_of(event), time));
@@ -922,6 +940,10 @@ function on_pointer_down(event) {
  */
 function on_pointer_up(event) {
     const time = Math.floor(event.timeStamp) >>> 0;
+    if (event.pointerType === "touch") {
+        after_input(wasm.touch_up(event.pointerId, time));
+        return;
+    }
     const x = event.offsetX;
     const y = event.offsetY;
     after_input(wasm.pointer_up(x, y, event.button, mods_of(event), time));
@@ -944,9 +966,25 @@ function on_wheel(event) {
 }
 
 /**
- * Forwards `pointerleave` and `pointercancel` so Wasm can clear hover and release any press.
+ * Forwards `pointerleave` so Wasm can clear hover and release any press.
+ * @param {PointerEvent} event
  */
-function on_pointer_leave() {
+function on_pointer_leave(event) {
+    // A finger's leave follows its lift (or its cancel, which has its own handler).
+    if (event.pointerType === "touch") return;
+    after_input(wasm.pointer_leave());
+}
+
+/**
+ * Forwards `pointercancel`: a finger the browser took ends without a click; anything else
+ * releases the pointer as a leave does.
+ * @param {PointerEvent} event
+ */
+function on_pointer_cancel(event) {
+    if (event.pointerType === "touch") {
+        after_input(wasm.touch_cancel(event.pointerId));
+        return;
+    }
     after_input(wasm.pointer_leave());
 }
 
@@ -1179,7 +1217,7 @@ async function main() {
     canvas.addEventListener("pointerdown", on_pointer_down);
     canvas.addEventListener("pointerup", on_pointer_up);
     canvas.addEventListener("pointerleave", on_pointer_leave);
-    canvas.addEventListener("pointercancel", on_pointer_leave);
+    canvas.addEventListener("pointercancel", on_pointer_cancel);
     canvas.addEventListener("wheel", on_wheel, { passive: false });
     canvas.addEventListener("contextmenu", (event) => event.preventDefault());
     canvas.addEventListener("keydown", on_key_down);

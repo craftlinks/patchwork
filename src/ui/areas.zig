@@ -130,7 +130,10 @@ pub const Flags = packed struct(u16) {
     /// The area takes drags between widgets: the topmost one under a drag session is its
     /// target (`ui/cx.zig`, section 7b).
     drag_target: bool = false,
-    unused: u3 = 0,
+    /// A press by any contact but the primary one treats the area as absent (`ui/cx.zig`,
+    /// section 5b): for a widget of several ids that shares press state.
+    primary_only: bool = false,
+    unused: u2 = 0,
 };
 
 /// One hit area. See the module guide, section 3.

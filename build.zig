@@ -691,7 +691,16 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(vector.install);
     add_example_steps(b, "-vector", "the filled shapes", vector);
-    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session, vector };
+    const touch = addApp(b, b, .{
+        .name = "touch",
+        .root_source_file = b.path("examples/touch/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    b.getInstallStep().dependOn(touch.install);
+    add_example_steps(b, "-touch", "the multi-touch pads and sliders", touch);
+    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session, vector, touch };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
@@ -762,7 +771,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [12]AppSteps,
+    examples: [13]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

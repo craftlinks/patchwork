@@ -237,7 +237,13 @@ pub const over_layer: draw.Layer = @fromBackingInt(1);
 pub const caret_px: f32 = 2;
 
 /// The editor's area flags (section 1).
-pub const flags: ui.Flags = .{ .wheel = false, .focusable = true, .tab = true, .cursor = .text };
+pub const flags: ui.Flags = .{
+    .wheel = false,
+    .focusable = true,
+    .tab = true,
+    .cursor = .text,
+    .primary_only = true,
+};
 
 /// Colours, straight RGBA, of an editor of language `L`: `classes` is indexed by `L.Class`
 /// (section 8).

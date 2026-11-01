@@ -70,6 +70,7 @@ pub const field_flags: ui.Flags = .{
     .focusable = true,
     .tab = false,
     .cursor = .text,
+    .primary_only = true,
 };
 /// Text field metrics in logical pixels: the text inset, the face's corner radius and border,
 /// and the caret's inset from the top and bottom.

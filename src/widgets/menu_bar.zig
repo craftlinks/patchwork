@@ -64,6 +64,7 @@ pub const menubar_title_flags: ui.Flags = .{
     .focusable = false,
     .tab = false,
     .cursor = .default,
+    .primary_only = true,
 };
 
 /// The default bar: `MenuBarOf(skins.Default)`.
