@@ -2,6 +2,11 @@
 """Browser check: an app's scenario replayed in Chromium against its headless regress frame.
 
 Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port N] [--cdp N] [--reuse]
+       [--root DIR]
+
+`--root DIR` names the tree that holds the app: its `zig-out/bin/<app>`, its golden files, and its
+`serve-<app>` step, for an app in a package of its own (Weft's Play). The default is this
+repository, so every other use is unchanged. Every path and step below is under that root.
 
 1. Renders the scenario headless on the high adapter with `zig-out/bin/<app> --regress --only
    <scenario> --adapter high --keep`, which leaves the reference frame in
@@ -301,6 +306,14 @@ def main(argv):
     reuse = "--reuse" in argv
     port = None
     cdp_port = None
+    root = ROOT
+    if "--root" in argv:
+        value = argv[argv.index("--root") + 1]
+        args.remove(value)
+        root = os.path.abspath(os.path.expanduser(value))
+        if not os.path.isdir(root):
+            print(f"browser_check: --root {root} is not a directory")
+            return 2
     for flag in ("--port", "--cdp"):
         if flag in argv:
             value = int(argv[argv.index(flag) + 1])
@@ -319,16 +332,16 @@ def main(argv):
         print(__doc__.strip().splitlines()[2])
         return 2
     app, scenario = args
-    out_dir = os.path.join(ROOT, "zig-out", "regress", app)
+    out_dir = os.path.join(root, "zig-out", "regress", app)
     reference_path = os.path.join(out_dir, f"{scenario}-high-on.png")
 
-    exe = os.path.join(ROOT, "zig-out", "bin", app)
+    exe = os.path.join(root, "zig-out", "bin", app)
     if not os.path.exists(exe):
         print(f"browser_check: {exe} is missing; run zig build -Doptimize=ReleaseFast")
         return 2
     regress = subprocess.run(
         [exe, "--regress", "--only", scenario, "--adapter", "high", "--keep"],
-        cwd=ROOT,
+        cwd=root,
         capture_output=True,
         text=True,
     )
@@ -353,11 +366,11 @@ def main(argv):
             if port_open(port):
                 print(f"browser_check: :{port} is taken; pass another --port, or --reuse")
                 return 2
-            step = "serve" if app == "rack" else f"serve-{app}"
+            step = "serve" if app == "rack" and root == ROOT else f"serve-{app}"
             print(f"server: zig build {step} on :{port}")
             server = subprocess.Popen(
                 [os.environ.get("ZIG", "zig"), "build", step],
-                cwd=ROOT,
+                cwd=root,
                 env=dict(os.environ, PATCHWORK_SERVE_PORT=str(port)),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

@@ -389,6 +389,7 @@ zig build test-consumer   # test/consumer, a package outside this build: native,
                           # and regress, its tool, and an argument (needs a GPU)
 ./zig-out/bin/gallery --render still --out frames     # A scenario's frames as PNGs
 python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
+python3 -I tools/browser_check.py --root ../app myapp still   # The same, for an app in another tree
 
 # Bench mode (see Bench Mode below)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
@@ -1722,7 +1723,8 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   `tools/browser_check.py <app> <scenario>` (standard library only) renders the headless
   frame, serves the app, drives system Chromium over CDP, and compares the screenshot: it
   passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
-  console errors.
+  console errors. `--root DIR` checks an app in another tree, a package of its own: the
+  executable, the reference frame, and the `serve-<app>` step are all taken from `DIR`.
 
 ## Rendering Frames
 
