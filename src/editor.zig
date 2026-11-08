@@ -7,6 +7,7 @@
 //! editor/language.zig  the language contract (State, Class, palette, next) and its check
 //! editor/buffer.zig     the text (64 KiB, contiguous), line index, start states, undo
 //! editor/tokenizer.zig  the patch language, the default: per-line states, seven classes
+//! editor/literal.zig    number literals a widget writes back digit for digit, and range shifts
 //! editor/editor.zig     the widget: geometry, drawing, keys, pointer, scrolling, rows
 //! ```
 //! The editor draws through `text/mono.zig` (one column per codepoint, the same glyph
@@ -32,6 +33,7 @@ const editor = @import("editor/editor.zig");
 pub const buffer = @import("editor/buffer.zig");
 pub const tokenizer = @import("editor/tokenizer.zig");
 pub const language = @import("editor/language.zig");
+pub const literal = @import("editor/literal.zig");
 
 pub const EditorOf = editor.EditorOf;
 pub const PaletteOf = editor.PaletteOf;
@@ -70,5 +72,6 @@ test {
     _ = buffer;
     _ = tokenizer;
     _ = language;
+    _ = literal;
     _ = editor;
 }

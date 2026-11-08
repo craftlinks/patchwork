@@ -694,7 +694,7 @@ pub const App = struct {
         if (!app.editor.replace(.{ .start = range.start, .end = range.end }, bytes)) return;
         const delta = @as(i32, @intCast(bytes.len)) - @as(i32, @intCast(range.end - range.start));
         app.parse.shift(range.end, delta);
-        entry.*.?.range.end = range.start + @as(u32, @intCast(bytes.len));
+        assert(entry.*.?.range.end == range.start + @as(u32, @intCast(bytes.len)));
         entry.*.?.number = number;
         app.parsed_revision = app.editor.revision();
         app.decorate();
