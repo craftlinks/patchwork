@@ -37,8 +37,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const patch = @import("patch.zig");
+const fixed_point = @import("patchwork").editor.literal;
 
-pub const Span = struct { start: u32, end: u32 };
+/// A byte range of the text, the editor's own, so `editor.literal.shift` moves it.
+pub const Span = fixed_point.Range;
 
 /// The values the text holds, by where they go.
 pub const Slot = enum(u8) {
@@ -214,30 +216,15 @@ pub const Parse = struct {
         self.flag(scan, index + 5, slot);
     }
 
-    /// Moves every range at or past `after` by `delta` (section 1).
+    /// Moves every range edge at or past `after` by `delta` (section 1), as
+    /// `editor.literal.shift` does: the rewritten literal's own end moves with it.
     pub fn shift(self: *Parse, after: u32, delta: i32) void {
         for (&self.values) |*entry| {
-            if (entry.*) |*value| {
-                if (value.range.start >= after) {
-                    value.range.start = moved(value.range.start, delta);
-                    value.range.end = moved(value.range.end, delta);
-                }
-            }
+            if (entry.*) |*value| fixed_point.shift(&value.range, after, delta);
         }
-        for (self.errors[0..self.error_count]) |*span| {
-            if (span.start >= after) {
-                span.start = moved(span.start, delta);
-                span.end = moved(span.end, delta);
-            }
-        }
+        for (self.errors[0..self.error_count]) |*span| fixed_point.shift(span, after, delta);
     }
 };
-
-fn moved(byte: u32, delta: i32) u32 {
-    const at: i64 = @as(i64, byte) + delta;
-    assert(at >= 0);
-    return @intCast(at);
-}
 
 /// One line's tokens over the text.
 const Scan = struct {
@@ -434,7 +421,7 @@ test "shift agrees with a full parse after every write" {
         const rewritten = buffer[0 .. start + swap.len + tail.len];
         const delta = @as(i32, @intCast(swap.len)) - @as(i32, @intCast(end - start));
         parsed.shift(end, delta);
-        parsed.values[index].?.range.end = @intCast(start + swap.len);
+        try testing.expectEqual(@as(u32, @intCast(start + swap.len)), parsed.values[index].?.range.end);
         const full = Parse.run(rewritten);
         for (parsed.values, full.values) |shifted, whole| {
             try testing.expectEqual(whole.?.range, shifted.?.range);

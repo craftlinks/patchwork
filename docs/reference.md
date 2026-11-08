@@ -154,6 +154,7 @@ patchwork/
 │   ├── editor/language.zig     # The language contract (State, Class, palette, faces, scales, next)
 │   ├── editor/buffer.zig       # 64 KiB contiguous text, line index, start states, undo arena
 │   ├── editor/tokenizer.zig    # The patch language (the default): per-line states, seven classes
+│   ├── editor/literal.zig      # Number literals a widget writes back digit for digit; range shifts
 │   ├── editor/editor.zig       # The editor widget: grid, view, keys, selection, rows
 │   ├── draw.zig                # Drawing namespace: projection, unit quad, dirty ranges, re-exports
 │   ├── draw/registry.zig       # DrawType, instance convention check, WGSL assembly, layouts
@@ -215,7 +216,7 @@ patchwork/
 │   │   └── app.zig             # Column App (config.timer_period_ms = 0)
 │   ├── live/                   # Live-coding screen
 │   │   ├── app.zig             # Live App: header, editor, knob column, curves, lanes, transport
-│   │   ├── bindings.zig        # Binding parser: k() calls, shape() calls, bpm, fixed point
+│   │   ├── bindings.zig        # Binding parser: k() calls, shape() calls, bpm
 │   │   ├── knob.zig            # The bound knob: any ring size, value text inside the ring
 │   │   ├── lanes.zig           # Transport and automation lanes: in-place rings, playhead
 │   │   ├── shaper.zig          # The inline shaper row's transfer curve
@@ -2278,6 +2279,16 @@ app.editor.draw(cx, ui.sized(.fill, .fill));                 // or the row itera
   `replace_keeping(range, utf8, after)` takes the selection from the caller and keeps it in the
   undo entry, for an edit that moves text, whose caret should move with it. `undo(cx)` and
   `redo(cx)` are what Ctrl+Z and Ctrl+Y do, for an app that routes them with no focus on the text.
+- **Number literals** (`editor.literal`, step 53), for an app that binds widgets to numbers in
+  its text. A literal is fixed point, `units / 10^decimals` (`Fixed`), so a widget writes back
+  exactly the digits it read: `parse` and `format` round trip every spelling within 9 integer
+  digits and 6 decimals, `.25` included. `steps(lo, value, hi)` is a widget's range at the
+  value's decimals, `fixed.with_units(units)` the same literal at a new value, and
+  `write(&editor, range, fixed)` one `replace` that returns the change in length, which
+  `shift(&range, at, delta)` applies to every range the app keeps. The protocol, in the module's
+  guide: a parse never writes and a write never parses; a grab opens `gesture_begin`, each step
+  writes and shifts, the release closes `gesture_end` (one undo entry) and parses once.
+  `examples/live` and `examples/session` follow it; the grammars stay in the apps.
 
 ## Text
 

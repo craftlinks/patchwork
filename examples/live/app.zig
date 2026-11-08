@@ -82,6 +82,7 @@ const ui = patchwork.ui;
 const widgets = patchwork.widgets;
 const kit = widgets.kit;
 const editor = patchwork.editor;
+const fixed_point = editor.literal;
 const bindings = @import("bindings.zig");
 const knob = @import("knob.zig");
 const shaper = @import("shaper.zig");
@@ -416,7 +417,7 @@ pub const App = struct {
         if (app.transport.recording) {
             const head = app.transport.head;
             for (0..app.parse.binding_count) |index| {
-                const value = bindings.to_f32(app.parse.bindings[index].value.fixed);
+                const value = fixed_point.to_f32(app.parse.bindings[index].value.fixed);
                 _ = app.lanes.write(@intCast(index), head, value);
             }
         }
@@ -501,7 +502,7 @@ pub const App = struct {
         for (0..app.parse.binding_count) |index| {
             var buffer: [label_cap]u8 = undefined;
             const lane_key = lanes.key_of(app.label_of(@intCast(index), &buffer));
-            const value = bindings.to_f32(app.parse.bindings[index].value.fixed);
+            const value = fixed_point.to_f32(app.parse.bindings[index].value.fixed);
             app.lanes.bind(@intCast(index), lane_key, value);
         }
         app.decorate();
@@ -733,7 +734,7 @@ pub const App = struct {
         var target = binding.step_lo;
         for (app.defaults[0..app.default_count]) |default| {
             if (default.key != lane_key) continue;
-            const units = bindings.rescale(default.fixed, binding.value.fixed.decimals, .nearest);
+            const units = fixed_point.rescale(default.fixed, binding.value.fixed.decimals, .nearest);
             target = std.math.clamp(units, binding.step_lo, binding.step_hi);
             break;
         }
@@ -749,20 +750,15 @@ pub const App = struct {
         assert(units >= binding.step_lo);
         assert(units <= binding.step_hi);
         if (units == binding.value.fixed.units) return false;
-        var fixed = binding.value.fixed;
-        fixed.units = units;
-        fixed.bare = fixed.bare and @abs(units) < bindings.pow10(fixed.decimals);
-        var out: [literal_cap]u8 = undefined;
-        const bytes = bindings.format_fixed(&out, fixed);
+        const fixed = binding.value.fixed.with_units(units);
         const old = binding.value.range;
-        if (!app.editor.replace(old, bytes)) {
+        const delta = fixed_point.write(&app.editor, old, fixed) orelse {
             app.set_status("knob");
             return false;
-        }
-        const delta = @as(i32, @intCast(bytes.len)) - @as(i32, @intCast(old.end - old.start));
+        };
         app.parse.shift(old.end, delta);
         binding.value.fixed = fixed;
-        assert(binding.value.range.end - binding.value.range.start == bytes.len);
+        assert(binding.value.range.end - binding.value.range.start == fixed_point.moved(old.end - old.start, delta));
         app.parsed_revision = app.editor.revision();
         app.decorate();
         app.status_len = 0;
@@ -802,7 +798,7 @@ pub const App = struct {
             };
             app.draw_shape_knob(cx, slot.index, @intCast(arg), ring);
             if (shape.bound[arg]) |target| {
-                values[arg] = bindings.to_f32(app.parse.bindings[target].value.fixed);
+                values[arg] = fixed_point.to_f32(app.parse.bindings[target].value.fixed);
             }
         }
         const plot_x = row.x + 2 * inline_pad_px + bindings.shape_args * inline_cell_px;
@@ -972,8 +968,8 @@ pub const App = struct {
     /// changed sample is one changed point (section 5).
     fn draw_lane(app: *App, cx: *Context, index: u8, lane: Rect, clip: Clip) void {
         const binding = &app.parse.bindings[index];
-        const low = bindings.to_f32(binding.lo.fixed);
-        const high = bindings.to_f32(binding.hi.fixed);
+        const low = fixed_point.to_f32(binding.lo.fixed);
+        const high = fixed_point.to_f32(binding.hi.fixed);
         const range: [2]f32 = .{ low, high };
         var points: [lanes.sample_count]Point = undefined;
         quads.path.plot_points(&points, app.lanes.samples(index), lane, range);

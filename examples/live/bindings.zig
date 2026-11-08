@@ -25,10 +25,9 @@
 //! a nameless knob is labelled `#n`.
 //!
 //! ## 3. Fixed Point
-//! A literal is `units / 10^decimals` with `units` an `i64`, parsed and formatted with integer
-//! arithmetic only, so a knob writes back exactly the digits it read. `bare` remembers the
-//! `.25` style (no integer digit). A binding's steps are `lo` rounded up and `hi` rounded down
-//! to the value's decimals, so a knob moves in steps of the value's last digit.
+//! Literals are `editor.literal`'s fixed point, so a knob writes back exactly the digits it
+//! read. A binding's steps are `editor.literal.steps` of its three literals: `lo` rounded up
+//! and `hi` rounded down to the value's decimals, so a knob moves in steps of its last digit.
 //!
 //! ## 4. Caps
 //! The first `binding_cap` well-formed calls bind; later ones are counted in `call_count`
@@ -45,6 +44,7 @@ const assert = std.debug.assert;
 const patchwork = @import("patchwork");
 const editor = patchwork.editor;
 const tokenizer = editor.tokenizer;
+const fixed_point = editor.literal;
 
 pub const Range = editor.buffer.Range;
 pub const Buffer = editor.buffer.Buffer;
@@ -55,19 +55,10 @@ pub const binding_cap: u32 = 64;
 pub const shape_cap: u32 = editor.row_cap;
 /// Errors kept; one box per binding plus every error fit the editor's decorations.
 pub const error_cap: u32 = editor.decoration_cap - binding_cap;
-pub const integer_digits_max: u32 = 9;
-pub const decimals_max: u32 = 6;
-/// Bytes of the longest literal: a sign, 9 digits, a point, and 6 decimals.
-pub const literal_cap: u32 = 1 + integer_digits_max + 1 + decimals_max;
+pub const literal_cap = fixed_point.literal_cap;
 pub const shape_args: u32 = 4;
 
-/// `units / 10^decimals` (section 3).
-pub const Fixed = struct {
-    units: i64,
-    decimals: u8,
-    /// Written without an integer digit, as in `.25`.
-    bare: bool,
-};
+pub const Fixed = fixed_point.Fixed;
 
 /// A number in the text and its value.
 pub const Literal = struct {
@@ -141,18 +132,18 @@ pub const Parse = struct {
     /// because the bytes before it changed length (a rewritten literal ending at `at`).
     pub fn shift(self: *Parse, at: u32, delta: i32) void {
         for (self.bindings[0..self.binding_count]) |*binding| {
-            shift_range(&binding.call, at, delta);
-            shift_range(&binding.lo.range, at, delta);
-            shift_range(&binding.value.range, at, delta);
-            shift_range(&binding.hi.range, at, delta);
-            shift_range(&binding.name, at, delta);
+            fixed_point.shift(&binding.call, at, delta);
+            fixed_point.shift(&binding.lo.range, at, delta);
+            fixed_point.shift(&binding.value.range, at, delta);
+            fixed_point.shift(&binding.hi.range, at, delta);
+            fixed_point.shift(&binding.name, at, delta);
         }
         for (self.shapes[0..self.shape_count]) |*shape| {
-            shift_range(&shape.call, at, delta);
-            for (&shape.args) |*arg| shift_range(arg, at, delta);
+            fixed_point.shift(&shape.call, at, delta);
+            for (&shape.args) |*arg| fixed_point.shift(arg, at, delta);
         }
-        for (self.errors[0..self.error_count]) |*range| shift_range(range, at, delta);
-        if (self.bpm) |*bpm| shift_range(&bpm.range, at, delta);
+        for (self.errors[0..self.error_count]) |*range| fixed_point.shift(range, at, delta);
+        if (self.bpm) |*bpm| fixed_point.shift(&bpm.range, at, delta);
     }
 
     fn run_line(self: *Parse, buffer: *const Buffer, line: u32) void {
@@ -222,7 +213,7 @@ pub const Parse = struct {
         if (!scan.is(assign, ":=")) return;
         const number = scan.next() orelse return;
         if (number.class != .number) return;
-        const fixed = parse_fixed(scan.bytes[number.start..number.end]) orelse return;
+        const fixed = fixed_point.parse(scan.bytes[number.start..number.end]) orelse return;
         if (fixed.decimals != 0) return;
         const range: Range = .{ .start = base + number.start, .end = base + number.end };
         self.bpm = .{ .range = range, .fixed = fixed };
@@ -290,18 +281,16 @@ fn binding_tail(scan: *Scan, head: tokenizer.Token, base: u32) Found {
         close = scan.next() orelse return .{ .broken = scan.end() };
     }
     if (!scan.is(close, ")")) return .{ .broken = close.end };
-    const decimals = literals[1].fixed.decimals;
-    const step_lo = rescale(literals[0].fixed, decimals, .up);
-    const step_hi = rescale(literals[2].fixed, decimals, .down);
-    if (step_lo >= step_hi) return .{ .broken = close.end };
+    const steps = fixed_point.steps(literals[0].fixed, literals[1].fixed, literals[2].fixed) orelse
+        return .{ .broken = close.end };
     return .{ .bound = .{
         .call = .{ .start = base + head.start, .end = base + close.end },
         .lo = literals[0],
         .value = literals[1],
         .hi = literals[2],
         .name = name,
-        .step_lo = step_lo,
-        .step_hi = step_hi,
+        .step_lo = steps.lo,
+        .step_hi = steps.hi,
     } };
 }
 
@@ -352,7 +341,7 @@ const Scan = struct {
             self.failed = token.end;
             return null;
         }
-        const fixed = parse_fixed(self.bytes[start..token.end]) orelse {
+        const fixed = fixed_point.parse(self.bytes[start..token.end]) orelse {
             self.failed = token.end;
             return null;
         };
@@ -382,120 +371,9 @@ fn range_before(context: void, a: Range, b: Range) bool {
     return a.start < b.start;
 }
 
-fn shift_range(range: *Range, at: u32, delta: i32) void {
-    if (range.start >= at) range.start = moved(range.start, delta);
-    if (range.end >= at) range.end = moved(range.end, delta);
-    assert(range.start <= range.end);
-}
-
-fn moved(byte: u32, delta: i32) u32 {
-    const result = @as(i64, byte) + delta;
-    assert(result >= 0);
-    return @intCast(result);
-}
-
-/// Parses `[-] digits [. digits]` or `[-] . digits` (section 3), or null.
-pub fn parse_fixed(bytes: []const u8) ?Fixed {
-    if (bytes.len == 0) return null;
-    if (bytes.len > literal_cap) return null;
-    const negative = bytes[0] == '-';
-    var index: usize = @intFromBool(negative);
-    var units: i64 = 0;
-    var integer_digits: u32 = 0;
-    while (index < bytes.len and std.ascii.isDigit(bytes[index])) : (index += 1) {
-        units = units * 10 + (bytes[index] - '0');
-        integer_digits += 1;
-    }
-    var decimals: u32 = 0;
-    if (index < bytes.len and bytes[index] == '.') {
-        index += 1;
-        while (index < bytes.len and std.ascii.isDigit(bytes[index])) : (index += 1) {
-            units = units * 10 + (bytes[index] - '0');
-            decimals += 1;
-        }
-        if (decimals == 0) return null;
-    }
-    if (index != bytes.len) return null;
-    if (integer_digits == 0 and decimals == 0) return null;
-    if (integer_digits > integer_digits_max) return null;
-    if (decimals > decimals_max) return null;
-    const fixed: Fixed = .{
-        .units = if (negative) -units else units,
-        .decimals = @intCast(decimals),
-        .bare = integer_digits == 0,
-    };
-    assert(fixed.decimals <= decimals_max);
-    return fixed;
-}
-
-/// Writes `fixed` with exactly its decimals; the bare style holds only below 1 (section 3).
-pub fn format_fixed(out: *[literal_cap]u8, fixed: Fixed) []const u8 {
-    assert(fixed.decimals <= decimals_max);
-    const scale = pow10(fixed.decimals);
-    const magnitude: u64 = @abs(fixed.units);
-    const whole = magnitude / scale;
-    const fraction = magnitude % scale;
-    var length: usize = 0;
-    if (fixed.units < 0) {
-        out[0] = '-';
-        length = 1;
-    }
-    if (!(fixed.bare and whole == 0 and fixed.decimals > 0)) {
-        const printed = std.fmt.bufPrint(out[length..], "{d}", .{whole}) catch unreachable;
-        length += printed.len;
-    }
-    if (fixed.decimals > 0) {
-        out[length] = '.';
-        length += 1;
-        var digit: u32 = fixed.decimals;
-        while (digit > 0) : (digit -= 1) {
-            const place = pow10(@intCast(digit - 1));
-            out[length] = '0' + @as(u8, @intCast((fraction / place) % 10));
-            length += 1;
-        }
-    }
-    assert(length <= literal_cap);
-    return out[0..length];
-}
-
-/// `fixed` in steps of `decimals` decimals, rounded `way` when it has more.
-pub fn rescale(fixed: Fixed, decimals: u8, way: enum { up, down, nearest }) i64 {
-    assert(decimals <= decimals_max);
-    if (decimals >= fixed.decimals) {
-        return fixed.units * @as(i64, @intCast(pow10(decimals - fixed.decimals)));
-    }
-    const divisor: i64 = @intCast(pow10(fixed.decimals - decimals));
-    return switch (way) {
-        .down => @divFloor(fixed.units, divisor),
-        .up => -@divFloor(-fixed.units, divisor),
-        // Halves round away from zero, so the rounding is symmetric about 0.
-        .nearest => if (fixed.units >= 0)
-            @divFloor(fixed.units * 2 + divisor, divisor * 2)
-        else
-            -@divFloor(-fixed.units * 2 + divisor, divisor * 2),
-    };
-}
-
-pub fn pow10(exponent: u8) u64 {
-    assert(exponent <= decimals_max + integer_digits_max);
-    var result: u64 = 1;
-    var index: u8 = 0;
-    while (index < exponent) : (index += 1) result *= 10;
-    return result;
-}
-
-/// `fixed` as an `f32`, for display and the lanes.
-pub fn to_f32(fixed: Fixed) f32 {
-    const scale: f32 = @floatFromInt(pow10(fixed.decimals));
-    return @as(f32, @floatFromInt(fixed.units)) / scale;
-}
-
 comptime {
     assert(binding_cap + error_cap == editor.decoration_cap);
     assert(shape_cap == 32);
-    assert(literal_cap == 17);
-    // 9 integer digits and 6 decimals stay far inside an i64.
-    assert(pow10(integer_digits_max + decimals_max) < std.math.maxInt(i64) / 10);
 }
 
 // ------------------------------------------------------------------------------ tests
@@ -636,51 +514,6 @@ test "shape arguments resolve by name and the excess are errors" {
     const many = parsed(source[0 .. 33 * 20 - 1]);
     try testing.expectEqual(shape_cap, many.shape_count);
     try testing.expectEqual(@as(u32, 32 * 4 + 1), many.error_total);
-}
-
-// Locks the fixed-point algebra: literals parse to units and decimals and format back to the
-// same bytes, carries and sign changes keep the decimals (9.99 + 0.01 is 10.00, -0.01 + 0.01
-// is 0.00), the bare style holds below 1, and bounds round inward to the value's decimals.
-test "literals round trip at their decimals" {
-    var out: [literal_cap]u8 = undefined;
-    const samples = [_][]const u8{ "0.023", "-0.98", ".25", "10", "4000", "-0.5", "0.000001" };
-    for (samples) |sample| {
-        const fixed = parse_fixed(sample).?;
-        try testing.expectEqualStrings(sample, format_fixed(&out, fixed));
-    }
-    try testing.expectEqualStrings("10.00", format_fixed(&out, .{
-        .units = 1000,
-        .decimals = 2,
-        .bare = false,
-    }));
-    try testing.expectEqualStrings("0.00", format_fixed(&out, .{
-        .units = 0,
-        .decimals = 2,
-        .bare = false,
-    }));
-    try testing.expectEqualStrings("-0.01", format_fixed(&out, .{
-        .units = -1,
-        .decimals = 2,
-        .bare = false,
-    }));
-    try testing.expectEqualStrings(".30", format_fixed(&out, .{
-        .units = 30,
-        .decimals = 2,
-        .bare = true,
-    }));
-    try testing.expectEqualStrings("1.00", format_fixed(&out, .{
-        .units = 100,
-        .decimals = 2,
-        .bare = true,
-    }));
-    try testing.expectEqual(@as(?Fixed, null), parse_fixed("1e3"));
-    try testing.expectEqual(@as(?Fixed, null), parse_fixed("1."));
-    try testing.expectEqual(@as(?Fixed, null), parse_fixed("-"));
-    try testing.expectEqual(@as(i64, 1), rescale(parse_fixed("0.001").?, 2, .up));
-    try testing.expectEqual(@as(i64, 99), rescale(parse_fixed("0.999").?, 2, .down));
-    try testing.expectEqual(@as(i64, -98), rescale(parse_fixed("-0.975").?, 2, .nearest));
-    try testing.expectEqual(@as(i64, 4000), rescale(parse_fixed("40").?, 2, .down));
-    try testing.expectApproxEqAbs(@as(f32, -0.98), to_f32(parse_fixed("-0.98").?), 1e-6);
 }
 
 // Locks `shift`: rewriting the first value of two lines from "0.5" to "0.75" moves every edge
