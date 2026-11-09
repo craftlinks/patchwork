@@ -130,6 +130,19 @@
 // blocks: `on_audio` copies them into `audio_inbox_ptr()` and calls `audio_push`, and schedules
 // a frame when it returns 1; `tick` drains the queue. No `SharedArrayBuffer`, no cross-origin
 // isolation.
+//
+// ## 9a. The App's Web Module
+// Before the wasm is instantiated the shell imports `./app.js`, the app's own ES module
+// (`AppOptions.web_module`, or Patchwork's empty `web/app.js`). If it exports `imports(shell)`,
+// the object it returns joins `env` beside `submit_js`, so the app's wasm may import functions
+// of its own; a name Patchwork already provides is an error, shown and thrown. After
+// `wasm.start()` the shell calls its `started(shell)`, if exported. `shell` is
+// `{ wasm, memory, wake, canvas }`: `wasm` and `memory` are null until the instance exists, so
+// an import reads them when it is called, not when it is made; `wake()` schedules one frame,
+// whose `tick` calls the app's `drain` (`src/host/web_exports.zig`, section 4b'). A module that
+// delivers data from another realm, such as a peer's AudioWorklet, copies it into the wasm
+// through the app's own exports and then calls `wake()`. Its own worklet or worker must start
+// inside a user gesture: a wasm import called from an input handler has the page's activation.
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
@@ -162,6 +175,8 @@ let timerInterval = 0;
 // The audio context once audio first started, and whether it was last resumed (section 9).
 let audioContext = null;
 let audioApplied = false;
+// What the app's web module is handed (section 9a).
+const shell = { wasm: null, memory: null, wake: () => schedule(), canvas };
 // Frames per Web Audio render quantum, and interleaved samples per block.
 const BLOCK_SAMPLES = 128 * 2;
 const textEncoder = new TextEncoder();
@@ -1183,12 +1198,24 @@ async function main() {
         alphaMode: "opaque",
     });
 
+    const app = await import("./app.js");
+    const env = { submit_js };
+    if (typeof app.imports === "function") {
+        for (const [name, value] of Object.entries(app.imports(shell))) {
+            if (name in env) {
+                const message = `app.js: the import ${name} is Patchwork's own`;
+                console.error(message);
+                throw new Error(message);
+            }
+            env[name] = value;
+        }
+    }
     const response = await fetch("patchwork.wasm");
-    const imported = await WebAssembly.instantiateStreaming(response, {
-        env: { submit_js },
-    });
+    const imported = await WebAssembly.instantiateStreaming(response, { env });
 
     wasm = imported.instance.exports;
+    shell.wasm = wasm;
+    shell.memory = wasm.memory;
     load_table();
     const names = new Uint8Array(
         wasm.memory.buffer,
@@ -1202,6 +1229,9 @@ async function main() {
     const scopes = setupScopes;
     setupScopes = null;
     await Promise.all(scopes);
+    if (typeof app.started === "function") {
+        app.started(shell);
+    }
 
     if (benchScenario !== null) {
         start_replay();

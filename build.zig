@@ -53,8 +53,9 @@
 //!   pkg-config (`link_xkbcommon`): a consumer's build machine needs both `.so` files and
 //!   their `.pc` files, and its users need both libraries. The wasm build links nothing.
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
-//! - `serve` serves the page, `shell.js`, the wasm, and `worklet.js` through `src/serve.zig`,
-//!   which owns the address and port.
+//! - `serve` serves the page, `shell.js`, the wasm, `worklet.js`, and `app.js`, the app's web
+//!   module (`AppOptions.web_module`, or `web/app.js`, which exports nothing), and the app's own
+//!   `web_files`, through `src/serve.zig`, which owns the address and port (step 54).
 //! - `bench` runs the installed native executable with `--bench` and the arguments after
 //!   `--`: a scenario name, `--frames`, `--adapter`, `--dump`, `--csv` (`src/bench.zig`).
 //!   Build with `-Doptimize=ReleaseFast` for numbers that mean something; the report names
@@ -160,6 +161,10 @@ pub const wasm_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .free
 /// A module an app or a tool imports by `name` (section 7).
 pub const Import = struct { name: []const u8, module: *std.Build.Module };
 
+/// A file the app's page needs beyond Patchwork's own, served at `route`, which starts with `/`
+/// (`web/shell.js`, section 9a).
+pub const WebFile = struct { route: []const u8, path: std.Build.LazyPath };
+
 /// Options for `addApp`. `target` applies to the native executable and the tests, and
 /// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
 pub const AppOptions = struct {
@@ -183,6 +188,11 @@ pub const AppOptions = struct {
     native_imports: []const Import = &.{},
     /// Modules for the wasm app module. A name here must be in `native_imports`.
     wasm_imports: []const Import = &.{},
+    /// The app's web module, an ES module served as `/app.js` that the shell imports before it
+    /// instantiates the wasm (`web/shell.js`, section 9a). Null serves Patchwork's empty one.
+    web_module: ?std.Build.LazyPath = null,
+    /// Files the app's page fetches, each served at its route.
+    web_files: []const WebFile = &.{},
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -676,10 +686,16 @@ fn add_serve(
     });
     const serve_run = b.addRunArtifact(serve_exe);
     serve_run.step.dependOn(wasm_install);
-    serve_run.addFileArg(patchwork_builder.path("web/index.html"));
-    serve_run.addFileArg(patchwork_builder.path("web/shell.js"));
-    serve_run.addFileArg(wasm.getEmittedBin());
-    serve_run.addFileArg(patchwork_builder.path("web/worklet.js"));
+    // `ROUTE=PATH` pairs (`src/serve.zig`, section 2): Patchwork's five, then the app's files.
+    serve_run.addPrefixedFileArg("/index.html=", patchwork_builder.path("web/index.html"));
+    serve_run.addPrefixedFileArg("/shell.js=", patchwork_builder.path("web/shell.js"));
+    serve_run.addPrefixedFileArg("/patchwork.wasm=", wasm.getEmittedBin());
+    serve_run.addPrefixedFileArg("/worklet.js=", patchwork_builder.path("web/worklet.js"));
+    const module = options.web_module orelse patchwork_builder.path("web/app.js");
+    serve_run.addPrefixedFileArg("/app.js=", module);
+    for (options.web_files) |file| {
+        serve_run.addPrefixedFileArg(b.fmt("{s}=", .{file.route}), file.path);
+    }
     return &serve_run.step;
 }
 

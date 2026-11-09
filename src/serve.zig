@@ -11,11 +11,16 @@
 //! file keeps the toolchain at Zig alone, with no Python, Node, or Go server needed.
 //!
 //! ## 2. Contract
-//! - Command line: four file paths, in order, for the page, `shell.js`, the wasm, and
-//!   `worklet.js` (the AudioWorklet processor, `web/worklet.js`).
-//!   `build.zig` (`add_serve`) passes them. Relative paths resolve against the working
-//!   directory.
-//! - Routes are exact path matches after the query string is dropped. Anything else gets 404.
+//! - Command line: `ROUTE=PATH` pairs, at most `routes_max`, each a route that starts with `/`
+//!   and the file it serves. `build.zig` (`add_serve`) passes Patchwork's five, `/index.html`,
+//!   `/shell.js`, `/patchwork.wasm`, `/worklet.js`, and `/app.js` (the app's web module, or
+//!   `web/app.js`), then the app's own `web_files` (step 54). Relative paths resolve against the
+//!   working directory. Every file is opened once at startup, so a missing one fails there,
+//!   naming its route, and not on a request; a route given twice or without `/index.html` is
+//!   refused too.
+//! - Routes are exact path matches after the query string is dropped; `/` is `/index.html`.
+//!   Anything else gets 404. The content type is the route's extension's: `.html`, `.js`,
+//!   `.wasm`, `.json`, `.wav`, `.css`, else `application/octet-stream`.
 //! - The server binds loopback only, on `listen_port` (8080) or on the port the environment
 //!   variable `PATCHWORK_SERVE_PORT` names (decimal, 1 to 65535; anything else fails at
 //!   startup), handles one connection at a time, and closes each connection after one
@@ -41,15 +46,87 @@ const listen_port: u16 = 8080;
 /// The environment variable that overrides `listen_port`.
 pub const port_env: []const u8 = "PATCHWORK_SERVE_PORT";
 
-const Paths = struct {
-    index: []const u8,
-    shell: []const u8,
-    wasm: []const u8,
-    worklet: []const u8,
+/// The most routes one server takes (section 2).
+pub const routes_max: u32 = 32;
+
+/// One `ROUTE=PATH` pair from the command line.
+pub const Route = struct {
+    route: []const u8,
+    path: []const u8,
 };
 
+/// The routes a server answers (section 2).
+pub const Routes = struct {
+    items: [routes_max]Route,
+    count: u32,
+
+    pub const empty: Routes = .{ .items = undefined, .count = 0 };
+
+    /// The route for `target`, `/` being `/index.html`, or null.
+    pub fn find(routes: *const Routes, target: []const u8) ?Route {
+        assert(routes.count <= routes_max);
+        const wanted = if (std.mem.eql(u8, target, "/")) "/index.html" else target;
+        for (routes.items[0..routes.count]) |item| {
+            if (std.mem.eql(u8, item.route, wanted)) return item;
+        }
+        return null;
+    }
+};
+
+pub const RouteError = error{ BadRoute, DuplicateRoute, TooManyRoutes, MissingIndexHtml };
+
+/// Splits `ROUTE=PATH` at its first `=`: the route must start with `/`, and neither side be empty.
+pub fn route_parse(text: []const u8) RouteError!Route {
+    const at = std.mem.findScalar(u8, text, '=') orelse return error.BadRoute;
+    const route = text[0..at];
+    const path = text[at + 1 ..];
+    if (route.len < 2 or route[0] != '/') return error.BadRoute;
+    if (path.len == 0) return error.BadRoute;
+    assert(route.len + path.len + 1 == text.len);
+    return .{ .route = route, .path = path };
+}
+
+/// Every pair of `texts` into `routes`, in order (section 2).
+pub fn routes_parse(texts: []const []const u8, routes: *Routes) RouteError!void {
+    routes.* = .empty;
+    for (texts) |text| {
+        if (routes.count == routes_max) return error.TooManyRoutes;
+        const item = try route_parse(text);
+        if (routes.find(item.route) != null) return error.DuplicateRoute;
+        routes.items[routes.count] = item;
+        routes.count += 1;
+    }
+    if (routes.find("/index.html") == null) return error.MissingIndexHtml;
+    assert(routes.count <= routes_max);
+}
+
+/// The content type a route is served with, by its extension (section 2).
+pub fn content_type_of(route: []const u8) []const u8 {
+    const types = [_][2][]const u8{
+        .{ ".html", "text/html; charset=utf-8" },
+        .{ ".js", "text/javascript; charset=utf-8" },
+        .{ ".wasm", "application/wasm" },
+        .{ ".json", "application/json" },
+        .{ ".wav", "audio/wav" },
+        .{ ".css", "text/css; charset=utf-8" },
+    };
+    for (types) |entry| {
+        if (std.mem.endsWith(u8, route, entry[0])) return entry[1];
+    }
+    return "application/octet-stream";
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
-    const paths = try parse_paths(init.args);
+    var texts: [routes_max + 1][]const u8 = undefined;
+    var count: u32 = 0;
+    var it = std.process.Args.Iterator.init(init.args);
+    _ = it.next();
+    while (it.next()) |arg| : (count += 1) {
+        if (count == texts.len) return error.TooManyRoutes;
+        texts[count] = arg;
+    }
+    var routes: Routes = .empty;
+    try routes_parse(texts[0..count], &routes);
     const port = try port_of(std.process.Environ.getPosix(init.environ, port_env));
     var threaded: std.Io.Threaded = .init(std.mem.Allocator.failing, .{
         .stack_size = std.Thread.SpawnConfig.default_stack_size,
@@ -61,7 +138,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     defer threaded.deinit();
     const io = threaded.io();
-    try serve_forever(io, paths, port);
+    try routes_check(io, &routes);
+    try serve_forever(io, &routes, port);
 }
 
 /// The port to listen on: `listen_port` without the variable, else its decimal value.
@@ -78,21 +156,23 @@ pub fn port_of(value: ?[]const u8) error{BadPort}!u16 {
     return @intCast(port);
 }
 
-/// Reads the four required file paths from the command line, in the order the module guide
-/// states.
-fn parse_paths(args: std.process.Args) !Paths {
-    var it = std.process.Args.Iterator.init(args);
-    const argv0 = it.next();
-    assert(argv0 != null);
-    const index = it.next() orelse return error.MissingIndexHtml;
-    const shell = it.next() orelse return error.MissingShellJs;
-    const wasm = it.next() orelse return error.MissingWasm;
-    const worklet = it.next() orelse return error.MissingWorkletJs;
-    assert(index.len != 0);
-    return .{ .index = index, .shell = shell, .wasm = wasm, .worklet = worklet };
+/// Opens every route's file once, so a missing one fails at startup, naming its route.
+fn routes_check(io: std.Io, routes: *const Routes) !void {
+    assert(routes.count <= routes_max);
+    for (routes.items[0..routes.count]) |item| {
+        var file = open_path(io, item.path) catch |err| {
+            std.debug.print("serve: {s}: cannot open {s}: {s}\n", .{
+                item.route,
+                item.path,
+                @errorName(err),
+            });
+            return err;
+        };
+        file.close(io);
+    }
 }
 
-fn serve_forever(io: std.Io, paths: Paths, listen: u16) !void {
+fn serve_forever(io: std.Io, routes: *const Routes, listen: u16) !void {
     assert(listen != 0);
     var address = try std.Io.net.IpAddress.parse("127.0.0.1", listen);
     var server = try address.listen(io, .{
@@ -106,13 +186,13 @@ fn serve_forever(io: std.Io, paths: Paths, listen: u16) !void {
     assert(port != 0);
     std.debug.print("serving http://127.0.0.1:{d}/\n", .{port});
     while (true) {
-        try serve_one(io, &server, paths);
+        try serve_one(io, &server, routes);
     }
 }
 
 /// Accepts one connection and answers its first request. A malformed request head drops the
 /// connection silently, since the only client is a local browser that will retry.
-fn serve_one(io: std.Io, server: *std.Io.net.Server, paths: Paths) !void {
+fn serve_one(io: std.Io, server: *std.Io.net.Server, routes: *const Routes) !void {
     var stream = try server.accept(io);
     defer stream.close(io);
     var recv_buffer: [header_cap]u8 = undefined;
@@ -127,35 +207,19 @@ fn serve_one(io: std.Io, server: *std.Io.net.Server, paths: Paths) !void {
         return;
     };
     var live_request = request;
-    try respond_target(io, &live_request, live_request.head.target, paths);
+    try respond_target(io, &live_request, live_request.head.target, routes);
 }
 
 fn respond_target(
     io: std.Io,
     request: *std.http.Server.Request,
     target: []const u8,
-    paths: Paths,
+    routes: *const Routes,
 ) !void {
     assert(target.len != 0);
     const path = strip_query(target);
-    if (std.mem.eql(u8, path, "/")) {
-        try respond_file(io, request, paths.index, "text/html; charset=utf-8");
-        return;
-    }
-    if (std.mem.eql(u8, path, "/index.html")) {
-        try respond_file(io, request, paths.index, "text/html; charset=utf-8");
-        return;
-    }
-    if (std.mem.eql(u8, path, "/shell.js")) {
-        try respond_file(io, request, paths.shell, "text/javascript; charset=utf-8");
-        return;
-    }
-    if (std.mem.eql(u8, path, "/worklet.js")) {
-        try respond_file(io, request, paths.worklet, "text/javascript; charset=utf-8");
-        return;
-    }
-    if (std.mem.eql(u8, path, "/patchwork.wasm")) {
-        try respond_file(io, request, paths.wasm, "application/wasm");
+    if (routes.find(path)) |item| {
+        try respond_file(io, request, item.path, content_type_of(item.route));
         return;
     }
     try request.respond("not found\n", .{
@@ -245,4 +309,34 @@ test "the serve port comes from the environment or defaults to 8080" {
     for ([_][]const u8{ "", "0", "65536", "123456", "-1", "80a", " 80" }) |bad| {
         try std.testing.expectError(error.BadPort, port_of(bad));
     }
+}
+
+// Locks the routes (section 2): pairs parse at their first `=`; a route without `/`, an empty
+// side, a second `/index.html`, a list without one, and a 33rd route are refused; `/` finds the
+// page; and the content types follow the extension, a file of none being bytes.
+test "routes parse, refuse, and type their files" {
+    const item = try route_parse("/kit/a.wav=/tmp/x=y.wav");
+    try std.testing.expectEqualStrings("/kit/a.wav", item.route);
+    try std.testing.expectEqualStrings("/tmp/x=y.wav", item.path);
+    for ([_][]const u8{ "a=b", "/=b", "/a=", "nope", "=b" }) |bad| {
+        try std.testing.expectError(error.BadRoute, route_parse(bad));
+    }
+    var routes: Routes = .empty;
+    try routes_parse(&.{ "/index.html=i", "/shell.js=s", "/app.js=m" }, &routes);
+    try std.testing.expectEqualStrings("i", routes.find("/").?.path);
+    try std.testing.expectEqualStrings("m", routes.find("/app.js").?.path);
+    try std.testing.expect(routes.find("/other.js") == null);
+    const twice = [_][]const u8{ "/index.html=i", "/index.html=j" };
+    try std.testing.expectError(error.DuplicateRoute, routes_parse(&twice, &routes));
+    try std.testing.expectError(error.MissingIndexHtml, routes_parse(&.{"/a.js=a"}, &routes));
+    var many: [routes_max + 1][]const u8 = undefined;
+    var names: [routes_max + 1][16]u8 = undefined;
+    for (&many, &names, 0..) |*text, *name, index| {
+        text.* = std.fmt.bufPrint(name, "/r{d}.js=p", .{index}) catch unreachable;
+    }
+    many[0] = "/index.html=i";
+    try std.testing.expectError(error.TooManyRoutes, routes_parse(&many, &routes));
+    try std.testing.expectEqualStrings("application/wasm", content_type_of("/patchwork.wasm"));
+    try std.testing.expectEqualStrings("audio/wav", content_type_of("/kit/a.wav"));
+    try std.testing.expectEqualStrings("application/octet-stream", content_type_of("/data"));
 }
