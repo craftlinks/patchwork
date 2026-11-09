@@ -48,6 +48,7 @@ Every example has `run-<name>`, `wasm-<name>` and `serve-<name>` steps:
 | `touch` | Multi-touch: ten fingers on pads and sliders, a pinch box |
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
 | `audio` | Audio meters and scope (silent natively, audible in the browser) |
+| `wake` | A producer on another thread into the UI, and its own web module in the browser |
 | `canvas` | Pan and zoom canvas |
 | `gallery`, `workspace` | Widget gallery; docking workspace |
 

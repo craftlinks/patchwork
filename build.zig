@@ -772,6 +772,15 @@ pub fn build(b: *std.Build) void {
         .wgpu_lib_dir = wgpu_lib_dir,
     });
     b.getInstallStep().dependOn(audio.install);
+    const wake = addApp(b, b, .{
+        .name = "wake",
+        .root_source_file = b.path("examples/wake/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+        .web_module = b.path("examples/wake/app.js"),
+    });
+    b.getInstallStep().dependOn(wake.install);
     add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
@@ -787,6 +796,7 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(canvas.install);
     add_example_steps(b, "-audio", "the audio meters and scope", audio);
+    add_example_steps(b, "-wake", "the wake producer", wake);
     add_example_steps(b, "-canvas", "the pan and zoom canvas", canvas);
     const gallery = addApp(b, b, .{
         .name = "gallery",
@@ -843,7 +853,7 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(touch.install);
     add_example_steps(b, "-touch", "the multi-touch pads and sliders", touch);
-    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, canvas, gallery, workspace, session, vector, touch };
+    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, wake, canvas, gallery, workspace, session, vector, touch };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
@@ -950,7 +960,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [13]AppSteps,
+    examples: [14]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
