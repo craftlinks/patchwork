@@ -33,6 +33,9 @@
 //! 3. while `cx.audio_on`, `bench.blocks_for_frame_at(k, fps)` blocks rendered on this thread in
 //!    pieces of at most `realtime.post_blocks * 2` and drained through `App.audio`, `k` counting
 //!    the frames fed so far;
+//! 3a. with a producer (`app.zig`, section 4e), `App.produce` with
+//!    `bench.producer_frames_at(k, fps)` frames when the app declares it, then `App.drain`, `k`
+//!    counting the frames stepped so far; no thread runs a producer here;
 //! 4. `ui.draw_frame` and `Renderer.frame` with `time_s` of `at`, then `gpu_wgpu.execute`.
 //! Input comes before `frame`: `step` stamps a scenario step's presses with the time it is given
 //! and dispatches them, then serves the drop and the window request as every replay does.
@@ -124,6 +127,7 @@ pub fn Offscreen(comptime App: type) type {
         const Renderer = renderer.Renderer(Context.DrawContext);
         const has_audio = app_contract.has_audio(App);
         const Engine = if (has_audio) audio_thread.Engine(App.Audio) else void;
+        const has_producer = app_contract.has_producer(App);
 
         // Module guide, section 3: static, initialized in place per start.
         var app_state: App = undefined;
@@ -145,6 +149,8 @@ pub fn Offscreen(comptime App: type) type {
         /// One start's state: the timer clock, the frames fed audio, and the clipboard.
         var clock: bench.Clock = undefined;
         var audio_frames: u64 = 0;
+        /// Frames the producer was stepped by (module guide, section 2, step 3a).
+        var producer_frames: u64 = 0;
         var owns_copy: bool = false;
 
         /// Opens the device at a size, a scale, and a rate. `error.BadScale` outside
@@ -208,6 +214,7 @@ pub fn Offscreen(comptime App: type) type {
             assert(render.ready);
             clock = .init(App.config.timer_period_ms);
             audio_frames = 0;
+            producer_frames = 0;
             owns_copy = false;
             // The first frame draws everything, as a window's first configure does.
             ui_context.redraw();
@@ -271,6 +278,7 @@ pub fn Offscreen(comptime App: type) type {
             if (has_audio and ui_context.audio_on) {
                 feed_audio();
             }
+            if (has_producer) produce();
             const logical_w = size.width_logical;
             const logical_h = size.height_logical;
             _ = ui.draw_frame(App, &app_state, &ui_context, logical_w, logical_h, size.scale_120);
@@ -293,6 +301,16 @@ pub fn Offscreen(comptime App: type) type {
             }
             audio_frames += 1;
             drain_audio();
+        }
+
+        /// Steps the producer by this frame's sample time and drains it (section 2, step 3a).
+        fn produce() void {
+            assert(has_producer);
+            if (comptime app_contract.has_produce(App)) {
+                App.produce(&app_state, bench.producer_frames_at(producer_frames, fps));
+            }
+            producer_frames += 1;
+            App.drain(&app_state, &ui_context);
         }
 
         fn drain_audio() void {

@@ -984,6 +984,15 @@ fn add_test_steps(
             .expected = "App declares `Audio` but is missing `pub fn audio`",
         },
         .{
+            .path = "test/contract_producer_without_drain.zig",
+            .expected = "App declares a producer but is missing `pub fn drain`",
+        },
+        .{
+            .path = "test/contract_producer_produce_only.zig",
+            .expected = "App declares `produce` but no producer: add `pub fn wake`, " ++
+                "`pub fn pending`, and `pub fn drain`",
+        },
+        .{
             .path = "test/contract_theme_range.zig",
             .expected = "App.config.theme.colors.panel: a component is outside [0, 1]",
         },

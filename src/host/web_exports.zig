@@ -81,6 +81,13 @@
 //! it wherever it reads `timer_on`, inside the input handler that changed it, so a start has
 //! the page's user activation.
 //!
+//! ## 4b'. A Producer
+//! An app with a producer (`app.zig`, section 4e) gets data from another realm, an AudioWorklet
+//! or a worker, through its own web module (`web/shell.js`, section 9a), which copies it in and
+//! calls `shell.wake()` to schedule a frame. `tick` calls `App.drain` once, after the audio drain
+//! and before `ui.animate`, and a drain that leaves the app dirty requests the frame's present.
+//! The app's `Wake` stays at -1 here: the page does not sleep on a descriptor.
+//!
 //! ## 4c. Scenario Replay (`?bench=<scenario>`)
 //! `bench_start(len)` names a scenario by the `len` bytes in the input buffer and, when the app
 //! declares it, sets the canvas to the regress size at scale 1 (`bench.regress_size`) and
@@ -88,12 +95,13 @@
 //! `host/headless.zig`, section 2). While a replay runs, `tick` ignores the rAF time: frame
 //! `n` applies the scenario's next step, the app timer's ticks due by `t_n`, `ui.animate` with
 //! the clock's delta, and, while `cx.audio_on`, `realtime.blocks_for_frame` blocks rendered by
-//! this instance's own audio source; then it presents with the animation time of `t_n`. It
-//! returns 1 while frames remain, 2 after the last one (`shell.js` logs `bench done`), and 3
-//! when a step's target has no area. From `bench_start` on, `timer_on` and `audio_on` report 0
-//! (so `shell.js` arms no interval and starts no worklet), `audio_push` and every input export
-//! are ignored, and after the run `tick` presents nothing more, so the canvas keeps the last
-//! frame for the screenshot. Without `bench_start` none of this runs.
+//! this instance's own audio source, and with a producer `App.produce` with
+//! `bench.producer_frames_at(n, 60)` frames and `App.drain`; then it presents with the animation
+//! time of `t_n`. It returns 1 while frames remain, 2 after the last one (`shell.js` logs
+//! `bench done`), and 3 when a step's target has no area. From `bench_start` on, `timer_on` and
+//! `audio_on` report 0 (so `shell.js` arms no interval and starts no worklet), `audio_push` and
+//! every input export are ignored, and after the run `tick` presents nothing more, so the canvas
+//! keeps the last frame for the screenshot. Without `bench_start` none of this runs.
 //!
 //! ## 4a. Keyboard, Clipboard, and Cursor
 //! All key mapping lives in Zig, so `shell.js` stays a generic interpreter plus glue:
@@ -296,6 +304,7 @@ fn WebApp(comptime App: type) type {
         /// The audio path (section 4b). The UI instance uses the queue and the inbox; the
         /// worklet's instance uses only the source and the block it renders into.
         const has_audio = app_contract.has_audio(App);
+        const has_producer = app_contract.has_producer(App);
         const Source = if (has_audio) App.Audio else void;
         var audio_queue: realtime.AudioQueue = undefined;
         var audio_inbox: [realtime.post_blocks]realtime.Block = undefined;
@@ -331,6 +340,8 @@ fn WebApp(comptime App: type) type {
             frames_max: u64,
             clock: bench.Clock,
             audio_frames: u64,
+            /// Frames the producer was stepped by (section 4c).
+            producer_frames: u64,
             owns_copy: bool,
         };
         var replay_run: ReplayRun = .{
@@ -341,6 +352,7 @@ fn WebApp(comptime App: type) type {
             .frames_max = 0,
             .clock = undefined,
             .audio_frames = 0,
+            .producer_frames = 0,
             .owns_copy = false,
         };
         var replay_paste: [ui.cx.clipboard_cap]u8 = undefined;
@@ -709,6 +721,7 @@ fn WebApp(comptime App: type) type {
             assert(state.frame.running);
             if (replay_run.phase != .off) return replay_tick();
             drain_audio();
+            drain_producer();
             const dt_ms = state.clock.advance(now_ms);
             if (render.animating) {
                 state.time.advance(dt_ms);
@@ -801,6 +814,7 @@ fn WebApp(comptime App: type) type {
                 .frames_max = setup_frames + found.frames + 1,
                 .clock = .init(App.config.timer_period_ms),
                 .audio_frames = 0,
+                .producer_frames = 0,
                 .owns_copy = false,
             };
             if (has_audio) App.Audio.init(&audio_source, realtime.sample_rate);
@@ -846,6 +860,13 @@ fn WebApp(comptime App: type) type {
                 replay_audio(realtime.blocks_for_frame(run.audio_frames));
                 run.audio_frames += 1;
                 drain_audio();
+            }
+            if (has_producer) {
+                if (comptime app_contract.has_produce(App)) {
+                    App.produce(&app, bench.producer_frames_at(run.producer_frames, 60));
+                }
+                run.producer_frames += 1;
+                drain_producer();
             }
             state.time = .{ .ms = t_ms };
             state.frame.request_redraw();
@@ -905,6 +926,13 @@ fn WebApp(comptime App: type) type {
 
         /// Drains the queue through `App.audio`, or releases it unread while audio is off.
         /// Bounded by the queue's capacity.
+        /// The app's one call for its producer (`app.zig`, section 4e; section 4b').
+        fn drain_producer() void {
+            if (!has_producer) return;
+            App.drain(&app, &context);
+            if (context.dirty) state.frame.request_redraw();
+        }
+
         fn drain_audio() void {
             if (!has_audio) return;
             var drained: u32 = 0;

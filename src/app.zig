@@ -53,6 +53,8 @@
 //!   each side and at least the regress size, so a render at that size always fits.
 //! - Optional, together: `pub const Audio` and `pub fn audio` (section 4a).
 //! - Optional, native only: `pub fn args`, the command line the host leaves (section 4d).
+//! - Optional, together: `pub fn wake`, `pub fn pending`, and `pub fn drain`, a producer on another
+//!   thread, and with them `pub fn produce` (section 4e).
 //!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
@@ -101,6 +103,33 @@
 //! (`ui/cx.zig`, section 9a). Start and stop are the only control: the source never reads the
 //! app. `check` requires both declarations or neither, and checks both signatures.
 //!
+//! ## 4e. The Optional Producer
+//! ```text
+//! pub fn wake(app: *App) *patchwork.Wake           the app's Wake, which its producer notifies
+//! pub fn pending(app: *const App) u32              what the producer has waiting
+//! pub fn drain(app: *App, cx: *Context(App)) void  the one callback, on the UI thread
+//! pub fn produce(app: *App, frames: u32) void      optional: where no producer thread runs
+//! ```
+//! A producer is anything on another thread that has data for the UI: a peer library's audio
+//! thread and its monitor, a worker. The app owns the queue between them, which any app can write;
+//! Patchwork owns only what an app cannot do, the sleep. The `Wake` is the app's, a field it
+//! initializes in `init`, because a producer is usually started in `args`, before any context
+//! exists; right after `init` the native window host attaches its `eventfd` (`wake.zig`), so a
+//! producer started in `args` can call `notify` from its own thread after each item it publishes.
+//! - Natively, before a sleep, the host arms the app's Wake over `pending`, which must load the
+//!   count `seq_cst` (`wake.zig`, section 2), and a wake from it or from the audio source clears
+//!   both. Each wake, after the audio drain and before `ui.animate`, it calls `drain` once; while
+//!   frames are presented, once a frame. `drain` may call `cx.redraw()`.
+//! - In the browser, `tick` calls `drain` before `ui.animate`; the app's web module delivers the
+//!   data and calls `shell.wake()` to schedule a frame (section 4f).
+//! - In regress, a native bench, and a browser replay there is no producer thread: each frame,
+//!   where audio blocks are fed, the host calls `produce(app, frames)` with
+//!   `bench.producer_frames_at(k, fps)` frames of sample time at 48 kHz, 800 a frame at 60 fps,
+//!   and then `drain`. A producer that is audio renders that many frames; one that is not reads
+//!   them as time. Without `produce`, nothing is produced there and `drain` still runs.
+//! `check` requires `wake`, `pending`, and `drain` together, checks their signatures, and refuses
+//! `produce` without them.
+//!
 //! ## 4b. The Theme
 //! `config.theme` (default `theme.dark`) is the scheme the app starts with: `start` copies it
 //! into the context, and `cx.theme()` reads it in any phase (`ui/cx.zig`, section 9b).
@@ -146,6 +175,7 @@ const areas = @import("ui/areas.zig");
 const pools = @import("draw/pools.zig");
 const bench = @import("bench.zig");
 const realtime = @import("realtime.zig");
+const wake_file = @import("wake.zig");
 const theme = @import("theme.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
@@ -202,6 +232,16 @@ pub fn has_args(comptime App: type) bool {
 
 /// The step 30 name of `start`, which it now is.
 pub const start_timer = start;
+
+/// Whether `App` declares a producer on another thread (section 4e).
+pub fn has_producer(comptime App: type) bool {
+    return @hasDecl(App, "drain");
+}
+
+/// Whether the app steps its producer by frame where no thread runs it (section 4e).
+pub fn has_produce(comptime App: type) bool {
+    return @hasDecl(App, "produce");
+}
 
 /// Whether `App` declares an audio source (section 4a).
 pub fn has_audio(comptime App: type) bool {
@@ -318,7 +358,44 @@ pub fn conformance(comptime App: type) ?[]const u8 {
                 "`, found `" ++ @typeName(found) ++ "`";
         }
     }
-    return audio_conformance(App);
+    if (audio_conformance(App)) |message| return message;
+    return producer_conformance(App);
+}
+
+/// The producer half of `conformance` (section 4e).
+fn producer_conformance(comptime App: type) ?[]const u8 {
+    const names = [_][]const u8{ "wake", "pending", "drain" };
+    const expected = [_]type{
+        fn (*App) *wake_file.Wake,
+        fn (*const App) u32,
+        fn (*App, *Context(App)) void,
+    };
+    var declared: u32 = 0;
+    inline for (names) |name| {
+        if (@hasDecl(App, name)) declared += 1;
+    }
+    if (declared == 0) {
+        if (!has_produce(App)) return null;
+        return "App declares `produce` but no producer: add `pub fn wake`, `pub fn pending`, " ++
+            "and `pub fn drain`";
+    }
+    inline for (names, expected) |name, signature| {
+        if (!@hasDecl(App, name)) {
+            return "App declares a producer but is missing `pub fn " ++ name ++ "`";
+        }
+        const found = @TypeOf(@field(App, name));
+        if (found != signature) {
+            return "App." ++ name ++ " must have type `" ++ @typeName(signature) ++
+                "`, found `" ++ @typeName(found) ++ "`";
+        }
+    }
+    if (has_produce(App)) {
+        const signature = fn (*App, u32) void;
+        if (@TypeOf(App.produce) != signature) {
+            return "App.produce must have type `" ++ @typeName(signature) ++ "`";
+        }
+    }
+    return null;
 }
 
 /// The audio half of `conformance` (section 4a).
@@ -634,6 +711,57 @@ test "a missing config, a slow timer, and an old event signature are rejected" {
     const wrong = comptime conformance(OldEvent).?;
     try std.testing.expect(std.mem.find(u8, wrong, "event") != null);
     try std.testing.expect(std.mem.find(u8, wrong, "Context") != null);
+}
+
+/// `GoodApp` with a producer (section 4e): a wake, a count, a drain, and `produce`.
+const ProducerApp = struct {
+    wake_value: wake_file.Wake,
+    items: u32,
+
+    pub const config = GoodApp.config;
+    pub fn init(app: *ProducerApp, textures: *quads.Textures) void {
+        app.wake_value = .init(-1);
+        app.items = 0;
+        _ = textures;
+    }
+    pub fn event(app: *ProducerApp, cx: *Context(ProducerApp), event_value: input.Event) void {
+        _ = app;
+        _ = cx;
+        _ = event_value;
+    }
+    pub fn timer(app: *ProducerApp, cx: *Context(ProducerApp), now_ms: u64) void {
+        _ = app;
+        _ = cx;
+        _ = now_ms;
+    }
+    pub fn draw(app: *ProducerApp, cx: *Context(ProducerApp)) void {
+        _ = app;
+        _ = cx;
+    }
+    pub fn wake(app: *ProducerApp) *wake_file.Wake {
+        return &app.wake_value;
+    }
+    pub fn pending(app: *const ProducerApp) u32 {
+        return app.items;
+    }
+    pub fn drain(app: *ProducerApp, cx: *Context(ProducerApp)) void {
+        app.items = 0;
+        _ = cx;
+    }
+    pub fn produce(app: *ProducerApp, frames: u32) void {
+        app.items += frames;
+    }
+};
+
+// Locks section 4e's check on a whole producer: it conforms, `has_producer` and `has_produce`
+// see it, and an app without one has neither. The refusals are build cases
+// (`test/contract_producer_*.zig`), since a missing declaration cannot be written in a test.
+test "a producer app conforms" {
+    try std.testing.expect(comptime conformance(ProducerApp) == null);
+    try std.testing.expect(has_producer(ProducerApp));
+    try std.testing.expect(has_produce(ProducerApp));
+    try std.testing.expect(!has_producer(GoodApp));
+    try std.testing.expect(!has_produce(GoodApp));
 }
 
 // Locks the audio pair (section 4a): the test tone with a sink passes, and either half alone
