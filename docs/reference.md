@@ -41,6 +41,8 @@ pub const App = struct {
 | `args` (optional, native) | `fn (*App, []const [:0]const u8) void` | Receives the arguments the host does not know, once, after `init` (see Use Patchwork From Another Project). |
 | `Audio` (optional) | a type with `init(*Audio, u32)` and `render(*Audio, *realtime.Block)` | An audio source the host runs off the UI thread (see Audio Data). |
 | `audio` (with `Audio`) | `fn (*App, *Context(App), *const realtime.Block) void` | Receives every block of the source, in order, on the UI thread. |
+| `wake`, `pending`, `drain` (optional, together) | `fn (*App) *patchwork.Wake`, `fn (*const App) u32`, `fn (*App, *Context(App)) void` | A producer on another thread: the app's own wake, what it has waiting, and the one call on the UI thread each wake (see Data From Another Thread). |
+| `produce` (with them) | `fn (*App, u32) void` | Steps the producer by frames of a 48 kHz clock where no thread runs it: regress, the bench, a browser replay. |
 
 `Context(App)` is the UI context (`patchwork.ui.Context`): the draw context (`cx.draw`), the
 turtle stack, the hit areas of the last frame, and pointer, hover, and capture state. There
@@ -58,6 +60,9 @@ drawing.
 
 **Audio.** An app with an `Audio` source starts with it stopped; `cx.set_audio(on)` starts and
 stops it, and the hosts apply the change after the call (see Audio Data below).
+
+**A producer.** An app whose data comes from another thread declares `wake`, `pending`, and
+`drain` (see Data From Another Thread below); the UI sleeps until the producer notifies.
 
 The contract is validated at compile time by `patchwork.app.check(App)`. Missing or
 mistyped declarations, a draw type that breaks the instance convention (the message names
@@ -183,7 +188,8 @@ patchwork/
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
 │   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM and PNG
-│   ├── realtime.zig            # Audio blocks, the SPSC queue, the wake, test tone, meters, scope
+│   ├── realtime.zig            # Audio blocks, the SPSC queue, test tone, meters, scope
+│   ├── wake.zig                # Wake: a producer on any thread wakes the UI's poll loop
 │   ├── drop.zig                # File drops: the file list, the URI list parser, the transfer
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
 │   └── native_tests.zig        # Test root of tests that call system libraries, files, or threads
@@ -234,6 +240,9 @@ patchwork/
 │   │   └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
 │   ├── audio/                  # Audio data into the UI
 │   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
+│   ├── wake/                   # A producer on another thread into the UI (step 54)
+│   │   ├── app.zig             # Wake App: a ring, a thread or produce or a page interval, a sparkline
+│   │   └── app.js              # Its web module: the page's producer on a 5 ms interval
 │   ├── canvas/                 # Pan and zoom
 │   │   └── app.zig             # Canvas App: a 1,000-module grid with cables, select and drag
 │   ├── gallery/                # Every library widget on tabbed pages (phases 6 and 7)
@@ -274,13 +283,16 @@ patchwork/
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   ├── shell.js                # Generic command interpreter, Wasm bridge, and input handler
-│   └── worklet.js              # AudioWorklet processor running the app's source from its wasm
+│   ├── worklet.js              # AudioWorklet processor running the app's source from its wasm
+│   └── app.js                  # The empty web module served when an app brings none
 └── test/                       # Regression tests
     ├── golden/<adapter>/<app>.txt # Regress hashes per adapter and driver (`zig build regress`)
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
     ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
+    ├── contract_producer_without_drain.zig # A producer without `drain` fails
+    ├── contract_producer_produce_only.zig # `produce` without a producer fails
     ├── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
     ├── contract_skin_missing.zig # Test verifying that a skin without `knob` fails, naming it
     ├── contract_overlays_none.zig # Test verifying that `ui.overlays` of a target without
@@ -339,6 +351,10 @@ zig build serve-fx        # Serve them on localhost (prints the address)
 zig build run-audio       # Build and run the audio meters and scope natively (silent)
 zig build wasm-audio      # Compile them to zig-out/bin/audio.wasm
 zig build serve-audio     # Serve them on localhost; Space plays the tone (audible)
+
+# Examples (Wake)
+zig build run-wake        # A producer thread into the UI; Space starts and stops it
+zig build serve-wake      # The same with the page's own producer (examples/wake/app.js)
 
 # Examples (Pan and Zoom Canvas)
 zig build run-canvas      # Build and run the module canvas natively
@@ -601,6 +617,21 @@ const steps = patchwork.addApp(b, dep.builder, .{
 ```
 
 `patchwork.wasm_query` is the query `addApp` uses, so the peer and the app cannot disagree.
+
+A page of the app's own code goes in `web_module`, an ES module served as `/app.js`, and the files
+it fetches in `web_files`, each at its route:
+
+```zig
+    .web_module = b.path("web/app.js"),
+    .web_files = &.{.{ .route = "/thrum-worklet.js", .path = thrum_dep.path("web/worklet.js") }},
+```
+
+The shell imports `/app.js` before it instantiates the wasm. Its `imports(shell)` returns
+functions the wasm imports beside Patchwork's own (a clash is an error); its `started(shell)`
+runs after `start`. `shell` is `{ wasm, memory, wake, canvas }`, with `wasm` and `memory` set once
+the instance exists. This is how a peer's AudioWorklet reaches the page: the wasm calls an import
+from a key handler to start it, the import posts the peer's messages, and the worklet's replies
+are copied in through the app's exports before `shell.wake()`.
 
 `addApp` panics at configure time, naming the app and the import, on the name `patchwork`, on a
 name that appears twice for one target (a name in `imports` and in a per-target list counts), and
@@ -1243,6 +1274,16 @@ microseconds of CPU on the RTX 3060 (41 on the UHD 770) plus 1.6 microseconds pe
 render the tone and 0.4 to drain it; the never-started screen is bitwise identical natively
 and in Chromium.
 
+### 7a. Wake (`examples/wake/app.zig`)
+
+A producer makes a value every 5 ms of a 48 kHz clock, a one-second sine, into the app's own
+ring and notifies its `patchwork.Wake`; `drain` takes them into a history of 256, drawn as a
+sparkline with the ticks, the values drained, and the drops. Space starts and stops it. Natively
+the producer is a thread that `args` starts and that waits on a futex while stopped, so a stopped
+window sleeps; in regress `produce` steps it by frame (scenarios `idle`, `run`, `stop`); in the
+browser its `app.js` runs an interval while the wasm's import says so. Both adapters' frames and
+Chromium's are equal.
+
 ### 8. Pan and Zoom Canvas (`examples/canvas/app.zig`)
 
 A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, and a
@@ -1622,6 +1663,32 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
 - **Idle.** With the tone stopped the audio thread parks on a futex and the UI thread sleeps
   (about 1 wake per second measured, against 30 for the rack's old timer); playing, the audio
   thread wakes 94 times per second and the UI presents at most once per display frame.
+
+## Data From Another Thread
+
+Step 54's seam, for any producer that is not the app's own `Audio`: a peer library's audio thread
+and its monitor (Thrum's), a worker, a socket reader. The app owns the queue between the two,
+which any app can write; Patchwork owns the sleep.
+- **The wake.** `patchwork.Wake` (`src/wake.zig`) is a field of the app, initialized in `init`.
+  The native window host attaches its `eventfd` right after `init` and before `args`, so a thread
+  `args` starts can call `wake.notify()` after each item it publishes. Notify writes only when
+  the UI armed the wake before sleeping, so while frames flow it costs one atomic swap.
+- **The count.** `pending` returns what is waiting, loaded `seq_cst`, with the producer's publish
+  `seq_cst` too: the host arms the wake, then reads the count, so an item published just before
+  the sleep is never missed. Thrum's monitor queue is published this way since its step 23.
+- **The drain.** The hosts call `drain(app, cx)` once a wake, after the audio drain and before
+  `ui.animate`, and once a frame while frames are presented; it pops what it wants and calls
+  `cx.redraw()`.
+- **By frame.** Regress, the native bench, and a browser replay run no producer thread: each
+  frame they call `produce(app, frames)` with `bench.producer_frames_at(k, fps)`, 800 frames a
+  frame at 60 fps, and then `drain`, so a scenario renders the same frames on every run.
+- **In a browser.** The producer lives in the page: the app's web module (`web_module`, served as
+  `/app.js`) imports functions into the wasm, copies data in through the app's own exports, and
+  calls `shell.wake()` to schedule the frame whose `tick` drains (see Browser below). A peer's
+  worklet or worker is started from a wasm import called in an input handler, which has the
+  page's user activation, and its files are `web_files`.
+- `examples/wake` is the whole seam with no peer: a producer of 200 values a second on a thread,
+  in regress by frame, and in the page on an interval, with its own `app.js`.
 
 ## Bench Mode
 

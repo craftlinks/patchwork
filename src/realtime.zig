@@ -32,7 +32,8 @@
 //! overflow is a counted drop by construction and not an assert that ReleaseFast removes.
 //!
 //! ## 4. The Wake and the Lost-Wakeup Argument
-//! `Wake` is an `armed` flag and a descriptor (an `eventfd` natively, -1 in the browser and in
+//! `Wake` lives in `wake.zig` since step 54, where any producer can use it; this file names it.
+//! It is an `armed` flag and a descriptor (an `eventfd` natively, -1 in the browser and in
 //! tests). The producer calls `notify` after each post: if `armed` was set, it clears it and
 //! writes the descriptor once. The consumer calls `arm(queue)` just before it sleeps: it sets
 //! `armed`, then loads the queue's `head`; if a block is pending it disarms and skips the sleep.
@@ -202,46 +203,9 @@ pub fn Queue(comptime T: type, comptime capacity: u32) type {
     };
 }
 
-/// The producer's way to wake a sleeping consumer (section 4).
-pub const Wake = struct {
-    /// Set by the consumer just before it sleeps; cleared by the notify that wakes it.
-    armed: std.atomic.Value(bool),
-    /// An `eventfd` natively; -1 where there is nothing to write (the browser, tests).
-    fd: i32,
-    /// Writes made so far, for tests and the bench.
-    notified: std.atomic.Value(u32),
-
-    pub fn init(fd: i32) Wake {
-        const wake: Wake = .{ .armed = .init(false), .fd = fd, .notified = .init(0) };
-        assert(!wake.armed.raw);
-        return wake;
-    }
-
-    /// Producer: wakes the consumer once if it is armed.
-    pub fn notify(self: *Wake) void {
-        if (!self.armed.swap(false, .seq_cst)) return;
-        _ = self.notified.fetchAdd(1, .monotonic);
-        if (self.fd < 0) return;
-        if (builtin.os.tag != .linux) return;
-        const one: u64 = 1;
-        // A full counter (2^64 - 2 unread writes) cannot happen: every wake reads it.
-        _ = std.os.linux.write(self.fd, std.mem.asBytes(&one), 8);
-    }
-
-    /// Consumer: arms before a sleep. Returns false, disarmed, when `queue` already holds an
-    /// item, so the caller must drain instead of sleeping.
-    pub fn arm(self: *Wake, queue: anytype) bool {
-        self.armed.store(true, .seq_cst);
-        if (queue.pending() == 0) return true;
-        self.armed.store(false, .seq_cst);
-        return false;
-    }
-
-    /// Consumer: clears the flag after a wake, or when it will not sleep on the wake.
-    pub fn disarm(self: *Wake) void {
-        self.armed.store(false, .seq_cst);
-    }
-};
+/// The producer's way to wake a sleeping consumer (section 4): moved to `wake.zig` at step 54,
+/// named here until the audio code goes.
+pub const Wake = @import("wake.zig").Wake;
 
 /// One sine of the test tone: frequency and the period of its gain triangle.
 const Voice = struct {
@@ -525,26 +489,6 @@ test "the queue crosses the u32 wrap" {
         queue.release();
     }
     try std.testing.expectEqual(@as(u32, 6), expected);
-}
-
-// Locks the wake (section 4): unarmed, notify writes nothing; armed, the first notify counts
-// and the second does not; arming over a pending item refuses the sleep and stays disarmed.
-test "the wake notifies once per arm and refuses a sleep over pending data" {
-    const Small = Queue(u32, 4);
-    var queue: Small = undefined;
-    queue.init();
-    var wake = Wake.init(-1);
-    wake.notify();
-    try std.testing.expectEqual(@as(u32, 0), wake.notified.raw);
-    try std.testing.expect(wake.arm(&queue));
-    wake.notify();
-    wake.notify();
-    try std.testing.expectEqual(@as(u32, 1), wake.notified.raw);
-    try std.testing.expect(queue.push(&@as(u32, 1)));
-    try std.testing.expect(!wake.arm(&queue));
-    try std.testing.expect(!wake.armed.raw);
-    wake.notify();
-    try std.testing.expectEqual(@as(u32, 1), wake.notified.raw);
 }
 
 // Locks the tone (section 5): both sines start at 0; a quarter period of 220 Hz at 48 kHz is

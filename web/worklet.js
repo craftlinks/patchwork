@@ -6,7 +6,7 @@
 // The app declares its source in Zig (`src/app.zig`, section 4a), so the signal has one
 // definition on both hosts. This processor holds no synthesis: `shell.js` passes the wasm's
 // bytes in `processorOptions.wasm`, the constructor compiles them synchronously (allowed off
-// the main thread) and instantiates them with a no-op `submit_js`, then calls
+// the main thread) and instantiates them with every import a no-op, then calls
 // `audio_init(sampleRate)`. That instance never calls `start`, so only the source's own static
 // storage is used (`src/host/web_exports.zig`, section 4b).
 //
@@ -22,7 +22,7 @@ class PatchworkAudio extends AudioWorkletProcessor {
     constructor(options) {
         super();
         const module = new WebAssembly.Module(options.processorOptions.wasm);
-        const instance = new WebAssembly.Instance(module, { env: { submit_js() {} } });
+        const instance = new WebAssembly.Instance(module, stubs_of(module));
         this.wasm = instance.exports;
         this.wasm.audio_init(sampleRate);
         this.postBlocks = this.wasm.audio_post_blocks();
@@ -51,6 +51,19 @@ class PatchworkAudio extends AudioWorkletProcessor {
         }
         return true;
     }
+}
+
+// A no-op returning 0 for every function the wasm imports: this instance only renders, and an
+// app with a web module imports functions of its own beside `submit_js` (`web/shell.js`, 9a).
+function stubs_of(module) {
+    const imports = {};
+    for (const entry of WebAssembly.Module.imports(module)) {
+        if (entry.kind === "function") {
+            imports[entry.module] ??= {};
+            imports[entry.module][entry.name] = () => 0;
+        }
+    }
+    return imports;
 }
 
 registerProcessor("patchwork-audio", PatchworkAudio);

@@ -116,7 +116,10 @@
 //! audio a frame receives follows it: `blocks_for_frame_at(k, fps)` is the difference of two
 //! floors, so every rate feeds the same blocks a second, and `ticks_per_frame_max` holds a 1 ms
 //! timer at `fps_min`. The formula lives here because it paces frames: at 60 it is
-//! `realtime.blocks_for_frame`, which the 60 Hz hosts keep calling.
+//! `realtime.blocks_for_frame`, which the 60 Hz hosts keep calling. A producer stepped by frame
+//! (`app.zig`, section 4e) gets the same pacing at the grain of a sample frame:
+//! `producer_frames_at(k, fps)` is `floor(48000 (k + 1) / fps) - floor(48000 k / fps)`, 800 at 60,
+//! and every rate gives 48,000 a second.
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: replay state is three counters, summaries sort the caller's slice, and
@@ -799,6 +802,20 @@ pub fn blocks_for_frame_at(k: u64, fps: u32) u32 {
     assert(count <= blocks_per_frame_max);
     return @intCast(count);
 }
+
+/// Frames of sample time at 48 kHz that frame `k` of a run at `fps` steps a producer by (section
+/// 5c; `app.zig`, section 4e).
+pub fn producer_frames_at(k: u64, fps: u32) u32 {
+    assert(fps >= fps_min and fps <= fps_max);
+    const rate: u64 = producer_rate_hz;
+    const count = (k + 1) * rate / fps - k * rate / fps;
+    assert(count <= producer_frames_max);
+    return @intCast(count);
+}
+
+/// The rate `producer_frames_at` counts in, and the most frames one frame gets, at `fps_min`.
+pub const producer_rate_hz: u32 = 48_000;
+pub const producer_frames_max: u32 = producer_rate_hz / fps_min + 1;
 
 /// The simulated clock (section 5b; `host/headless.zig`, section 2): frame times, `ui.animate`'s
 /// delta, and the app timer's ticks.
@@ -2088,6 +2105,21 @@ test "audio blocks per frame follow the frame rate" {
     var most: u32 = 0;
     for (0..1000) |k| most = @max(most, blocks_for_frame_at(k, fps_min));
     try testing.expectEqual(blocks_per_frame_max, most);
+}
+
+// Locks the producer's pacing (section 5c): 800 frames a frame at 60 fps; 1600 at 30; 333, 333,
+// 334 at 144's first three; and 48,000 a second at every rate.
+test "a producer's frames per frame follow the frame rate" {
+    for (0..1000) |k| try testing.expectEqual(@as(u32, 800), producer_frames_at(k, 60));
+    for (0..1000) |k| try testing.expectEqual(@as(u32, 1600), producer_frames_at(k, 30));
+    try testing.expectEqual(@as(u32, 333), producer_frames_at(0, 144));
+    try testing.expectEqual(@as(u32, 333), producer_frames_at(1, 144));
+    try testing.expectEqual(@as(u32, 334), producer_frames_at(2, 144));
+    for ([_]u32{ 10, 24, 25, 30, 50, 60, 120, 144, 240 }) |fps| {
+        var total: u32 = 0;
+        for (0..fps) |k| total += producer_frames_at(k, fps);
+        try testing.expectEqual(producer_rate_hz, total);
+    }
 }
 
 // Locks the regress flags: `--regress` alone, then with `--bless`, `--only`, `--keep`, and

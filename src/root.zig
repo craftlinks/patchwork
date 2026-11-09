@@ -24,6 +24,9 @@ pub const commands = @import("gpu/commands.zig");
 pub const renderer = @import("draw/renderer.zig");
 pub const bench = @import("bench.zig");
 pub const realtime = @import("realtime.zig");
+pub const wake = @import("wake.zig");
+/// A wake from any thread for the UI's poll loop (`wake.zig`, `app.zig` section 4e).
+pub const Wake = wake.Wake;
 pub const drop = @import("drop.zig");
 
 /// The platform hosts. `linux_window.run` and `web_exports.export_app` are the only entry
@@ -74,6 +77,7 @@ test {
     _ = renderer;
     _ = bench;
     _ = realtime;
+    _ = wake;
     _ = drop;
     // `build.zig` imports it by path; nothing in the library does.
     _ = @import("imports.zig");

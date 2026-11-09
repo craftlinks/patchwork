@@ -158,6 +158,18 @@
 //!   sleep. Every wait disarms on its way out, and a readable wake is read to clear it.
 //! - A hidden window keeps its frame callback in flight, so the wake is never armed, the
 //!   queue fills, and the thread counts drops (`Queue.dropped`) until frames resume.
+//!
+//! ## 5c'. A Producer
+//! An app that declares a producer (`app.zig`, section 4e) shares the same `eventfd`, created
+//! right after `App.init` and attached to the app's own `Wake` before `args`, so a producer that
+//! `args` starts can notify at once. `Slot.wake` is that one descriptor for both.
+//! - `sync_producer`, every wake after `sync_audio`: calls `App.drain` once, then owes a redraw if
+//!   the app is dirty. While frames are presented it runs once a frame.
+//! - Arming (`arm_producer`): under the same conditions as audio, the app's `Wake` is armed over
+//!   `App.pending`; a pending item skips the sleep. Both wakes disarm on the way out.
+//! - Bench mode starts no producer (`args` is not called): each frame, beside the audio blocks,
+//!   it calls `App.produce` with `bench.producer_frames_at` and then drains.
+//! - The exit line reads `wake: N notified, N drains`.
 //! - Bench mode starts no thread: while audio is on every frame is presented, and before its
 //!   draw the host renders `realtime.blocks_for_frame(n)` blocks on this thread into the same
 //!   queue, so dumps are deterministic (`realtime.zig`, section 7).
@@ -612,6 +624,12 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     if (options.check) return AppHost.check(&state, options.adapter);
+    // Before `args`, so a producer it starts can notify at once (section 5c').
+    if (AppHost.has_wake) AppHost.wake_fd = try create_wake();
+    defer if (AppHost.has_wake) {
+        _ = std.os.linux.close(AppHost.wake_fd);
+    };
+    if (AppHost.has_producer) App.wake(&AppHost.app_static).attach(AppHost.wake_fd);
     if (comptime app_contract.has_args(App)) {
         if (!options.bench) App.args(&AppHost.app_static, options.app_args);
     } else {
@@ -639,14 +657,11 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     }
     if (AppHost.has_audio) {
         AppHost.audio_queue.init();
-        AppHost.wake = .init(try create_wake());
+        AppHost.wake = .init(AppHost.wake_fd);
         AppHost.engine.init(&AppHost.audio_queue, &AppHost.wake, realtime.sample_rate);
     }
     defer {
-        if (AppHost.has_audio) {
-            AppHost.engine.finish();
-            _ = std.os.linux.close(AppHost.wake.fd);
-        }
+        if (AppHost.has_audio) AppHost.engine.finish();
     }
     defer {
         if (host.timer_fd >= 0) {
@@ -655,6 +670,7 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     }
     try host.loop();
     host.log_audio();
+    host.log_producer();
     if (options.bench) AppHost.bench_finish(&state);
 }
 
@@ -744,7 +760,8 @@ const Slot = enum(u8) {
     repeat,
     send,
     receive,
-    audio,
+    /// The `eventfd` an audio source and a producer share (sections 5c and 5c').
+    wake,
     drop_list,
 };
 const slot_count: u32 = @typeInfo(Slot).@"enum".field_names.len;
@@ -777,7 +794,8 @@ fn ignore_sigpipe() void {
     std.posix.sigaction(.PIPE, &action, null);
 }
 
-/// A nonblocking `eventfd` at 0: the audio wake (section 5c).
+/// A nonblocking `eventfd` at 0: the wake an audio source and a producer share (sections 5c and
+/// 5c').
 fn create_wake() !i32 {
     const flags = std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC;
     const created = std.os.linux.eventfd(0, flags);
@@ -844,6 +862,12 @@ fn Host(comptime App: type) type {
         var wake: realtime.Wake = .init(-1);
         /// Blocks handed to `App.audio` since startup, for the exit line (`log_audio`).
         var audio_blocks: u64 = 0;
+        /// A producer on another thread (section 5c'), and the descriptor it shares with audio.
+        const has_producer = app_contract.has_producer(App);
+        const has_wake = has_audio or has_producer;
+        var wake_fd: i32 = -1;
+        /// `App.drain` calls since startup, for the exit line (`log_producer`).
+        var producer_drains: u64 = 0;
 
         // ------------------------------------------------------------ bench mode
 
@@ -876,6 +900,8 @@ fn Host(comptime App: type) type {
             /// Time spent rendering the blocks and draining them through `App.audio`.
             audio_render_ns: u64,
             audio_drain_ns: u64,
+            /// Frames the producer was stepped by (section 5c').
+            producer_frames: u64,
         };
         var bench_run: BenchRun = .{
             .active = false,
@@ -894,6 +920,7 @@ fn Host(comptime App: type) type {
             .audio_drained_max = 0,
             .audio_render_ns = 0,
             .audio_drain_ns = 0,
+            .producer_frames = 0,
         };
         var bench_samples: [bench.sample_cap]bench.Sample = undefined;
         var bench_values: [bench.sample_cap]u64 = undefined;
@@ -1321,6 +1348,7 @@ fn Host(comptime App: type) type {
                 // A dispatch that left `close` ended the run (section 5e).
                 if (!state.frame.running) break;
                 self.sync_audio();
+                self.sync_producer();
                 self.bench_step();
                 self.sync_clock();
                 try self.present_if_dirty();
@@ -1482,6 +1510,7 @@ fn Host(comptime App: type) type {
             }
             state.present_at_ns = 0;
             self.bench_audio();
+            self.bench_produce();
             const draw_start_ns = monotonic_ns();
             self.prepare_app();
             bench_run.draw_ns = monotonic_ns() - draw_start_ns;
@@ -1546,6 +1575,8 @@ fn Host(comptime App: type) type {
             assert(wl_display_get_fd(display) >= 0);
             if (!self.arm_audio()) return;
             defer if (has_audio) wake.disarm();
+            if (!self.arm_producer()) return;
+            defer if (has_producer) App.wake(self.app).disarm();
             if (wl_display_prepare_read(display) != 0) {
                 const pending = wl_display_dispatch_pending(display);
                 if (pending < 0) {
@@ -1569,7 +1600,7 @@ fn Host(comptime App: type) type {
             fds[@backingInt(Slot.repeat)] = poll_entry(state.repeat_fd, std.posix.POLL.IN);
             fds[@backingInt(Slot.send)] = poll_entry(clipboard.send_fd, std.posix.POLL.OUT);
             fds[@backingInt(Slot.receive)] = poll_entry(clipboard.receive_fd, std.posix.POLL.IN);
-            fds[@backingInt(Slot.audio)] = poll_entry(wake.fd, std.posix.POLL.IN);
+            fds[@backingInt(Slot.wake)] = poll_entry(wake_fd, std.posix.POLL.IN);
             fds[@backingInt(Slot.drop_list)] = poll_entry(clipboard.dnd.list_fd, std.posix.POLL.IN);
             const ready = poll_wayland(state, fds[0..]) catch {
                 wl_display_cancel_read(display);
@@ -1599,7 +1630,7 @@ fn Host(comptime App: type) type {
             if (fds[@backingInt(Slot.repeat)].revents != 0) drain_repeat(state);
             if (fds[@backingInt(Slot.send)].revents != 0) clipboard.pump_send(context.copied());
             if (fds[@backingInt(Slot.receive)].revents != 0) clipboard.pump_receive();
-            if (fds[@backingInt(Slot.audio)].revents != 0) drain_wake(wake.fd);
+            if (fds[@backingInt(Slot.wake)].revents != 0) drain_wake(wake_fd);
             if (fds[@backingInt(Slot.drop_list)].revents != 0) clipboard.dnd.pump_list();
             // A bench run that ended in a callback read above stops the loop. That wake is not
             // a failure.
@@ -1629,6 +1660,55 @@ fn Host(comptime App: type) type {
                 bench_run.audio_drained_max = @max(bench_run.audio_drained_max, drained);
             }
             if (context.dirty) state.frame.request_redraw();
+        }
+
+        /// Calls `App.drain` once, and owes a redraw if it left the app dirty (section 5c').
+        fn sync_producer(self: *Self) void {
+            if (!has_producer) return;
+            App.drain(self.app, &context);
+            producer_drains += 1;
+            if (context.dirty) self.state.frame.request_redraw();
+        }
+
+        /// Bench mode only: steps the producer by this frame's sample time, then drains
+        /// (section 5c').
+        fn bench_produce(self: *Self) void {
+            if (!has_producer) return;
+            if (!bench_run.active) return;
+            if (comptime app_contract.has_produce(App)) {
+                App.produce(self.app, bench.producer_frames_at(bench_run.producer_frames, 60));
+            }
+            bench_run.producer_frames += 1;
+            self.sync_producer();
+        }
+
+        /// Arms the app's wake before a sleep under the conditions audio uses (section 5c').
+        /// Returns false when the producer has something pending, so the caller drains.
+        fn arm_producer(self: *Self) bool {
+            if (!has_producer) return true;
+            const state = self.state;
+            if (state.frame_callback != null) return true;
+            if (state.present_at_ns != 0) return true;
+            const count: ProducerCount = .{ .app = self.app };
+            return App.wake(self.app).arm(&count);
+        }
+
+        /// What `Wake.arm` reads for a producer: the app's own count (`app.zig`, section 4e).
+        const ProducerCount = struct {
+            app: *const App,
+
+            pub fn pending(count: *const ProducerCount) u32 {
+                return App.pending(count.app);
+            }
+        };
+
+        /// After the loop of an app with a producer: the wakes its `notify` wrote, and drains.
+        fn log_producer(self: *const Self) void {
+            if (!has_producer) return;
+            std.log.info("wake: {d} notified, {d} drains", .{
+                App.wake(self.app).notified.load(.monotonic),
+                producer_drains,
+            });
         }
 
         /// After the loop of a run that started audio: blocks received, blocks dropped, wakes the
