@@ -5,14 +5,15 @@ Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port N] [-
        [--root DIR]
 
 `--root DIR` names the tree that holds the app: its `zig-out/bin/<app>`, its golden files, and its
-`serve-<app>` step, for an app in a package of its own (Weft's Play). The default is this
+`serve-<app>` step, for an app in a package of its own (Weft's Play, or `examples/sound` for the
+audio and rack examples). The default is this
 repository, so every other use is unchanged. Every path and step below is under that root.
 
 1. Renders the scenario headless on the high adapter with `zig-out/bin/<app> --regress --only
    <scenario> --adapter high --keep`, which leaves the reference frame in
    `zig-out/regress/<app>/<scenario>-high-on.png` (build the examples first with
    `zig build -Doptimize=ReleaseFast`).
-2. Starts its own `zig build serve-<app>` (`serve` for the rack), which builds the wasm from
+2. Starts its own `zig build serve-<app>`, which builds the wasm from
    this tree, on a free port (or `--port`) through `PATCHWORK_SERVE_PORT` (src/serve.zig), and
    waits for it. It never uses a server it did not start, since one already on a port may serve
    another tree's or an older build (another session in this repository runs its own), unless
@@ -366,7 +367,7 @@ def main(argv):
             if port_open(port):
                 print(f"browser_check: :{port} is taken; pass another --port, or --reuse")
                 return 2
-            step = "serve" if app == "rack" and root == ROOT else f"serve-{app}"
+            step = f"serve-{app}"
             print(f"server: zig build {step} on :{port}")
             server = subprocess.Popen(
                 [os.environ.get("ZIG", "zig"), "build", step],

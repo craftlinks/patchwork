@@ -1,0 +1,20 @@
+.{
+    .name = .sound,
+    .version = "0.0.0",
+    .fingerprint = 0xf88ec384dc86c133,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .patchwork = .{ .path = "../.." },
+        .thrum = .{ .path = "../../../thrum" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "audio.zig",
+        "rack.zig",
+        "rack",
+        "tone.zig",
+        "tone.js",
+        "test",
+    },
+}

@@ -1,13 +1,13 @@
 //! Audio example: stereo meters, a triggered scope, and an XY trace with persistence, all fed by
-//! the test tone through the audio queue.
+//! Thrum's test tone through Patchwork's producer seam.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
 //! ## 1. What It Demonstrates
-//! The audio data path (step 26, `realtime.zig`): the app declares `Audio =
-//! realtime.TestTone`, the host runs it off the UI thread (an audio thread natively, an
-//! AudioWorklet in the browser, where it is audible), and `audio` receives every block on the
-//! UI thread. At fixed positions from the top-left:
+//! A peer's audio through the producer contract (`app.zig`, section 4e; step 55): the app owns a
+//! `tone.Tone`, which plays Thrum's test tone on a PipeWire device natively and in Thrum's
+//! AudioWorklet in the browser, audible on both, and hands each block it played to the UI thread
+//! (`tone.zig`). At fixed positions from the top-left:
 //! ```text
 //! meters  16, 56, 160 by 384    L and R: RMS fill, peak line, hold tick, 60 dB scale
 //! scope   192, 56, 512 by 384   L and R, 512 frames from the latest rising crossing of L
@@ -17,16 +17,17 @@
 //! ```
 //!
 //! ## 2. Data Flow
-//! Each block updates four `realtime.Ballistics` (RMS and peak of L and R, on the meter scale),
-//! pushes into the `realtime.Scope` history, counts, and owes a draw. The meters therefore move
-//! by the block (2.67 ms), not by the frame, and a frame draws whatever arrived since the last
-//! one. Nothing here runs on a timer: with the tone stopped no block arrives and nothing is drawn.
+//! `drain` takes every block waiting; each updates four `thrum.level.Ballistics` (RMS and peak of
+//! L and R, on the meter scale), pushes into the `thrum.level.Scope` history, counts, and owes a
+//! draw. The meters therefore move by the block (2.67 ms), not by the frame, and a frame draws
+//! whatever arrived since the last one. Nothing here runs on a timer: with the tone stopped no
+//! block arrives and nothing is drawn.
 //!
 //! ## 3. Start and Stop
-//! Space toggles `cx.set_audio`. Stopping resets the meters to 0 and keeps the scope's last
-//! window; the XY trail keeps drawing `decay_frames` frames until it has faded below 1/255, then
-//! the screen sleeps. The bench feeds the tone frame by frame (`realtime.blocks_for_frame`), so
-//! `play` dumps are deterministic.
+//! Space toggles the tone. Stopping resets the meters to 0 and keeps the scope's last window; the
+//! XY trail keeps drawing `decay_frames` frames until it has faded below 1/255, then the screen
+//! sleeps. Regress and the bench step the tone frame by frame through `produce`, so `play` dumps
+//! are deterministic. Natively a start that cannot open the device says so in the title.
 //!
 //! ## 4. TigerStyle Invariants
 //! Capacities are exact (comptime block); a block costs O(128) and a frame O(scope frames).
@@ -34,9 +35,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const patchwork = @import("patchwork");
+const thrum = @import("thrum");
+const testtone = @import("testtone");
+const tone = @import("tone.zig");
 const quads = patchwork.draw;
 const input = patchwork.input;
-const realtime = patchwork.realtime;
+const level = thrum.level;
 const text = patchwork.text;
 const theme = patchwork.theme;
 const ui = patchwork.ui;
@@ -58,7 +62,7 @@ pub const signal_scale: f32 = 300;
 pub const track_top: f32 = 80;
 pub const track_height: f32 = 320;
 pub const bar_width: f32 = 32;
-pub const bar_x = [realtime.channels]f32{ 48, 112 };
+pub const bar_x = [tone.channels]f32{ 48, 112 };
 /// The scale marks, in dBFS.
 pub const marks_db = [_]f32{ -6, -12, -24, -48 };
 
@@ -68,7 +72,7 @@ pub const decay_frames: u32 = 44;
 /// Levels a faded XY texel loses per frame beyond `persistence` (`draw/fx.zig`, section 3).
 pub const fade_bias: f32 = 1.5 / 255.0;
 
-pub const Scope = realtime.Scope(scope_frames);
+pub const Scope = level.Scope(scope_frames, tone.channels);
 
 const xy_layer: quads.Layer = @fromBackingInt(@intCast(1));
 
@@ -77,7 +81,7 @@ const rms_color: [4]f32 = .{ 0.25, 0.75, 0.40, 1 };
 const peak_color: [4]f32 = .{ 0.75, 1.0, 0.80, 1 };
 const hold_color: [4]f32 = .{ 1.0, 0.75, 0.25, 1 };
 const mark_color: [4]f32 = .{ 1, 1, 1, 0.18 };
-const trace_colors = [realtime.channels][4]f32{
+const trace_colors = [tone.channels][4]f32{
     .{ 0.35, 1.0, 0.55, 1 },
     .{ 0.40, 0.70, 1.0, 1 },
 };
@@ -90,13 +94,15 @@ const centered: text.Options = .{ .align_x = .center, .align_y = .center, .ellip
 
 /// The three faces, per bar a track, an RMS fill, a peak line, and a hold tick, the marks, and
 /// the scope's center line.
-const box_cap: u32 = 3 + realtime.channels * 4 + marks_db.len + 1;
+const box_cap: u32 = 3 + tone.channels * 4 + marks_db.len + 1;
 const glyph_cap: u32 = 256;
 /// Two scope traces and the XY trace.
 const trace_count: u32 = 3;
 const path_cap: u32 = trace_count * quads.path.chunks_max(scope_frames);
 const point_cap: u32 = trace_count * scope_frames;
 const stats_cap: u32 = 96;
+/// The title band's longest line: a failure names the device's error.
+const title_cap: u32 = 96;
 
 comptime {
     assert(std.math.pow(f32, persistence, decay_frames) < 1.0 / 255.0);
@@ -104,29 +110,31 @@ comptime {
     assert(scope_rect.width == @as(f32, @floatFromInt(scope_frames)));
     assert(track_top + track_height <= meters_rect.y + meters_rect.height);
     // The tone's peak stays inside the scope and the XY panel.
-    assert((realtime.gain_floor + realtime.gain_swing) * signal_scale < scope_rect.height / 2);
-    assert((realtime.gain_floor + realtime.gain_swing) * signal_scale < xy_rect.width / 2);
+    assert((testtone.gain_floor + testtone.gain_swing) * signal_scale < scope_rect.height / 2);
+    assert((testtone.gain_floor + testtone.gain_swing) * signal_scale < xy_rect.width / 2);
 }
 
 /// One meter bar's ballistics.
 pub const Bar = struct {
-    rms: realtime.Ballistics,
-    peak: realtime.Ballistics,
+    rms: level.Ballistics,
+    peak: level.Ballistics,
 
     pub const zero: Bar = .{ .rms = .zero, .peak = .zero };
 };
 
 /// The audio screen. See the module guide.
 pub const App = struct {
-    bars: [realtime.channels]Bar,
+    bars: [tone.channels]Bar,
     scope: Scope,
     xy: quads.TextureId,
     /// Blocks received since startup.
     blocks: u64,
     /// Frames still owed after a stop, while the XY trail decays.
     decaying: u32,
-
-    pub const Audio = realtime.TestTone;
+    /// The tone and its hosts (`tone.zig`).
+    tone: tone.Tone,
+    /// Why the last start played nothing, natively; empty when it played (section 3).
+    failure: []const u8,
 
     pub const config: patchwork.app.Config = .{
         .title = "audio",
@@ -158,6 +166,37 @@ pub const App = struct {
         app.xy = textures.create_target(.feedback);
         app.blocks = 0;
         app.decaying = 0;
+        app.tone.init("patchwork-audio");
+        app.failure = "";
+    }
+
+    /// Lets Space open the audio device: only the native window host calls this (`tone.zig`).
+    pub fn args(app: *App, arguments: []const [:0]const u8) void {
+        _ = arguments;
+        app.tone.allow_device();
+    }
+
+    pub fn wake(app: *App) *patchwork.Wake {
+        return app.tone.wake();
+    }
+
+    pub fn pending(app: *const App) u32 {
+        return app.tone.pending();
+    }
+
+    /// Takes every block waiting (section 2), at most the monitor's capacity.
+    pub fn drain(app: *App, cx: *Context) void {
+        var count: u32 = 0;
+        while (count < tone.monitor_blocks) : (count += 1) {
+            const block = app.tone.pop() orelse break;
+            app.block_in(cx, &block);
+        }
+        assert(count <= tone.monitor_blocks);
+    }
+
+    /// Steps the tone by `frames` where no device plays (section 3).
+    pub fn produce(app: *App, frames: u32) void {
+        app.tone.produce(frames);
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
@@ -179,8 +218,11 @@ pub const App = struct {
 
     /// Starts or stops the tone (section 3).
     fn toggle(app: *App, cx: *Context) void {
-        const on = !cx.audio_on;
-        cx.set_audio(on);
+        const on = !app.tone.playing;
+        switch (app.tone.set_playing(on)) {
+            .playing => app.failure = "",
+            .failed => |reason| app.failure = reason,
+        }
         if (!on) {
             app.bars = @splat(.zero);
             app.decaying = decay_frames;
@@ -196,12 +238,13 @@ pub const App = struct {
         _ = now_ms;
     }
 
-    /// One block from the source (section 2).
-    pub fn audio(app: *App, cx: *Context, block: *const realtime.Block) void {
-        const levels = realtime.levels(block);
+    /// One block of the tone (section 2).
+    fn block_in(app: *App, cx: *Context, block: *const tone.Block) void {
+        assert(app.tone.playing);
+        const levels = level.levels(tone.channels, block);
         for (&app.bars, 0..) |*bar, channel| {
-            bar.rms.step(realtime.meter_of(levels.rms[channel]));
-            bar.peak.step(realtime.meter_of(levels.peak[channel]));
+            bar.rms.step(level.meter_of(levels.rms[channel]));
+            bar.peak.step(level.meter_of(levels.peak[channel]));
         }
         app.scope.push(block);
         app.blocks += 1;
@@ -212,7 +255,15 @@ pub const App = struct {
         const draw_cx = cx.drawing();
         const window = clip_of(cx.window);
         const band: Rect = .{ .x = 16, .y = 0, .width = 1056, .height = 40 };
-        const title = if (cx.audio_on) "audio: test tone running (space stops)" else "audio: test tone stopped (space plays)";
+        var failed: [title_cap]u8 = undefined;
+        const title = if (app.failure.len > 0)
+            std.fmt.bufPrint(&failed, "audio: no sound, the device did not open ({s})", .{
+                app.failure,
+            }) catch unreachable
+        else if (app.tone.playing)
+            "audio: test tone running (space stops)"
+        else
+            "audio: test tone stopped (space plays)";
         // Faces first: batches draw in order of first appearance, so the Box batch must come
         // before the Glyph batch for labels on a face to show.
         append_box(cx, meters_rect, face_color, meters_rect, 8);
@@ -223,7 +274,7 @@ pub const App = struct {
         app.draw_scope(cx);
         app.draw_xy(cx);
         app.draw_stats(cx);
-        if (!cx.audio_on and app.decaying > 0) app.decaying -= 1;
+        if (!app.tone.playing and app.decaying > 0) app.decaying -= 1;
         assert(cx.draw.overflow_count == 0);
     }
 
@@ -256,7 +307,7 @@ pub const App = struct {
         const draw_cx = cx.drawing();
         const center_y = scope_rect.y + scope_rect.height / 2;
         append_box(cx, .{ .x = scope_rect.x, .y = center_y, .width = scope_rect.width, .height = 1 }, mark_color, scope_rect, 0);
-        var window: [realtime.channels][scope_frames]f32 = undefined;
+        var window: Scope.Window = undefined;
         _ = app.scope.window_of(&window);
         for (window, trace_colors) |samples, color| {
             var points: [scope_frames]quads.path.Point = undefined;
@@ -276,8 +327,8 @@ pub const App = struct {
         draw_cx.offscreen(xy_layer, app.xy, target);
         const previous = draw_cx.layer(xy_layer);
         fx.composite(draw_cx, app.xy, target, target, clip, persistence, 1, fade_bias);
-        if (cx.audio_on and app.blocks > 0) {
-            var window: [realtime.channels][scope_frames]f32 = undefined;
+        if (app.tone.playing and app.blocks > 0) {
+            var window: Scope.Window = undefined;
             app.scope.newest(&window);
             const center_x = inner.x + inner.width / 2;
             const center_y = inner.y + inner.height / 2;
@@ -293,9 +344,9 @@ pub const App = struct {
 
     fn draw_stats(app: *const App, cx: *Context) void {
         var buffer: [stats_cap]u8 = undefined;
-        const state = if (cx.audio_on) "running" else "stopped";
+        const state = if (app.tone.playing) "running" else "stopped";
         const line = std.fmt.bufPrint(&buffer, "blocks {d}    dropped {d}    {s}", .{
-            app.blocks, cx.audio_dropped, state,
+            app.blocks, app.tone.dropped(), state,
         }) catch unreachable;
         text.place(cx.drawing(), label_style, line, stats_rect, clip_of(cx.window), left);
     }
@@ -312,7 +363,7 @@ pub fn value_y(value: f32) f32 {
 
 /// The y of the `db` mark.
 pub fn mark_y(db: f32) f32 {
-    return value_y((db + realtime.meter_range_db) / realtime.meter_range_db);
+    return value_y((db + level.meter_range_db) / level.meter_range_db);
 }
 
 /// A 2-pixel line across a bar at meter value `value`, inside the track.
@@ -358,12 +409,11 @@ fn send_space(app: *App) void {
     ui.dispatch(App, app, &fixture.context, .{ .key_down = input.key_press(.other, .none, false, " ") });
 }
 
-/// Feeds `count` tone blocks the way a host drains them.
-fn feed(app: *App, tone: *realtime.TestTone, count: u32) void {
-    var block: realtime.Block = undefined;
+/// Steps the tone by `count` blocks where no device plays, draining each as a host does.
+fn feed(app: *App, count: u32) void {
     for (0..count) |_| {
-        tone.render(&block);
-        App.audio(app, &fixture.context, &block);
+        App.produce(app, testtone.block_frames);
+        App.drain(app, &fixture.context);
     }
 }
 
@@ -372,7 +422,7 @@ fn feed(app: *App, tone: *realtime.TestTone, count: u32) void {
 // to layer 1 at the inner rect, with no trace drawn.
 test "the stopped screen draws the panels and no trace" {
     const app = new_app();
-    try std.testing.expect(!fixture.context.audio_on);
+    try std.testing.expect(!app.tone.playing);
     const cx = frame_at(app);
     try std.testing.expectEqual(@as(f32, 112), mark_y(-6));
     try std.testing.expectEqual(@as(f32, 336), mark_y(-48));
@@ -391,14 +441,12 @@ test "the stopped screen draws the panels and no trace" {
 test "blocks move the meters and draw the trace" {
     const app = new_app();
     send_space(app);
-    try std.testing.expect(fixture.context.audio_on);
-    var tone: realtime.TestTone = undefined;
-    tone.init(realtime.sample_rate);
-    feed(app, &tone, 375);
+    try std.testing.expect(app.tone.playing);
+    feed(app, 375);
     try std.testing.expectEqual(@as(u64, 375), app.blocks);
     for (app.bars) |bar| {
-        try std.testing.expect(bar.peak.value > realtime.meter_of(0.05));
-        try std.testing.expect(bar.peak.value <= realtime.meter_of(0.5) + 1e-6);
+        try std.testing.expect(bar.peak.value > level.meter_of(0.05));
+        try std.testing.expect(bar.peak.value <= level.meter_of(0.5) + 1e-6);
         try std.testing.expect(bar.rms.value < bar.peak.value);
     }
     const cx = frame_at(app);
@@ -416,11 +464,9 @@ test "blocks move the meters and draw the trace" {
 test "a stop zeroes the meters, decays, and sleeps" {
     const app = new_app();
     send_space(app);
-    var tone: realtime.TestTone = undefined;
-    tone.init(realtime.sample_rate);
-    feed(app, &tone, 40);
+    feed(app, 40);
     send_space(app);
-    try std.testing.expect(!fixture.context.audio_on);
+    try std.testing.expect(!app.tone.playing);
     try std.testing.expectEqual(@as(f32, 0), app.bars[0].peak.value);
     for (0..decay_frames) |_| {
         try std.testing.expect(ui.animate(App, app, &fixture.context, 16));
@@ -435,11 +481,16 @@ test "the scenarios replay headless" {
     const cx = &fixture.context;
     const play = bench.find(App.scenarios, "play").?;
     _ = try bench.replay_headless(App, new_app(), cx, play, .{ 1280, 720 }, 20);
-    try std.testing.expect(cx.audio_on);
+    try std.testing.expect(fixture.app.tone.playing);
     const still = bench.find(App.scenarios, "still").?;
     _ = try bench.replay_headless(App, new_app(), cx, still, .{ 1280, 720 }, 10);
 }
 
 comptime {
     patchwork.app.check(App);
+    tone.exports();
+}
+
+test {
+    _ = tone;
 }

@@ -214,10 +214,15 @@ patchwork/
 │   ├── wp_fractional_scale.zig # wp_fractional_scale_v1 and wp_viewporter bindings
 │   └── xdg_shell.zig           # XDG shell surface and toplevel protocol
 ├── examples/                   # Example applications
-│   ├── rack/                   # Modular synthesizer rack
-│   │   ├── app.zig             # Rack App implementing the patchwork.app contract
-│   │   ├── led.zig             # The rack's own draw type: a glowing LED
-│   │   └── badge.zig           # Procedural 32 by 32 RGBA badge texture
+│   ├── sound/                  # A package of its own: the examples that play Thrum (step 55)
+│   │   ├── build.zig           # Both apps through addApp; Patchwork and Thrum as path deps
+│   │   ├── rack.zig            # Rack App: the modular synthesizer rack
+│   │   ├── rack/led.zig        # The rack's own draw type: a glowing LED
+│   │   ├── rack/badge.zig      # Procedural 32 by 32 RGBA badge texture
+│   │   ├── audio.zig           # Audio App: test tone meters, triggered scope, XY trace
+│   │   ├── tone.zig            # The glue: Thrum's test tone on a device, offline, or a page
+│   │   ├── tone.js             # Their web module: Thrum's worklet from the app's own wasm
+│   │   └── test/golden/        # The two apps' goldens
 │   ├── column/                 # Scrolling view regression app
 │   │   └── app.zig             # Column App (config.timer_period_ms = 0)
 │   ├── live/                   # Live-coding screen
@@ -238,8 +243,6 @@ patchwork/
 │   │   └── track.zig           # The synthetic track, its band envelopes, and the DFT columns
 │   ├── fx/                     # Offscreen effects
 │   │   └── app.zig             # Fx App: phosphor scope with bloom, a panel faded as one layer
-│   ├── audio/                  # Audio data into the UI
-│   │   └── app.zig             # Audio App: test tone meters, triggered scope, XY trace
 │   ├── wake/                   # A producer on another thread into the UI (step 54)
 │   │   ├── app.zig             # Wake App: a ring, a thread or produce or a page interval, a sparkline
 │   │   └── app.js              # Its web module: the page's producer on a 5 ms interval
@@ -317,10 +320,19 @@ their `.pc` files must be installed (every Wayland desktop ships the libraries);
 without them refuses to start the executable. The wasm build links nothing.
 
 ```bash
-# Examples (Rack)
-zig build run             # Build and run the synthesizer rack natively (Wayland + wgpu-native)
-zig build wasm            # Compile the rack to zig-out/bin/rack.wasm (wasm32-freestanding)
-zig build serve           # Serve the rack WebGPU application on localhost (prints the address)
+# Examples (Gallery, which also owns the plain names)
+zig build run             # Build and run the widget gallery natively (Wayland + wgpu-native)
+zig build wasm            # Compile the gallery to zig-out/bin/gallery.wasm (wasm32-freestanding)
+zig build serve           # Serve the gallery WebGPU application on localhost (prints the address)
+
+# Examples (Rack and Audio, in examples/sound, with Thrum checked out at ../thrum)
+cd examples/sound
+zig build run             # The synthesizer rack natively; Space plays Thrum's test tone, audible
+zig build serve           # The rack in the browser; Space plays the tone in Thrum's worklet
+zig build run-audio       # The audio meters, scope, and XY trace natively, audible
+zig build serve-audio     # The same in the browser
+zig build test            # Both apps' tests and the glue's
+zig build regress         # Both apps' scenarios against examples/sound/test/golden
 
 # Examples (Scroll Column)
 zig build run-column      # Build and run the scroll column natively
@@ -346,11 +358,6 @@ zig build serve-wave      # Serve them on localhost (prints the address)
 zig build run-fx          # Build and run the offscreen effects natively
 zig build wasm-fx         # Compile them to zig-out/bin/fx.wasm
 zig build serve-fx        # Serve them on localhost (prints the address)
-
-# Examples (Audio)
-zig build run-audio       # Build and run the audio meters and scope natively (silent)
-zig build wasm-audio      # Compile them to zig-out/bin/audio.wasm
-zig build serve-audio     # Serve them on localhost; Space plays the tone (audible)
 
 # Examples (Wake)
 zig build run-wake        # A producer thread into the UI; Space starts and stops it
@@ -426,14 +433,11 @@ zig build run -Dwgpu-lib-dir=/path/to/wgpu-native/lib
 
 ```text
 zig-out/
-├── bin/rack, column, live,     # native executables, RUNPATH $ORIGIN/../lib
-│   data, wave, fx, audio,
-│   canvas, gallery
-├── bin/rack.wasm, column.wasm, # from `zig build wasm`, `zig build wasm-column`,
-│   live.wasm, data.wasm,       #   `zig build wasm-live`, `zig build wasm-data`,
-│   wave.wasm, fx.wasm,         #   `zig build wasm-wave`, `zig build wasm-fx`,
-│   audio.wasm, canvas.wasm,    #   `zig build wasm-audio`, `zig build wasm-canvas`,
-│   gallery.wasm                #   and `zig build wasm-gallery`
+├── bin/column, live, data,     # native executables, RUNPATH $ORIGIN/../lib
+│   wave, fx, wake, canvas,
+│   gallery, workspace, ...
+├── bin/column.wasm, ...        # from `zig build wasm-column` and the other wasm steps;
+│   gallery.wasm                #   `zig build wasm` is the gallery's
 └── lib/libwgpu_native.so       # from the wgpu_native package, or from -Dwgpu-lib-dir
 ```
 
@@ -1103,14 +1107,14 @@ switch (app.dock.handle(cx, event)) { .activated, .closed, .moved => |panel| ...
 Worked coordinates, initial values, palettes, and budgets live in the examples' tests, not
 here, so they cannot drift. Run `zig build test` for the checked numbers.
 
-### 1. Synthesizer Rack (`examples/rack/app.zig`)
+### 1. Synthesizer Rack (`examples/sound/rack.zig`)
 
 A modular rack under a header bar: a column of panels, three holding a row of knobs and a
 level meter and the fourth four envelope knobs and an envelope display, with patch cables
 between knobs, beside a scrolling list of 1,000 presets and a status line. It demonstrates:
 - **Layout while drawing.** Nested `begin` and `end` with `share(4)` panels; the knob and
   meter omission rules are a few lines against `cx.remaining()` and `cx.fits()`. The worked
-  layouts are locked by the tests in `examples/rack/app.zig`.
+  layouts are locked by the tests in `examples/sound/rack.zig`.
 - **Actions.** Knobs return `changed`, which the rack writes to its status line
   ("filter.cut changed 0.42"); a right click resets a knob to its initial value
   ("filter.cut reset 0.50"); clicking a preset row selects and highlights it ("preset 412
@@ -1133,10 +1137,10 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
   the meter sits in its own clipping cell so its fixed-height track cannot cover the title.
 - **Per-instance accents.** Knob accents are per-instance colors (`draw.Arc.color`), not theme
   slots. The palette is `widgets.accents`.
-- **An app-defined draw type** (`examples/rack/led.zig`). `Led` is an `extern struct` plus a
+- **An app-defined draw type** (`examples/sound/rack/led.zig`). `Led` is an `extern struct` plus a
   WGSL `pixel` function, registered in `config.draw` with no library edit. Each voice panel's
   LED sits in the title band over the meter and glows with the meter level.
-- **An image texture** (`examples/rack/badge.zig`). `init` generates a 32 by 32 RGBA badge,
+- **An image texture** (`examples/sound/rack/badge.zig`). `init` generates a 32 by 32 RGBA badge,
   creates a texture for it, and queues its pixels; each title band draws it as a `draw.Image`.
 - **Patch cables.** The center of each knob's ring is a jack hub. Dragging from a hub draws a
   preview cable to the pointer; releasing over another knob patches a cable ("osc.rate ->
@@ -1155,12 +1159,13 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
   the neighbour's text on the tooltip layer" locks it, and "the tooltip draws the records of
   the rack's own tooltip" that its box and text are byte for byte those of the rack's earlier
   hand-made tooltip.
-- **Audio-driven meters.** The rack declares `Audio = realtime.TestTone`; Space (when no
-  title is being renamed) starts and stops it ("tone on", "tone off"). Each block's L, R, and
-  mid peaks go through `realtime.Ballistics` onto the osc, filter, and amp meters, and the
-  LEDs follow. Dragging a knob never changes a bar. The rack has no timer: stopped, it draws
-  empty meters and sleeps (before step 26 a 30 Hz timer woke it forever). In the browser the
-  tone is audible.
+- **Audio-driven meters.** The rack plays Thrum's test tone through the producer seam
+  (Producers below; `examples/sound/tone.zig`): a PipeWire device natively and Thrum's worklet
+  in the browser, both audible. Space (when no title is being renamed) starts and stops it
+  ("tone on", "tone off"). Each block's L, R, and mid peaks go through `thrum.level.Ballistics`
+  onto the osc, filter, and amp meters, and the LEDs follow. Dragging a knob never changes a
+  bar. The rack has no timer: stopped, no stream is open, it draws empty meters, and it sleeps
+  (before step 26 a 30 Hz timer woke it forever).
 
 Knob interaction: a knob draws a track arc and, unless its value is at the minimum, a value
 arc. Dragging vertically adjusts the value in proportion to `-dy` (up increases). Wheel over
@@ -1261,15 +1266,19 @@ frames, so its pictures are deterministic. At 2856 by 2514 the scope target cost
 770), 2.5 MB in all; the panel's target never re-renders when only its opacity changes.
 Natively and in Chromium the faded screen is bitwise identical.
 
-### 7. Audio (`examples/audio/app.zig`)
+### 7. Audio (`examples/sound/audio.zig`)
 
 Stereo meters (RMS fill, peak line, and a one-second hold on a 60 dB scale), a scope of 512
 frames triggered on L's rising zero crossing, and an XY trace of L against R on a feedback
-target with persistence, all fed by `realtime.TestTone` (220 and 330 Hz with slow gain
-triangles) through the audio queue, plus a line of blocks received and dropped. Space starts
-and stops the tone; stopped, the meters reset, the XY trail decays for 44 frames, and the
-screen sleeps. Scenarios: `still` and `play` (the bench feeds 6, 6, 6, 7 blocks per frame on
-the UI thread, so dumps are deterministic). At 2856 by 2514 a playing frame costs about 28
+target with persistence, all fed by Thrum's test tone (220 and 330 Hz with slow gain
+triangles, `thrum/examples/testtone`) through the producer seam, plus a line of blocks received
+and dropped. It is the worked example of a peer's audio through the seam: `tone.zig` opens a
+`thrum.pipewire.Device` on Space natively (audible), steps an offline `thrum.Engine` in
+`produce` where no device plays, and in a page `tone.js` runs Thrum's worklet from the app's own
+wasm. Space starts and stops the tone; stopped, the meters reset, the XY trail decays for 44
+frames, and the screen sleeps. Scenarios: `still` and `play` (`produce` renders 6, 6, 6, 7
+blocks per frame at 60 fps, so dumps are deterministic); their goldens are the lines the app
+had before it moved (step 55). At 2856 by 2514 a playing frame costs about 28
 microseconds of CPU on the RTX 3060 (41 on the UHD 770) plus 1.6 microseconds per block to
 render the tone and 0.4 to drain it; the never-started screen is bitwise identical natively
 and in Chromium.
@@ -1919,7 +1928,7 @@ hover writes the changed arc records only, and a scale change writes the uniform
 rectangle, and the glyph range, but no box or arc record. Pipeline, vertex
 buffer, and texture bind group sets are skipped when the previous batch already set them. The
 exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack frames record
-the step 16 op sequences" in `examples/rack/app.zig`. The path point pool follows the same
+the step 16 op sequences" in `examples/sound/rack.zig`. The path point pool follows the same
 rule with its own shadow: a rebuilt path whose shape is unchanged writes no points, and a
 recolored one writes its `Path` records only.
 

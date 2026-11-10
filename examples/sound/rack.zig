@@ -133,11 +133,13 @@
 //! is hovered" and "the envelope polyline follows the four knobs".
 //!
 //! ## 4. Meter Data Flow
-//! The rack declares `Audio = realtime.TestTone` (`app.zig`, section 4a), which the host runs off
-//! the UI thread; Space (when no title is being renamed) starts and stops it, and the status
-//! line says "tone on" or "tone off". The host calls `App.audio` once per block:
+//! The rack plays Thrum's test tone through Patchwork's producer seam (`app.zig`, section 4e;
+//! `tone.zig`): a PipeWire device natively and Thrum's worklet in the browser, audible on both,
+//! and the offline engine where no device plays. Space (when no title is being renamed) starts
+//! and stops it, and the status line says "tone on" or "tone off", or why the device did not
+//! open. `drain` takes each block the tone played:
 //! ```text
-//! realtime.levels(block) -> peaks of L, R, mid -> meter_of -> Ballistics per meter
+//! thrum.level.levels(block) -> peaks of L, R, mid -> meter_of -> Ballistics per meter
 //!   -> Meter.set_value -> cx.redraw() only if a value changed
 //! ```
 //! The osc, filter, and amp meters show L, R, and mid. A stop zeroes them, so a rack at rest
@@ -163,9 +165,11 @@ const theme = patchwork.theme;
 const ui = patchwork.ui;
 const widgets = patchwork.widgets;
 const kit = widgets.kit;
-const realtime = patchwork.realtime;
-const led = @import("led.zig");
-const badge = @import("badge.zig");
+const thrum = @import("thrum");
+const thrum_level = thrum.level;
+const tone = @import("tone.zig");
+const led = @import("rack/led.zig");
+const badge = @import("rack/badge.zig");
 
 const Rect = quads.Rect;
 
@@ -301,6 +305,9 @@ const preset_glyphs: u32 = preset_name_cap - 1;
 /// The status line under the list and its fixed buffer.
 const status_px: f32 = 24;
 const status_cap: u32 = 52;
+/// The status line when a start could not open the device, and the most of its reason it shows.
+const failed_prefix = "no sound: the device did not open: ";
+const failed_reason_max: u32 = status_cap - failed_prefix.len;
 const status_style: text.Style = .{ .face = .sans, .size = 14, .color = theme.dark.colors.text };
 
 /// Pool, batch, area, and point capacities. The comptime block checks each against the worst
@@ -386,13 +393,15 @@ const knob_table = [_]struct { name: []const u8, value: f32 }{
 
 const Context = patchwork.app.Context(App);
 
-/// The rack app: panels of knobs and meters. `audio` writes the test tone's levels onto the
+/// The rack app: panels of knobs and meters. `drain` writes the test tone's levels onto the
 /// meters (section 4).
 pub const App = struct {
     knobs: [knob_count]widgets.Knob,
     meters: [meter_panel_count]widgets.Meter,
-    /// The meters' ballistics, fed by `audio`: L, R, and mid peaks.
-    bars: [meter_panel_count]realtime.Ballistics,
+    /// The meters' ballistics, fed by `drain`: L, R, and mid peaks.
+    bars: [meter_panel_count]thrum_level.Ballistics,
+    /// The tone and its hosts (`tone.zig`).
+    tone: tone.Tone,
     /// Panel titles, the shared rename field, and the panel it renames (section 2b).
     titles: [panel_count]Title,
     rename: widgets.TextField,
@@ -416,8 +425,6 @@ pub const App = struct {
     /// The envelope playhead: shown and moving while the display is hovered (section 3d).
     envelope_hovered: bool,
     envelope_phase: f32,
-
-    pub const Audio = realtime.TestTone;
 
     pub const config: patchwork.app.Config = .{
         .title = "patchwork",
@@ -472,6 +479,7 @@ pub const App = struct {
         app.patch_end = .{ .x = 0, .y = 0 };
         app.envelope_hovered = false;
         app.envelope_phase = 0;
+        app.tone.init("patchwork-rack");
         assert(app.knobs[knob_count - 1].value == knob_table[knob_count - 1].value);
         assert(!app.tooltip.visible());
     }
@@ -520,12 +528,41 @@ pub const App = struct {
         _ = now_ms;
     }
 
+    /// Lets Space open the audio device: only the native window host calls this (`tone.zig`).
+    pub fn args(app: *App, arguments: []const [:0]const u8) void {
+        _ = arguments;
+        app.tone.allow_device();
+    }
+
+    pub fn wake(app: *App) *patchwork.Wake {
+        return app.tone.wake();
+    }
+
+    pub fn pending(app: *const App) u32 {
+        return app.tone.pending();
+    }
+
+    /// Takes every block waiting onto the meters (section 4), at most the monitor's capacity.
+    pub fn drain(app: *App, cx: *Context) void {
+        var count: u32 = 0;
+        while (count < tone.monitor_blocks) : (count += 1) {
+            const block = app.tone.pop() orelse break;
+            app.block_in(cx, &block);
+        }
+        assert(count <= tone.monitor_blocks);
+    }
+
+    /// Steps the tone by `frames` where no device plays (`tone.zig`, section 3).
+    pub fn produce(app: *App, frames: u32) void {
+        app.tone.produce(frames);
+    }
+
     /// One block of the tone: its L, R, and mid peaks through the ballistics onto the meters.
     /// Owes a draw only when a meter changes (section 4).
-    pub fn audio(app: *App, cx: *Context, block: *const realtime.Block) void {
-        const levels = realtime.levels(block);
+    fn block_in(app: *App, cx: *Context, block: *const tone.Block) void {
+        const levels = thrum_level.levels(tone.channels, block);
         for (&app.meters, &app.bars, 0..) |*meter, *bar, channel| {
-            bar.step(realtime.meter_of(levels.peak[channel]));
+            bar.step(thrum_level.meter_of(levels.peak[channel]));
             if (meter.set_value(bar.value)) cx.redraw();
             assert(meter.value == bar.value);
         }
@@ -533,13 +570,18 @@ pub const App = struct {
 
     /// Starts or stops the tone; a stop zeroes the meters (section 4).
     fn toggle_tone(app: *App, cx: *Context) void {
-        const on = !cx.audio_on;
-        cx.set_audio(on);
+        const on = !app.tone.playing;
+        switch (app.tone.set_playing(on)) {
+            .playing => app.set_status(&.{if (on) "tone on" else "tone off"}),
+            .failed => |reason| {
+                const shown = reason[0..@min(reason.len, failed_reason_max)];
+                app.set_status(&.{ failed_prefix, shown });
+            },
+        }
         if (!on) {
             app.bars = @splat(.zero);
             for (&app.meters) |*meter| _ = meter.set_value(0);
         }
-        app.set_status(&.{if (on) "tone on" else "tone off"});
         cx.redraw();
     }
 
@@ -1296,7 +1338,8 @@ comptime {
     assert(env_panel == meter_panel_count);
     assert(knobs_per_panel == 4);
     assert(knob_count == 16);
-    assert(realtime.mid + 1 == meter_panel_count);
+    assert(thrum_level.mid + 1 == meter_panel_count);
+    assert(failed_prefix.len + failed_reason_max <= status_cap);
     // Worst-case boxes: one face per panel, two per meter, the tooltip, the header bar, the
     // preset panel, the selected and the hovered row, the thumb, the rename field's face,
     // selection, and caret, one hub per knob, the display face, and the playhead.
@@ -1547,12 +1590,11 @@ test "rack layout at 800 by 600" {
     try expect_rect(meter_cell(cx, 0).?, 448, 108, 80, 81);
 }
 
-/// Feeds `count` blocks of the tone the way a host drains them.
-fn feed(app: *App, tone: *realtime.TestTone, count: u32) void {
-    var block: realtime.Block = undefined;
+/// Steps the tone by `count` blocks where no device plays, draining each as a host does.
+fn feed(app: *App, count: u32) void {
     for (0..count) |_| {
-        tone.render(&block);
-        App.audio(app, &fixture.context, &block);
+        App.produce(app, thrum.block_frames);
+        App.drain(app, &fixture.context);
     }
 }
 
@@ -1568,20 +1610,20 @@ test "audio blocks write the meters and a knob drag does not" {
     const app = new_app();
     const cx = frame_at(app, 1280, 720);
     press_space(app);
-    try std.testing.expect(cx.audio_on);
+    try std.testing.expect(app.tone.playing);
     try std.testing.expectEqualStrings("tone on", app.status_text());
-    var tone: realtime.TestTone = undefined;
-    tone.init(realtime.sample_rate);
     cx.dirty = false;
-    feed(app, &tone, 200);
+    feed(app, 200);
     try std.testing.expect(cx.dirty);
     for (app.meters, app.bars) |meter, bar| {
-        try std.testing.expect(meter.value > realtime.meter_of(0.05));
+        try std.testing.expect(meter.value > thrum_level.meter_of(0.05));
         try std.testing.expectEqual(bar.value, meter.value);
     }
     const amp = app.meters[2].value;
-    App.audio(app, cx, &realtime.Block.silent);
-    try std.testing.expectApproxEqAbs(amp - realtime.fall_per_block, app.meters[2].value, 1e-6);
+    const silent: tone.Block = @splat(@splat(0));
+    app.block_in(cx, &silent);
+    const fallen = amp - thrum_level.fall_per_block;
+    try std.testing.expectApproxEqAbs(fallen, app.meters[2].value, 1e-6);
     const held = app.meters[2].value;
     _ = frame_at(app, 1280, 720);
     const center = ring_grip(cx, app, 8);
@@ -1591,7 +1633,7 @@ test "audio blocks write the meters and a knob drag does not" {
     try std.testing.expectEqual(held, app.meters[2].value);
     _ = send(app, .{ .pointer_up = input.left_at(.{ .x = center.x, .y = center.y - 60 }) });
     press_space(app);
-    try std.testing.expect(!cx.audio_on);
+    try std.testing.expect(!app.tone.playing);
     try std.testing.expectEqualStrings("tone off", app.status_text());
     for (app.meters) |meter| try std.testing.expectEqual(@as(f32, 0), meter.value);
 }
@@ -1977,9 +2019,7 @@ test "badges clear the title and leds follow the meters" {
     const app = new_app();
     const cx = &fixture.context;
     press_space(app);
-    var tone: realtime.TestTone = undefined;
-    tone.init(realtime.sample_rate);
-    feed(app, &tone, 100);
+    feed(app, 100);
     _ = frame_at(app, 1280, 720);
     const images = cx.draw.items(quads.Image);
     try std.testing.expectEqual(@as(usize, panel_count), images.len);
@@ -2449,4 +2489,8 @@ test "cables sag by their length" {
     const control = cable_control(.{ 0, 0 }, .{ 300, 0 });
     try std.testing.expectEqual(quads.Point{ 100, 84 }, control[1]);
     try std.testing.expectEqual(quads.Point{ 200, 84 }, control[2]);
+}
+
+comptime {
+    tone.exports();
 }

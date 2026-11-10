@@ -81,9 +81,11 @@
 //!   language lacks `next`, the batch audit without a `Box`, an editor language with too few
 //!   `faces` or `scales` without them, an `args` of the wrong type, and passes only if the
 //!   compiler rejects each with its expected message.
-//! - `zig build test-consumer` in this repo builds and runs `test/consumer` (section 9).
+//! - `zig build test-consumer` in this repo builds and runs `test/consumer` (section 9), and
+//!   `zig build test-sound` builds, tests, and regresses `examples/sound` (section 9).
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
-//!   `add_example_steps`, with a name suffix for every example but the first.
+//!   `add_example_steps`, with the example's name as a suffix; the gallery also owns the plain
+//!   names.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
 //!   compares two frame dumps, and writes a diff picture or a cropped PNG of the first
 //!   (`tools/compare.zig`).
@@ -130,6 +132,11 @@
 //! this file only as a consumer does. `test-consumer` runs `zig build` there for `install`, `wasm`,
 //! `test`, and `regress`, one after another, then the tool at a chosen time on each adapter and
 //! the app with an argument. It needs a GPU, so it is not part of `test`.
+//!
+//! `examples/sound`, the audio and rack examples, is a package of its own for the same reason
+//! seen from the other side: it takes Thrum as a path dependency (`../../../thrum`), and this file
+//! never names Thrum, so the library cannot import it (step 55). `test-sound` runs `install`,
+//! `wasm`, `test`, and `regress` there.
 
 const std = @import("std");
 const subset = @import("src/text/subset.zig");
@@ -716,13 +723,6 @@ pub fn build(b: *std.Build) void {
     });
     library.addImport("patchwork_fonts", add_font_module(b, default_font_ranges, &.{}));
 
-    const rack = addApp(b, b, .{
-        .name = "rack",
-        .root_source_file = b.path("examples/rack/app.zig"),
-        .target = target,
-        .optimize = optimize,
-        .wgpu_lib_dir = wgpu_lib_dir,
-    });
     const column = addApp(b, b, .{
         .name = "column",
         .root_source_file = b.path("examples/column/app.zig"),
@@ -737,7 +737,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .wgpu_lib_dir = wgpu_lib_dir,
     });
-    b.getInstallStep().dependOn(rack.install);
     b.getInstallStep().dependOn(column.install);
     const data = addApp(b, b, .{
         .name = "data",
@@ -764,14 +763,6 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(wave.install);
     b.getInstallStep().dependOn(fx.install);
-    const audio = addApp(b, b, .{
-        .name = "audio",
-        .root_source_file = b.path("examples/audio/app.zig"),
-        .target = target,
-        .optimize = optimize,
-        .wgpu_lib_dir = wgpu_lib_dir,
-    });
-    b.getInstallStep().dependOn(audio.install);
     const wake = addApp(b, b, .{
         .name = "wake",
         .root_source_file = b.path("examples/wake/app.zig"),
@@ -781,7 +772,6 @@ pub fn build(b: *std.Build) void {
         .web_module = b.path("examples/wake/app.js"),
     });
     b.getInstallStep().dependOn(wake.install);
-    add_example_steps(b, "", "the rack", rack);
     add_example_steps(b, "-column", "the scroll column", column);
     add_example_steps(b, "-live", "the live editor", live);
     add_example_steps(b, "-data", "the data textures", data);
@@ -795,7 +785,6 @@ pub fn build(b: *std.Build) void {
         .wgpu_lib_dir = wgpu_lib_dir,
     });
     b.getInstallStep().dependOn(canvas.install);
-    add_example_steps(b, "-audio", "the audio meters and scope", audio);
     add_example_steps(b, "-wake", "the wake producer", wake);
     add_example_steps(b, "-canvas", "the pan and zoom canvas", canvas);
     const gallery = addApp(b, b, .{
@@ -812,6 +801,8 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(gallery.install);
     add_example_steps(b, "-gallery", "the widget gallery", gallery);
+    // The gallery owns the plain names since the rack moved to `examples/sound` (step 55).
+    add_example_steps(b, "", "the widget gallery", gallery);
     const workspace = addApp(b, b, .{
         .name = "workspace",
         .root_source_file = b.path("examples/workspace/app.zig"),
@@ -853,12 +844,16 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(touch.install);
     add_example_steps(b, "-touch", "the multi-touch pads and sliders", touch);
-    const examples = [_]AppSteps{ rack, column, live, data, wave, fx, audio, wake, canvas, gallery, workspace, session, vector, touch };
+    const examples = [_]AppSteps{
+        column, live,    data,      wave,    fx,     wake,
+        canvas, gallery, workspace, session, vector, touch,
+    };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
     add_compare_step(b, library);
     add_consumer_step(b, optimize);
+    add_sound_step(b, optimize);
 }
 
 /// `test-consumer`: `test/consumer`, a package outside this build graph, through its own `zig
@@ -869,27 +864,44 @@ fn add_consumer_step(b: *std.Build, optimize: std.lang.Optimize) void {
     const zig = b.graph.zig_exe;
     var last: ?*std.Build.Step = null;
     for ([_][]const u8{ "install", "wasm", "test", "regress" }) |name| {
-        const run = add_consumer_run(b, &.{ zig, "build", name, mode }, &last);
+        const run = add_package_run(b, "test/consumer", &.{ zig, "build", name, mode }, &last);
         run.stdio = .inherit;
     }
     for ([_][]const u8{ "high", "low" }) |adapter| {
         const argv = [_][]const u8{ "zig-out/bin/consumer-tool", "1500", adapter };
-        const run = add_consumer_run(b, &argv, &last);
+        const run = add_package_run(b, "test/consumer", &argv, &last);
         run.expectStdErrMatch("t=1500 ms, 640x360, bar 150 px, keysym 0x71");
     }
-    const file = add_consumer_run(b, &.{ "zig-out/bin/consumer", "song.txt", "--print" }, &last);
+    const print = [_][]const u8{ "zig-out/bin/consumer", "song.txt", "--print" };
+    const file = add_package_run(b, "test/consumer", &print, &last);
     file.expectStdErrMatch("consumer: song.txt: 22 bytes");
     step.dependOn(last.?);
 }
 
-/// One command in `test/consumer`, after `last`, which it replaces.
-fn add_consumer_run(
+/// `test-sound`: `examples/sound`, the audio and rack examples in a package of their own with
+/// Thrum beside Patchwork (step 55), through its own `zig build`, one step after another. It needs
+/// a GPU and Thrum's checkout at `../thrum`, so it is not part of `test`.
+fn add_sound_step(b: *std.Build, optimize: std.lang.Optimize) void {
+    const step = b.step("test-sound", "Build, test, and regress examples/sound (needs ../thrum)");
+    const mode = b.fmt("-Doptimize={s}", .{@tagName(optimize)});
+    var last: ?*std.Build.Step = null;
+    for ([_][]const u8{ "install", "wasm", "test", "regress" }) |name| {
+        const argv = [_][]const u8{ b.graph.zig_exe, "build", name, mode };
+        const run = add_package_run(b, "examples/sound", &argv, &last);
+        run.stdio = .inherit;
+    }
+    step.dependOn(last.?);
+}
+
+/// One command in the package at `cwd`, after `last`, which it replaces.
+fn add_package_run(
     b: *std.Build,
+    cwd: []const u8,
     argv: []const []const u8,
     last: *?*std.Build.Step,
 ) *std.Build.Step.Run {
     const run = b.addSystemCommand(argv);
-    run.setCwd(b.path("test/consumer"));
+    run.setCwd(b.path(cwd));
     run.has_side_effects = true;
     if (last.*) |previous| run.step.dependOn(previous);
     last.* = &run.step;
@@ -925,7 +937,7 @@ fn add_compare_step(b: *std.Build, library: *std.Build.Module) void {
     step.dependOn(&run_cmd.step);
 }
 
-/// Names the steps of one example. The rack owns the plain names.
+/// Names the steps of one example. The gallery owns the plain names too.
 fn add_example_steps(
     b: *std.Build,
     suffix: []const u8,
@@ -960,7 +972,7 @@ fn add_example_steps(
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [14]AppSteps,
+    examples: [12]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");
