@@ -20,7 +20,7 @@
 //! - `Bevel` (64 bytes: rect, clip, `face`, `radius`, `depth`, `down`, `hover`): a rounded box
 //!   whose top edge is lit and bottom edge shaded over `depth` px, inverted as `down` goes to
 //!   1, and lightened by `hover`.
-//! - `Led`: the rack's glowing disc (`examples/rack/led.zig`), unchanged.
+//! - `Led`: the rack's glowing disc (`examples/sound/rack/led.zig`), unchanged.
 //!
 //! ## 3. Draw Order
 //! Within a layer a type's batch draws where its first instance appeared, and the default row
@@ -105,7 +105,7 @@ pub const Bevel = extern struct {
     ;
 };
 
-/// The rack's glowing disc (`examples/rack/led.zig`), copied so the gallery stands alone.
+/// The rack's glowing disc (`examples/sound/rack/led.zig`), copied so the gallery stands alone.
 pub const Led = extern struct {
     rect: [4]f32,
     clip: [4]f32,
