@@ -31,23 +31,33 @@ The browser build needs only Zig and a browser with WebGPU.
 
 ```bash
 git clone <repo-url> patchwork && cd patchwork
-zig build run                 # the synthesizer rack, natively
+zig build run                 # every widget on one screen, natively
 zig build serve               # the same app in the browser; prints the address
-zig build run-gallery         # every widget on one screen
 ```
 
-Every example has `run-<name>`, `wasm-<name>` and `serve-<name>` steps:
+Every example has `run-<name>`, `wasm-<name>` and `serve-<name>` steps; the gallery also has
+the plain ones. The two examples that make sound, `rack` and `audio`, are in `examples/sound`, a
+package of its own that plays Thrum's test tone, so Patchwork's own build never names Thrum. It
+needs [Thrum](https://github.com/craftlinks/thrum) checked out beside this repository
+(`../thrum`) and `libpipewire-0.3`:
+
+```bash
+cd examples/sound
+zig build run                 # the synthesizer rack, the tone audible natively
+zig build serve-audio         # the meters and scope in the browser; Space plays the tone
+```
+
 
 | Example | Shows |
 |---|---|
-| `rack` | Synthesizer rack: knobs, meters, toggles, a timer |
+| `rack` | Synthesizer rack: knobs, meters, toggles (in `examples/sound`) |
 | `column` | One scrolling view of mixed controls |
 | `live` | Code editor with syntax colors |
 | `session` | Live-coding screen, rebuilt from photos with the public API only |
 | `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph; text as outlines |
 | `touch` | Multi-touch: ten fingers on pads and sliders, a pinch box |
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
-| `audio` | Audio meters and scope (silent natively, audible in the browser) |
+| `audio` | Audio meters, scope, and XY trace of Thrum's test tone (in `examples/sound`) |
 | `wake` | A producer on another thread into the UI, and its own web module in the browser |
 | `canvas` | Pan and zoom canvas |
 | `gallery`, `workspace` | Widget gallery; docking workspace |
@@ -98,6 +108,7 @@ zig build test-contract         # the app contract rejects malformed apps at com
 zig build check                 # compile every shader and pipeline headless (needs a GPU)
 zig build regress -Doptimize=ReleaseFast   # headless frame hashes against test/golden (GPU)
 zig build test-consumer         # build and run test/consumer as another project would (GPU)
+zig build test-sound            # build, test, and regress examples/sound (GPU, ../thrum)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
 ./zig-out/bin/fx --render scope --size 1920x1080 --scale 2 --out -   # raw RGBA for ffmpeg
 ```
