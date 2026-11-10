@@ -2344,8 +2344,12 @@ Both targets `@embedFile` them, so the browser fetches no font files and a proje
 - **Subset at build time.** The build runs `tools/subset.zig` (`src/text/subset.zig`) once
   per range set and embeds the results through a generated `patchwork_fonts` module. By
   default the faces keep Basic Latin, Latin-1, Latin Extended-A, the punctuation and symbols
-  UI text uses (dashes, quotes, the ellipsis, arrows, €, ™, ≤, ≥), and U+FFFD: about 365
-  glyphs and 23 KB a face, without hinting instructions, which the rasterizer never ran.
+  UI text uses (dashes, quotes, the ellipsis, the minus sign, €, ™), and U+FFFD: about 365
+  glyphs and 23 KB a face, without hinting instructions, which the rasterizer never ran. The
+  default ranges also name the arrows (U+2190 to U+2193) and ≈, ≠, ≤, ≥, but a range keeps
+  only what its face holds: Noto Sans Mono has them, and Noto Sans and Noto Sans Bold do not,
+  so `.sans` and `.sans_bold` draw `.notdef` for `→` and `≤`. Draw those in `.mono`, or add a
+  face that has them (see Fonts).
   Native and wasm embed the same bytes, so they draw the same. A ReleaseSmall `live.wasm`
   went from 2.04 MB to 254 KB. A codepoint outside the ranges draws `.notdef`;
   `AppOptions.font_ranges` widens them, and `null` embeds the full faces.
