@@ -64,8 +64,10 @@ pub const Monitor = Engine.Monitor;
 pub const Block = Engine.B;
 pub const channels: u8 = testtone.channels;
 
-/// The quantum the device asks for: 5.3 ms at 48 kHz.
-const latency_frames: u32 = 256;
+/// The quantum the device asks for: 21.3 ms at 48 kHz, PipeWire's default. At 256 (5.3 ms) the
+/// audio example popped every second or two on a Scarlett 4i4 with no xrun reported and clean
+/// samples in the graph (2026-11-10); a test signal for meters needs no low latency.
+const latency_frames: u32 = 1024;
 /// Blocks one worklet post carries (Thrum's `web/worklet.js`, section 5b).
 const inbox_blocks: u32 = 8;
 
