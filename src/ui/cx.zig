@@ -233,14 +233,6 @@
 //! `clearInterval` in the browser), so a paused app sleeps. Setting it on an app without a
 //! period is a programming error (asserted).
 //!
-//! ## 9a. The Audio Flag
-//! `audio_setup(has_audio)` (from the hosts, once) records whether the app declares an
-//! `Audio` source (`app.zig`); `audio_on` starts false. `set_audio(on)` during an event starts or
-//! stops the source: the native host starts or parks its audio thread to match, and the
-//! browser resumes or suspends its `AudioContext`, so a stopped app produces nothing and sleeps
-//! (`realtime.zig`). Setting it on an app without a source is a programming error (asserted).
-//! After each drain the hosts copy the queue's drop count into `audio_dropped`.
-//!
 //! ## 9b. The Theme
 //! `scheme` is the app's `theme.Scheme` and `draw.theme` its GPU record (`theme.zig`, section
 //! 1). `theme_setup(scheme)` (from `app.start`, once) copies `App.config.theme`; until then
@@ -697,12 +689,6 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// timer, and whether the app wants it running (section 9). Hosts read `timer_on`.
         timer_period_ms: u32,
         timer_on: bool,
-        /// Whether the app declares an audio source, and whether it wants it running
-        /// (section 9a). Hosts read `audio_on`.
-        has_audio: bool,
-        audio_on: bool,
-        /// Blocks the audio queue refused so far; the hosts copy it after each drain.
-        audio_dropped: u32,
         /// The canvas being drawn, if any (section 3a).
         canvas_open: ?Canvas,
         /// The popup being drawn, if any, and the popups drawn this frame (section 3c).
@@ -792,9 +778,6 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.animating = false;
             self.timer_period_ms = 0;
             self.timer_on = false;
-            self.has_audio = false;
-            self.audio_on = false;
-            self.audio_dropped = 0;
             self.canvas_open = null;
             self.popup_open = null;
             self.popup_count = 0;
@@ -826,24 +809,6 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.timer_period_ms != 0);
             self.timer_on = on;
             assert(self.timer_on == on);
-        }
-
-        /// Records whether the app declares an audio source; the hosts call it once after
-        /// `init` (section 9a). The source starts stopped.
-        pub fn audio_setup(self: *Self, has_audio: bool) void {
-            assert(self.phase == .idle);
-            self.has_audio = has_audio;
-            self.audio_on = false;
-        }
-
-        /// Starts or stops the app's audio source. The host applies the change after the
-        /// current call returns (section 9a). Not during a draw, and only for an app with a
-        /// source.
-        pub fn set_audio(self: *Self, on: bool) void {
-            assert(self.phase != .draw);
-            assert(self.has_audio);
-            self.audio_on = on;
-            assert(self.audio_on == on);
         }
 
         /// Records the app's starting scheme; the hosts call it once after `init` (section 9b).
@@ -3201,24 +3166,6 @@ test "the timer flag starts from setup and follows set_timer" {
     cx.timer_setup(0, true);
     try testing.expect(!cx.timer_on);
     try testing.expectEqual(@as(u32, 0), cx.timer_period_ms);
-}
-
-// Locks the audio flag: a fresh context has no source, setup records one stopped, and
-// `set_audio` starts and stops it during an event.
-test "the audio flag starts stopped and follows set_audio" {
-    const cx = new_context();
-    try testing.expect(!cx.has_audio);
-    try testing.expect(!cx.audio_on);
-    cx.audio_setup(true);
-    try testing.expect(!cx.audio_on);
-    cx.event_begin(.{ .frame = 0 });
-    cx.set_audio(true);
-    try testing.expect(cx.audio_on);
-    cx.event_end();
-    cx.event_begin(.{ .frame = 0 });
-    cx.set_audio(false);
-    cx.event_end();
-    try testing.expect(!cx.audio_on);
 }
 
 // Locks the theme (section 9b): a fresh context holds `theme.dark` and its record; setting it

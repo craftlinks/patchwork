@@ -115,21 +115,9 @@
 // size, at scale 1 whatever the device pixel ratio, and the window's resize and ratio changes
 // are not watched. Every animation frame is one replay frame; when the last one is presented
 // the console logs `bench done <scenario>` (or `bench failed <scenario>` when a step's target
-// has no area). While replaying, Wasm ignores input, reports its timer and audio off, and
-// renders audio itself, so the page arms no interval and starts no worklet. Without the
-// parameter none of this runs.
-//
-// ## 9. Audio
-// An app with an audio source exports `audio_on`'s companions (`src/host/web_exports.zig`,
-// section 4b). `sync_audio` runs wherever `sync_timer` runs, so the call that sets audio on is
-// inside the input handler and has the page's user activation. The first start creates an
-// `AudioContext` at 48 kHz and resumes it at once, then adds `worklet.js`, fetches the wasm's
-// bytes, and creates the `patchwork-audio` node, which runs the source from its own instance of
-// the wasm and is connected to the speakers. Later changes resume or suspend the context, so a
-// stopped app's worklet does not run. Each message from the node is `post_blocks` interleaved
-// blocks: `on_audio` copies them into `audio_inbox_ptr()` and calls `audio_push`, and schedules
-// a frame when it returns 1; `tick` drains the queue. No `SharedArrayBuffer`, no cross-origin
-// isolation.
+// has no area). While replaying, Wasm ignores input and reports its timer off, so the page arms
+// no interval; an app's web module keeps its own producer off too (`?bench=` is in the URL).
+// Without the parameter none of this runs.
 //
 // ## 9a. The App's Web Module
 // Before the wasm is instantiated the shell imports `./app.js`, the app's own ES module
@@ -139,10 +127,12 @@
 // `wasm.start()` the shell calls its `started(shell)`, if exported. `shell` is
 // `{ wasm, memory, wake, canvas }`: `wasm` and `memory` are null until the instance exists, so
 // an import reads them when it is called, not when it is made; `wake()` schedules one frame,
-// whose `tick` calls the app's `drain` (`src/host/web_exports.zig`, section 4b'). A module that
+// whose `tick` calls the app's `drain` (`src/host/web_exports.zig`, section 4b). A module that
 // delivers data from another realm, such as a peer's AudioWorklet, copies it into the wasm
 // through the app's own exports and then calls `wake()`. Its own worklet or worker must start
 // inside a user gesture: a wasm import called from an input handler has the page's activation.
+// Patchwork brings no audio worklet of its own: an app serves its peer's as a web file, as
+// `examples/sound` serves Thrum's (step 56).
 
 const canvas = document.getElementById("surface");
 const trace = new URLSearchParams(window.location.search).get("trace") === "1";
@@ -172,13 +162,8 @@ let cursorNames = null;
 let cursorShown = -1;
 // The app timer's interval id, or 0 while the app's timer is stopped (guide, section 5).
 let timerInterval = 0;
-// The audio context once audio first started, and whether it was last resumed (section 9).
-let audioContext = null;
-let audioApplied = false;
 // What the app's web module is handed (section 9a).
 const shell = { wasm: null, memory: null, wake: () => schedule(), canvas };
-// Frames per Web Audio render quantum, and interleaved samples per block.
-const BLOCK_SAMPLES = 128 * 2;
 const textEncoder = new TextEncoder();
 /** The `File`s of the last drop, by the index Wasm lists them under (guide, section 7a). */
 let droppedFiles = [];
@@ -724,7 +709,6 @@ function schedule() {
         log_overflow();
         sync_cursor();
         sync_timer();
-        sync_audio();
         if (live === 1) {
             schedule();
         }
@@ -755,67 +739,6 @@ function on_timer() {
         schedule();
     }
     sync_timer();
-    sync_audio();
-}
-
-/**
- * Resumes the audio context while `wasm.audio_on()` is 1 and suspends it otherwise, creating it
- * at the first start (guide, section 9).
- */
-function sync_audio() {
-    const on = wasm.audio_on() === 1;
-    if (on === audioApplied) {
-        return;
-    }
-    audioApplied = on;
-    if (audioContext === null) {
-        start_audio();
-        return;
-    }
-    if (on) {
-        audioContext.resume();
-    } else {
-        audioContext.suspend();
-    }
-}
-
-/**
- * Creates the context and resumes it inside the user's gesture, then loads the worklet and the
- * wasm bytes and connects the node.
- */
-function start_audio() {
-    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
-    audioContext.resume();
-    const context = audioContext;
-    const loaded = Promise.all([
-        context.audioWorklet.addModule("worklet.js"),
-        fetch("patchwork.wasm").then((response) => response.arrayBuffer()),
-    ]);
-    loaded.then(([, bytes]) => {
-        const node = new AudioWorkletNode(context, "patchwork-audio", {
-            numberOfInputs: 0,
-            numberOfOutputs: 1,
-            outputChannelCount: [2],
-            processorOptions: { wasm: bytes },
-        });
-        node.port.onmessage = on_audio;
-        node.connect(context.destination);
-    }).catch((error) => {
-        console.error(`audio: ${error.message}`);
-    });
-}
-
-/**
- * Copies one posted run of blocks into the wasm inbox and pushes them into the queue.
- * @param {MessageEvent} event Its data is a Float32Array of interleaved blocks.
- */
-function on_audio(event) {
-    const samples = event.data;
-    const blocks = samples.length / BLOCK_SAMPLES;
-    new Float32Array(wasm.memory.buffer, wasm.audio_inbox_ptr(), samples.length).set(samples);
-    if (wasm.audio_push(blocks) === 1) {
-        schedule();
-    }
 }
 
 /**
@@ -881,7 +804,6 @@ function after_input(result) {
     }
     sync_cursor();
     sync_timer();
-    sync_audio();
 }
 
 /**
@@ -1241,7 +1163,6 @@ async function main() {
         watch_ratio();
     }
     sync_timer();
-    sync_audio();
 
     canvas.addEventListener("pointermove", on_pointer_move);
     canvas.addEventListener("pointerdown", on_pointer_down);

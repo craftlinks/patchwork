@@ -39,8 +39,6 @@ pub const App = struct {
 | `draw` | `fn (*App, *Context(App)) void` | Lays out and appends every instance, recording hit areas. |
 | `scenarios` (optional) | `[]const bench.Scenario` | Scripted runs for `--bench` (see Bench Mode). |
 | `args` (optional, native) | `fn (*App, []const [:0]const u8) void` | Receives the arguments the host does not know, once, after `init` (see Use Patchwork From Another Project). |
-| `Audio` (optional) | a type with `init(*Audio, u32)` and `render(*Audio, *realtime.Block)` | An audio source the host runs off the UI thread (see Audio Data). |
-| `audio` (with `Audio`) | `fn (*App, *Context(App), *const realtime.Block) void` | Receives every block of the source, in order, on the UI thread. |
 | `wake`, `pending`, `drain` (optional, together) | `fn (*App) *patchwork.Wake`, `fn (*const App) u32`, `fn (*App, *Context(App)) void` | A producer on another thread: the app's own wake, what it has waiting, and the one call on the UI thread each wake (see Data From Another Thread). |
 | `produce` (with them) | `fn (*App, u32) void` | Steps the producer by frames of a 48 kHz clock where no thread runs it: regress, the bench, a browser replay. |
 
@@ -58,8 +56,9 @@ drawing.
 `setInterval` and `clearInterval` in the browser), so a stopped timer wakes nothing. Calling
 `set_timer` on an app without a period is an assertion failure.
 
-**Audio.** An app with an `Audio` source starts with it stopped; `cx.set_audio(on)` starts and
-stops it, and the hosts apply the change after the call (see Audio Data below).
+**Audio.** Patchwork has no audio engine since step 56: an app plays sound through a peer
+library such as Thrum and brings its data back through a producer (below). `examples/sound` is
+the worked example.
 
 **A producer.** An app whose data comes from another thread declares `wake`, `pending`, and
 `drain` (see Data From Another Thread below); the UI sleeps until the producer notifies.
@@ -188,7 +187,6 @@ patchwork/
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
 │   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM and PNG
-│   ├── realtime.zig            # Audio blocks, the SPSC queue, test tone, meters, scope
 │   ├── wake.zig                # Wake: a producer on any thread wakes the UI's poll loop
 │   ├── drop.zig                # File drops: the file list, the URI list parser, the transfer
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
@@ -196,8 +194,7 @@ patchwork/
 ├── src/host/                   # Platform host implementations generic over App
 │   ├── native_main.zig         # Native entry point: parses options, runs linux_window.run(App)
 │   ├── web_main.zig            # Wasm entry point: calls web_exports.export_app(app.App)
-│   ├── linux_window.zig        # Linux Wayland event loop, timerfd, audio wake, and Host(App)
-│   ├── audio_thread.zig        # Native audio engine: the app's source on a paced thread
+│   ├── linux_window.zig        # Linux Wayland event loop, timerfd, producer wake, and Host(App)
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
 │   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain, headless target
 │   ├── offscreen.zig           # Offscreen(App): frames with no window, at any size and time
@@ -286,14 +283,12 @@ patchwork/
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
 │   ├── shell.js                # Generic command interpreter, Wasm bridge, and input handler
-│   ├── worklet.js              # AudioWorklet processor running the app's source from its wasm
 │   └── app.js                  # The empty web module served when an app brings none
 └── test/                       # Regression tests
     ├── golden/<adapter>/<app>.txt # Regress hashes per adapter and driver (`zig build regress`)
     ├── contract_missing_draw.zig # Test verifying that missing draw fails compilation
     ├── contract_ragged_type.zig  # Test verifying that a 36-byte draw type fails compilation
     ├── contract_frozen_time.zig  # Test verifying that reading time without `animated` fails
-    ├── contract_audio_without_sink.zig # Test verifying that `Audio` without `audio` fails
     ├── contract_producer_without_drain.zig # A producer without `drain` fails
     ├── contract_producer_produce_only.zig # `produce` without a producer fails
     ├── contract_theme_range.zig  # Test verifying that a theme color of 1.5 fails, naming it
@@ -397,7 +392,7 @@ zig build serve-touch     # Serve it on localhost (prints the address)
 zig build test            # Run unit tests across the library and the twelve examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
-                          # `Audio` source without `audio`, a theme color of 1.5, a
+                          # producer without `drain`, a theme color of 1.5, a
                           # knob skin without `knob`, `ui.overlays` of a target
                           # with no `draw_overlay`, an editor language without
                           # `next`, `draw.covered_glyphs` without a `Box`, too few `faces`
@@ -1646,37 +1641,10 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
   cached like anything else.
 - **Paths.** `draw.path.cubic` flattens by the on-screen length (`view_zoom`).
 
-## Audio Data
-
-`patchwork.realtime` (`src/realtime.zig`) carries data from an audio engine into the UI:
-- **Blocks.** 128 stereo frames (the Web Audio render quantum), interleaved `f32`, 1 KiB, at
-  48 kHz; the producer posts 4 at a time (10.7 ms). `AudioQueue` holds 256 (683 ms).
-- **Queue.** A lock-free single-producer, single-consumer ring with `u32` indices on separate
-  cache lines. The producer renders into `slot()` and calls `publish()`; the consumer reads
-  `peek()` and calls `release()`. A full queue refuses and counts (`dropped`); it never
-  blocks or overwrites, so an audio thread is never held up by the UI.
-- **Wake.** The producer writes the wake's descriptor only when the consumer armed it before
-  sleeping, and the consumer arms only when nothing else will wake it (no frame callback in
-  flight, no commit latched). Both sides use `seq_cst` on the flag and the queue head, so a
-  block published just before the sleep is never missed. While frames flow the producer
-  makes no syscall.
-- **Source.** The app's `Audio` runs off the UI thread: natively on a thread paced by
-  `clock_nanosleep` at the device rate (there is no audio output yet; a PipeWire sink would
-  replace the clock), in the browser in an AudioWorklet (`web/worklet.js`) that instantiates
-  the same wasm and calls its `audio_render` export, so the browser plays it. Start and stop
-  (`cx.set_audio`) are the only control; no `SharedArrayBuffer` or cross-origin isolation is
-  needed.
-- **Analysis.** `levels` (peak and RMS of L, R, mid), `meter_of` (60 dB scale), `Ballistics`
-  (24 dB/s fall and a one-second hold, counted in blocks), and `Scope` (a history with a
-  rising-crossing trigger).
-- **Idle.** With the tone stopped the audio thread parks on a futex and the UI thread sleeps
-  (about 1 wake per second measured, against 30 for the rack's old timer); playing, the audio
-  thread wakes 94 times per second and the UI presents at most once per display frame.
-
 ## Data From Another Thread
 
-Step 54's seam, for any producer that is not the app's own `Audio`: a peer library's audio thread
-and its monitor (Thrum's), a worker, a socket reader. The app owns the queue between the two,
+Step 54's seam, for any producer: a peer library's audio thread and its monitor (Thrum's, as
+`examples/sound` shows), a worker, a socket reader. The app owns the queue between the two,
 which any app can write; Patchwork owns the sleep.
 - **The wake.** `patchwork.Wake` (`src/wake.zig`) is a field of the app, initialized in `init`.
   The native window host attaches its `eventfd` right after `init` and before `args`, so a thread
@@ -1685,8 +1653,7 @@ which any app can write; Patchwork owns the sleep.
 - **The count.** `pending` returns what is waiting, loaded `seq_cst`, with the producer's publish
   `seq_cst` too: the host arms the wake, then reads the count, so an item published just before
   the sleep is never missed. Thrum's monitor queue is published this way since its step 23.
-- **The drain.** The hosts call `drain(app, cx)` once a wake, after the audio drain and before
-  `ui.animate`, and once a frame while frames are presented; it pops what it wants and calls
+- **The drain.** The hosts call `drain(app, cx)` once a wake, before `ui.animate`, and once a frame while frames are presented; it pops what it wants and calls
   `cx.redraw()`.
 - **By frame.** Regress, the native bench, and a browser replay run no producer thread: each
   frame they call `produce(app, frames)` with `bench.producer_frames_at(k, fps)`, 800 frames a
@@ -1755,10 +1722,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   pass, and the report ends with each target's device size and memory.
 - **Render.** `--render` writes a scenario's frames instead of timing them (see Rendering
   Frames).
-- **Audio.** No thread runs in bench mode: while the app's audio is on, every frame is
-  presented and first fed `realtime.blocks_for_frame(n)` blocks (6, 6, 6, 7) rendered on the UI
-  thread, so dumps are deterministic. The report adds the blocks, drops, the most drained at
-  once, and the render and drain time per block.
+- **A producer.** No producer thread runs in bench mode: each frame calls `produce` with
+  `bench.producer_frames_at` and then `drain`, so dumps are deterministic.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
   timed passes (`window.patchworkBench` holds the last). `?bench=<scenario>` replays a
   scenario (see Regression).
@@ -1782,9 +1747,10 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   tables re-created), at 1280 x 720 and scale 1 (`pub const regress_size: [2]u32` overrides,
   1 to 4096 a side), and the last frame's RGB rows are hashed (XxHash64, seed 0).
 - **Clock.** Frame `n` is at `n * 1000 / 60` ms: the step of that frame, then every app timer
-  tick due by then (each at its own multiple of the period), `ui.animate` by 1/60 s, the
-  frame's audio blocks (`realtime.blocks_for_frame`), and the draw. Nothing reads wall time,
-  so timer and audio scenarios (wave `play`, audio `play`) give the same hash every run.
+  tick due by then (each at its own multiple of the period), `ui.animate` by 1/60 s, a
+  producer's `produce` and `drain` (`bench.producer_frames_at`), and the draw. Nothing reads
+  wall time, so timer and producer scenarios (wave `play`, wake `run`) give the same hash every
+  run.
 - **Goldens.** `test/golden/<adapter slug>/<app>.txt` names the adapter, its driver, and the
   size, then one sorted `scenario  hash` line per scenario. A golden blessed on another driver
   is refused before anything renders ("Re-bless from master"); a missing line is `new`.
@@ -1796,7 +1762,8 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   and a diff PNG (dim grey where equal, red by difference) against cache on, or against the
   baseline `<scenario>-<adapter>-on.png` that a `--keep` run on a passing tree leaves.
 - **Browser.** `?bench=<scenario>` sets the canvas to the regress size at scale 1 and replays
-  the scenario on the same clock (input, the interval timer, and the worklet are off).
+  the scenario on the same clock (input and the interval timer are off, and an app's web module
+  keeps its producer off).
   `tools/browser_check.py <app> <scenario>` (standard library only) renders the headless
   frame, serves the app, drives system Chromium over CDP, and compares the screenshot: it
   passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
@@ -1821,8 +1788,8 @@ so a scenario's frame count is its `setup` plus `frames` plus one.
   `pub const render_size_max: [2]u32` (device pixels, at least the regress size, 3840 x 2160 by
   default), the size of a static buffer that only `--render` touches.
 - **Rate.** `--fps` is 10 to 240. Frame `n` is at `n * 1000 / fps` ms in whole milliseconds, the
-  app timer ticks as time passes each multiple of its period, and audio blocks per frame follow
-  the rate (`bench.blocks_for_frame_at`), 375 a second at every rate. The output is the same
+  app timer ticks as time passes each multiple of its period, and a producer's frames follow
+  the rate (`bench.producer_frames_at`), 48,000 a second at every rate. The output is the same
   bytes every run.
 - **Output.** `--out <dir>` writes `<dir>/<scenario>-000000.png` and so on (RGB, stored, about
   24.9 MB a frame at 4K, so use a pipe for a video). `--out -` writes raw RGBA frames back to
@@ -2519,7 +2486,7 @@ Zig's package manager, cached in `~/.cache/zig/p/`, and copied into the project'
 The event loop in `src/host/linux_window.zig` (`Host(App)`) implements the libwayland
 multi-thread reader protocol integrated with an optional Linux `timerfd`:
 - `poll` descriptor set: six fixed slots, the Wayland display socket, `timer_fd`, the key
-  repeat timerfd, the clipboard's send and receive pipes, and the audio wake's `eventfd`; an
+  repeat timerfd, the clipboard's send and receive pipes, and a producer's wake `eventfd`; an
   inactive slot is -1, which `poll` ignores. The repeat timer is armed only while a repeating key is held, and the pipes
   exist only during a transfer, so a focused idle text field sleeps.
   When `App.config.timer_period_ms == 0`, `timer_fd` is -1 (`no_timer_fd`), which `poll`
@@ -2527,10 +2494,9 @@ multi-thread reader protocol integrated with an optional Linux `timerfd`:
 - When `timer_period_ms != 0`, the timer is created disarmed and `sync_timer` arms or
   disarms it before every sleep to match `cx.timer_on`; while armed it wakes the thread via
   `drain_timer` calling `App.timer(now_ms)`.
-- An app with an `Audio` source gets an engine (`src/host/audio_thread.zig`): a thread spawned
-  at the first `set_audio(true)`, paced by `clock_nanosleep`, parked on a futex while stopped,
-  and joined at exit. Every wake drains the queue through `App.audio` (`sync_audio`) before
-  the frame is scheduled, and the exit log line reports blocks, drops, wakes, and late posts.
+- An app with a producer gets that `eventfd`, attached to its `Wake` before `args`. Every wake
+  calls `App.drain` (`sync_producer`) before the frame is scheduled, and the exit log line
+  reports the wakes notified and the drains.
 - Frame pacing during gestures: each commit requests `wl_surface.frame` and
   `wp_presentation.feedback`. The `presented` event carries the pageflip time and the
   output's refresh period; the next commit is scheduled `present_margin_ns` before the vblank
@@ -2605,8 +2571,5 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   asserts that `pass_begin` carries the canvas backing size.
 - `?bench=1` times every render pass with `timestamp-query` when the adapter has it (see Bench
   Mode).
-- Audio: `sync_audio()` runs wherever `sync_timer()` runs. The first `audio_on()` creates an
-  `AudioContext` at 48 kHz inside the input handler, loads `worklet.js`, and passes it the
-  wasm's bytes; later changes resume or suspend the context. Each message of 4 blocks is
-  copied into `audio_inbox_ptr()` and pushed with `audio_push`, which schedules a frame;
-  `tick` drains the queue before it animates and presents.
+- A producer: the app's web module delivers its data and calls `shell.wake()`; `tick` calls
+  `drain` before it animates and presents. Patchwork serves no audio worklet of its own.

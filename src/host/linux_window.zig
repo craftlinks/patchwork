@@ -12,11 +12,11 @@
 //!    timers, and skip the sleep.
 //! 2. `wl_display_flush` pushes requests out, then `ppoll` waits on a fixed set of seven
 //!    descriptors (`Slot`): the Wayland socket, the optional app timer, the key repeat timer,
-//!    the clipboard's send and receive pipes, the audio wake (section 5c), and a file drop's
+//!    the clipboard's send and receive pipes, the producer's wake (section 5c), and a file drop's
 //!    URI list pipe (section 5d). A negative descriptor is ignored by `poll`, so an app without
 //!    a timer passes `no_timer_fd` and never wakes on ticks, the repeat timer is disarmed
-//!    unless a repeating key is held, an idle clipboard has no pipes, an app without an audio
-//!    source has no wake, and no drop has no list.
+//!    unless a repeating key is held, an idle clipboard has no pipes, an app without a
+//!    producer has no wake, and no drop has no list.
 //! 3. The timeout is null (sleep until the compositor writes) unless a commit is latched in
 //!    `State.present_at_ns`, in which case it is the time remaining until that deadline, or a
 //!    file transfer runs (section 5d), in which case it is zero.
@@ -61,8 +61,8 @@
 //!   presentation listeners are asserted in their own files.
 //!
 //! ## 4. Loop State Machine
-//! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_audio`, `bench_step`,
-//! `sync_clock`, `present_if_dirty`, `sync_timer`, `sync_engine`, `wait_for_events`.
+//! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_producer`, `bench_step`,
+//! `sync_clock`, `present_if_dirty`, `sync_timer`, `wait_for_events`.
 //! Callbacks only write `State`; all app calls happen in this order on the main thread. A bench
 //! frame's work runs in the order `host/offscreen.zig` states (section 2); this host adds the
 //! pacing and the presentation.
@@ -143,36 +143,21 @@
 //! the frame dump and prints the report. Without `--bench` only two clock reads per present
 //! remain.
 //!
-//! ## 5c. Audio
-//! An app that declares an `Audio` source (`app.zig`, section 4a) gets an `audio_thread.Engine`,
-//! the `realtime.AudioQueue` it renders into, and a `realtime.Wake` on an `eventfd` in
-//! `Slot.audio` (`realtime.zig`, sections 3 and 4).
-//! - `sync_audio`, every wake: drains every pending block through `App.audio`, oldest first,
-//!   then owes a redraw if the app is dirty. While `cx.audio_on` is false the blocks still in
-//!   the queue (the post in flight when the app stopped) are released unread.
-//! - `sync_engine`, before the sleep: starts or parks the audio thread to match `cx.audio_on`.
-//! - Arming (`arm_audio`, before `prepare_read`): only while audio is on, no frame callback
-//!   is in flight, and no commit is latched; a callback or a deadline wakes the loop anyway and
-//!   the next iteration drains. So while frames flow the thread makes no syscall, and data
-//!   drives at most one present per display frame. Arming over a pending block skips the
-//!   sleep. Every wait disarms on its way out, and a readable wake is read to clear it.
-//! - A hidden window keeps its frame callback in flight, so the wake is never armed, the
-//!   queue fills, and the thread counts drops (`Queue.dropped`) until frames resume.
-//!
-//! ## 5c'. A Producer
-//! An app that declares a producer (`app.zig`, section 4e) shares the same `eventfd`, created
-//! right after `App.init` and attached to the app's own `Wake` before `args`, so a producer that
-//! `args` starts can notify at once. `Slot.wake` is that one descriptor for both.
-//! - `sync_producer`, every wake after `sync_audio`: calls `App.drain` once, then owes a redraw if
-//!   the app is dirty. While frames are presented it runs once a frame.
-//! - Arming (`arm_producer`): under the same conditions as audio, the app's `Wake` is armed over
-//!   `App.pending`; a pending item skips the sleep. Both wakes disarm on the way out.
-//! - Bench mode starts no producer (`args` is not called): each frame, beside the audio blocks,
-//!   it calls `App.produce` with `bench.producer_frames_at` and then drains.
+//! ## 5c. A Producer
+//! An app that declares a producer (`app.zig`, section 4e) gets an `eventfd` in `Slot.wake`,
+//! created right after `App.init` and attached to the app's own `Wake` before `args`, so a
+//! producer that `args` starts can notify at once. An app without one has no descriptor there.
+//! - `sync_producer`, every wake: calls `App.drain` once, then owes a redraw if the app is dirty.
+//!   While frames are presented it runs once a frame.
+//! - Arming (`arm_producer`, before `prepare_read`): only while no frame callback is in flight
+//!   and no commit is latched; a callback or a deadline wakes the loop anyway and the next
+//!   iteration drains. So while frames flow the producer makes no syscall, and data drives at
+//!   most one present per display frame. The app's `Wake` is armed over `App.pending`; a pending
+//!   item skips the sleep. Every wait disarms on its way out, and a readable wake is read to
+//!   clear it.
+//! - Bench mode starts no producer (`args` is not called): each frame it calls `App.produce`
+//!   with `bench.producer_frames_at` and then drains, so dumps are deterministic.
 //! - The exit line reads `wake: N notified, N drains`.
-//! - Bench mode starts no thread: while audio is on every frame is presented, and before its
-//!   draw the host renders `realtime.blocks_for_frame(n)` blocks on this thread into the same
-//!   queue, so dumps are deterministic (`realtime.zig`, section 7).
 //!
 //! ## 5d. File Drops
 //! The data device's drag events reach `clipboard.dnd` (`dnd.zig`), which queues `drop_over`
@@ -235,8 +220,6 @@ const wl_data_device = @import("wl_data_device.zig");
 const clipboard_module = @import("clipboard.zig");
 const drop = @import("../drop.zig");
 const bench = @import("../bench.zig");
-const realtime = @import("../realtime.zig");
-const audio_thread = @import("audio_thread.zig");
 const builtin = @import("builtin");
 
 /// First refresh-period guess, re-exported from `frame` for `main`.
@@ -624,9 +607,9 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     AppHost.render.cache = options.cache;
     App.init(&AppHost.app_static, &AppHost.context.draw.textures);
     if (options.check) return AppHost.check(&state, options.adapter);
-    // Before `args`, so a producer it starts can notify at once (section 5c').
-    if (AppHost.has_wake) AppHost.wake_fd = try create_wake();
-    defer if (AppHost.has_wake) {
+    // Before `args`, so a producer it starts can notify at once (section 5c).
+    if (AppHost.has_producer) AppHost.wake_fd = try create_wake();
+    defer if (AppHost.has_producer) {
         _ = std.os.linux.close(AppHost.wake_fd);
     };
     if (AppHost.has_producer) App.wake(&AppHost.app_static).attach(AppHost.wake_fd);
@@ -647,7 +630,6 @@ pub fn run(comptime App: type, options: bench.Options) !void {
         .app = &AppHost.app_static,
         .timer_fd = no_timer_fd,
         .timer_armed = false,
-        .audio_running = false,
     };
     try host.setup();
     assert(AppHost.context.draw.batch_count == 0);
@@ -655,21 +637,12 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     if (App.config.timer_period_ms != 0) {
         host.timer_fd = try create_timer();
     }
-    if (AppHost.has_audio) {
-        AppHost.audio_queue.init();
-        AppHost.wake = .init(AppHost.wake_fd);
-        AppHost.engine.init(&AppHost.audio_queue, &AppHost.wake, realtime.sample_rate);
-    }
-    defer {
-        if (AppHost.has_audio) AppHost.engine.finish();
-    }
     defer {
         if (host.timer_fd >= 0) {
             _ = std.os.linux.close(host.timer_fd);
         }
     }
     try host.loop();
-    host.log_audio();
     host.log_producer();
     if (options.bench) AppHost.bench_finish(&state);
 }
@@ -760,7 +733,7 @@ const Slot = enum(u8) {
     repeat,
     send,
     receive,
-    /// The `eventfd` an audio source and a producer share (sections 5c and 5c').
+    /// The `eventfd` a producer notifies (section 5c).
     wake,
     drop_list,
 };
@@ -794,8 +767,7 @@ fn ignore_sigpipe() void {
     std.posix.sigaction(.PIPE, &action, null);
 }
 
-/// A nonblocking `eventfd` at 0: the wake an audio source and a producer share (sections 5c and
-/// 5c').
+/// A nonblocking `eventfd` at 0: the producer's wake (section 5c).
 fn create_wake() !i32 {
     const flags = std.os.linux.EFD.NONBLOCK | std.os.linux.EFD.CLOEXEC;
     const created = std.os.linux.eventfd(0, flags);
@@ -844,8 +816,6 @@ fn Host(comptime App: type) type {
         app: *App,
         timer_fd: i32,
         timer_armed: bool,
-        /// Whether the audio thread was last told to run (section 5c).
-        audio_running: bool,
 
         /// The app, its UI context (pools, areas, pointer state), and the renderer. Static so
         /// app storage and the pools and shadows sized by `App.config` stay off the stack;
@@ -854,17 +824,8 @@ fn Host(comptime App: type) type {
         var context: Context = undefined;
         var render: Renderer = undefined;
 
-        /// The audio source's engine, queue, and wake (section 5c); unused without `Audio`.
-        const has_audio = app_contract.has_audio(App);
-        const Engine = if (has_audio) audio_thread.Engine(App.Audio) else void;
-        var engine: Engine = undefined;
-        var audio_queue: realtime.AudioQueue = undefined;
-        var wake: realtime.Wake = .init(-1);
-        /// Blocks handed to `App.audio` since startup, for the exit line (`log_audio`).
-        var audio_blocks: u64 = 0;
-        /// A producer on another thread (section 5c'), and the descriptor it shares with audio.
+        /// A producer on another thread (section 5c), and its descriptor.
         const has_producer = app_contract.has_producer(App);
-        const has_wake = has_audio or has_producer;
         var wake_fd: i32 = -1;
         /// `App.drain` calls since startup, for the exit line (`log_producer`).
         var producer_drains: u64 = 0;
@@ -892,15 +853,7 @@ fn Host(comptime App: type) type {
             /// Instances and shaded area per draw type of the last measured frame.
             types: [type_count]bench.TypeArea,
             csv_fd: i32,
-            /// Frames fed audio so far (`realtime.blocks_for_frame`), blocks drained, and the
-            /// most drained by one `sync_audio` (section 5c).
-            audio_frames: u64,
-            audio_blocks: u64,
-            audio_drained_max: u32,
-            /// Time spent rendering the blocks and draining them through `App.audio`.
-            audio_render_ns: u64,
-            audio_drain_ns: u64,
-            /// Frames the producer was stepped by (section 5c').
+            /// Frames the producer was stepped by (section 5c).
             producer_frames: u64,
         };
         var bench_run: BenchRun = .{
@@ -915,11 +868,6 @@ fn Host(comptime App: type) type {
             .count = 0,
             .types = undefined,
             .csv_fd = -1,
-            .audio_frames = 0,
-            .audio_blocks = 0,
-            .audio_drained_max = 0,
-            .audio_render_ns = 0,
-            .audio_drain_ns = 0,
             .producer_frames = 0,
         };
         var bench_samples: [bench.sample_cap]bench.Sample = undefined;
@@ -1065,25 +1013,6 @@ fn Host(comptime App: type) type {
             bench_report_rows();
             bench_report_targets();
             bench_report_types(state);
-            bench_report_audio();
-        }
-
-        /// The audio line: blocks fed and drained, drops, and the most drained at once.
-        fn bench_report_audio() void {
-            if (!has_audio) return;
-            std.debug.print("audio: {d} blocks over {d} frames, {d} dropped, at most {d} " ++
-                "drained at once\n", .{
-                bench_run.audio_blocks,
-                bench_run.audio_frames,
-                audio_queue.dropped_count(),
-                bench_run.audio_drained_max,
-            });
-            if (bench_run.audio_blocks == 0) return;
-            const blocks: f64 = @floatFromInt(bench_run.audio_blocks);
-            std.debug.print("audio per block: render {d:.2} us, drain {d:.2} us\n", .{
-                microseconds(bench_run.audio_render_ns) / blocks,
-                microseconds(bench_run.audio_drain_ns) / blocks,
-            });
         }
 
         fn bench_write_image(state: *State, path: [:0]const u8) void {
@@ -1347,13 +1276,11 @@ fn Host(comptime App: type) type {
                 self.sync_input();
                 // A dispatch that left `close` ended the run (section 5e).
                 if (!state.frame.running) break;
-                self.sync_audio();
                 self.sync_producer();
                 self.bench_step();
                 self.sync_clock();
                 try self.present_if_dirty();
                 self.sync_timer();
-                try self.sync_engine();
                 try self.wait_for_events();
             }
             assert(!state.frame.running);
@@ -1468,8 +1395,6 @@ fn Host(comptime App: type) type {
             if (context.dirty) {
                 state.frame.request_redraw();
             }
-            // Bench audio has no thread to wake the loop, so it presents every frame.
-            if (bench_run.active and context.audio_on) state.frame.request_redraw();
             if (animating) {
                 state.frame.request_redraw();
             } else {
@@ -1509,7 +1434,6 @@ fn Host(comptime App: type) type {
                 }
             }
             state.present_at_ns = 0;
-            self.bench_audio();
             self.bench_produce();
             const draw_start_ns = monotonic_ns();
             self.prepare_app();
@@ -1573,8 +1497,6 @@ fn Host(comptime App: type) type {
             const display = state.display;
             assert(@intFromPtr(display) != 0);
             assert(wl_display_get_fd(display) >= 0);
-            if (!self.arm_audio()) return;
-            defer if (has_audio) wake.disarm();
             if (!self.arm_producer()) return;
             defer if (has_producer) App.wake(self.app).disarm();
             if (wl_display_prepare_read(display) != 0) {
@@ -1641,28 +1563,7 @@ fn Host(comptime App: type) type {
             assert(state.frame.running);
         }
 
-        /// Drains the audio queue through `App.audio`, oldest first, or releases it unread
-        /// while audio is off (section 5c). Bounded by the queue's capacity.
-        fn sync_audio(self: *Self) void {
-            if (!has_audio) return;
-            const state = self.state;
-            var drained: u32 = 0;
-            while (drained < realtime.queue_blocks) : (drained += 1) {
-                const block = audio_queue.peek() orelse break;
-                if (context.audio_on) App.audio(self.app, &context, block);
-                audio_queue.release();
-            }
-            assert(drained <= realtime.queue_blocks);
-            audio_blocks += drained;
-            context.audio_dropped = audio_queue.dropped_count();
-            if (bench_run.active) {
-                bench_run.audio_blocks += drained;
-                bench_run.audio_drained_max = @max(bench_run.audio_drained_max, drained);
-            }
-            if (context.dirty) state.frame.request_redraw();
-        }
-
-        /// Calls `App.drain` once, and owes a redraw if it left the app dirty (section 5c').
+        /// Calls `App.drain` once, and owes a redraw if it left the app dirty (section 5c).
         fn sync_producer(self: *Self) void {
             if (!has_producer) return;
             App.drain(self.app, &context);
@@ -1671,7 +1572,7 @@ fn Host(comptime App: type) type {
         }
 
         /// Bench mode only: steps the producer by this frame's sample time, then drains
-        /// (section 5c').
+        /// (section 5c).
         fn bench_produce(self: *Self) void {
             if (!has_producer) return;
             if (!bench_run.active) return;
@@ -1682,7 +1583,8 @@ fn Host(comptime App: type) type {
             self.sync_producer();
         }
 
-        /// Arms the app's wake before a sleep under the conditions audio uses (section 5c').
+        /// Arms the app's wake before a sleep when nothing else will wake the loop: no frame
+        /// callback is in flight and no commit is latched (section 5c).
         /// Returns false when the producer has something pending, so the caller drains.
         fn arm_producer(self: *Self) bool {
             if (!has_producer) return true;
@@ -1709,61 +1611,6 @@ fn Host(comptime App: type) type {
                 App.wake(self.app).notified.load(.monotonic),
                 producer_drains,
             });
-        }
-
-        /// After the loop of a run that started audio: blocks received, blocks dropped, wakes the
-        /// thread wrote (each one woke an idle loop), and re-anchors after a stall.
-        fn log_audio(self: *const Self) void {
-            if (!has_audio) return;
-            if (engine.thread == null) return;
-            _ = self;
-            std.log.info("audio: {d} blocks, {d} dropped, {d} wakes, {d} late", .{
-                audio_blocks,
-                audio_queue.dropped_count(),
-                wake.notified.load(.monotonic),
-                engine.late.load(.monotonic),
-            });
-        }
-
-        /// Bench mode only: renders this frame's blocks on this thread and drains them before
-        /// the draw (section 5c).
-        fn bench_audio(self: *Self) void {
-            if (!has_audio) return;
-            if (!bench_run.active) return;
-            if (!context.audio_on) return;
-            const render_start_ns = monotonic_ns();
-            engine.render(realtime.blocks_for_frame(bench_run.audio_frames));
-            const drain_start_ns = monotonic_ns();
-            bench_run.audio_frames += 1;
-            self.sync_audio();
-            bench_run.audio_render_ns += drain_start_ns - render_start_ns;
-            bench_run.audio_drain_ns += monotonic_ns() - drain_start_ns;
-        }
-
-        /// Starts or parks the audio thread to match `cx.audio_on`, once per wake before the
-        /// sleep. Bench mode feeds blocks itself and starts no thread.
-        fn sync_engine(self: *Self) !void {
-            if (!has_audio) {
-                assert(!context.audio_on);
-                return;
-            }
-            if (bench_run.active) return;
-            if (context.audio_on == self.audio_running) return;
-            try engine.set_running(context.audio_on);
-            self.audio_running = context.audio_on;
-            assert(self.audio_running == context.audio_on);
-        }
-
-        /// Arms the audio wake before a sleep when nothing else will wake the loop: audio is
-        /// on, no frame callback is in flight, and no commit is latched (section 5c). Returns
-        /// false when a block is already pending, so the caller drains instead of sleeping.
-        fn arm_audio(self: *Self) bool {
-            if (!has_audio) return true;
-            if (!context.audio_on) return true;
-            const state = self.state;
-            if (state.frame_callback != null) return true;
-            if (state.present_at_ns != 0) return true;
-            return wake.arm(&audio_queue);
         }
 
         /// Arms or disarms the app timer to match `cx.timer_on`, once per wake before the

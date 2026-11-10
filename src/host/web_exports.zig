@@ -66,26 +66,11 @@
 //! - Timing is host-driven: no Web Workers, no `SharedArrayBuffer`, and no cross-origin
 //!   isolation headers are required.
 //!
-//! ## 4b. Audio
-//! An app with an `Audio` source (`app.zig`, section 4a) has its source run by a second
-//! instance of this same module inside an AudioWorklet (`web/worklet.js`): that instance calls
-//! only `audio_init(rate)` once and `audio_render()` per render quantum, which renders one
-//! `realtime.Block` into `audio_rendered` and returns its address. It never calls `start`, so
-//! the UI state of that instance stays untouched BSS. The worklet posts `post_blocks` blocks
-//! at a time over its port; `shell.js` copies them into `audio_inbox_ptr()` of this (the UI)
-//! instance and calls `audio_push(count)`, which pushes them into `realtime.AudioQueue` and
-//! returns 1 when the queue holds a block, so a frame is scheduled. `tick` drains the queue
-//! through `App.audio` before `ui.animate`, so a frame shows the newest blocks; blocks that
-//! arrive while `cx.audio_on` is false are released unread. `audio_on` (exported for every
-//! app, 0 without a source) tells `shell.js` to resume or suspend its `AudioContext`; it reads
-//! it wherever it reads `timer_on`, inside the input handler that changed it, so a start has
-//! the page's user activation.
-//!
-//! ## 4b'. A Producer
+//! ## 4b. A Producer
 //! An app with a producer (`app.zig`, section 4e) gets data from another realm, an AudioWorklet
 //! or a worker, through its own web module (`web/shell.js`, section 9a), which copies it in and
-//! calls `shell.wake()` to schedule a frame. `tick` calls `App.drain` once, after the audio drain
-//! and before `ui.animate`, and a drain that leaves the app dirty requests the frame's present.
+//! calls `shell.wake()` to schedule a frame. `tick` calls `App.drain` once, before
+//! `ui.animate`, and a drain that leaves the app dirty requests the frame's present.
 //! The app's `Wake` stays at -1 here: the page does not sleep on a descriptor.
 //!
 //! ## 4c. Scenario Replay (`?bench=<scenario>`)
@@ -94,13 +79,12 @@
 //! starts replaying it on the simulated clock of `--regress` (`bench.zig`, section 5b;
 //! `host/headless.zig`, section 2). While a replay runs, `tick` ignores the rAF time: frame
 //! `n` applies the scenario's next step, the app timer's ticks due by `t_n`, `ui.animate` with
-//! the clock's delta, and, while `cx.audio_on`, `realtime.blocks_for_frame` blocks rendered by
-//! this instance's own audio source, and with a producer `App.produce` with
+//! the clock's delta, and with a producer `App.produce` with
 //! `bench.producer_frames_at(n, 60)` frames and `App.drain`; then it presents with the animation
 //! time of `t_n`. It returns 1 while frames remain, 2 after the last one (`shell.js` logs
-//! `bench done`), and 3 when a step's target has no area. From `bench_start` on, `timer_on` and
-//! `audio_on` report 0 (so `shell.js` arms no interval and starts no worklet), `audio_push` and
-//! every input export are ignored, and after the run `tick` presents nothing more, so the canvas
+//! `bench done`), and 3 when a step's target has no area. From `bench_start` on, `timer_on`
+//! reports 0 (so `shell.js` arms no interval) and every input export is ignored, and after the
+//! run `tick` presents nothing more, so the canvas
 //! keeps the last frame for the screenshot. Without `bench_start` none of this runs.
 //!
 //! ## 4a. Keyboard, Clipboard, and Cursor
@@ -159,7 +143,6 @@ const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
-const realtime = @import("../realtime.zig");
 const ui = @import("../ui.zig");
 const bench = @import("../bench.zig");
 const drop = @import("../drop.zig");
@@ -268,17 +251,9 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.timer, .{ .name = "timer" });
     @export(&Web.tick, .{ .name = "tick" });
     @export(&Web.overflow_take, .{ .name = "overflow_take" });
-    @export(&Web.audio_on, .{ .name = "audio_on" });
     @export(&Web.bench_start, .{ .name = "bench_start" });
     @export(&Web.bench_width, .{ .name = "bench_width" });
     @export(&Web.bench_height, .{ .name = "bench_height" });
-    if (app_contract.has_audio(App)) {
-        @export(&Web.audio_inbox_ptr, .{ .name = "audio_inbox_ptr" });
-        @export(&Web.audio_post_blocks, .{ .name = "audio_post_blocks" });
-        @export(&Web.audio_push, .{ .name = "audio_push" });
-        @export(&Web.audio_init, .{ .name = "audio_init" });
-        @export(&Web.audio_render, .{ .name = "audio_render" });
-    }
 }
 
 /// The app-facing half of the browser host. `state` and `app` are static (BSS) storage.
@@ -301,15 +276,8 @@ fn WebApp(comptime App: type) type {
         var render: Renderer = undefined;
         var app: App = undefined;
 
-        /// The audio path (section 4b). The UI instance uses the queue and the inbox; the
-        /// worklet's instance uses only the source and the block it renders into.
-        const has_audio = app_contract.has_audio(App);
+        /// A producer (section 4b), whose data the app's web module delivers.
         const has_producer = app_contract.has_producer(App);
-        const Source = if (has_audio) App.Audio else void;
-        var audio_queue: realtime.AudioQueue = undefined;
-        var audio_inbox: [realtime.post_blocks]realtime.Block = undefined;
-        var audio_source: Source = undefined;
-        var audio_rendered: realtime.Block = undefined;
         /// The last overflow report, and whether `overflow_take` has yet to hand it out.
         var overflow_counts: [5]u32 = @splat(0);
         var overflow_pending: bool = false;
@@ -339,7 +307,6 @@ fn WebApp(comptime App: type) type {
             n: u64,
             frames_max: u64,
             clock: bench.Clock,
-            audio_frames: u64,
             /// Frames the producer was stepped by (section 4c).
             producer_frames: u64,
             owns_copy: bool,
@@ -351,7 +318,6 @@ fn WebApp(comptime App: type) type {
             .n = 0,
             .frames_max = 0,
             .clock = undefined,
-            .audio_frames = 0,
             .producer_frames = 0,
             .owns_copy = false,
         };
@@ -371,7 +337,6 @@ fn WebApp(comptime App: type) type {
             state.commands.count = 0;
             context.init();
             app_contract.start(App, &context);
-            if (has_audio) audio_queue.init();
             drops.transfer.init();
             drops.list.reset(0, 0);
             render.init();
@@ -720,7 +685,6 @@ fn WebApp(comptime App: type) type {
         fn tick(now_ms: u32) callconv(.c) u32 {
             assert(state.frame.running);
             if (replay_run.phase != .off) return replay_tick();
-            drain_audio();
             drain_producer();
             const dt_ms = state.clock.advance(now_ms);
             if (render.animating) {
@@ -750,49 +714,6 @@ fn WebApp(comptime App: type) type {
             return @intCast(@intFromPtr(&overflow_counts));
         }
 
-        /// 1 while the app wants its audio source running (`cx.audio_on`), else 0 (section 4b).
-        fn audio_on() callconv(.c) u32 {
-            if (!has_audio) assert(!context.audio_on);
-            if (replay_run.phase != .off) return 0;
-            return @intFromBool(context.audio_on);
-        }
-
-        /// The inbox `shell.js` copies the worklet's posted blocks into.
-        fn audio_inbox_ptr() callconv(.c) [*]realtime.Block {
-            assert(has_audio);
-            return &audio_inbox;
-        }
-
-        fn audio_post_blocks() callconv(.c) u32 {
-            assert(audio_inbox.len == realtime.post_blocks);
-            return realtime.post_blocks;
-        }
-
-        /// Pushes the first `count` inbox blocks into the queue, counting any it refuses, and
-        /// returns 1 when the queue holds a block, so `shell.js` schedules a frame. Ignored while
-        /// audio is off (section 4b).
-        fn audio_push(count: u32) callconv(.c) u32 {
-            assert(state.frame.running);
-            assert(count <= realtime.post_blocks);
-            if (!context.audio_on) return 0;
-            if (replay_run.phase != .off) return 0;
-            for (audio_inbox[0..count]) |*block| _ = audio_queue.push(block);
-            return @intFromBool(audio_queue.pending() != 0);
-        }
-
-        /// Worklet instance: initializes the source at the context's rate.
-        fn audio_init(rate: u32) callconv(.c) void {
-            assert(has_audio);
-            App.Audio.init(&audio_source, rate);
-        }
-
-        /// Worklet instance: renders one block and returns its address (section 4b).
-        fn audio_render() callconv(.c) [*]const f32 {
-            assert(has_audio);
-            App.Audio.render(&audio_source, &audio_rendered);
-            return &audio_rendered.samples;
-        }
-
         /// Starts replaying the scenario named by the first `len` bytes of the input buffer
         /// (section 4c). Returns 1 when the app declares it, 0 otherwise (nothing changes).
         /// Called once, after `start` and before the first frame.
@@ -813,11 +734,9 @@ fn WebApp(comptime App: type) type {
                 .n = 0,
                 .frames_max = setup_frames + found.frames + 1,
                 .clock = .init(App.config.timer_period_ms),
-                .audio_frames = 0,
                 .producer_frames = 0,
                 .owns_copy = false,
             };
-            if (has_audio) App.Audio.init(&audio_source, realtime.sample_rate);
             state.frame.request_redraw();
             return 1;
         }
@@ -856,11 +775,6 @@ fn WebApp(comptime App: type) type {
                 App.timer(&app, &context, at);
             }
             _ = ui.animate(App, &app, &context, bench.Clock.frame_dt(n));
-            if (has_audio and context.audio_on) {
-                replay_audio(realtime.blocks_for_frame(run.audio_frames));
-                run.audio_frames += 1;
-                drain_audio();
-            }
             if (has_producer) {
                 if (comptime app_contract.has_produce(App)) {
                     App.produce(&app, bench.producer_frames_at(run.producer_frames, 60));
@@ -907,42 +821,10 @@ fn WebApp(comptime App: type) type {
             ui.dispatch(App, &app, &context, .{ .paste = replay_paste[0..own.len] });
         }
 
-        /// Renders `count` blocks from this instance's source into the queue, as the native
-        /// engine does (`audio_thread.zig`), counting a refused one.
-        fn replay_audio(count: u32) void {
-            if (!has_audio) return;
-            assert(count <= realtime.post_blocks * 2);
-            var index: u32 = 0;
-            while (index < count) : (index += 1) {
-                if (audio_queue.slot()) |block| {
-                    App.Audio.render(&audio_source, block);
-                    audio_queue.publish();
-                } else {
-                    App.Audio.render(&audio_source, &audio_rendered);
-                    audio_queue.refuse();
-                }
-            }
-        }
-
-        /// Drains the queue through `App.audio`, or releases it unread while audio is off.
-        /// Bounded by the queue's capacity.
-        /// The app's one call for its producer (`app.zig`, section 4e; section 4b').
+        /// The app's one call for its producer (`app.zig`, section 4e; section 4b).
         fn drain_producer() void {
             if (!has_producer) return;
             App.drain(&app, &context);
-            if (context.dirty) state.frame.request_redraw();
-        }
-
-        fn drain_audio() void {
-            if (!has_audio) return;
-            var drained: u32 = 0;
-            while (drained < realtime.queue_blocks) : (drained += 1) {
-                const block = audio_queue.peek() orelse break;
-                if (context.audio_on) App.audio(&app, &context, block);
-                audio_queue.release();
-            }
-            assert(drained <= realtime.queue_blocks);
-            context.audio_dropped = audio_queue.dropped_count();
             if (context.dirty) state.frame.request_redraw();
         }
 
