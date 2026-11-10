@@ -10,7 +10,7 @@
 //! (`--regress`, `--render`), and any native caller may be another.
 //! ```text
 //! open({adapter, width, height, scale_120, fps})   device, target, staging buffer
-//!   start({cache})                                 fresh app, context, renderer, audio (section 3)
+//!   start({cache})                                 fresh app, context, and renderer (section 3)
 //!     dispatch(event), step(step, time_ms)         input at the caller's pace
 //!     frame(at)                                    one frame's work (section 2)
 //!     read(layout, out)                            the target as rows, top to bottom
@@ -23,17 +23,14 @@
 //! of a device with default limits. Frames are opaque: `read` gives alpha 255.
 //!
 //! ## 2. The Frame
-//! `frame(at)` is the windowed bench's order of work (`linux_window.zig`, sections 4 and 5c)
+//! `frame(at)` is the windowed bench's order of work (`linux_window.zig`, sections 4 and 5c')
 //! with the time given instead of measured:
 //! 1. every app timer tick due by `at.time_ms` (`bench.Clock.due`, shared with the browser
 //!    replay): with period `p`, a tick at every multiple of `p` up to the time, oldest first,
 //!    while `cx.timer_on`, each one `App.timer` call with the tick's own time, at most
 //!    `bench.ticks_per_frame_max`; ticks that fall while the timer is off are skipped;
 //! 2. `ui.animate` with `at.dt_ms`;
-//! 3. while `cx.audio_on`, `bench.blocks_for_frame_at(k, fps)` blocks rendered on this thread in
-//!    pieces of at most `realtime.post_blocks * 2` and drained through `App.audio`, `k` counting
-//!    the frames fed so far;
-//! 3a. with a producer (`app.zig`, section 4e), `App.produce` with
+//! 3. with a producer (`app.zig`, section 4e), `App.produce` with
 //!    `bench.producer_frames_at(k, fps)` frames when the app declares it, then `App.drain`, `k`
 //!    counting the frames stepped so far; no thread runs a producer here;
 //! 4. `ui.draw_frame` and `Renderer.frame` with `time_s` of `at`, then `gpu_wgpu.execute`.
@@ -43,7 +40,7 @@
 //! changed nothing leaves the target as it was.
 //!
 //! ## 3. Fresh State per Start
-//! The app, the UI context, the renderer, the audio engine, and the command buffer are static
+//! The app, the UI context, the renderer, and the command buffer are static
 //! (their sizes follow `App.config`), and every `start` initializes them in place as the windowed
 //! host's `run` does. The device is kept between starts and its tables are emptied with
 //! `gpu_wgpu.reset` before the setup stream is replayed again, which costs far less than a new
@@ -56,13 +53,13 @@
 //! `bench.Clock`. A caller that keeps its state outside the app timer may draw any time in any
 //! order: ticks fire only as time passes the next multiple of the period, `dt_ms` is the
 //! caller's, and `Offscreen` never rewinds the app. The shader clock is the only thing that
-//! follows the time exactly. `fps` paces audio only.
+//! follows the time exactly. `fps` paces a producer only.
 //!
 //! ## 5. TigerStyle Invariants
 //! - No allocation: every buffer is static and sized by `App.config`; pixels go to the caller's
 //!   `out`.
-//! - Bounded loops: timer ticks by `bench.ticks_per_frame_max`, audio blocks by
-//!   `bench.blocks_per_frame_max`, drained blocks by `realtime.queue_blocks`.
+//! - Bounded loops: timer ticks by `bench.ticks_per_frame_max`; a producer's frames by
+//!   `bench.producer_frames_max`.
 //! - `open` and every call after it check the instance's state with asserts, and a size or scale
 //!   out of range is refused with an error before a device exists.
 
@@ -75,10 +72,8 @@ const commands = @import("../gpu/commands.zig");
 const frame_module = @import("../frame.zig");
 const gpu_wgpu = @import("gpu_wgpu.zig");
 const input = @import("../input.zig");
-const realtime = @import("../realtime.zig");
 const renderer = @import("../draw/renderer.zig");
 const ui = @import("../ui.zig");
-const audio_thread = @import("audio_thread.zig");
 
 /// A frame read back: `height` rows of `width` pixels in `layout`, top to bottom, over the
 /// caller's `out`.
@@ -116,7 +111,7 @@ pub fn Offscreen(comptime App: type) type {
             width: u32,
             height: u32,
             scale_120: u32 = 120,
-            /// Paces audio only (module guide, section 4).
+            /// Paces a producer only (module guide, section 4).
             fps: u32 = 60,
         };
 
@@ -125,8 +120,6 @@ pub fn Offscreen(comptime App: type) type {
         };
 
         const Renderer = renderer.Renderer(Context.DrawContext);
-        const has_audio = app_contract.has_audio(App);
-        const Engine = if (has_audio) audio_thread.Engine(App.Audio) else void;
         const has_producer = app_contract.has_producer(App);
 
         // Module guide, section 3: static, initialized in place per start.
@@ -135,9 +128,6 @@ pub fn Offscreen(comptime App: type) type {
         var render: Renderer = undefined;
         var buffer: commands.CommandBuffer = undefined;
         var device: gpu_wgpu.Gpu = undefined;
-        var engine: Engine = undefined;
-        var audio_queue: realtime.AudioQueue = undefined;
-        var wake: realtime.Wake = .init(-1);
         var paste_buffer: [ui.cx.clipboard_cap]u8 = undefined;
 
         var opened: bool = false;
@@ -146,10 +136,9 @@ pub fn Offscreen(comptime App: type) type {
         var size: renderer.Size = undefined;
         var fps: u32 = 0;
 
-        /// One start's state: the timer clock, the frames fed audio, and the clipboard.
+        /// One start's state: the timer clock, the producer's frames, and the clipboard.
         var clock: bench.Clock = undefined;
-        var audio_frames: u64 = 0;
-        /// Frames the producer was stepped by (module guide, section 2, step 3a).
+        /// Frames the producer was stepped by (module guide, section 2, step 3).
         var producer_frames: u64 = 0;
         var owns_copy: bool = false;
 
@@ -204,16 +193,11 @@ pub fn Offscreen(comptime App: type) type {
             render.init();
             render.cache = options.cache;
             App.init(&app_state, &ui_context.draw.textures);
-            if (has_audio) {
-                audio_queue.init();
-                engine.init(&audio_queue, &wake, realtime.sample_rate);
-            }
             buffer.reset();
             render.setup(&buffer, &ui_context.draw);
             try gpu_wgpu.execute(&device, &buffer);
             assert(render.ready);
             clock = .init(App.config.timer_period_ms);
-            audio_frames = 0;
             producer_frames = 0;
             owns_copy = false;
             // The first frame draws everything, as a window's first configure does.
@@ -275,9 +259,6 @@ pub fn Offscreen(comptime App: type) type {
                 App.timer(&app_state, &ui_context, tick);
             }
             _ = ui.animate(App, &app_state, &ui_context, at.dt_ms);
-            if (has_audio and ui_context.audio_on) {
-                feed_audio();
-            }
             if (has_producer) produce();
             const logical_w = size.width_logical;
             const logical_h = size.height_logical;
@@ -289,21 +270,7 @@ pub fn Offscreen(comptime App: type) type {
             drawn = true;
         }
 
-        fn feed_audio() void {
-            var left: u32 = bench.blocks_for_frame_at(audio_frames, fps);
-            const blocks = left;
-            var pieces: u32 = 0;
-            while (left > 0) : (pieces += 1) {
-                assert(pieces <= blocks);
-                const take: u32 = @min(left, realtime.post_blocks * 2);
-                engine.render(take);
-                left -= take;
-            }
-            audio_frames += 1;
-            drain_audio();
-        }
-
-        /// Steps the producer by this frame's sample time and drains it (section 2, step 3a).
+        /// Steps the producer by this frame's sample time and drains it (section 2, step 3).
         fn produce() void {
             assert(has_producer);
             if (comptime app_contract.has_produce(App)) {
@@ -311,17 +278,6 @@ pub fn Offscreen(comptime App: type) type {
             }
             producer_frames += 1;
             App.drain(&app_state, &ui_context);
-        }
-
-        fn drain_audio() void {
-            var drained: u32 = 0;
-            while (drained < realtime.queue_blocks) : (drained += 1) {
-                const block = audio_queue.peek() orelse break;
-                if (ui_context.audio_on) App.audio(&app_state, &ui_context, block);
-                audio_queue.release();
-            }
-            assert(drained <= realtime.queue_blocks);
-            ui_context.audio_dropped = audio_queue.dropped_count();
         }
 
         /// Copies the target into `out`, whose length is the frame's in `layout`. Blocks until
@@ -434,6 +390,6 @@ test "the caller's calls compile for any app" {
 }
 
 comptime {
-    assert(bench.blocks_per_frame_max <= realtime.queue_blocks);
+    assert(bench.producer_frames_max > 0);
     assert(bench.width_max <= frame_module.edge_max);
 }

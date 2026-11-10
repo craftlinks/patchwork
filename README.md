@@ -122,8 +122,8 @@ A bare argument or `--` ends them, and the rest go to an app that declares `args
 ```text
 src/            library: draw, ui, widgets, text, editor, gpu
 src/host/       platform hosts: Wayland + wgpu-native (native_main), browser (web_main)
-web/            browser shell: shell.js, worklet.js, index.html
-examples/       twelve apps
+web/            browser shell: shell.js, app.js, index.html
+examples/       twelve apps, and sound/: rack and audio on Thrum, a package of its own
 test/golden/    frame hashes per adapter
 test/consumer/  a package outside this build: two peers, a tool, its own goldens
 tools/          frame comparison, font subsetting
@@ -139,5 +139,5 @@ Everything else is Zig.
 ## Documentation
 
 - [docs/reference.md](docs/reference.md): the full manual covering the app contract, layout,
-  widgets, theming, drawing, text, audio, platform hosts, benchmarks, regression and
-  rendering frames.
+  widgets, theming, drawing, text, data from other threads, platform hosts, benchmarks,
+  regression and rendering frames.

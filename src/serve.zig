@@ -12,10 +12,10 @@
 //!
 //! ## 2. Contract
 //! - Command line: `ROUTE=PATH` pairs, at most `routes_max`, each a route that starts with `/`
-//!   and the file it serves. `build.zig` (`add_serve`) passes Patchwork's five, `/index.html`,
-//!   `/shell.js`, `/patchwork.wasm`, `/worklet.js`, and `/app.js` (the app's web module, or
-//!   `web/app.js`), then the app's own `web_files` (step 54). Relative paths resolve against the
-//!   working directory. Every file is opened once at startup, so a missing one fails there,
+//!   and the file it serves. `build.zig` (`add_serve`) passes Patchwork's four, `/index.html`,
+//!   `/shell.js`, `/patchwork.wasm`, and `/app.js` (the app's web module, or `web/app.js`),
+//!   then the app's own `web_files` (step 54); an audio worklet is one of those (step 56).
+//!   Relative paths resolve against the working directory. Every file is opened once at startup, so a missing one fails there,
 //!   naming its route, and not on a request; a route given twice or without `/index.html` is
 //!   refused too.
 //! - Routes are exact path matches after the query string is dropped; `/` is `/index.html`.

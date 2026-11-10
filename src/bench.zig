@@ -112,14 +112,11 @@
 //! `regress_size` is the size both render at: `App.regress_size`, or 1280 x 720.
 //!
 //! ## 5c. Other Frame Rates
-//! A client of `Offscreen` (`host/offscreen.zig`) picks a rate from `fps_min` to `fps_max`. The
-//! audio a frame receives follows it: `blocks_for_frame_at(k, fps)` is the difference of two
-//! floors, so every rate feeds the same blocks a second, and `ticks_per_frame_max` holds a 1 ms
-//! timer at `fps_min`. The formula lives here because it paces frames: at 60 it is
-//! `realtime.blocks_for_frame`, which the 60 Hz hosts keep calling. A producer stepped by frame
-//! (`app.zig`, section 4e) gets the same pacing at the grain of a sample frame:
-//! `producer_frames_at(k, fps)` is `floor(48000 (k + 1) / fps) - floor(48000 k / fps)`, 800 at 60,
-//! and every rate gives 48,000 a second.
+//! A client of `Offscreen` (`host/offscreen.zig`) picks a rate from `fps_min` to `fps_max`, and
+//! `ticks_per_frame_max` holds a 1 ms timer at `fps_min`. A producer stepped by frame (`app.zig`,
+//! section 4e) follows the rate at the grain of a sample frame: `producer_frames_at(k, fps)` is
+//! `floor(48000 (k + 1) / fps) - floor(48000 k / fps)`, 800 at 60, and every rate gives 48,000 a
+//! second. The formula lives here because it paces frames.
 //!
 //! ## 6. TigerStyle Invariants
 //! - No allocation: replay state is three counters, summaries sort the caller's slice, and
@@ -134,7 +131,6 @@ const areas = @import("ui/areas.zig");
 const ui = @import("ui.zig");
 const renderer = @import("draw/renderer.zig");
 const textures = @import("draw/textures.zig");
-const realtime = @import("realtime.zig");
 const drop = @import("drop.zig");
 const frame = @import("frame.zig");
 
@@ -167,9 +163,6 @@ pub const fps_min: u32 = 10;
 
 /// Fastest frame rate a frame clock runs at (section 5c).
 pub const fps_max: u32 = 240;
-
-/// Most audio blocks one frame receives at any rate: `fps_min`'s (section 5c).
-pub const blocks_per_frame_max: u32 = 38;
 
 /// Most frames `--frames` asks `--render` to measure: an hour at 60 fps.
 pub const render_frames_max: u32 = 216_000;
@@ -791,17 +784,6 @@ pub const frame_ms: f32 = 1000.0 / 60.0;
 /// Most app timer ticks one simulated frame runs: a 1 ms timer over a 100 ms step (`fps_min`),
 /// with margin.
 pub const ticks_per_frame_max: u32 = 128;
-
-/// Audio blocks frame `k` of a run at `fps` receives (section 5c), counting the frames fed so
-/// far. At 60 this is `realtime.blocks_for_frame(k)`.
-pub fn blocks_for_frame_at(k: u64, fps: u32) u32 {
-    assert(fps >= fps_min and fps <= fps_max);
-    const rate: u64 = realtime.sample_rate;
-    const block: u64 = realtime.block_frames;
-    const count = ((k + 1) * rate / fps) / block - (k * rate / fps) / block;
-    assert(count <= blocks_per_frame_max);
-    return @intCast(count);
-}
 
 /// Frames of sample time at 48 kHz that frame `k` of a run at `fps` steps a producer by (section
 /// 5c; `app.zig`, section 4e).
@@ -2084,29 +2066,6 @@ test "an rgba frame hashes like its rgb" {
     try testing.expectEqual(rgb_hash(&static.rgb), rgb_hash_rgba(&static.rgba));
 }
 
-// Locks audio pacing at any rate: fps 60 is `realtime.blocks_for_frame`; fps 30 feeds 12, 13,
-// 12, 13 and fps 24 feeds 15, 16, 15, 16; every rate feeds 375 blocks a second (48,000 / 128);
-// and no frame takes more than 38, fps 10's most.
-test "audio blocks per frame follow the frame rate" {
-    for (0..10_000) |k| {
-        try testing.expectEqual(realtime.blocks_for_frame(k), blocks_for_frame_at(k, 60));
-    }
-    for ([4]u32{ 12, 13, 12, 13 }, 0..) |blocks, k| {
-        try testing.expectEqual(blocks, blocks_for_frame_at(k, 30));
-    }
-    for ([4]u32{ 15, 16, 15, 16 }, 0..) |blocks, k| {
-        try testing.expectEqual(blocks, blocks_for_frame_at(k, 24));
-    }
-    for ([_]u32{ 10, 24, 25, 30, 50, 60, 120, 240 }) |fps| {
-        var total: u32 = 0;
-        for (0..fps) |k| total += blocks_for_frame_at(k, fps);
-        try testing.expectEqual(@as(u32, 375), total);
-    }
-    var most: u32 = 0;
-    for (0..1000) |k| most = @max(most, blocks_for_frame_at(k, fps_min));
-    try testing.expectEqual(blocks_per_frame_max, most);
-}
-
 // Locks the producer's pacing (section 5c): 800 frames a frame at 60 fps; 1600 at 30; 333, 333,
 // 334 at 144's first three; and 48,000 a second at every rate.
 test "a producer's frames per frame follow the frame rate" {
@@ -2146,8 +2105,7 @@ test "regress arguments parse" {
 
 // Locks the simulated clock over 20 frames: frame times 0, 16, 33, ... 316 ms; a 33 ms timer
 // ticks at 33, 66, ... 297 on frames 2, 4, ... 18 (one each); a 125 ms timer at 125 (frame 8)
-// and 250 (frame 15); ticks while off are skipped; and the audio blocks fed per frame are
-// `realtime.blocks_for_frame`, 375 over the first 60 frames (one second at 48 kHz).
+// and 250 (frame 15); and ticks while off are skipped.
 test "the simulated clock fires timers at multiples of their period" {
     try testing.expectEqual(@as(u64, 16), Clock.frame_time_ms(1));
     try testing.expectEqual(@as(u64, 316), Clock.frame_time_ms(19));
@@ -2184,15 +2142,12 @@ test "the simulated clock fires timers at multiples of their period" {
     try testing.expectEqual(@as(?u64, 132), paused.due(133, true));
     var none: Clock = .init(0);
     try testing.expectEqual(@as(?u64, null), none.due(1000, true));
-    var blocks: u32 = 0;
-    for (0..60) |n| blocks += realtime.blocks_for_frame(n);
-    try testing.expectEqual(realtime.sample_rate / realtime.block_frames, blocks);
 }
 
 comptime {
     assert(event_cap == 10);
     assert(ticks_per_frame_max >= 1000 / fps_min);
-    assert(blocks_per_frame_max <= realtime.queue_blocks);
+    assert(producer_frames_max * fps_min > producer_rate_hz);
     assert(render_frames_max > sample_cap);
     assert(render_size_default[0] <= width_max and render_size_default[1] <= width_max);
     assert(sample_cap <= 1 << 16);

@@ -7,8 +7,8 @@
 //! it: an audio thread's blocks, a peer library's monitor, a worker's results. `Wake` is the one
 //! piece of that a library must own, since only the host's poll loop can sleep on a descriptor;
 //! the data itself travels in whatever queue the producer and the app share (an app can write a
-//! queue, so the library holds none for it). It moved here from `realtime.zig` at step 54 so a
-//! producer that is not Patchwork's audio source can use it (`app.zig`, section 4e).
+//! queue, so the library holds none for it). It moved here from `realtime.zig` at step 54, so any
+//! producer can use it (`app.zig`, section 4e); the rest of that file went at step 56.
 //!
 //! ## 2. The Lost-Wakeup Argument
 //! `Wake` is an `armed` flag and a descriptor: an `eventfd` the native window host attaches, or

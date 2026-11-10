@@ -53,7 +53,7 @@
 //!   pkg-config (`link_xkbcommon`): a consumer's build machine needs both `.so` files and
 //!   their `.pc` files, and its users need both libraries. The wasm build links nothing.
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
-//! - `serve` serves the page, `shell.js`, the wasm, `worklet.js`, and `app.js`, the app's web
+//! - `serve` serves the page, `shell.js`, the wasm, and `app.js`, the app's web
 //!   module (`AppOptions.web_module`, or `web/app.js`, which exports nothing), and the app's own
 //!   `web_files`, through `src/serve.zig`, which owns the address and port (step 54).
 //! - `bench` runs the installed native executable with `--bench` and the arguments after
@@ -76,8 +76,8 @@
 //!   (`src/native_tests.zig`, linked with libxkbcommon and libwayland-client).
 //!   `zig build test-contract` compiles an app with no `draw`, an app whose draw type is not a
 //!   multiple of 16 bytes, an app whose draw type reads time without declaring `animated`, an
-//!   app that declares `Audio` without `audio`, a theme color out of range, a knob whose
-//!   skin lacks `knob`, overlays on a type without an overlay field, an editor whose
+//!   app whose producer lacks `drain` or has only `produce`, a theme color out of range, a knob
+//!   whose skin lacks `knob`, overlays on a type without an overlay field, an editor whose
 //!   language lacks `next`, the batch audit without a `Box`, an editor language with too few
 //!   `faces` or `scales` without them, an `args` of the wrong type, and passes only if the
 //!   compiler rejects each with its expected message.
@@ -693,11 +693,10 @@ fn add_serve(
     });
     const serve_run = b.addRunArtifact(serve_exe);
     serve_run.step.dependOn(wasm_install);
-    // `ROUTE=PATH` pairs (`src/serve.zig`, section 2): Patchwork's five, then the app's files.
+    // `ROUTE=PATH` pairs (`src/serve.zig`, section 2): Patchwork's four, then the app's files.
     serve_run.addPrefixedFileArg("/index.html=", patchwork_builder.path("web/index.html"));
     serve_run.addPrefixedFileArg("/shell.js=", patchwork_builder.path("web/shell.js"));
     serve_run.addPrefixedFileArg("/patchwork.wasm=", wasm.getEmittedBin());
-    serve_run.addPrefixedFileArg("/worklet.js=", patchwork_builder.path("web/worklet.js"));
     const module = options.web_module orelse patchwork_builder.path("web/app.js");
     serve_run.addPrefixedFileArg("/app.js=", module);
     for (options.web_files) |file| {
@@ -1016,10 +1015,6 @@ fn add_test_steps(
             .path = "test/contract_frozen_time.zig",
             .expected = "contract_frozen_time.Frozen: reads time but does not declare " ++
                 "`animated = true`",
-        },
-        .{
-            .path = "test/contract_audio_without_sink.zig",
-            .expected = "App declares `Audio` but is missing `pub fn audio`",
         },
         .{
             .path = "test/contract_producer_without_drain.zig",

@@ -51,7 +51,6 @@
 //! - Optional: `pub const render_size_max: [2]u32`, the most device pixels `--render` keeps a
 //!   frame for (`bench.render_size`; 3840 x 2160 without it). `check` requires 1 to 8192 for
 //!   each side and at least the regress size, so a render at that size always fits.
-//! - Optional, together: `pub const Audio` and `pub fn audio` (section 4a).
 //! - Optional, native only: `pub fn args`, the command line the host leaves (section 4d).
 //! - Optional, together: `pub fn wake`, `pub fn pending`, and `pub fn drain`, a producer on another
 //!   thread, and with them `pub fn produce` (section 4e).
@@ -84,24 +83,7 @@
 //! the app starts and stops it at run time with `cx.set_timer(on)` (`ui/cx.zig`, section 9):
 //! after each call into the app the hosts arm or disarm it to match `cx.timer_on`, so a
 //! stopped timer wakes nothing and calls no `timer`. `start(App, cx)` is the one setup both
-//! hosts (and app tests) run after `cx.init`; it records the timer, the audio flag, and the
-//! theme.
-//!
-//! ## 4a. The Optional Audio Source
-//! ```text
-//! pub const Audio = struct {   // runs on the audio thread or in the worklet, never on App
-//!     pub fn init(audio: *Audio, sample_rate: u32) void
-//!     pub fn render(audio: *Audio, block: *patchwork.realtime.Block) void
-//! };
-//! pub fn audio(app: *App, cx: *Context(App), block: *const patchwork.realtime.Block) void
-//! ```
-//! The host owns one `Audio` and runs it off the UI thread: natively on a paced audio thread
-//! (`host/audio_thread.zig`), in the browser inside an AudioWorklet that instantiates the same
-//! wasm (`web/worklet.js`). Its blocks reach the UI through `realtime.AudioQueue`, and the host
-//! calls `App.audio` once per block, in order, on the UI thread, before it presents; `audio`
-//! may call `cx.redraw()`. The source starts stopped; `cx.set_audio(on)` starts and stops it
-//! (`ui/cx.zig`, section 9a). Start and stop are the only control: the source never reads the
-//! app. `check` requires both declarations or neither, and checks both signatures.
+//! hosts (and app tests) run after `cx.init`; it records the timer and the theme.
 //!
 //! ## 4e. The Optional Producer
 //! ```text
@@ -111,19 +93,18 @@
 //! pub fn produce(app: *App, frames: u32) void      optional: where no producer thread runs
 //! ```
 //! A producer is anything on another thread that has data for the UI: a peer library's audio
-//! thread and its monitor, a worker. The app owns the queue between them, which any app can write;
+//! thread and its monitor (Thrum's, in `examples/sound`), a worker. The app owns the queue between them, which any app can write;
 //! Patchwork owns only what an app cannot do, the sleep. The `Wake` is the app's, a field it
 //! initializes in `init`, because a producer is usually started in `args`, before any context
 //! exists; right after `init` the native window host attaches its `eventfd` (`wake.zig`), so a
 //! producer started in `args` can call `notify` from its own thread after each item it publishes.
 //! - Natively, before a sleep, the host arms the app's Wake over `pending`, which must load the
-//!   count `seq_cst` (`wake.zig`, section 2), and a wake from it or from the audio source clears
-//!   both. Each wake, after the audio drain and before `ui.animate`, it calls `drain` once; while
-//!   frames are presented, once a frame. `drain` may call `cx.redraw()`.
+//!   count `seq_cst` (`wake.zig`, section 2). Each wake, before `ui.animate`, it calls `drain`
+//!   once; while frames are presented, once a frame. `drain` may call `cx.redraw()`.
 //! - In the browser, `tick` calls `drain` before `ui.animate`; the app's web module delivers the
 //!   data and calls `shell.wake()` to schedule a frame (section 4f).
 //! - In regress, a native bench, and a browser replay there is no producer thread: each frame,
-//!   where audio blocks are fed, the host calls `produce(app, frames)` with
+//!   after `ui.animate` and before the draw, the host calls `produce(app, frames)` with
 //!   `bench.producer_frames_at(k, fps)` frames of sample time at 48 kHz, 800 a frame at 60 fps,
 //!   and then `drain`. A producer that is audio renders that many frames; one that is not reads
 //!   them as time. Without `produce`, nothing is produced there and `drain` still runs.
@@ -174,7 +155,6 @@ const ui = @import("ui.zig");
 const areas = @import("ui/areas.zig");
 const pools = @import("draw/pools.zig");
 const bench = @import("bench.zig");
-const realtime = @import("realtime.zig");
 const wake_file = @import("wake.zig");
 const theme = @import("theme.zig");
 
@@ -213,16 +193,15 @@ pub fn Context(comptime App: type) type {
     return ui.Context(Draw, App.config.area_cap);
 }
 
-/// Records `App.config`'s timer (section 4), whether the app has an audio source (section
-/// 4a), its theme (section 4b), and its batch order in a freshly initialized context. Both
-/// hosts call it after `cx.init`; app tests call it to start where a host starts.
+/// Records `App.config`'s timer (section 4), its theme (section 4b), and its batch order in a
+/// freshly initialized context. Both hosts call it after `cx.init`; app tests call it to start
+/// where a host starts.
 pub fn start(comptime App: type, cx: *Context(App)) void {
     cx.timer_setup(App.config.timer_period_ms, App.config.timer_armed);
-    cx.audio_setup(has_audio(App));
     cx.theme_setup(App.config.theme);
     cx.draw.batch_order = App.config.batch_order;
     if (App.config.timer_period_ms == 0) assert(!cx.timer_on);
-    assert(!cx.audio_on);
+    assert(cx.draw.batch_order == App.config.batch_order);
 }
 
 /// Whether `App` takes the host's leftover arguments (section 4d).
@@ -241,11 +220,6 @@ pub fn has_producer(comptime App: type) bool {
 /// Whether the app steps its producer by frame where no thread runs it (section 4e).
 pub fn has_produce(comptime App: type) bool {
     return @hasDecl(App, "produce");
-}
-
-/// Whether `App` declares an audio source (section 4a).
-pub fn has_audio(comptime App: type) bool {
-    return @hasDecl(App, "Audio");
 }
 
 /// Upper bound for `Config.timer_period_ms`, chosen so a period given in the wrong unit is
@@ -358,7 +332,6 @@ pub fn conformance(comptime App: type) ?[]const u8 {
                 "`, found `" ++ @typeName(found) ++ "`";
         }
     }
-    if (audio_conformance(App)) |message| return message;
     return producer_conformance(App);
 }
 
@@ -394,37 +367,6 @@ fn producer_conformance(comptime App: type) ?[]const u8 {
         if (@TypeOf(App.produce) != signature) {
             return "App.produce must have type `" ++ @typeName(signature) ++ "`";
         }
-    }
-    return null;
-}
-
-/// The audio half of `conformance` (section 4a).
-fn audio_conformance(comptime App: type) ?[]const u8 {
-    const source = @hasDecl(App, "Audio");
-    const sink = @hasDecl(App, "audio");
-    if (source and !sink) return "App declares `Audio` but is missing `pub fn audio`";
-    if (sink and !source) return "App declares `audio` but is missing `pub const Audio`";
-    if (!source) return null;
-    if (@TypeOf(App.Audio) != type) return "App.Audio must be a type";
-    const Audio = App.Audio;
-    const names = [_][]const u8{ "init", "render" };
-    const expected = [_]type{
-        fn (*Audio, u32) void,
-        fn (*Audio, *realtime.Block) void,
-    };
-    inline for (names, expected) |name, signature| {
-        if (!@hasDecl(Audio, name)) {
-            return "App.Audio is missing `pub fn " ++ name ++ "`";
-        }
-        const found = @TypeOf(@field(Audio, name));
-        if (found != signature) {
-            return "App.Audio." ++ name ++ " must have type `" ++ @typeName(signature) ++
-                "`, found `" ++ @typeName(found) ++ "`";
-        }
-    }
-    const sink_type = fn (*App, *Context(App), *const realtime.Block) void;
-    if (@TypeOf(App.audio) != sink_type) {
-        return "App.audio must have type `" ++ @typeName(sink_type) ++ "`";
     }
     return null;
 }
@@ -488,50 +430,6 @@ const GoodApp = struct {
     pub fn draw(app: *GoodApp, cx: *Context(GoodApp)) void {
         _ = app;
         _ = cx;
-    }
-};
-
-/// `GoodApp` plus the test tone as its source.
-const AudioApp = struct {
-    pub const config = GoodApp.config;
-    pub const Audio = realtime.TestTone;
-    pub fn init(app: *AudioApp, textures: *quads.Textures) void {
-        _ = app;
-        _ = textures;
-    }
-    pub fn event(app: *AudioApp, cx: *Context(AudioApp), event_value: input.Event) void {
-        _ = app;
-        _ = cx;
-        _ = event_value;
-    }
-    pub fn timer(app: *AudioApp, cx: *Context(AudioApp), now_ms: u64) void {
-        _ = app;
-        _ = cx;
-        _ = now_ms;
-    }
-    pub fn draw(app: *AudioApp, cx: *Context(AudioApp)) void {
-        _ = app;
-        _ = cx;
-    }
-    pub fn audio(app: *AudioApp, cx: *Context(AudioApp), block: *const realtime.Block) void {
-        _ = app;
-        _ = cx;
-        _ = block;
-    }
-};
-
-/// A source without the UI half.
-const SourceOnly = struct {
-    pub const config = GoodApp.config;
-    pub const Audio = realtime.TestTone;
-};
-
-/// The UI half without a source.
-const SinkOnly = struct {
-    pub const config = GoodApp.config;
-    pub fn audio(app: *SinkOnly, block: *const realtime.Block) void {
-        _ = app;
-        _ = block;
     }
 };
 
@@ -762,18 +660,6 @@ test "a producer app conforms" {
     try std.testing.expect(has_produce(ProducerApp));
     try std.testing.expect(!has_producer(GoodApp));
     try std.testing.expect(!has_produce(GoodApp));
-}
-
-// Locks the audio pair (section 4a): the test tone with a sink passes, and either half alone
-// is rejected by name.
-test "an audio source needs its sink and the sink its source" {
-    try std.testing.expect(comptime conformance(AudioApp) == null);
-    try std.testing.expect(has_audio(AudioApp));
-    try std.testing.expect(!has_audio(GoodApp));
-    const source = comptime audio_conformance(SourceOnly).?;
-    try std.testing.expect(std.mem.find(u8, source, "pub fn audio") != null);
-    const sink = comptime audio_conformance(SinkOnly).?;
-    try std.testing.expect(std.mem.find(u8, sink, "pub const Audio") != null);
 }
 
 // Locks the area capacity bounds: zero and one past `area_cap_max` are rejected by name.
