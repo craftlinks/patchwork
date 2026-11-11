@@ -687,7 +687,7 @@ An app may declare `pub fn args(app: *App, arguments: []const [:0]const u8) void
   there is fine, since no frame has run.
 
 ```zig
-var file_bytes: [1 << 20]u8 = undefined;
+var file_bytes: [1 << 20]u8 = @splat(0);
 
 pub fn args(app: *App, arguments: []const [:0]const u8) void {
     if (arguments.len == 0) return;
@@ -697,10 +697,17 @@ pub fn args(app: *App, arguments: []const [:0]const u8) void {
 }
 ```
 
-A file too long for the buffer comes back cut to it. A large static buffer costs Debug builds
-dearly, because static undefined memory is written out per host: a 128 MiB slab in `App` gave a
-981 MiB Debug executable against 71 MiB, and 6 MiB either way in ReleaseFast. Use ReleaseFast or
-ReleaseSmall for an app with large slabs.
+A file too long for the buffer comes back cut to it. A large static left `undefined` makes a Debug
+executable large. Zig's own Debug code generator and linker write it into the file, filled with
+Debug's undefined pattern, and the linker leaves earlier copies behind as the data grows, so each
+such byte costs about 3.7 bytes of file. Builds through LLVM (ReleaseSafe, ReleaseFast,
+ReleaseSmall) keep it in BSS, where it costs nothing. The hosts keep the app, its UI context, and
+the renderer in such statics, and an executable holds two sets, the window host's and the one
+`Offscreen` uses for `--regress` and `--render`, so a slab that is a field of `App` is written
+twice: 128 MiB there gave a 981 MiB Debug executable. Only disk pays: a rebuild after an edit
+takes about as long either way. To keep an app's own slab out of the file, declare it at file
+scope and start it at zero, as `file_bytes` above does and as the headless host does for its
+`--render` frame: a zeroed static goes to BSS in every build.
 
 ## Layout While Drawing
 
