@@ -107,6 +107,7 @@ zig build test                  # unit tests: library and all examples (no GPU n
 zig build test-contract         # the app contract rejects malformed apps at compile time
 zig build check                 # compile every shader and pipeline headless (needs a GPU)
 zig build regress -Doptimize=ReleaseFast   # headless frame hashes against test/golden (GPU)
+python3 -I tools/browser_check.py gallery still --headless   # a scenario in Chromium, compared
 zig build test-consumer         # build and run test/consumer as another project would (GPU)
 zig build test-sound            # build, test, and regress examples/sound (GPU, ../thrum)
 zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low

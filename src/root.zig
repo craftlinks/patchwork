@@ -23,6 +23,8 @@ pub const gpu = @import("gpu.zig");
 pub const commands = @import("gpu/commands.zig");
 pub const renderer = @import("draw/renderer.zig");
 pub const bench = @import("bench.zig");
+/// PNG files: the uncompressed writer and its reader (`png.zig`).
+pub const png = @import("png.zig");
 pub const wake = @import("wake.zig");
 /// A wake from any thread for the UI's poll loop (`wake.zig`, `app.zig` section 4e).
 pub const Wake = wake.Wake;
@@ -75,6 +77,7 @@ test {
     _ = commands;
     _ = renderer;
     _ = bench;
+    _ = png;
     _ = wake;
     _ = drop;
     // `build.zig` imports it by path; nothing in the library does.
