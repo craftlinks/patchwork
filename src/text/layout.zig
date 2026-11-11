@@ -760,6 +760,7 @@ pub const Glyphs = struct {
         };
     }
 
+    /// The next codepoint, spaces included, or null after the last.
     pub fn next(self: *Glyphs) ?Glyph {
         if (self.done) return null;
         var spins: u32 = 0;

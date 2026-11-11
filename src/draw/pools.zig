@@ -123,10 +123,11 @@ pub const point_cap_max: u32 = 65536;
 /// Layers per frame. A layer is drawn entirely after every lower layer.
 pub const layer_count: u32 = 8;
 
-/// A draw layer, `0 .. layer_count`. `base` holds ordinary content and `overlay` content that
-/// must cover it, such as an app's own hover boxes; `popup` holds menus and dialogs
-/// (`ui.Context.begin_popup`) and `tooltip` tooltips, above everything else. Other values are
-/// free for an app's own use (canvases take 1 to 4).
+/// A draw layer, 0 to `layer_count - 1` (7), where an unnamed one is written by its number, as
+/// `@fromBackingInt(2)` for layer 2 (`@enumFromInt` also compiles). `base` holds ordinary
+/// content and `overlay` content that must cover it, such as an app's own hover boxes; `popup`
+/// holds menus and dialogs (`ui.Context.begin_popup`) and `tooltip` tooltips, above everything
+/// else. Other values are free for an app's own use (canvases take 1 to 4).
 pub const Layer = enum(u8) {
     base = 0,
     overlay = 4,

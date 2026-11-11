@@ -112,6 +112,8 @@ const Dirty = struct {
     y1: u32,
 };
 
+/// The glyph cache: an atlas mirror and its table, which `text.place` draws through; a draw
+/// context holds one as `text`.
 pub const Cache = struct {
     mirror: [atlas_side * atlas_side]u8,
     entries: [slot_count]Entry,
@@ -223,6 +225,8 @@ pub const Cache = struct {
         assert(self.icon_missing >= 1);
     }
 
+    /// The cache entry of `glyph_id` of `face` at `size_q` quarter device pixels, rasterizing
+    /// it on a miss; null when this frame's budget or the atlas is spent (section 3).
     pub fn glyph(
         self: *Cache,
         face: u8,

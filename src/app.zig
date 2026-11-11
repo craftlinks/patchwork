@@ -55,6 +55,9 @@
 //! - Optional, together: `pub fn wake`, `pub fn pending`, and `pub fn drain`, a producer on another
 //!   thread, and with them `pub fn produce` (section 4e).
 //!
+//! `declarations(App)` is this list as a table, each with the type `check` requires and when it
+//! is required; `check` reads its types from it, and `zig build describe` prints it.
+//!
 //! ## 2a. Draw Configuration
 //! `config.draw` lists the app's draw types and the instances each pool holds per frame; a
 //! type's id is its index. `config.batch_cap` (default 256) bounds the batches per frame and
@@ -64,8 +67,8 @@
 //! built from them (`ui.Context`, which embeds the draw context as `cx.draw`). `check` rejects
 //! an empty or oversized list, a type that breaks the instance convention (the message names
 //! the type; see `draw/registry.zig`), a zero cap, a `batch_cap` whose worst frame would not
-//! fit one command buffer, an `area_cap` outside `1 .. areas.area_cap_max`, and a
-//! `point_cap` outside `1 .. pools.point_cap_max`.
+//! fit one command buffer, an `area_cap` outside `1 .. area_cap_max`, and a
+//! `point_cap` outside `1 .. point_cap_max`.
 //!
 //! ## 3. Host Order Per Wake
 //! Drain queued events through `ui.dispatch`. When a frame callback completes, call
@@ -227,11 +230,69 @@ pub fn has_produce(comptime App: type) bool {
 /// comptime assert at the end of this file and the "slow timer" test keep in sync.
 pub const timer_period_ms_max: u32 = 1000;
 
+/// Largest `Config.area_cap`, the hit areas one frame records (`ui/areas.zig`).
+pub const area_cap_max: u32 = areas.area_cap_max;
+
+/// Largest `Config.point_cap`, the path points one frame holds (`draw/pools.zig`).
+pub const point_cap_max: u32 = pools.point_cap_max;
+
 /// Largest side of `App.regress_size`, in logical pixels.
 pub const regress_side_max: u32 = 4096;
 
 /// Largest side of `App.render_size_max`, in device pixels: the largest target.
 pub const render_side_max: u32 = bench.width_max;
+
+/// When a declaration of the contract must be present (section 2).
+pub const Need = enum {
+    /// Every app declares it.
+    required,
+    /// An app may declare it on its own.
+    optional,
+    /// `wake`, `pending`, and `drain`: all three or none (section 4e).
+    producer,
+    /// Only beside the producer (section 4e).
+    with_producer,
+};
+
+/// One declaration of the contract: its name, the type `check` requires, and when.
+pub const Declaration = struct {
+    name: []const u8,
+    type: type,
+    need: Need,
+};
+
+/// Declarations in the contract.
+pub const declaration_count: u32 = 13;
+
+/// The contract's declarations for `App`, the table `conformance` checks against: the
+/// one place their types are written.
+pub fn declarations(comptime App: type) [declaration_count]Declaration {
+    const Cx = *Context(App);
+    return .{
+        .{ .name = "config", .type = Config, .need = .required },
+        .{ .name = "init", .type = fn (*App, *quads.Textures) void, .need = .required },
+        .{ .name = "event", .type = fn (*App, Cx, input.Event) void, .need = .required },
+        .{ .name = "timer", .type = fn (*App, Cx, u64) void, .need = .required },
+        .{ .name = "draw", .type = fn (*App, Cx) void, .need = .required },
+        .{ .name = "scenarios", .type = []const bench.Scenario, .need = .optional },
+        .{ .name = "regress_size", .type = [2]u32, .need = .optional },
+        .{ .name = "render_size_max", .type = [2]u32, .need = .optional },
+        .{ .name = "args", .type = fn (*App, []const [:0]const u8) void, .need = .optional },
+        .{ .name = "wake", .type = fn (*App) *wake_file.Wake, .need = .producer },
+        .{ .name = "pending", .type = fn (*const App) u32, .need = .producer },
+        .{ .name = "drain", .type = fn (*App, Cx) void, .need = .producer },
+        .{ .name = "produce", .type = fn (*App, u32) void, .need = .with_producer },
+    };
+}
+
+/// The type `declarations` requires of `name`. Only once `App.config` has passed its checks,
+/// since the table instantiates `Context(App)`.
+fn required(comptime App: type, comptime name: []const u8) type {
+    for (declarations(App)) |declaration| {
+        if (std.mem.eql(u8, declaration.name, name)) return declaration.type;
+    }
+    @compileError("app.declarations has no " ++ name);
+}
 
 /// Returns null when `App` satisfies the contract, otherwise a message naming the first
 /// problem. Pure, so tests can check failure cases without a compile error. Signature types
@@ -244,6 +305,7 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     if (!@hasDecl(App, "config")) {
         return "App must declare `pub const config: patchwork.app.Config`";
     }
+    // Not through `required`: the table builds `Context(App)`, which needs a valid config.
     if (@TypeOf(App.config) != Config) {
         return "App.config must have type patchwork.app.Config";
     }
@@ -266,20 +328,20 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     if (App.config.area_cap == 0) {
         return "App.config.area_cap must be at least 1";
     }
-    if (App.config.area_cap > areas.area_cap_max) {
+    if (App.config.area_cap > area_cap_max) {
         return "App.config.area_cap must be at most 65536";
     }
     if (App.config.point_cap == 0) {
         return "App.config.point_cap must be at least 1";
     }
-    if (App.config.point_cap > pools.point_cap_max) {
+    if (App.config.point_cap > point_cap_max) {
         return "App.config.point_cap must be at most 65536";
     }
     if (theme.problem(App.config.theme)) |message| {
         return "App.config.theme." ++ message;
     }
     if (@hasDecl(App, "scenarios")) {
-        if (@TypeOf(App.scenarios) != []const bench.Scenario) {
+        if (@TypeOf(App.scenarios) != required(App, "scenarios")) {
             return "App.scenarios must have type []const patchwork.bench.Scenario";
         }
         if (bench.validate(App.scenarios)) |message| {
@@ -287,7 +349,9 @@ pub fn conformance(comptime App: type) ?[]const u8 {
         }
     }
     if (@hasDecl(App, "regress_size")) {
-        if (@TypeOf(App.regress_size) != [2]u32) return "App.regress_size must have type [2]u32";
+        if (@TypeOf(App.regress_size) != required(App, "regress_size")) {
+            return "App.regress_size must have type [2]u32";
+        }
         for (App.regress_size) |side| {
             if (side < 1 or side > regress_side_max) {
                 return "App.regress_size: each side must be 1 to 4096";
@@ -296,7 +360,9 @@ pub fn conformance(comptime App: type) ?[]const u8 {
     }
     if (@hasDecl(App, "render_size_max")) {
         const render_size = App.render_size_max;
-        if (@TypeOf(render_size) != [2]u32) return "App.render_size_max must have type [2]u32";
+        if (@TypeOf(render_size) != required(App, "render_size_max")) {
+            return "App.render_size_max must have type [2]u32";
+        }
         for (render_size) |side| {
             if (side < 1 or side > render_side_max) {
                 return "App.render_size_max: each side must be 1 to 8192";
@@ -308,7 +374,7 @@ pub fn conformance(comptime App: type) ?[]const u8 {
         }
     }
     if (has_args(App)) {
-        const signature = fn (*App, []const [:0]const u8) void;
+        const signature = required(App, "args");
         const found = @TypeOf(App.args);
         if (found != signature) {
             return "App.args must have type `" ++ @typeName(signature) ++ "`, found `" ++
@@ -316,13 +382,8 @@ pub fn conformance(comptime App: type) ?[]const u8 {
         }
     }
     const names = [_][]const u8{ "init", "event", "timer", "draw" };
-    const expected = [_]type{
-        fn (*App, *quads.Textures) void,
-        fn (*App, *Context(App), input.Event) void,
-        fn (*App, *Context(App), u64) void,
-        fn (*App, *Context(App)) void,
-    };
-    inline for (names, expected) |name, signature| {
+    inline for (names) |name| {
+        const signature = required(App, name);
         if (!@hasDecl(App, name)) {
             return "App is missing `pub fn " ++ name ++ "`";
         }
@@ -338,11 +399,6 @@ pub fn conformance(comptime App: type) ?[]const u8 {
 /// The producer half of `conformance` (section 4e).
 fn producer_conformance(comptime App: type) ?[]const u8 {
     const names = [_][]const u8{ "wake", "pending", "drain" };
-    const expected = [_]type{
-        fn (*App) *wake_file.Wake,
-        fn (*const App) u32,
-        fn (*App, *Context(App)) void,
-    };
     var declared: u32 = 0;
     inline for (names) |name| {
         if (@hasDecl(App, name)) declared += 1;
@@ -352,7 +408,8 @@ fn producer_conformance(comptime App: type) ?[]const u8 {
         return "App declares `produce` but no producer: add `pub fn wake`, `pub fn pending`, " ++
             "and `pub fn drain`";
     }
-    inline for (names, expected) |name, signature| {
+    inline for (names) |name| {
+        const signature = required(App, name);
         if (!@hasDecl(App, name)) {
             return "App declares a producer but is missing `pub fn " ++ name ++ "`";
         }
@@ -363,7 +420,7 @@ fn producer_conformance(comptime App: type) ?[]const u8 {
         }
     }
     if (has_produce(App)) {
-        const signature = fn (*App, u32) void;
+        const signature = required(App, "produce");
         if (@TypeOf(App.produce) != signature) {
             return "App.produce must have type `" ++ @typeName(signature) ++ "`";
         }
@@ -588,6 +645,23 @@ const OldEvent = struct {
 test "a complete app satisfies the contract" {
     try std.testing.expect(comptime conformance(GoodApp) == null);
     check(GoodApp);
+}
+
+// Locks the table `check` reads: 13 declarations, `config` first with type `Config`, each name
+// once, the four calls required, and the producer's three marked together.
+test "the contract's declarations are one table" {
+    const table = comptime declarations(GoodApp);
+    try std.testing.expectEqual(@as(usize, 13), table.len);
+    try std.testing.expect(table[0].type == Config);
+    var counts: [4]u32 = @splat(0);
+    inline for (table, 0..) |declaration, index| {
+        counts[@backingInt(declaration.need)] += 1;
+        inline for (table[0..index]) |before| {
+            try std.testing.expect(!std.mem.eql(u8, before.name, declaration.name));
+        }
+    }
+    try std.testing.expectEqual([4]u32{ 5, 4, 3, 1 }, counts);
+    try std.testing.expect(required(GoodApp, "draw") == fn (*GoodApp, *Context(GoodApp)) void);
 }
 
 // Locks the negative space: a missing declaration is named in the message. The compile-error

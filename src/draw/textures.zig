@@ -150,6 +150,7 @@ pub const Write = struct {
     data: []const u8,
 };
 
+/// The app's textures: creates and writes queued for the renderer's next stream (section 2).
 pub const Textures = struct {
     count: u32,
     /// Ids below `created` have been recorded into a stream; the rest are pending.
