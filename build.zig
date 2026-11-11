@@ -100,6 +100,9 @@
 //! module has no target, so one serves the native and wasm libraries, and the default ranges'
 //! module without app faces is made once per builder. Null ranges copy a face whole instead.
 //! The tool's runs are cached, so a build with unchanged faces and ranges runs it zero times.
+//! A face's own ranges are a claim (`--own`): the build fails naming the face and the first
+//! codepoint in them it has no glyph for. The app-wide `font_ranges` stay silent, since faces
+//! that differ share them.
 //! `addApp` checks the app's face list first (`subset.check_faces`) and panics naming the
 //! face and the problem.
 //!
@@ -156,8 +159,9 @@ pub const FontOption = struct {
     name: []const u8,
     /// A TrueType face with `glyf` outlines, usually `b.path(...)` in the consumer's tree.
     source: std.Build.LazyPath,
-    /// Codepoints to keep, increasing and apart. Null keeps the app's `font_ranges` (null
-    /// there: the full face).
+    /// Codepoints to keep, increasing and apart, each with a glyph in this face: the build
+    /// fails naming the face and the first codepoint without one. Null keeps the app's
+    /// `font_ranges` (null there: the full face), which keep what the face holds.
     ranges: ?[]const [2]u21 = null,
 };
 
@@ -424,9 +428,13 @@ pub fn add_font_module(
     const files = b.addWriteFiles();
     var tool: ?*std.Build.Step.Compile = null;
     for (faces) |face| {
-        add_face(b, files, &tool, .{ .name = face.name, .source = b.path(face.source) }, ranges);
+        const font: FontOption = .{ .name = face.name, .source = b.path(face.source) };
+        add_face(b, files, &tool, font, ranges, .shared);
     }
-    for (fonts) |font| add_face(b, files, &tool, font, font.ranges orelse ranges);
+    for (fonts) |font| {
+        const claim: subset.Claim = if (font.ranges == null) .shared else .own;
+        add_face(b, files, &tool, font, font.ranges orelse ranges, claim);
+    }
     _ = files.add("fonts.zig", fonts_source(b, ranges, fonts));
     const root = files.getDirectory().path(b, "fonts.zig");
     const module = b.createModule(.{ .root_source_file = root });
@@ -435,13 +443,15 @@ pub fn add_font_module(
 }
 
 /// Writes `<name>.ttf` into `files`: `font` subset to `ranges` by the tool (built on first
-/// use into `tool`), or copied whole when `ranges` is null.
+/// use into `tool`), or copied whole when `ranges` is null. With `.own` the ranges are the
+/// face's own, and the tool fails naming the face and a codepoint in them it has no glyph for.
 fn add_face(
     b: *std.Build,
     files: *std.Build.Step.WriteFile,
     tool: *?*std.Build.Step.Compile,
     font: FontOption,
     ranges: ?[]const [2]u21,
+    claim: subset.Claim,
 ) void {
     const name = b.fmt("{s}.ttf", .{font.name});
     const list = ranges orelse {
@@ -467,6 +477,7 @@ fn add_face(
     run.addFileArg(font.source);
     const output = run.addOutputFileArg(name);
     run.addArg(ranges_arg(b, list));
+    if (claim == .own) run.addArgs(&.{ "--own", font.name });
     _ = files.addCopyFile(output, name);
 }
 

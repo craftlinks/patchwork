@@ -35,7 +35,9 @@
 //! Extended-A, and UI punctuation), and `patchwork_fonts` embeds the results, with the ranges
 //! and `subset`. Both targets get the same bytes, so native and browser draw the same. A
 //! codepoint outside the ranges maps to glyph 0 and draws `.notdef`, as an unmapped one
-//! always has; `font_ranges = null` embeds the full faces.
+//! always has; `font_ranges = null` embeds the full faces. A range keeps only what its face
+//! holds, so the default ranges keep fewer codepoints in some faces than in others (Noto Sans
+//! has no arrows); `covers` says which, at run time and in an app's test.
 //!
 //! ## 2b. App Faces
 //! An app adds up to five faces of its own (`AppOptions.fonts`, `build.zig`): any TrueType
@@ -202,6 +204,16 @@ pub const place_runs_outlines = layout.place_runs_outlines;
 pub const place_wrapped_outlines = layout.place_wrapped_outlines;
 pub const place_runs_wrapped_outlines = layout.place_runs_wrapped_outlines;
 
+/// True when `face` maps `codepoint` to a glyph other than `.notdef`: what `place` draws as
+/// itself rather than as a box. Pure, like `measure`; there is no fallback to another face.
+pub fn covers(face: Face, codepoint: u21) bool {
+    assert(@backingInt(face) < fonts.len);
+    const font = font_of(face);
+    const glyph = ttf.glyph_id(font, codepoint);
+    assert(glyph < font.glyph_count);
+    return glyph != 0;
+}
+
 /// The face record of `face`.
 pub fn font_of(face: Face) *const ttf.Font {
     return &fonts[@backingInt(face)];
@@ -279,4 +291,43 @@ test "without app faces Face is the library's three" {
         try std.testing.expectEqualStrings(want, name);
     }
     for (font_data.face_ranges) |kept| try std.testing.expectEqual(font_data.ranges.ptr, kept.ptr);
+}
+
+// Locks `covers` (section 2a): Noto Sans holds the minus sign U+2212 and no arrow, so `.sans`
+// covers U+2212 and not U+2192; Noto Sans Mono covers both; U+0416, outside the ranges, none.
+test "covers says which face holds a codepoint" {
+    try std.testing.expect(covers(.sans, 0x2212));
+    try std.testing.expect(!covers(.sans, 0x2192));
+    try std.testing.expect(covers(.mono, 0x2212));
+    try std.testing.expect(covers(.mono, 0x2192));
+    try std.testing.expect(covers(.sans_bold, 'A'));
+    try std.testing.expect(!covers(.sans_bold, 0x0416));
+}
+
+// Locks what the default ranges keep in each bundled face (section 2a): every codepoint of
+// `subset.default_ranges` that the face has no glyph for. Noto Sans and Noto Sans Bold lack the
+// four arrows U+2190 to U+2193 and the relations U+2248, U+2260, U+2264, U+2265; Noto Sans Mono
+// lacks only the soft hyphen U+00AD. A new bundled face adds its own list here.
+test "the default ranges keep all but these codepoints in each face" {
+    const sans_missing = [_]u21{ 0x2190, 0x2191, 0x2192, 0x2193, 0x2248, 0x2260, 0x2264, 0x2265 };
+    const lacks = [_]struct { face: Face, missing: []const u21 }{
+        .{ .face = .sans, .missing = &sans_missing },
+        .{ .face = .sans_bold, .missing = &sans_missing },
+        .{ .face = .mono, .missing = &.{0x00AD} },
+    };
+    try std.testing.expectEqual(@as(usize, 16), font_data.ranges.len);
+    for (lacks) |lack| {
+        var found: [16]u21 = undefined;
+        var count: u32 = 0;
+        for (font_data.ranges) |range| {
+            var codepoint: u21 = range[0];
+            while (codepoint <= range[1]) : (codepoint += 1) {
+                if (covers(lack.face, codepoint)) continue;
+                try std.testing.expect(count < found.len);
+                found[count] = codepoint;
+                count += 1;
+            }
+        }
+        try std.testing.expectEqualSlices(u21, lack.missing, found[0..count]);
+    }
 }

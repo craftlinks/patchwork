@@ -2349,7 +2349,9 @@ Both targets `@embedFile` them, so the browser fetches no font files and a proje
   default ranges also name the arrows (U+2190 to U+2193) and ≈, ≠, ≤, ≥, but a range keeps
   only what its face holds: Noto Sans Mono has them, and Noto Sans and Noto Sans Bold do not,
   so `.sans` and `.sans_bold` draw `.notdef` for `→` and `≤`. Draw those in `.mono`, or add a
-  face that has them (see Fonts).
+  face that has them (see Fonts). Noto Sans Mono in turn lacks the soft hyphen U+00AD. A test
+  in `src/text.zig` locks these lists, and `text.covers(face, codepoint)` answers for any
+  face at run time.
   Native and wasm embed the same bytes, so they draw the same. A ReleaseSmall `live.wasm`
   went from 2.04 MB to 254 KB. A codepoint outside the ranges draws `.notdef`;
   `AppOptions.font_ranges` widens them, and `null` embeds the full faces.
@@ -2456,16 +2458,45 @@ const steps = patchwork.addApp(b, dep.builder, .{
 ```
 
 - **The face.** TrueType with `glyf` outlines, any units per em (16 to 16384), a Unicode
-  `cmap` of format 12 or 4. A CFF (`.otf`) face fails the build naming the file. Commit its
-  licence next to it.
+  `cmap` of format 12 or 4, and any number of glyphs: Noto Sans Math's 5,014 cut to six ranges
+  is 16 glyphs and 1.5 KB. What a face keeps is capped at 4,096 glyphs (the glyph cache's
+  12-bit id). Commit its licence next to it. A face the subsetter refuses fails the build with
+  one line naming the file and why:
+
+  ```text
+  subset: fonts/a.otf: no glyf table; CFF outlines are not supported, use a TrueType (glyf) face
+  subset: fonts/a.ttf: the ranges keep 4,200 glyphs, and a subset keeps at most 4,096: narrow the ranges
+  subset: fonts/a.ttf: no Unicode cmap of format 4 or 12
+  subset: fonts/a.ttf: the file ends inside its table directory
+  ```
 - **The name** is a Zig identifier other than `sans`, `sans_bold`, and `mono`, used once; it
   becomes the `text.Face` tag. `addApp` checks the list at configure time and panics naming the
   face and the rule.
 - **Ranges.** `ranges` lists the codepoints to keep, increasing and apart; null keeps the app's
-  `font_ranges` (null there too: the whole face). Keep them tight: the gallery's 917 KB Lucide
+  `font_ranges` (null there too: the whole face). A face's own `ranges` are a claim: a
+  codepoint in them that the face has no glyph for fails the build, naming the face and the
+  codepoint, since it is most likely a typo in an icon list (`subset: face 'icons'
+  (fonts/lucide.ttf): U+E999 is in the face's own ranges and has no glyph`). Leave out the
+  codepoints Unicode does not assign, as `examples/session/faces.zig` skips U+03A2 in Greek.
+  The app-wide `font_ranges` stay silent, since faces that differ share them: there a range
+  keeps only what each face holds. Keep them tight: the gallery's 917 KB Lucide
   face subset to its 14 icons is 4.5 KB, so its `gallery.wasm` grew by 10 KB with the page's
   code. Name the codepoints in one file the app and its `build.zig` both import, as
   `examples/gallery/icons.zig` does, so they cannot drift apart.
+- **Coverage.** `text.covers(face, codepoint)` is true when the face maps the codepoint to a
+  glyph other than `.notdef`. There is no fallback from one face to another, so a codepoint a
+  face lacks draws its box; a test of every codepoint the app draws in each face catches that
+  before a screen does:
+
+  ```zig
+  // The app's strings and the face each is drawn in: .{ .face = .sans, .text = "a − b" }, ...
+  test "every codepoint the app draws is in its face" {
+      for (strings) |string| {
+          var codepoints = (try std.unicode.Utf8View.init(string.text)).iterator();
+          while (codepoints.nextCodepoint()) |codepoint| try std.testing.expect(text.covers(string.face, codepoint));
+      }
+  }
+  ```
 - **Drawing.** Text in an app face is a `text.Style` like any other. For icons,
   `kit.icon(cx, face, codepoint, size, rect, clip, color)` (`text.icon` on the draw context)
   centres the glyph's ink on `rect`, snapped to the device grid: icon fonts' advances and
