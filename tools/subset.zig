@@ -1,10 +1,12 @@
-//! `subset <in.ttf> <out.ttf> <ranges>`: writes the subset of a TrueType face covering
-//! `<ranges>` (hex, `20-7E,A0-17F,...`) for the build's `patchwork_fonts` module
-//! (`src/text/subset.zig`, `build.zig`).
+//! `subset <in.ttf> <out.ttf> <ranges> [--own <face>]`: writes the subset of a TrueType face
+//! covering `<ranges>` (hex, `20-7E,A0-17F,...`) for the build's `patchwork_fonts` module
+//! (`src/text/subset.zig`, `build.zig`). With `--own`, the ranges are the face's own and every
+//! codepoint in them must have a glyph (`subset.Claim.own`); `<face>` names it in the error.
 //!
-//! Silent on success, because the build counts a run step's stderr as a failure; errors name
-//! the input. Linux only, like `tools/compare.zig`: the input is mapped read-only and the
-//! output written from a static buffer, so nothing is allocated.
+//! Silent on success, because the build counts a run step's stderr as a failure; a refusal
+//! prints one line naming the input and why (`subset.message`). Linux only, like
+//! `tools/compare.zig`: the input is mapped read-only and the output written from a static
+//! buffer, so nothing is allocated.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,23 +28,26 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const path_in = args.next() orelse return usage();
     const path_out = args.next() orelse return usage();
     const spec = args.next() orelse return usage();
+    var own: ?[]const u8 = null;
+    if (args.next()) |flag| {
+        if (!std.mem.eql(u8, flag, "--own")) return usage();
+        own = args.next() orelse return usage();
+    }
     if (args.next() != null) return usage();
+    if (path_in.len > subset.path_max) return usage();
+    if (own) |face| {
+        if (face.len > subset.face_name_max) return usage();
+    }
     var ranges: [range_cap]subset.Range = undefined;
     const count = parse_ranges(spec, &ranges) catch {
         std.debug.print("subset: bad ranges '{s}'\n", .{spec});
         return 2;
     };
     const input = try map_file(path_in);
-    const summary = subset.subset(&scratch, input, ranges[0..count], &output) catch |err| {
-        if (err == error.NoGlyf) {
-            std.debug.print(
-                "subset: {s}: no glyf table; CFF outlines are not supported, " ++
-                    "use a TrueType (glyf) face\n",
-                .{path_in},
-            );
-            return 1;
-        }
-        std.debug.print("subset: {s}: {s}\n", .{ path_in, @errorName(err) });
+    const claim: subset.Claim = if (own == null) .shared else .own;
+    const summary = subset.subset(&scratch, input, ranges[0..count], claim, &output) catch |err| {
+        var buffer: [subset.refusal_max]u8 = undefined;
+        std.debug.print("{s}\n", .{subset.refusal(&buffer, path_in, own, err, &scratch.detail)});
         return 1;
     };
     try write_file(path_out, output[0..summary.bytes]);
@@ -51,7 +56,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 }
 
 fn usage() u8 {
-    std.debug.print("usage: subset in.ttf out.ttf 20-7E,A0-FF\n", .{});
+    std.debug.print("usage: subset in.ttf out.ttf 20-7E,A0-FF [--own face]\n", .{});
     return 2;
 }
 
