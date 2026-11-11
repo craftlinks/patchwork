@@ -7,6 +7,10 @@ Patchwork provides a compile-time application contract that compiles to both nat
 Linux (Wayland + wgpu-native) and the browser (`wasm32-freestanding` + WebGPU) from
 a single Zig app definition without dynamic dispatch or vtables.
 
+This manual explains why. Names and signatures are in `docs/describe/`, generated from the
+code by `zig build describe` and checked by `zig build test`, so they cannot drift: read
+`docs/describe/index.json` first, then the file for the area (`draw.json`, `text.json`, ...).
+
 ## The App Contract
 
 An application defines a type satisfying the contract in `src/app.zig`:
@@ -2051,7 +2055,8 @@ if (!kit.glass(cx, sidebar, clip, kit.glass_look(cx.theme(), .frosted, 22)))
   down, and up pipelines.
 
 - **Instance convention.** The first `vec4` is `rect` (x, y, width, height in logical
-  pixels), the second is `clip` (exclusive-max x0, y0, x1, y1), and up to six parameter groups
+  pixels), the second is `clip` (exclusive-max x0, y0, x1, y1: `draw.Clip`'s fields `.x0`,
+  `.y0`, `.x1`, `.y1`, with `x1 > x0` and `y1 > y0`), and up to six parameter groups
   follow. Every field is `f32`, `[2]f32` (at an 8-byte boundary), or `[4]f32` (at a 16-byte
   one), and the size is any multiple of 4, so no hand padding: each full 16 bytes is one
   `float32x4` attribute at locations 1 to 8, and a last partial group is `float32`,
@@ -2229,8 +2234,9 @@ const placed = draw.fill.append(cx.drawing(), &shape, .{ .color = color, .rule =
 
 - **Flattening.** Quadratics use the glyph rasterizer's rule (`raster.quad_chords`, at most 16
   chords) at `fill.tolerance_px` of 0.05 px, a quarter of the atlas's 0.2, and cubics the stroke's
-  (`path.cubic_segments_at`), both at `zoom`, so pass `cx.text.device_scale()` (the display scale
-  times `cx.view_zoom`) for chords that follow the screen. At 0.05 a glyph shows no facets at
+  (`path.cubic_segments_at`), both at `zoom`, so pass `cx.drawing().text.device_scale()` (the
+  display scale times `cx.view_zoom`; `cx` is the UI context, whose draw context holds the
+  glyph cache) for chords that follow the screen. At 0.05 a glyph shows no facets at
   2,000 px and none of the 1,517 glyphs of U+0021 to U+017F is refused; a bitmap's 0.2 showed them.
 - **Transforms.** `draw.Transform` is a 2 x 3 affine (`translation`, `scaling`, `rotation`,
   `then`, `around`, `apply`; `+y` down, so a positive angle turns clockwise).
@@ -2384,8 +2390,13 @@ const style: text.Style = .{ .face = .mono, .size = 16, .color = .{ 1, 1, 1, 1 }
 const width = text.measure(style, "0.50");                    // logical px, pure
 const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
 text.place(cx.drawing(), style, "0.50", rect, clip, options);  // during App.draw
+const runs = [_]text.Run{ .{ .style = style, .bytes = "x = " }, .{ .style = bold, .bytes = "2" } };
 text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline for mixed styles
 ```
+
+`text.Options` has no defaults: `align_x`, `align_y`, and `ellipsis` are all required.
+`text.WrapOptions` defaults both alignments to `.start`. A `text.Run` is `.style`, a
+`text.Style`, and `.bytes`, its UTF-8.
 
 **Wrapped text.** `text.place_wrapped` and `text.place_runs_wrapped` break text into lines no
 wider than `rect.width`; `text.measure_wrapped` and `measure_runs_wrapped` give the height
@@ -2437,12 +2448,25 @@ context must register `draw.Fill` (a compile error names it otherwise).
 text.place_outlines(cx.drawing(), style, "Patchwork", rect, clip, options);
 // Your own loop: each glyph's pen before snapping, a transform, a colour, a progress.
 var glyphs: text.Glyphs = .wrapped(&runs, rect, .{});          // or .line(&runs, rect, options)
-var shape: draw.fill.Builder = .init(cx.text.device_scale());
+var shape: draw.fill.Builder = .init(cx.drawing().text.device_scale());
 while (glyphs.next()) |glyph| {                                // every codepoint, spaces too
     shape.reset();
     shape.set_transform(.around(glyph.pen, .scaling(local, local)));
     if (!text.contours(&shape, glyph.style.face, glyph.glyph, glyph.style.size, glyph.pen)) continue;
     _ = draw.fill.append(cx.drawing(), &shape, .{ .color = glyph.style.color }, clip);
+}
+```
+
+- **One glyph by codepoint,** placed by the app's own layout: `text.contours` takes a glyph id,
+  which `text.ttf.glyph_id(text.font_of(face), codepoint)` gives (0, `.notdef`, when the face
+  does not map it), and its advance in font units is `text.ttf.advance(font, id)`, over
+  `font.units_per_em`:
+
+```zig
+const id = text.ttf.glyph_id(text.font_of(.sans), 'A');
+shape.reset();
+if (text.contours(&shape, .sans, id, size, pen)) { // pen: the baseline's left end, logical px
+    _ = draw.fill.append(cx.drawing(), &shape, .{ .color = color }, clip);
 }
 ```
 

@@ -190,7 +190,8 @@ pub const place_runs_wrapped = layout.place_runs_wrapped;
 /// `text/layout.zig`, section 3a.
 pub const icon = layout.icon;
 
-/// One glyph's outline into a `draw.fill.Builder`. See `text/layout.zig`, section 3b.
+/// One glyph's outline into a `draw.fill.Builder`, where `glyph` is a glyph id of `face`, from
+/// `text.ttf.glyph_id(text.font_of(face), codepoint)`. See `text/layout.zig`, section 3b.
 pub const contours = layout.contours;
 
 /// The codepoints of a line or a wrapped block with their unsnapped pens. Pure.

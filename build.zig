@@ -86,6 +86,11 @@
 //! - Each example in this repo gets `run`, `serve`, `wasm`, and `bench` steps through
 //!   `add_example_steps`, with the example's name as a suffix; the gallery also owns the plain
 //!   names.
+//! - `zig build describe` prints the library as JSON, generated from the code by
+//!   `tools/describe.zig`: `docs/describe/index.json`, then one file per area (`draw`, `text`,
+//!   ...); `-- draw text` prints only those, and `-- --write docs/describe` writes the golden
+//!   files that `zig build test` compares it with. Only `build` below adds it, never `addApp`,
+//!   so a consumer's build neither builds nor runs it.
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
 //!   compares two frame dumps, and writes a diff picture or a cropped PNG of the first
 //!   (`tools/compare.zig`).
@@ -976,6 +981,45 @@ fn add_example_steps(
     bench_step.dependOn(steps.bench);
 }
 
+/// `describe` prints the library as JSON, generated from the code (`tools/describe.zig`): the
+/// index and every part, or the parts named after `--` (`zig build describe -- draw text`);
+/// `zig build describe -- --write docs/describe` writes the golden files. `test` runs the tool's
+/// own tests and compares its output with `docs/describe/`, failing with that command. Only this
+/// file's `build` reaches it, never `addApp`, so a consumer's build neither builds nor runs it.
+fn add_describe_steps(b: *std.Build, test_step: *std.Build.Step) void {
+    // For the host in Debug, as `tools/subset.zig` is built for the host: the output, sizes
+    // included, does not depend on `-Dtarget` or `-Doptimize`.
+    const fonts = add_font_module(b, default_font_ranges, &.{});
+    const library = add_library_module(b, b.graph.host, .Debug, fonts);
+    const root = b.createModule(.{
+        .root_source_file = b.path("tools/describe.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    root.addImport("patchwork", library);
+    const exe = b.addExecutable(.{ .name = "describe", .root_module = root });
+    const print = b.addRunArtifact(exe);
+    print.addDirectoryArg(b.path("src"));
+    print.addPassthruArgs();
+    print.setCwd(b.path("."));
+    print.has_side_effects = true;
+    const what = "Print the library as JSON: -- [parts] [--write docs/describe]";
+    const step = b.step("describe", what);
+    step.dependOn(&print.step);
+
+    const check = b.addRunArtifact(exe);
+    check.addDirectoryArg(b.path("src"));
+    check.addArg("--check");
+    check.addDirectoryArg(b.path("docs/describe"));
+    check.has_side_effects = true;
+    test_step.dependOn(&check.step);
+
+    const tests = b.addTest(.{ .root_module = root });
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_tests.step);
+}
+
 /// `test` runs the library tests and every example's tests. A test root that imported only
 /// the library would drop the examples without an error, so each example is listed here.
 /// `test-contract` runs compiles that must fail.
@@ -1008,6 +1052,7 @@ fn add_test_steps(
     for (examples) |example| {
         test_step.dependOn(example.tests);
     }
+    add_describe_steps(b, test_step);
 
     const contract_step = b.step(
         "test-contract",

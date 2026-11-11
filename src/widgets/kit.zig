@@ -172,6 +172,7 @@ pub const centered: text.Options = .{
     .ellipsis = false,
 };
 
+/// `color` as a widget's paint, with `radius` for the faces it rounds.
 pub fn paint_of(color: [4]f32, radius: f32) Paint {
     assert(radius >= 0);
     assert(color[3] >= 0);

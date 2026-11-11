@@ -102,7 +102,12 @@ full snippet is in [docs/reference.md](docs/reference.md#use-patchwork-from-anot
 
 ## Commands
 
+Every public name and signature, generated from the code, is in
+[docs/describe/](docs/describe/): read [index.json](docs/describe/index.json) first, which names
+each file (`draw.json`, `text.json`, ...) with what it holds and its size.
+
 ```bash
+zig build describe -- draw text # the library as JSON, generated: draw types, types, functions
 zig build test                  # unit tests: library and all examples (no GPU needed)
 zig build test-contract         # the app contract rejects malformed apps at compile time
 zig build check                 # compile every shader and pipeline headless (needs a GPU)
@@ -127,8 +132,8 @@ web/            browser shell: shell.js, app.js, index.html
 examples/       twelve apps, and sound/: rack and audio on Thrum, a package of its own
 test/golden/    frame hashes per adapter
 test/consumer/  a package outside this build: two peers, a tool, its own goldens
-tools/          frame comparison, font subsetting
-docs/           reference manual
+tools/          frame comparison, font subsetting, describe (the library as JSON)
+docs/           reference manual; describe/, the library as JSON (generated, checked)
 ```
 
 ## Dependencies
@@ -139,6 +144,9 @@ Everything else is Zig.
 
 ## Documentation
 
+- [docs/describe/](docs/describe/): every draw type, type, constant, and public function, with
+  its parameters and one sentence, generated from the code by `zig build describe` and checked by
+  `zig build test`. Start at `index.json`.
 - [docs/reference.md](docs/reference.md): the full manual covering the app contract, layout,
   widgets, theming, drawing, text, data from other threads, platform hosts, benchmarks,
   regression and rendering frames.

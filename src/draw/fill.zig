@@ -133,10 +133,12 @@ pub const Transform = struct {
 
     pub const identity: Transform = .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = 0, .ty = 0 };
 
+    /// Moves every point by `x`, `y`.
     pub fn translation(x: f32, y: f32) Transform {
         return .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = x, .ty = y };
     }
 
+    /// Scales about the origin by `sx` across and `sy` down.
     pub fn scaling(sx: f32, sy: f32) Transform {
         return .{ .a = sx, .b = 0, .c = 0, .d = sy, .tx = 0, .ty = 0 };
     }
@@ -168,6 +170,7 @@ pub const Transform = struct {
         return result;
     }
 
+    /// `point` mapped by the transform.
     pub fn apply(self: Transform, point: Point) Point {
         return .{
             self.a * point[0] + self.c * point[1] + self.tx,
@@ -280,6 +283,8 @@ pub const Builder = struct {
     start: Point,
     open: bool,
 
+    /// An empty Builder whose chords suit `zoom` screen pixels per logical pixel: pass
+    /// `cx.drawing().text.device_scale()` (the display scale times the canvas zoom).
     pub fn init(zoom: f32) Builder {
         assert(zoom > 0);
         const builder: Builder = .{
@@ -321,6 +326,7 @@ pub const Builder = struct {
         self.open = true;
     }
 
+    /// A straight segment from the pen to `point`.
     pub fn line_to(self: *Builder, point: Point) void {
         assert(self.open);
         self.add(self.transform.apply(point));

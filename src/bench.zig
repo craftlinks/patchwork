@@ -285,6 +285,7 @@ pub const Step = union(enum) {
     touch: []const Finger,
 };
 
+/// A scripted run: steps once, steps repeated, and the frames to measure (module guide).
 pub const Scenario = struct {
     name: []const u8,
     /// Run once before measuring.
