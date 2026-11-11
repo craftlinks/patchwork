@@ -186,7 +186,8 @@ patchwork/
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
-│   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM and PNG
+│   ├── bench.zig               # Bench mode: scenarios, replay, simulated clock, PPM, hashes
+│   ├── png.zig                 # PNG: the uncompressed writer and its reader (`patchwork.png`)
 │   ├── wake.zig                # Wake: a producer on any thread wakes the UI's poll loop
 │   ├── drop.zig                # File drops: the file list, the URI list parser, the transfer
 │   ├── serve.zig               # Built-in static HTTP server for browser testing
@@ -408,6 +409,7 @@ zig build test-consumer   # test/consumer, a package outside this build: native,
                           # and regress, its tool, and an argument (needs a GPU)
 ./zig-out/bin/gallery --render still --out frames     # A scenario's frames as PNGs
 python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
+python3 -I tools/browser_check.py gallery still --headless   # The same in headless Chromium
 python3 -I tools/browser_check.py --root ../app myapp still   # The same, for an app in another tree
 
 # Bench mode (see Bench Mode below)
@@ -1776,6 +1778,16 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
   console errors. `--root DIR` checks an app in another tree, a package of its own: the
   executable, the reference frame, and the `serve-<app>` step are all taken from `DIR`.
+  The viewport is the app's regress size, read from the headless run's first line
+  (`regress <app>  WxH@1.00`). Before it waits for the replay, the check asks the page for one
+  animation frame: a Chromium window the compositor does not show (on a workspace that is not
+  shown) gets none, so the replay never starts, and the check stops with "the page drew no
+  frame" and exit status 3, apart from a scenario that did not finish (status 1).
+  `--headless` runs Chromium's new headless mode on the hardware adapter instead, with no
+  window to hide, and compares the canvas's last frame (`toDataURL`), since headless Chromium
+  leaves a WebGPU canvas out of its screenshots; the windowed run compares what the screen
+  shows, and is exact only in a window at least the regress size (a tiled window narrower than
+  the viewport is scaled to fit), so a regress size above 1280 x 720 wants `--headless`.
 
 ## Rendering Frames
 
@@ -1798,14 +1810,18 @@ so a scenario's frame count is its `setup` plus `frames` plus one.
   app timer ticks as time passes each multiple of its period, and a producer's frames follow
   the rate (`bench.producer_frames_at`), 48,000 a second at every rate. The output is the same
   bytes every run.
-- **Output.** `--out <dir>` writes `<dir>/<scenario>-000000.png` and so on (RGB, stored, about
-  24.9 MB a frame at 4K, so use a pipe for a video). `--out -` writes raw RGBA frames back to
-  back on stdout and nothing else; the encoder sets the pace, and a closed pipe ends the run
-  with "output closed after N frames", exit 1. Frames are opaque: alpha is 255.
+- **Output.** `--out <dir>` writes `<dir>/<scenario>-000000.png` and so on through
+  `patchwork.png.write`: RGB, stored (no compression), 3 bytes a pixel, so 6.2 MB a frame at
+  1920 x 1080 and 24.9 MB at 4K (`png.size` gives the exact length); use a pipe for a video.
+  `--out -` writes raw RGBA frames back to back on stdout and nothing else; the encoder sets the
+  pace, and a closed pipe ends the run with "output closed after N frames", exit 1. Frames are
+  opaque: alpha is 255.
 - **Report.** One line on stderr: the size, the frame count, the last frame's hash, and the time
-  per frame. `draw` is the CPU's side of the frame; the GPU's work is waited on in `read`. At
-  the regress size, scale 1, and 60 fps the hash is the scenario's golden on that adapter, a
-  check that needs no picture. `--adapter` is `high` by default; `both` is refused.
+  per frame. `draw` is the CPU's side of the frame; the GPU's work is waited on in `read`.
+  Measure and export in ReleaseFast: a Debug build draws and writes PNGs several times slower,
+  and its times say nothing about the app's. At the regress size, scale 1, and 60 fps the hash
+  is the scenario's golden on that adapter, a check that needs no picture. `--adapter` is
+  `high` by default; `both` is refused.
 
 `--regress` and `--render` are clients of a library type, `patchwork.host.offscreen`, which any
 native caller can drive at a time it picks:

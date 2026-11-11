@@ -2,7 +2,7 @@
 """Browser check: an app's scenario replayed in Chromium against its headless regress frame.
 
 Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port N] [--cdp N] [--reuse]
-       [--root DIR]
+       [--root DIR] [--headless]
 
 `--root DIR` names the tree that holds the app: its `zig-out/bin/<app>`, its golden files, and its
 `serve-<app>` step, for an app in a package of its own (Weft's Play, or `examples/sound` for the
@@ -19,9 +19,22 @@ repository, so every other use is unchanged. Every path and step below is under 
    another tree's or an older build (another session in this repository runs its own), unless
    `--reuse` says to use the one on `--port` (default 8080) as it is.
 3. Starts system Chromium with WebGPU and remote debugging on a free port (or `--cdp`), sets
-   the viewport to
-   1280 x 720 at scale 1, loads `?bench=<scenario>` (web/shell.js, section 8a), waits for the
-   console line `bench done <scenario>`, and screenshots the canvas at the regress size.
+   the viewport to the app's regress size at scale 1 (the `WxH` of the headless run's first
+   line, `regress <app>  WxH@1.00`; 1280 x 720 unless the app declares `regress_size`), loads
+   `?bench=<scenario>` (web/shell.js, section 8a), and asks the page for one animation frame.
+   None within `FRAME_TIMEOUT_S` means the compositor is not showing the window (a window on a
+   workspace that is not shown gets no frame, so the replay never starts): the check stops
+   with "the page drew no frame" and exit status 3. Otherwise it waits for the console line
+   `bench done <scenario>` (none within `DONE_TIMEOUT_S`: "the scenario did not finish", exit
+   status 1) and screenshots the canvas at the regress size.
+   `--headless` runs Chromium's new headless mode instead of a window, so nothing shows on the
+   screen and no workspace can hide it; its flags give WebGPU the hardware Vulkan adapter
+   (`HEADLESS_FLAGS`). It compares the canvas's last frame (`toDataURL`) in place of the
+   screenshot, which headless Chromium takes without the WebGPU canvas.
+   A windowed run is exact only when the compositor gives the window at least the regress
+   size: a tiled window narrower than the viewport is scaled to fit, and the screenshot then
+   differs on the edges of the text. `--headless` has no window, so any size passes as the
+   frame does.
 4. Prints `differ N px, max level M`; passes when M <= 3 and N <= 0.1% of the pixels (Tint and
    naga round trigonometry differently). On a failure, or with --keep, writes the screenshot
    and a diff picture beside the reference (`<scenario>-browser.png`, `.diff.png`).
@@ -29,12 +42,14 @@ repository, so every other use is unchanged. Every path and step below is under 
    its whole process groups, also on SIGTERM, SIGHUP, or Ctrl+C. It never kills a process it did
    not start; a port still taken afterwards is reported with its pid.
 
-Python standard library only, so it runs with `python3 -I`. Exit status 0 on a pass.
+Python standard library only, so it runs with `python3 -I`. Exit status 0 on a pass, 1 on a
+failure, 2 on a usage or setup error, 3 when the page drew no frame.
 """
 
 import base64
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -51,6 +66,19 @@ LEVEL_MAX = 3
 SHARE_MAX = 0.001
 DONE_TIMEOUT_S = 60
 SERVE_TIMEOUT_S = 300
+LOAD_TIMEOUT_S = 30
+FRAME_TIMEOUT_S = 5
+NO_FRAME_STATUS = 3
+# Chromium's new headless mode with WebGPU on the hardware adapter. Without
+# `--disable-gpu-compositing` the page gets no adapter ("A valid external Instance reference no
+# longer exists"), and without `--use-angle=vulkan` it gets SwiftShader, Chromium's CPU one.
+HEADLESS_FLAGS = (
+    "--headless=new",
+    "--use-angle=vulkan",
+    "--disable-gpu-compositing",
+)
+# The windowed run: a Wayland window the compositor shows.
+WINDOW_FLAGS = ("--ozone-platform=wayland",)
 
 
 class Cdp:
@@ -75,6 +103,8 @@ class Cdp:
         self.buf = self.buf.split(b"\r\n\r\n", 1)[1]
         self.next_id = 0
         self.logs = []
+        self.events = set()
+        self.replies = {}
 
     def send(self, obj):
         data = json.dumps(obj).encode()
@@ -112,6 +142,10 @@ class Cdp:
 
     def note(self, message):
         method = message.get("method")
+        if method is not None:
+            self.events.add(method)
+        elif "id" in message:
+            self.replies[message["id"]] = message
         if method == "Runtime.consoleAPICalled":
             args = message["params"]["args"]
             text = " ".join(str(a.get("value", a.get("description", ""))) for a in args)
@@ -130,6 +164,18 @@ class Cdp:
                     raise RuntimeError(f"{method}: {message['error']}")
                 return message.get("result", {})
             self.note(message)
+
+    def call_within(self, method, params, seconds):
+        """`call`, but gives up after `seconds`; returns the result, or None when no reply came."""
+        self.next_id += 1
+        sent = self.next_id
+        self.send({"id": sent, "method": method, "params": params})
+        if not self.pump_until(lambda _: sent in self.replies, seconds):
+            return None
+        reply = self.replies.pop(sent)
+        if "error" in reply:
+            raise RuntimeError(f"{method}: {reply['error']}")
+        return reply.get("result", {})
 
     def pump_until(self, predicate, seconds):
         """Reads events until `predicate(logs)` holds or `seconds` pass; returns whether it held."""
@@ -296,6 +342,38 @@ def check_released(port, process):
             print(f"browser_check: :{port} is held by pid {pid}, which this check did not start")
 
 
+def regress_size(first_line):
+    """The `(width, height)` of the headless run's first line, `regress <app>  WxH@S`, or None."""
+    match = re.match(r"regress \S+\s+(\d+)x(\d+)@", first_line)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def first_frame(cdp, seconds):
+    """Whether the page runs one animation frame within `seconds`. The limit is kept here, not
+    by a page timer, since a page that gets no frame may get its timers late too."""
+    expression = "new Promise(resolve => requestAnimationFrame(() => resolve(true)))"
+    result = cdp.call_within(
+        "Runtime.evaluate",
+        {"expression": expression, "awaitPromise": True, "returnByValue": True},
+        seconds,
+    )
+    return result is not None and result.get("result", {}).get("value") is True
+
+
+def canvas_png(cdp):
+    """The canvas's last presented frame as PNG bytes (`toDataURL`), or None. Headless Chromium
+    composites in software, which leaves a WebGPU canvas out of the page's screenshot."""
+    expression = "document.getElementById('surface').toDataURL('image/png')"
+    result = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+    url = result.get("result", {}).get("value", "")
+    prefix = "data:image/png;base64,"
+    if not isinstance(url, str) or not url.startswith(prefix):
+        return None
+    return base64.b64decode(url[len(prefix) :])
+
+
 def exit_on_signal(signum, _frame):
     """Turns SIGTERM and SIGHUP into SystemExit, so `main`'s cleanup runs."""
     raise SystemExit(128 + signum)
@@ -305,6 +383,7 @@ def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     keep = "--keep" in argv
     reuse = "--reuse" in argv
+    headless = "--headless" in argv
     port = None
     cdp_port = None
     root = ROOT
@@ -351,6 +430,11 @@ def main(argv):
     if not os.path.exists(reference_path):
         print(f"browser_check: no reference frame {reference_path}")
         return 1
+    size = regress_size(summary[0]) if summary else None
+    if size is None:
+        print(f"browser_check: no size on the headless run's first line ({summary[:1]})")
+        return 1
+    view_width, view_height = size
 
     server = None
     chromium = None
@@ -387,6 +471,8 @@ def main(argv):
             print(f"browser_check: devtools port :{cdp_port} is taken")
             return 2
         url = f"http://127.0.0.1:{port}/?bench={scenario}"
+        # A window a little larger than the viewport, so the emulated one fits inside it.
+        window = (view_width, view_height) if headless else (view_width + 120, view_height + 180)
         chromium = subprocess.Popen(
             [
                 "chromium",
@@ -394,8 +480,8 @@ def main(argv):
                 f"--remote-debugging-port={cdp_port}",
                 "--enable-unsafe-webgpu",
                 "--enable-features=Vulkan",
-                "--ozone-platform=wayland",
-                "--window-size=1400,900",
+                *(HEADLESS_FLAGS if headless else WINDOW_FLAGS),
+                f"--window-size={max(window[0], 1400)},{max(window[1], 900)}",
                 "--no-first-run",
                 "--mute-audio",
                 "--autoplay-policy=no-user-gesture-required",
@@ -419,10 +505,27 @@ def main(argv):
         cdp.call("Page.enable")
         cdp.call(
             "Emulation.setDeviceMetricsOverride",
-            {"width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False},
+            {
+                "width": view_width,
+                "height": view_height,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+            },
         )
         cdp.logs.clear()
+        cdp.events.discard("Page.loadEventFired")
         cdp.call("Page.reload", {"ignoreCache": True})
+        # A page that gets no frame still loads, so the frame is asked of the reloaded page.
+        cdp.pump_until(lambda _: "Page.loadEventFired" in cdp.events, LOAD_TIMEOUT_S)
+        if not first_frame(cdp, FRAME_TIMEOUT_S):
+            why = (
+                "headless Chromium gave it none"
+                if headless
+                else "its window is not being shown (show its workspace, or pass --headless)"
+            )
+            print(f"browser_check: the page drew no frame in {FRAME_TIMEOUT_S} s: {why}")
+            report_console(cdp.logs)
+            return NO_FRAME_STATUS
         done_line = f"bench done {scenario}"
         ended = cdp.pump_until(
             lambda logs: any(t in (done_line, f"bench failed {scenario}") for _, t in logs)
@@ -430,17 +533,32 @@ def main(argv):
             DONE_TIMEOUT_S,
         )
         if not ended or not any(t == done_line for _, t in cdp.logs):
-            print(f"browser_check: no \"{done_line}\" within {DONE_TIMEOUT_S} s")
+            print(
+                f"browser_check: the scenario did not finish: "
+                f"no \"{done_line}\" within {DONE_TIMEOUT_S} s"
+            )
             report_console(cdp.logs)
             return 1
         # One more frame for the compositor to show the last present.
         cdp.pump_until(lambda logs: False, 0.3)
         width, height, reference = png_decode(open(reference_path, "rb").read())
-        shot = cdp.call(
-            "Page.captureScreenshot",
-            {"format": "png", "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}},
-        )
-        shot_bytes = base64.b64decode(shot["data"])
+        if (width, height) != (view_width, view_height):
+            print(f"browser_check: the reference is {width}x{height}, the run said {size}")
+            return 1
+        if headless:
+            shot_bytes = canvas_png(cdp)
+            if shot_bytes is None:
+                print("browser_check: the canvas gave no PNG")
+                return 1
+        else:
+            shot = cdp.call(
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
+                },
+            )
+            shot_bytes = base64.b64decode(shot["data"])
         shot_width, shot_height, browser = png_decode(shot_bytes)
         if (shot_width, shot_height) != (width, height):
             print(f"browser_check: screenshot is {shot_width}x{shot_height}, not {width}x{height}")
