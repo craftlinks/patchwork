@@ -71,13 +71,8 @@ pub const menu_pad_x: f32 = 12;
 /// Space above the first row and below the last.
 pub const menu_pad_y: f32 = 4;
 
-/// The default face's corner radius and border.
-pub const menu_radius: f32 = 6;
-pub const menu_border_px: f32 = 1;
-
-/// The highlight band's inset from the row's sides and its corner radius.
+/// The highlight band's inset from the row's sides.
 pub const menu_band_inset: f32 = 4;
-pub const menu_band_radius: f32 = 4;
 
 /// Labels start at the left, centered vertically, cut with an ellipsis when the popup was cut.
 pub const menu_text_options: text.Options = .{

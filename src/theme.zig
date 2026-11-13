@@ -9,7 +9,8 @@
 //! `cx.theme()` (`ui/cx.zig`, section 9b) to fill per-instance colors. `Theme` is the part the
 //! GPU needs, `Scheme.record()`: the colors the shaders mix toward (`lighten`, `darken`), the
 //! background the passes clear to, the chrome slots, and the arc angles. Sizes are not themed;
-//! they stay per instance (`Knob.sized`, `Meter.track_h`).
+//! they stay per instance (`Knob.sized`, `Meter.track_h`). Corners and strokes are, in the
+//! scheme's `form` (section 8).
 //! ```text
 //! App.config.theme : Scheme ---copied at app.start---> ui.Context.scheme --cx.theme()--> widgets
 //!                       cx.set_theme(s): scheme = s, draw.theme = s.record(), redraw
@@ -52,8 +53,12 @@
 //! ## 5. Making a Scheme
 //! Start from a preset and change what differs: `var s = theme.dark; s.colors.panel = ...;`.
 //! Colors are straight (non-premultiplied) RGBA with every component in `[0, 1]`, and the text
-//! sizes are within `text.size_max`; `app.check` refuses a `config.theme` that breaks either
-//! and names the field (`conformance`). Keep each `background` component off an 8-bit
+//! sizes are within `text.size_max`; the material's and the form's fields are in their ranges
+//! (a corner in `[0, radius_max]`, `capsule` in `[0, 0.5]`, `hairline` in `[0, stroke_max]`,
+//! `mark` in `(0, stroke_max]`, and a hairline above 0 when controls are outlined).
+//! `app.check` refuses a `config.theme` that breaks any of these and names the field
+//! (`conformance`); `cx.set_theme` asserts the material and the form of a scheme built at run
+//! time. Keep each `background` component off an 8-bit
 //! rounding tie (`c * 255` a half, such as 0.90): the background reaches the screen both as a
 //! pass's clear value and as the clear pipeline's output, which some GPUs round apart, so a
 //! cached frame would differ from a direct one by one step. Instance colors an app sets (`Button.paint`,
@@ -77,6 +82,31 @@
 //! panel. The material is CPU state only: it is not part of the GPU record, and switching it is
 //! a redraw. `blur` is the backdrop's sigma; the rest become the `draw.GlassLook` that
 //! `kit.glass_look` derives with the scheme's colours.
+//!
+//! ## 8. Forms
+//! `Scheme.form` says what shape the default skins give faces: corners by role, how round the
+//! pill-shaped parts are, how wide borders and emphasis lines are, and three choices of style.
+//! Like the material it is CPU state only, outside the GPU record, so switching it is a
+//! redraw. `Form{}` is exactly the constants of the faces before forms, so `dark` and `light`
+//! draw what they always drew.
+//! - `radius` has three roles: `control` (faces pressed or typed in, the scroll thumb),
+//!   `popup` (menus, the dropdown face that opens one, tooltips), and `band` (highlight bands
+//!   in menus, lists, the menu bar, and the dock's drop overlay).
+//! - `capsule` is a fraction of the side the default skin halves, not a radius: 0.5 rounds a
+//!   toggle's pill and thumb, a meter, the checkbox's mixed bar, the splitter's divider, and
+//!   `Segmented` into capsules; 0 squares them. One radius could not give each its own corner.
+//! - `hairline` is every border and rule; `mark` every emphasis line (the selected tab's
+//!   underline, the tab insertion marker, the divider, the drop outline).
+//! - `controls = .outlined` draws buttons, dropdowns, number boxes, fields, checkboxes,
+//!   toggles' pills, and tabs as a `hairline` border in their ink (`colors.control`, a
+//!   button's paint, `colors.focus` on a focused field) over a tint of that ink that shows only
+//!   on hover and press; a button's label takes its paint's colour.
+//! - `tab_mark = .filled` fills the selected tab in `accents[0]`, its label in
+//!   `colors.panel`, instead of underlining it.
+//! - `framed` gives a solid panel a `hairline` border in `colors.control`.
+//! Paints an app stores (`Button.paint`, `Panel.paint`, a slider's) keep their own radius:
+//! instance values win over the scheme. Insets, icon strokes, and window buttons are not in
+//! the form.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -222,6 +252,82 @@ pub const Material = struct {
     }
 };
 
+/// The widest corner a form may ask for, logical pixels (a `draw.Box` clamps its corner to half
+/// the short side).
+pub const radius_max: f32 = 64;
+
+/// The widest border or mark a form may ask for, logical pixels (under `widgets.splitter_px`).
+pub const stroke_max: f32 = 4;
+
+/// What shape the default skins give a scheme's faces (module guide, section 8): corners by
+/// role, how round the pill-shaped parts are, border and mark widths, whether controls are
+/// filled or outlined, how the selected tab is marked, and whether panels are framed. Sizes
+/// are not here; they stay per instance or constants.
+pub const Form = struct {
+    radius: Radii = .{},
+    /// A pill-shaped part's corner as a fraction of the side the default skin halves,
+    /// `[0, 0.5]`: 0.5 a capsule, 0 square. The toggle's pill and thumb, the meter, the
+    /// checkbox's mixed bar, the splitter's divider, the `Segmented` track and segments.
+    capsule: f32 = 0.5,
+    /// Borders and rules, logical pixels, `[0, stroke_max]`: field, number box, checkbox,
+    /// dropdown, menu, tooltip, a focused disclosure or segmented bar, column header lines,
+    /// framed panels.
+    hairline: f32 = 1,
+    /// Emphasis lines, logical pixels, `(0, stroke_max]`: the selected tab's underline, the tab
+    /// insertion marker, the splitter's divider, the dock's drop outline.
+    mark: f32 = 2,
+    /// Whether the default skin fills controls or outlines them (section 8).
+    controls: Controls = .filled,
+    /// How the default skin marks the selected tab (section 8).
+    tab_mark: TabMark = .underline,
+    /// A `hairline` border in `colors.control` around solid panels.
+    framed: bool = false,
+
+    /// Corner radii by role, logical pixels, `[0, radius_max]`.
+    pub const Radii = struct {
+        /// Faces pressed or typed in: text field, number box, checkbox box, tab, a tab's
+        /// close band, disclosure header, scroll thumb.
+        control: f32 = 4,
+        /// Popups and what opens them: menu face, dropdown face (it matches its list),
+        /// tooltip, and the glass look of all three.
+        popup: f32 = 6,
+        /// Highlight bands: menu row, list and tree row, menu bar title, dock drop overlay.
+        band: f32 = 4,
+    };
+
+    /// `filled` is the faces of steps 1 to 62; `outlined` draws a control as its border in
+    /// the control's ink over a tint that shows only on hover and press.
+    pub const Controls = enum(u8) { filled, outlined };
+
+    /// `underline` is a `mark`-high line in `accents[0]` under the selected tab; `filled`
+    /// fills the selected tab in `accents[0]`.
+    pub const TabMark = enum(u8) { underline, filled };
+
+    /// Null when every field is in its range, otherwise the first that is not, relative to
+    /// the form (`radius.popup`). A NaN is out of every range.
+    pub fn problem(self: Form) ?[]const u8 {
+        const radius_rule = ": must be in [0, 64]";
+        if (!(self.radius.control >= 0 and self.radius.control <= radius_max)) {
+            return "radius.control" ++ radius_rule;
+        }
+        if (!(self.radius.popup >= 0 and self.radius.popup <= radius_max)) {
+            return "radius.popup" ++ radius_rule;
+        }
+        if (!(self.radius.band >= 0 and self.radius.band <= radius_max)) {
+            return "radius.band" ++ radius_rule;
+        }
+        if (!(self.capsule >= 0 and self.capsule <= 0.5)) return "capsule: must be in [0, 0.5]";
+        if (!(self.hairline >= 0 and self.hairline <= stroke_max)) {
+            return "hairline: must be in [0, 4]";
+        }
+        if (!(self.mark > 0 and self.mark <= stroke_max)) return "mark: must be in (0, 4]";
+        if (self.controls == .outlined) {
+            if (!(self.hairline > 0)) return "hairline: outlined controls need a hairline above 0";
+        }
+        return null;
+    }
+};
+
 /// The app-level theme (module guide, section 1). `App.config.theme` sets it at start and
 /// `cx.set_theme` switches it at run time.
 pub const Scheme = struct {
@@ -238,6 +344,8 @@ pub const Scheme = struct {
     down_darken: f32,
     /// What panels and popups are made of (section 7); a panel or menu may override it.
     material: Material = .solid,
+    /// What shape the default skins give faces (section 8). CPU state only, like `material`.
+    form: Form = .{},
 
     /// The GPU record: the colors the shaders and the passes read, and the constant arc.
     pub fn record(self: *const Scheme) Theme {
@@ -360,6 +468,7 @@ pub fn problem(comptime scheme: Scheme) ?[]const u8 {
             return "down_darken: must be in [0, 1]";
         }
         if (scheme.material.problem()) |message| return "material." ++ message;
+        if (scheme.form.problem()) |message| return "form." ++ message;
         return null;
     }
 }
@@ -393,6 +502,13 @@ comptime {
     assert(!dark.material.glass());
     assert(!light.material.glass());
     assert(@typeInfo(Colors).@"struct".field_names.len == 11);
+    // The form is CPU state: small enough to copy with the scheme, and valid in both presets.
+    assert(@sizeOf(Form) <= 32);
+    assert((Form{}).problem() == null);
+    assert(std.meta.eql(dark.form, Form{}));
+    assert(std.meta.eql(light.form, Form{}));
+    assert(radius_max > 0);
+    assert(stroke_max > 0);
 }
 
 /// The record steps 1 to 30 uploaded, `pad0` and all, for the comparison test below.
@@ -529,4 +645,62 @@ test "materials are glass but solid and name their first bad field" {
     };
     const message = comptime problem(scheme).?;
     try std.testing.expectEqualStrings("material.rim: must be in [0, 1]", message);
+}
+
+// Locks the default form (section 8) as the constants the default skin read before forms:
+// corners 4, 6, 4, capsule 0.5, hairline 1, mark 2, filled controls, the underline, no frame;
+// `dark` and `light` carry it; and the form is not in the record (`dark.record()` is `chrome`).
+test "the default form is today's constants" {
+    const form: Form = .{};
+    try std.testing.expectEqual(@as(f32, 4), form.radius.control);
+    try std.testing.expectEqual(@as(f32, 6), form.radius.popup);
+    try std.testing.expectEqual(@as(f32, 4), form.radius.band);
+    try std.testing.expectEqual(@as(f32, 0.5), form.capsule);
+    try std.testing.expectEqual(@as(f32, 1), form.hairline);
+    try std.testing.expectEqual(@as(f32, 2), form.mark);
+    try std.testing.expectEqual(Form.Controls.filled, form.controls);
+    try std.testing.expectEqual(Form.TabMark.underline, form.tab_mark);
+    try std.testing.expect(!form.framed);
+    try std.testing.expect(std.meta.eql(form, dark.form));
+    try std.testing.expect(std.meta.eql(form, light.form));
+    var square = dark;
+    square.form.radius = .{ .control = 0, .popup = 0, .band = 0 };
+    square.form.capsule = 0;
+    const record = square.record();
+    try std.testing.expect(std.mem.eql(u8, std.mem.asBytes(&chrome), std.mem.asBytes(&record)));
+}
+
+// Locks `Form.problem` (section 5): a popup radius of -1, a capsule of 0.6, a hairline of 5, a
+// mark of 0, an outlined form with no hairline, and a NaN capsule each name their field, and
+// `problem` prefixes "form.".
+test "form problem names the first field out of range" {
+    var bad: Form = .{};
+    bad.radius.popup = -1;
+    try std.testing.expectEqualStrings("radius.popup: must be in [0, 64]", bad.problem().?);
+    bad = .{};
+    bad.capsule = 0.6;
+    try std.testing.expectEqualStrings("capsule: must be in [0, 0.5]", bad.problem().?);
+    bad = .{};
+    bad.hairline = 5;
+    try std.testing.expectEqualStrings("hairline: must be in [0, 4]", bad.problem().?);
+    bad = .{};
+    bad.mark = 0;
+    try std.testing.expectEqualStrings("mark: must be in (0, 4]", bad.problem().?);
+    bad = .{};
+    bad.controls = .outlined;
+    bad.hairline = 0;
+    const outlined = "hairline: outlined controls need a hairline above 0";
+    try std.testing.expectEqualStrings(outlined, bad.problem().?);
+    bad.hairline = 1;
+    try std.testing.expect(bad.problem() == null);
+    bad = .{};
+    bad.capsule = std.math.nan(f32);
+    try std.testing.expectEqualStrings("capsule: must be in [0, 0.5]", bad.problem().?);
+    const scheme = comptime blk: {
+        var out = dark;
+        out.form.capsule = 0.6;
+        break :blk out;
+    };
+    const message = comptime problem(scheme).?;
+    try std.testing.expectEqualStrings("form.capsule: must be in [0, 0.5]", message);
 }

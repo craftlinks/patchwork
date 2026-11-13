@@ -73,7 +73,8 @@ pub const field_flags: ui.Flags = .{
     .primary_only = true,
 };
 /// Text field metrics in logical pixels: the text inset, the face's corner radius and border,
-/// and the caret's inset from the top and bottom.
+/// and the caret's inset from the top and bottom. The radius and border are the default
+/// form's (`theme.Form`); the default skin and the hit area read the app's.
 pub const field_padding_x: f32 = 6;
 pub const field_radius: f32 = 4;
 pub const field_border_px: f32 = 1;
@@ -219,7 +220,7 @@ pub fn TextFieldOf(comptime Skin: type) type {
             const rect = cx.walk(walk);
             const clip = cx.visible(rect) orelse return;
             const focused = cx.focused(self.id);
-            cx.area(self.id, rect, field_radius, field_flags);
+            cx.area(self.id, rect, cx.theme().form.radius.control, field_flags);
             Skin.field(cx, .{ .rect = rect, .clip = clip, .focused = focused });
             const colors = &cx.theme().colors;
             var faint = self.style.color;

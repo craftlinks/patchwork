@@ -53,7 +53,8 @@ pub const Id = areas.Id;
 pub const gutter_px: f32 = 16;
 /// Shortest thumb, so a long content keeps a grabbable handle.
 pub const thumb_min_px: f32 = 24;
-/// Corner radius of the thumb face.
+/// Corner radius of the thumb face in the default form; the thumb reads the app's
+/// (`scheme.form.radius.control`).
 pub const thumb_radius: f32 = 4;
 /// The `derive` salt of a view's thumb id.
 pub const thumb_salt: u64 = 1;

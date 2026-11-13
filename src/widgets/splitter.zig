@@ -52,6 +52,7 @@ const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const input = @import("../input.zig");
 const ui = @import("../ui.zig");
+const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 
@@ -61,9 +62,6 @@ const Id = kit.Id;
 
 /// The divider's thickness across the axis, in logical pixels.
 pub const splitter_px: f32 = 6;
-
-/// The default divider line's thickness.
-pub const divider_line_px: f32 = 2;
 
 /// The salt of the divider's id: `id.derive(divider_salt)`.
 pub const divider_salt: u64 = 0x64697669;
@@ -335,7 +333,8 @@ pub fn SplitterOf(comptime Skin: type) type {
 }
 
 comptime {
-    assert(splitter_px > divider_line_px);
+    // The default skin's divider line is the scheme's `mark`, at most `stroke_max`.
+    assert(splitter_px > theme.stroke_max);
     assert(divider_salt != ui.view.thumb_salt);
 }
 

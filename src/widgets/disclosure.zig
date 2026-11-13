@@ -40,8 +40,6 @@ const Id = kit.Id;
 pub const disclosure_h: f32 = 28;
 /// The chevron's cell at the header's left, and the label's start after it.
 pub const disclosure_chevron_w: f32 = 24;
-/// The header's corner radius.
-pub const disclosure_radius: f32 = 4;
 /// The longest label, in bytes.
 pub const disclosure_label_max: u32 = 64;
 
