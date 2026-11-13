@@ -152,6 +152,7 @@ const subset = @import("src/text/subset.zig");
 const imports = @import("src/imports.zig");
 const gallery_icons = @import("examples/gallery/icons.zig");
 const session_faces = @import("examples/session/faces.zig");
+const skins_faces = @import("examples/skins/faces.zig");
 
 /// The codepoints an app's faces cover unless it passes `font_ranges` (`src/text/subset.zig`).
 pub const default_font_ranges: []const [2]u21 = &subset.default_ranges;
@@ -860,9 +861,27 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(touch.install);
     add_example_steps(b, "-touch", "the multi-touch pads and sliders", touch);
+    // Paper and Codex name their modules in session's serif faces, already cut to a range that
+    // holds the skins ranges; the other three are cut to them in `examples/skins/fonts`.
+    const skins = addApp(b, b, .{
+        .name = "skins",
+        .root_source_file = b.path("examples/skins/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+        .fonts = &.{
+            .{ .name = "serif", .source = b.path("examples/session/fonts/NotoSerif-Regular.ttf"), .ranges = &skins_faces.ranges },
+            .{ .name = "serif_italic", .source = b.path("examples/session/fonts/NotoSerif-Italic.ttf"), .ranges = &skins_faces.ranges },
+            .{ .name = "sans_medium", .source = b.path("examples/skins/fonts/NotoSans-Medium.ttf"), .ranges = &skins_faces.ranges },
+            .{ .name = "mono_bold", .source = b.path("examples/skins/fonts/NotoSansMono-Bold.ttf"), .ranges = &skins_faces.ranges },
+            .{ .name = "mono_light", .source = b.path("examples/skins/fonts/NotoSansMono-Light.ttf"), .ranges = &skins_faces.ranges },
+        },
+    });
+    b.getInstallStep().dependOn(skins.install);
+    add_example_steps(b, "-skins", "the four looks", skins);
     const examples = [_]AppSteps{
-        column, live,    data,      wave,    fx,     wake,
-        canvas, gallery, workspace, session, vector, touch,
+        column,  live,      data,    wave,   fx,    wake,  canvas,
+        gallery, workspace, session, vector, touch, skins,
     };
     add_test_steps(b, library, examples);
     add_check_step(b, &examples);
@@ -1031,7 +1050,7 @@ fn add_describe_steps(b: *std.Build, test_step: *std.Build.Step) void {
 fn add_test_steps(
     b: *std.Build,
     library: *std.Build.Module,
-    examples: [12]AppSteps,
+    examples: [13]AppSteps,
 ) void {
     const library_tests = b.addTest(.{ .root_module = library });
     const test_step = b.step("test", "Run library and example unit tests");

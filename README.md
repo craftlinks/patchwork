@@ -61,6 +61,7 @@ zig build serve-audio         # the meters and scope in the browser; Space plays
 | `wake` | A producer on another thread into the UI, and its own web module in the browser |
 | `canvas` | Pan and zoom canvas; `d` dashes the cables, `f` makes them flow |
 | `gallery`, `workspace` | Widget gallery; docking workspace |
+| `skins` | Four looks over one set of widgets, switched live |
 
 Smaller binaries: add `-Doptimize=ReleaseSmall` (the `session` executable drops from 103 MB
 to 0.6 MB). A shipped app is the executable plus `lib/libwgpu_native.so`; keep `bin/` and
@@ -129,7 +130,7 @@ A bare argument or `--` ends them, and the rest go to an app that declares `args
 src/            library: draw, ui, widgets, text, editor, gpu
 src/host/       platform hosts: Wayland + wgpu-native (native_main), browser (web_main)
 web/            browser shell: shell.js, app.js, index.html
-examples/       twelve apps, and sound/: rack and audio on Thrum, a package of its own
+examples/       thirteen apps, and sound/: rack and audio on Thrum, a package of its own
 test/golden/    frame hashes per adapter
 test/consumer/  a package outside this build: two peers, a tool, its own goldens
 tools/          frame comparison, font subsetting, describe (the library as JSON)
