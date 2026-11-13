@@ -450,10 +450,11 @@ pub const Path = extern struct {
     // `fwidth` runs before the loop, whose bound is instance data, so the derivative stays in
     // uniform control flow (prelude, section 3). For an exact distance it is one device pixel
     // in logical pixels. A fragment that a neighbouring chunk's seam segment is nearer to
-    // belongs to that chunk. Distances within `tie` of each other are a tie, which the side of a
-    // line through the seam decides, and the owner draws the nearest of the three distances
-    // (`draw/path.zig`, section 4a). The literals are `path.seam_tie` and `path.seam_bias`,
-    // which `path.zig` asserts. CPU twins: `path.chunk_alpha` and `path.seam_side`.
+    // belongs to that chunk. Where the two segments meeting at the seam are within `tie` of
+    // each other, the side of a line through the seam decides, and the owner draws the nearest
+    // of the three distances (`draw/path.zig`, section 4a). The literals are `path.seam_tie` and
+    // `path.seam_bias`, which `path.zig` asserts. CPU twins: `path.chunk_alpha` and
+    // `path.seam_side`.
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
         \\    let pixel_size = max(fwidth(px.local.x), 1.0e-5);
@@ -464,26 +465,37 @@ pub const Path = extern struct {
         \\    for (var i = head; i < tail; i = i + 1u) {
         \\        own = min(own, sdf_segment(q, points[i], points[i + 1u]));
         \\    }
-        \\    // The side test runs only inside a tie (`draw/path.zig`, section 4a).
+        \\    // A seam is a tie only where its two segments are within `tie` of each other, and
+        \\    // the side test runs only there (`draw/path.zig`, section 4a).
         \\    let tie = 8.0e-2;
         \\    var before = 3.0e38;
         \\    var wins_before = true;
         \\    if (px.prev > 0.5) {
-        \\        before = sdf_segment(q, points[head - 1u], points[head]);
+        \\        let a = points[head - 1u];
+        \\        let b = points[head];
+        \\        let c = points[head + 1u];
+        \\        before = sdf_segment(q, a, b);
         \\        wins_before = own < before - tie;
-        \\        if (!wins_before && own <= before + tie) {
-        \\            let a = points[head - 1u];
-        \\            wins_before = path_seam_side(q, a, points[head], points[head + 1u]) > 2.5e-2;
+        \\        if (!wins_before) {
+        \\            wins_before = own < before;
+        \\            if (abs(sdf_segment(q, b, c) - before) <= tie) {
+        \\                wins_before = path_seam_side(q, a, b, c) > 2.5e-2;
+        \\            }
         \\        }
         \\    }
         \\    var after = 3.0e38;
         \\    var wins_after = true;
         \\    if (px.next > 0.5) {
-        \\        after = sdf_segment(q, points[tail], points[tail + 1u]);
+        \\        let a = points[tail - 1u];
+        \\        let b = points[tail];
+        \\        let c = points[tail + 1u];
+        \\        after = sdf_segment(q, b, c);
         \\        wins_after = own < after - tie;
-        \\        if (!wins_after && own <= after + tie) {
-        \\            let a = points[tail - 1u];
-        \\            wins_after = path_seam_side(q, a, points[tail], points[tail + 1u]) <= 2.5e-2;
+        \\        if (!wins_after) {
+        \\            wins_after = own <= after;
+        \\            if (abs(sdf_segment(q, a, b) - after) <= tie) {
+        \\                wins_after = path_seam_side(q, a, b, c) <= 2.5e-2;
+        \\            }
         \\        }
         \\    }
         \\    let owned = select(0.0, 1.0, wins_before && wins_after);

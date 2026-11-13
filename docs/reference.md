@@ -2244,8 +2244,8 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   segment, so a translucent stroke shows no dots at seams. Parts of one path closer than the
   width, more than a segment apart across a seam, still blend twice; the path tests measure
   it.
-- **Ties at seams.** Distances within `seam_tie` (0.08 px) of each other are a tie, which the
-  side of one line through the seam point decides: the bisector of the turn, or past a right
+- **Ties at seams.** Where the two segments meeting at a seam are within `seam_tie` (0.08 px)
+  of each other, the side of one line through the seam point decides: the bisector of the turn, or past a right
   angle the line across the earlier segment, moved `seam_bias` (0.025 px) off. Both chunks
   compute that line from the same points, so they agree where their distances cannot: the
   rasterizer places one fragment a few thousandths of a pixel apart in two chunks. Before
@@ -2267,7 +2267,9 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
 - **Closed strokes.** `polygon` joins the last point to the first with the seam rule, so a
-  translucent ring shows no dot at its start. A ring of one chunk has no seam.
+  translucent ring shows no dot at its start. A ring of one chunk has no seam. A ring is never
+  two chunks of which the second is one segment: up to 15 segments it is one chunk, beyond that
+  its first chunk ends a point earlier (step 62).
 
 The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `seam_side`,
 `draw.sdf_segment`) check the shader's math, the chunk rects and quads, and the seam blending
