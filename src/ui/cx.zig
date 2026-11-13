@@ -3156,6 +3156,37 @@ test "a path area moves with its container's shift" {
     context.event_end();
 }
 
+// Locks hit testing on a dashed stroke (`draw/path.zig`, section 6): a path area measures the
+// whole polyline, so a press in the middle of a gap of a 100 px line dashed on 10, off 5 (width
+// 4, area radius 5) hits the path, and one 6 px off the line misses.
+test "a dashed path is hit in its gaps" {
+    const static = struct {
+        var context: PathTestContext = undefined;
+    };
+    const context = &static.context;
+    context.init();
+    context.begin_frame(400, 300, 120);
+    const window = context.clip().?;
+    const stroke: draw.path.Stroke = .{
+        .color = .{ 1, 1, 1, 1 },
+        .width = 4,
+        .hover = 0,
+        .dash = .{ .on = 10, .off = 5 },
+    };
+    const points = [_]draw.Point{ .{ 50, 100 }, .{ 150, 100 } };
+    const placed = draw.path.polyline(context.drawing(), &points, stroke, window).?;
+    const cable = areas.id("cable", 0);
+    context.path_area(cable, placed, stroke.width, plain);
+    _ = context.end_frame();
+    try testing.expectEqual(@as(f32, 15), context.draw.items(draw.Path)[0].dash_period);
+    context.event_begin(.{ .pointer_move = .{ .x = 50 + 12.5, .y = 100 } });
+    try testing.expectEqual(cable, context.hot);
+    context.event_end();
+    context.event_begin(.{ .pointer_move = .{ .x = 50 + 12.5, .y = 106 } });
+    try testing.expectEqual(areas.Id.none, context.hot);
+    context.event_end();
+}
+
 // Locks the timer flag: a fresh context has no timer, setup with a period and `armed` false
 // starts stopped, `set_timer` flips it during an event, and a zero period never runs even when
 // asked to start armed.

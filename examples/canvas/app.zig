@@ -28,7 +28,12 @@
 //! drag or wheel a knob    turns it (`widgets.Knob`, routed with `ui.route`, at any zoom)
 //! arrows                  pan by pan_step                       = and -              a rung about
 //! 0                       back to the start view                                     the center
+//! d                       dashes every cable at 8 / 4             f                  flows them
 //! ```
+//! Flow lowers the cables' dash offset by `flow_speed` world pixels a second on the `frame`
+//! event, wrapped to the period, and asks for the next frame (`draw/path.zig`, section 4b): every
+//! frame redraws the app and rewrites the dashed cables' records, and no point. Dashes stay at
+//! every zoom, so the bench measures the dashed shader's worst case.
 //! A header drag keeps the world point under the pointer under it: on press the grab is the
 //! world offset of the pointer from the module's origin (`CanvasState.to_world`), and each drag
 //! puts the origin at the pointer's world point minus that offset.
@@ -81,6 +86,9 @@ pub const drop_every: u32 = 3;
 pub const cable_width: f32 = 2.5;
 /// How far a cable hangs below its chord, plus 15% of its length.
 pub const cable_sag: f32 = 24;
+/// The pattern `d` gives every cable, and the flow speed `f` runs it at, in world pixels.
+pub const cable_dash: quads.path.Dash = .{ .on = 8, .off = 4 };
+pub const flow_speed: f32 = 40;
 
 pub const horizontal_cables: u32 = (columns - 1) * rows;
 pub const vertical_cables: u32 = ((columns + drop_every - 1) / drop_every) * (rows - 1);
@@ -146,6 +154,10 @@ pub const App = struct {
     /// What the last frame drew, for the status line.
     visible: u32,
     cables_drawn: u32,
+    /// Whether the cables are dashed and flowing, and their dash offset in `[0, period)`.
+    dashed: bool,
+    flowing: bool,
+    flow_offset: f32,
 
     pub const config: patchwork.app.Config = .{
         .title = "canvas",
@@ -167,6 +179,8 @@ pub const App = struct {
     const right: patchwork.bench.Step = .{ .key = .{ .key = .right, .text = "" } };
     const back: patchwork.bench.Step = .{ .key = .{ .key = .left, .text = "" } };
     const wait: patchwork.bench.Step = .{ .wait = 5 };
+    const dash_key: patchwork.bench.Step = .{ .key = .{ .key = .other, .text = "d" } };
+    const flow_key: patchwork.bench.Step = .{ .key = .{ .key = .other, .text = "f" } };
 
     fn steps(comptime count: usize, comptime step: patchwork.bench.Step) [count]patchwork.bench.Step {
         return @splat(step);
@@ -192,6 +206,21 @@ pub const App = struct {
             .cycle = &.{.{ .wait = 1 }},
             .frames = 60,
         },
+        .{
+            .name = "dashed-zoom",
+            .setup = &.{ dash_key, wait },
+            .cycle = &(steps(8, zoom_in) ++ steps(16, zoom_out) ++ steps(8, zoom_in)),
+            .frames = 320,
+        },
+        // 60 s of flow. Whether a frame's cost grows over a long run is measured offscreen on
+        // the scenario's clock, `--render flow --frames 36000 --out -` (600 s) against 3,600:
+        // a windowed run that long stalls whenever the compositor stops sending frames.
+        .{
+            .name = "flow",
+            .setup = &.{ flow_key, wait },
+            .cycle = &.{},
+            .frames = 3600,
+        },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {
@@ -207,11 +236,15 @@ pub const App = struct {
         app.drag = null;
         app.visible = 0;
         app.cables_drawn = 0;
+        app.dashed = false;
+        app.flowing = false;
+        app.flow_offset = 0;
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
         switch (event_value) {
             .key_down => |press| app.key(cx, press),
+            .frame => |dt_ms| app.flow(cx, dt_ms),
             else => {},
         }
         // Every knob, then selection and header drags, then the background (section 3).
@@ -262,6 +295,16 @@ pub const App = struct {
         return false;
     }
 
+    /// One frame of flow (section 3): the offset moves toward the cables' ends, wrapped.
+    fn flow(app: *App, cx: *Context, dt_ms: f32) void {
+        if (!app.flowing) return;
+        assert(app.dashed);
+        const period = cable_dash.on + cable_dash.off;
+        app.flow_offset = @mod(app.flow_offset - flow_speed * dt_ms / 1000, period);
+        cx.redraw();
+        cx.keep_animating();
+    }
+
     fn select(app: *App, cx: *Context, index: u32) void {
         assert(index < module_count);
         if (app.selected != null and app.selected.? == index) return;
@@ -286,6 +329,16 @@ pub const App = struct {
                 } else if (std.mem.eql(u8, typed, "0")) {
                     app.view = .init(start_x, start_y, 1);
                     cx.redraw();
+                } else if (std.mem.eql(u8, typed, "d")) {
+                    app.dashed = !app.dashed;
+                    app.flowing = app.flowing and app.dashed;
+                    cx.redraw();
+                } else if (std.mem.eql(u8, typed, "f")) {
+                    app.flowing = !app.flowing;
+                    app.dashed = app.dashed or app.flowing;
+                    // The frame event takes it from here (section 3).
+                    cx.redraw();
+                    cx.keep_animating();
                 }
             },
         }
@@ -390,7 +443,12 @@ pub const App = struct {
         const bounds: Rect = .{ .x = low[0] - pad, .y = low[1] - pad, .width = high[0] - low[0] + 2 * pad, .height = high[1] - low[1] + 2 * pad };
         const clip = cx.visible(bounds) orelse return false;
         const color = cable_colors[tint % cable_colors.len];
-        _ = quads.path.cubic(cx.drawing(), control, .{ .color = color, .width = cable_width, .hover = 0 }, clip);
+        var stroke: quads.path.Stroke = .{ .color = color, .width = cable_width, .hover = 0 };
+        if (app.dashed) {
+            stroke.dash = cable_dash;
+            stroke.dash.?.offset = app.flow_offset;
+        }
+        _ = quads.path.cubic(cx.drawing(), control, stroke, clip);
         return true;
     }
 
@@ -568,6 +626,40 @@ test "the scenarios replay headless" {
     try std.testing.expectEqual(canvas.rungs[canvas.rung_one + 3], again.view.zoom);
     const still = bench.find(App.scenarios, "still").?;
     _ = try bench.replay_headless(App, new_app(), cx, still, .{ 1280, 720 }, 10);
+    const dashed_zoom = bench.find(App.scenarios, "dashed-zoom").?;
+    const dashing = new_app();
+    _ = try bench.replay_headless(App, dashing, cx, dashed_zoom, .{ 1280, 720 }, 1 + 5 + 32);
+    try std.testing.expect(dashing.dashed);
+    try std.testing.expectEqual(@as(f32, 1), dashing.view.zoom);
+    const flow = bench.find(App.scenarios, "flow").?;
+    const flowing = new_app();
+    _ = try bench.replay_headless(App, flowing, cx, flow, .{ 1280, 720 }, 3);
+    try std.testing.expect(flowing.flowing);
+}
+
+// Locks the dash keys (section 3): `d` dashes every cable at 8 / 4, `f` flows them, lowering the
+// offset by `flow_speed` a second wrapped to the period and asking for the next frame, and a
+// second `f` stops asking. `d` again draws them solid.
+test "d dashes the cables and f flows them" {
+    const app = new_app();
+    _ = frame_at(app);
+    for (fixture.context.draw.items(quads.Path)) |chunk| {
+        try std.testing.expectEqual(@as(f32, 0), chunk.dash_period);
+    }
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "d") });
+    const cx = frame_at(app);
+    for (cx.draw.items(quads.Path)) |chunk| {
+        try std.testing.expectEqual(@as(f32, 12), chunk.dash_period);
+        try std.testing.expectEqual(@as(f32, 8), chunk.dash_on);
+    }
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "f") });
+    try std.testing.expect(ui.animate(App, app, cx, 25));
+    try std.testing.expectApproxEqAbs(@as(f32, 12 - 1), app.flow_offset, 1.0e-5);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "f") });
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "d") });
+    try std.testing.expect(!app.dashed);
 }
 
 comptime {

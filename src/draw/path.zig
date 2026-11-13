@@ -18,7 +18,9 @@
 //!   -> one Path instance per chunk, indexing the shared point buffer
 //! GPU: own   = min over the chunk's segments of sdf_segment(q, p[i], p[i + 1])
 //!      owned = the seam rule against `before` and `after` (sections 4 and 4a)
-//!      alpha = color.a * coverage(min(own, before, after) - width / 2) * owned * clip_mask
+//!      near  = min(own, before, after)                                     solid
+//!              min of the dashed distances of the same segments (4b)      dashed
+//!      alpha = color.a * coverage(near - width / 2) * owned * clip_mask
 //! ```
 //! The point buffer is the context's point pool (`draw/pools.zig`, section 5b), uploaded by
 //! dirty range like the instance pools and bound once per pass (`draw/renderer.zig`).
@@ -93,6 +95,44 @@
 //! device mapping in the frame uniform. Test "a stroke that turns back at a seam draws once"
 //! locks the rule with the chunks moved apart.
 //!
+//! ## 4b. Dashes
+//! A `Stroke` with a `Dash` draws only the on-parts of its pattern: at arc length `s` along the
+//! flattened polyline the phase is `u = mod(s + offset, on + off)`, and the pattern is on where
+//! `u <= on`. A fragment's dashed distance is its distance to the union of the on-parts, so the
+//! stroke of that distance is the dashed stroke with round caps and round joins, `on = 0` gives
+//! dots, and a dash across a corner is one distance field, blended once.
+//!
+//! Per segment the nearest on-point is the projection `t` when its phase is on; otherwise the
+//! nearer of the end of the dash before it and the start of the dash after it, when they lie on
+//! the segment; and none when the whole segment is in a gap. Distance along a straight segment
+//! grows with the distance from `t`, so that is the nearest on-point, and in a dash it is
+//! `sdf_segment`'s distance exactly. `distance_to_dashes` is the CPU twin of a chunk's loop.
+//!
+//! Arc length is the CPU's: the appenders sum each stored segment's `f32` length in `f64` and
+//! write each chunk's phase at its first point, wrapped into `[0, on + off)` in `f64`, so the
+//! record never holds a large value however long the path or however far `offset` has run. The
+//! fragment adds its own segments' lengths from there, and the record carries `1 / period` so
+//! the phase costs a multiply. A solid stroke writes zeros, and `dash_period = 0` is the
+//! shader's switch: the solid branch is the code before dashes, unchanged.
+//!
+//! Ownership is the solid rule (sections 4 and 4a) on plain distances, so the plane splits
+//! between chunks exactly as for a solid path; only the distance the owner draws differs. That
+//! owner also measures the dashes on the two neighbour segments at the phases their own chunks
+//! use (`dash_phase - length` before, the accumulated phase after; equal up to `f32` rounding),
+//! so a dash whose cap crosses a seam is drawn whole by whichever chunk owns each fragment. What
+//! remains is section 4's class: a dash on a segment two or more away across a seam, within half
+//! the width of a fragment the other chunk owns; flattened cubics' segments are near
+//! `flatten_px`, so it needs a polyline with segments shorter than half the width.
+//!
+//! `polygon` fits the pattern to the ring: with ring length `T` and
+//! `k = max(1, round(T / (on + off)))` it scales `on`, `off`, and `offset` by
+//! `T / (k * (on + off))`, so a ring has no short dash at its start, flow round it loops
+//! seamlessly, and the closure's neighbour phases agree.
+//!
+//! Flow is the app's: it lowers `offset` on the `frame` event and asks for the next frame. A
+//! moved offset rewrites the chunks' records and no points. `Path` is not an animated type,
+//! because an animated type keeps every path tile dirty and the app awake, solid or not.
+//!
 //! ## 5. Coordinates
 //! Points are stored relative to the path's origin, the top-left of its unpadded bounds, and
 //! each chunk carries `anchor = origin - rect.xy`. `polyline_at` takes the origin from the
@@ -121,7 +161,8 @@
 //! ## 6. Hit Testing
 //! `distance_to_polyline` is the CPU twin of the stroke distance. `ui.Context.path_area`
 //! records a path area whose `radius` is `width / 2 + hit_slop` and whose rect is the bounds
-//! padded by that radius, so the origin is `rect.xy + radius` (`ui/areas.zig`).
+//! padded by that radius, so the origin is `rect.xy + radius` (`ui/areas.zig`). It measures the
+//! whole polyline, so a dashed stroke is hit in its gaps too: a cable is picked by its length.
 //!
 //! ## 7. TigerStyle Invariants
 //! - No allocation: flattening and plotting use stack buffers of `cubic_points_max` and
@@ -182,11 +223,25 @@ pub const plot_samples_max: u32 = 256;
 /// Points `polygon` takes at most.
 pub const polygon_points_max: u32 = 256;
 
-/// Color, width in logical pixels, and the hover mix toward `theme.lighten`.
+/// A dash pattern in logical pixels (world pixels on a canvas, like `width`), measured along
+/// the flattened polyline (section 4b). Dashes have round caps, as the stroke has: a dash of
+/// `on` covers `on + width` on screen, and `on = 0` draws dots `off` apart.
+pub const Dash = struct {
+    on: f32,
+    off: f32,
+    /// Shifts the pattern toward the path's start, as SVG `stroke-dashoffset` does: a dash at
+    /// arc length `s` with offset 0 is at `s - offset` with `offset`. Lowering it each frame
+    /// moves the dashes toward the path's end (flow).
+    offset: f32 = 0,
+};
+
+/// Color, width in logical pixels, the hover mix toward `theme.lighten`, and the dash pattern.
 pub const Stroke = struct {
     color: [4]f32,
     width: f32,
     hover: f32,
+    /// Null is a solid stroke, drawn exactly as before dashes existed.
+    dash: ?Dash = null,
 };
 
 /// Where a path's points went: `count` points from `first` in the point pool, relative to
@@ -440,7 +495,10 @@ pub fn chunk_alpha(
     }
     const clip = chunk.clip;
     if (x < clip[0] or y < clip[1] or x > clip[2] or y > clip[3]) return 0;
-    const near = @min(own, @min(before, after));
+    const near = if (chunk.dash_period > 0)
+        dashed_near(points, chunk, q)
+    else
+        @min(own, @min(before, after));
     const alpha = std.math.clamp(0.5 - (near - 0.5 * chunk.width) / pixel_size, 0, 1);
     assert(alpha >= 0);
     return chunk.color[3] * alpha;
@@ -482,6 +540,118 @@ fn unit_or_zero(v: Point) Point {
     const unit: Point = .{ v[0] * scale, v[1] * scale };
     assert(unit[0] * unit[0] + unit[1] * unit[1] <= 1.0001);
     return unit;
+}
+
+/// The dashed distance a dashed chunk's owner draws (section 4b): the nearest on-part of its own
+/// segments and of the neighbour segment at each seam, at the phases the neighbours draw them.
+fn dashed_near(points: []const Point, chunk: *const types.Path, q: Point) f32 {
+    assert(chunk.dash_period > 0);
+    assert(chunk.dash_inverse > 0);
+    const head: u32 = @intFromFloat(chunk.first_point);
+    const tail: u32 = head + @as(u32, @intFromFloat(chunk.point_count)) - 1;
+    const pattern: Pattern = .{
+        .on = chunk.dash_on,
+        .period = chunk.dash_period,
+        .inverse = chunk.dash_inverse,
+    };
+    const along = dashes_along(points[head .. tail + 1], chunk.dash_phase, pattern, q);
+    var near = along.distance;
+    if (chunk.prev > 0.5) {
+        const span = length(points[head - 1], points[head]);
+        const phase = chunk.dash_phase - span;
+        near = @min(near, dash_segment(q, points[head - 1], points[head], phase, pattern).distance);
+    }
+    if (chunk.next > 0.5) {
+        const phase = along.phase;
+        near = @min(near, dash_segment(q, points[tail], points[tail + 1], phase, pattern).distance);
+    }
+    assert(near >= 0);
+    return near;
+}
+
+/// A dash pattern as a record carries it: the on length, the period, and its inverse.
+const Pattern = struct {
+    on: f32,
+    period: f32,
+    inverse: f32,
+};
+
+/// One segment's dashed distance and its length (`dash_segment`).
+const Measure = struct {
+    distance: f32,
+    span: f32,
+};
+
+/// The nearest dashed distance over the segments of `points` and the phase at their last point.
+const Along = struct {
+    distance: f32,
+    phase: f32,
+};
+
+/// Distance from `(x, y)` to the on-parts of the polyline through `points` (at least two),
+/// whose pattern of `dash_on` and `dash_period` has phase `phase` at the first point. A stroke
+/// of width `w` covers the dashed stroke where it is at most `w / 2` (section 4b). CPU twin of
+/// the dashed loop of `types.Path.pixel` over one chunk.
+pub fn distance_to_dashes(
+    points: []const Point,
+    phase: f32,
+    dash_on: f32,
+    dash_period: f32,
+    x: f32,
+    y: f32,
+) f32 {
+    assert(points.len >= 2);
+    assert(dash_on >= 0);
+    assert(dash_period > dash_on);
+    const pattern: Pattern = .{ .on = dash_on, .period = dash_period, .inverse = 1 / dash_period };
+    const distance = dashes_along(points, phase, pattern, .{ x, y }).distance;
+    assert(distance >= 0);
+    return distance;
+}
+
+fn dashes_along(points: []const Point, phase: f32, pattern: Pattern, q: Point) Along {
+    assert(points.len >= 2);
+    assert(pattern.period > 0);
+    var along: Along = .{ .distance = std.math.floatMax(f32), .phase = phase };
+    for (points[0 .. points.len - 1], points[1..]) |a, b| {
+        const measure = dash_segment(q, a, b, along.phase, pattern);
+        along.distance = @min(along.distance, measure.distance);
+        along.phase += measure.span;
+    }
+    assert(along.phase >= phase);
+    return along;
+}
+
+/// The distance from `q` to the on-parts of the segment a-b, whose pattern phase at `a` is
+/// `phase`, and the segment's length: the nearest on-point is the projection when it lies in a
+/// dash, else the nearer end of the dash before or after it on the segment, and none when the
+/// segment lies inside a gap (section 4b). CPU twin of `path_dash_segment` in
+/// `types.Path.pixel`; in a dash the distance is `sdf_segment`'s.
+fn dash_segment(q: Point, a: Point, b: Point, phase: f32, pattern: Pattern) Measure {
+    assert(pattern.period > 0);
+    assert(pattern.on >= 0);
+    const pa: Point = .{ q[0] - a[0], q[1] - a[1] };
+    const ba: Point = .{ b[0] - a[0], b[1] - a[1] };
+    const span = @sqrt(ba[0] * ba[0] + ba[1] * ba[1]);
+    const ratio = (pa[0] * ba[0] + pa[1] * ba[1]) / @max(ba[0] * ba[0] + ba[1] * ba[1], 1.0e-12);
+    const h = std.math.clamp(ratio, 0, 1);
+    const t = h * span;
+    const s = phase + t;
+    const u = s - pattern.period * @floor(s * pattern.inverse);
+    const back = t - (u - pattern.on);
+    const ahead = t + (pattern.period - u);
+    const back_ok = back >= 0;
+    const ahead_ok = ahead <= span;
+    const take_back = back_ok and (!ahead_ok or u - pattern.on <= pattern.period - u);
+    const target = if (take_back) back else ahead;
+    const inside = u <= pattern.on;
+    const at = if (inside) h else target / @max(span, 1.0e-6);
+    const dx = pa[0] - ba[0] * at;
+    const dy = pa[1] - ba[1] * at;
+    const reached = inside or back_ok or ahead_ok;
+    const distance = if (reached) @sqrt(dx * dx + dy * dy) else 3.0e38;
+    assert(distance >= 0);
+    return .{ .distance = distance, .span = span };
 }
 
 fn segment_at(points: []const Point, index: u32, x: f32, y: f32) f32 {
@@ -533,6 +703,7 @@ fn append_from(
     assert(stroke.width > 0);
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
+    if (stroke.dash) |dash| assert_dash(dash);
     const count: u32 = @intCast(points.len);
     const chunks = chunk_count(points, stroke.width);
     if (cx.room(types.Path) < chunks) {
@@ -544,10 +715,12 @@ fn append_from(
         stored.* = .{ point[0] - origin[0], point[1] - origin[1] };
     }
     const last = count - 1;
+    // Arc length to the chunk's first point, over the stored points the GPU reads (section 4b).
+    var arc: f64 = 0;
     var start: u32 = 0;
     while (start < last) {
         const end = chunk_end(points, start, stroke.width);
-        const instance = chunk_of(points, start, end, first, origin, stroke, clip);
+        const instance = chunk_of(points, start, end, first, origin, stroke, clip, arc);
         cx.append(types.Path, null, instance) catch |err| switch (err) {
             // Only the first chunk can open a batch: the rest share its layer and type.
             error.BatchFull => {
@@ -557,6 +730,7 @@ fn append_from(
             },
             error.PoolFull, error.EdgeNotPositive, error.ClipUnordered => unreachable,
         };
+        if (stroke.dash != null) arc += arc_length(cx.points[first + start .. first + end + 1]);
         start = end;
     }
     return first;
@@ -597,6 +771,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
     assert(stroke.width > 0);
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
+    if (stroke.dash) |dash| assert_dash(dash);
     const count: u32 = @intCast(points.len);
     var closed: [polygon_points_max + 1]Point = undefined;
     @memcpy(closed[0..count], points);
@@ -623,10 +798,14 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
     }
     relative[count + 2] = .{ points[1][0] - origin[0], points[1][1] - origin[1] };
     const first = reserved + 1;
+    // The pattern fitted to the ring's stored length, so the closure is seamless (section 4b).
+    var fitted = stroke;
+    if (stroke.dash) |dash| fitted.dash = fit_to_ring(dash, arc_length(relative[1 .. count + 2]));
+    var arc: f64 = 0;
     var start: u32 = 0;
     while (start < count) {
         const end = if (start == 0) first_end else chunk_end(ring, start, stroke.width);
-        var instance = chunk_of(ring, start, end, first, origin, stroke, clip);
+        var instance = chunk_of(ring, start, end, first, origin, fitted, clip, arc);
         if (chunks > 1) {
             if (start == 0) instance.prev = 1;
             if (end == count) instance.next = 1;
@@ -640,6 +819,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
             },
             error.PoolFull, error.EdgeNotPositive, error.ClipUnordered => unreachable,
         };
+        if (stroke.dash != null) arc += arc_length(relative[1 + start .. 1 + end + 1]);
         start = end;
     }
     return .{ .first = first, .count = count + 1, .bounds = bounds };
@@ -659,8 +839,9 @@ fn ring_first_end(ring: []const Point, width: f32) u32 {
     return end - 1;
 }
 
-/// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index
-/// and `origin` the point its stored points are relative to.
+/// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index,
+/// `origin` the point its stored points are relative to, and `arc` the path's arc length at
+/// `start` (section 4b), which a solid stroke ignores.
 fn chunk_of(
     points: []const Point,
     start: u32,
@@ -669,9 +850,11 @@ fn chunk_of(
     origin: Point,
     stroke: Stroke,
     clip: Clip,
+    arc: f64,
 ) types.Path {
     assert(start < end);
     assert(end < points.len);
+    const dash = dash_fields(stroke.dash, arc);
     const box = bounds_of(points[start .. end + 1]);
     const pad = stroke.width * 0.5 + aa_pad;
     const x = box.x - pad;
@@ -688,10 +871,66 @@ fn chunk_of(
         .point_count = @floatFromInt(end - start + 1),
         .prev = if (start > 0) 1 else 0,
         .next = if (end + 1 < points.len) 1 else 0,
+        .dash_on = dash[0],
+        .dash_period = dash[1],
+        .dash_phase = dash[2],
+        .dash_inverse = dash[3],
     };
     assert(instance.rect[2] > 0);
     assert(instance.rect[3] > 0);
     return instance;
+}
+
+/// A chunk's `dash_on`, `dash_period`, `dash_phase`, and `dash_inverse` for the pattern `dash`
+/// at arc length `arc` (section 4b): zeros for a solid stroke. The phase is wrapped in `f64`,
+/// so the record never holds a large value however long the path or the offset has run.
+fn dash_fields(dash: ?Dash, arc: f64) [4]f32 {
+    assert(arc >= 0);
+    const pattern = dash orelse return .{ 0, 0, 0, 0 };
+    const period = pattern.on + pattern.off;
+    assert(period > pattern.on);
+    const wrapped = @mod(arc + @as(f64, pattern.offset), @as(f64, period));
+    var phase: f32 = @floatCast(wrapped);
+    // Rounding to f32 can reach the period itself, which is the pattern's start again.
+    if (phase >= period) phase = 0;
+    assert(phase >= 0);
+    assert(phase < period);
+    return .{ pattern.on, period, phase, 1 / period };
+}
+
+/// The pattern scaled so a whole number of periods, at least one, fits the ring of length
+/// `ring_length` (section 4b). A ring of no length keeps the pattern.
+fn fit_to_ring(dash: Dash, ring_length: f64) Dash {
+    assert(ring_length >= 0);
+    assert_dash(dash);
+    if (ring_length <= 0) return dash;
+    const period: f64 = @as(f64, dash.on) + @as(f64, dash.off);
+    const periods = @max(1, @round(ring_length / period));
+    const scale = ring_length / (periods * period);
+    assert(scale > 0);
+    const fitted: Dash = .{
+        .on = @floatCast(dash.on * scale),
+        .off = @floatCast(dash.off * scale),
+        .offset = @floatCast(dash.offset * scale),
+    };
+    assert(fitted.off > 0);
+    return fitted;
+}
+
+fn assert_dash(dash: Dash) void {
+    assert(dash.on >= 0);
+    assert(dash.off > 0);
+    assert(std.math.isFinite(dash.offset));
+}
+
+/// The length of the polyline through `points`, each segment's length in `f32` as the shader
+/// computes it, summed in `f64` (section 4b).
+fn arc_length(points: []const Point) f64 {
+    assert(points.len >= 2);
+    var total: f64 = 0;
+    for (points[0 .. points.len - 1], points[1..]) |a, b| total += length(a, b);
+    assert(total >= 0);
+    return total;
 }
 
 /// The unpadded axis-aligned bounds of `points` (zero width or height for a straight line).
@@ -1277,4 +1516,278 @@ test "a path anchored at a fixed origin stores points relative to it" {
     try testing.expectEqual(Point{ 30, 0 }, cx.point_items()[3]);
     try testing.expectApproxEqAbs(flat, composite(cx, 85, 50, 1), 1.0e-5);
     try testing.expect(flat > 0.4);
+}
+
+/// The test stroke of section 4b's tests: width 2, alpha 0.85, dashed as `dash`.
+fn dashed_stroke(width: f32, dash: Dash) Stroke {
+    return .{ .color = .{ 1, 1, 1, 0.85 }, .width = width, .hover = 0, .dash = dash };
+}
+
+// Locks the dashed distance on a straight line of one chunk (section 4b): on 10, off 5, offset 0
+// puts on-parts at [0, 10], [15, 25], ..., [90, 100], so a dash's round cap reaches 0.5 px past
+// its end at full alpha, half alpha at 1 px, and nothing at 2.5 px in a 5 px gap; the path's own
+// start cap is a dash's too. Offset 5 moves the on-parts to [0, 5], [10, 20], [25, 35], ...
+test "a straight dashed line leaves gaps with round caps" {
+    const cx = new_context();
+    // The line runs from (50, 50), off the window clip's edge; probes are along it.
+    const line = [_]Point{ .{ 50, 50 }, .{ 150, 50 } };
+    _ = polyline(cx, &line, dashed_stroke(2, .{ .on = 10, .off = 5 }), window).?;
+    try testing.expectEqual(@as(usize, 1), cx.items(types.Path).len);
+    const record = cx.items(types.Path)[0];
+    try testing.expectEqual(@as(f32, 10), record.dash_on);
+    try testing.expectEqual(@as(f32, 15), record.dash_period);
+    try testing.expectEqual(@as(f32, 0), record.dash_phase);
+    try testing.expectEqual(@as(f32, 1.0 / 15.0), record.dash_inverse);
+    const xs = [_]f32{ 5, 10.5, 11, 11.25, 12.5, -0.5, 20, 99.5 };
+    const want = [_]f32{ 0.85, 0.85, 0.425, 0.2125, 0, 0.85, 0.85, 0.85 };
+    for (xs, want) |x, alpha| {
+        try testing.expectApproxEqAbs(alpha, composite(cx, 50 + x, 50, 1), 1.0e-4);
+    }
+    cx.reset();
+    _ = polyline(cx, &line, dashed_stroke(2, .{ .on = 10, .off = 5, .offset = 5 }), window).?;
+    try testing.expectEqual(@as(f32, 5), cx.items(types.Path)[0].dash_phase);
+    try testing.expectApproxEqAbs(@as(f32, 0.85), composite(cx, 52.5, 50, 1), 1.0e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0), composite(cx, 57.5, 50, 1), 1.0e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.85), composite(cx, 65, 50, 1), 1.0e-4);
+}
+
+// Locks dots (section 4b): on 0, off 6 at width 4 is a round dot every 6 px, each of radius 2:
+// full alpha 1.5 px from a dot's centre, half at 2 px, none at 2.5 and 3 px (between two dots).
+test "on zero draws dots off apart" {
+    const cx = new_context();
+    const line = [_]Point{ .{ 50, 50 }, .{ 80, 50 } };
+    _ = polyline(cx, &line, dashed_stroke(4, .{ .on = 0, .off = 6 }), window).?;
+    const xs = [_]f32{ 0, 1.5, 2, 2.5, 3, 6, 30 };
+    const want = [_]f32{ 0.85, 0.85, 0.425, 0, 0, 0.85, 0.85 };
+    for (xs, want) |x, alpha| {
+        try testing.expectApproxEqAbs(alpha, composite(cx, 50 + x, 50, 1), 1.0e-4);
+    }
+}
+
+/// 101 points 1 px apart on y = 50 from x = 50: chunks of 15 segments, seams 15, 30, ..., 90
+/// px along.
+fn ruler() [101]Point {
+    var points: [101]Point = undefined;
+    for (&points, 0..) |*point, index| point.* = .{ 50 + @as(f32, @floatFromInt(index)), 50 };
+    return points;
+}
+
+// Locks the seams of a dashed path (section 4b): a ruler of 1 px segments, on 10, off 5,
+// offset 3, has a dash across every seam; the composite of its seven chunks equals one segment
+// with the same dash at every half pixel along it, on the axis and 0.75 px off it, and never
+// blends twice.
+test "a dash across a seam draws once" {
+    const cx = new_context();
+    const points = ruler();
+    const stroke = dashed_stroke(2, .{ .on = 10, .off = 5, .offset = 3 });
+    _ = polyline(cx, &points, stroke, window).?;
+    try testing.expectEqual(@as(usize, 7), cx.items(types.Path).len);
+    const whole = [_]Point{ .{ 50, 50 }, .{ 150, 50 } };
+    var x: f32 = 48;
+    while (x <= 152) : (x += 0.5) {
+        for ([_]f32{ 50, 50.75 }) |y| {
+            const got = composite(cx, x, y, 1);
+            const d = distance_to_dashes(&whole, 3, 10, 15, x, y);
+            const want = 0.85 * std.math.clamp(0.5 - (d - 1), 0, 1);
+            try testing.expectApproxEqAbs(want, got, 1.0e-4);
+            try testing.expect(got <= 0.85 + 1.0e-4);
+        }
+    }
+}
+
+// Locks the neighbour measure at a seam (section 4b): with offset 10.5 every dash ends 0.5 px
+// before a seam. At (15.25, 0) chunk 1 owns the fragment (its own distance 0 against the
+// previous segment's 0.25) and reaches the dash ending at 14.5 through that segment: distance
+// 0.75, alpha 0.75 of 0.85. Its own nearest on-part starts at 19.5.
+test "a cap across a seam is drawn by the owner" {
+    const cx = new_context();
+    const points = ruler();
+    _ = polyline(cx, &points, dashed_stroke(2, .{ .on = 10, .off = 5, .offset = 10.5 }), window).?;
+    const chunks = cx.items(types.Path);
+    try testing.expectEqual(@as(f32, 10.5), chunks[1].dash_phase);
+    try testing.expectEqual(@as(f32, 0), chunk_alpha(cx.point_items(), &chunks[0], 65.25, 50, 1));
+    try testing.expectApproxEqAbs(@as(f32, 0.6375), composite(cx, 65.25, 50, 1), 1.0e-4);
+    // The stored points are relative to the ruler's start.
+    const own = distance_to_dashes(cx.point_items()[15..31], 10.5, 10, 15, 15.25, 0);
+    try testing.expectApproxEqAbs(@as(f32, 4.25), own, 1.0e-4);
+}
+
+// Locks the arc length (section 4b): a quarter circle of radius 100 in 32 segments of
+// 200 sin(pi / 128) = 4.90825 px, on 10, off 10: vertices 1 and 2 (s 4.91 and 9.82) lie in the
+// first dash, vertex 3 (14.72) in the gap 4.7 px from either end, vertex 5 (24.54) in the next.
+test "dashes follow the arc length" {
+    const cx = new_context();
+    var arc: [33]Point = undefined;
+    for (&arc, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.pi / 64;
+        point.* = .{ 300 + 100 * @cos(turn), 300 + 100 * @sin(turn) };
+    }
+    _ = polyline(cx, &arc, dashed_stroke(2, .{ .on = 10, .off = 10 }), window).?;
+    try testing.expect(cx.items(types.Path).len >= 2);
+    const want = [_]f32{ 0.85, 0.85, 0.85, 0, 0.85, 0.85 };
+    for (want, 0..) |alpha, index| {
+        const vertex = arc[index];
+        try testing.expectApproxEqAbs(alpha, composite(cx, vertex[0], vertex[1], 1), 1.0e-4);
+    }
+    // Each chunk's phase is the arc length at its first point, wrapped: 4.90825 px per point.
+    for (cx.items(types.Path)) |chunk| {
+        const s = chunk.first_point * 200 * @sin(std.math.pi / 128.0);
+        try testing.expectApproxEqAbs(@mod(s, 20), chunk.dash_phase, 2.0e-3);
+    }
+}
+
+// Locks joins (section 4b): an L of width 4 dashed so its corner lies inside a dash draws the
+// solid L there, with one round outer corner (alpha 0.3787 at (21.5, -1.5)), and blends once
+// over the whole L. A dash that ends at the corner keeps that round cap, and the gap after it
+// leaves the second leg's start empty where the solid L is opaque.
+test "a dash across a corner is one round join" {
+    const cx = new_context();
+    const corner = [_]Point{ .{ 50, 50 }, .{ 70, 50 }, .{ 70, 70 } };
+    const white: Stroke = .{ .color = .{ 1, 1, 1, 1 }, .width = 4, .hover = 0 };
+    _ = polyline(cx, &corner, white, window).?;
+    // Relative to the L's start at (50, 50).
+    const probes = [_]Point{
+        .{ 71.5, 48.5 }, .{ 60, 51 }, .{ 71, 55 }, .{ 70, 52.5 }, .{ 72, 55 },
+    };
+    var solid: [probes.len]f32 = undefined;
+    for (probes, 0..) |probe, index| solid[index] = composite(cx, probe[0], probe[1], 1);
+    try testing.expectApproxEqAbs(@as(f32, 0.3787), solid[0], 1.0e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1), solid[3], 1.0e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), solid[4], 1.0e-4);
+    cx.reset();
+    var inside = white;
+    inside.dash = .{ .on = 30, .off = 10 };
+    _ = polyline(cx, &corner, inside, window).?;
+    for (probes[0..3], solid[0..3]) |probe, alpha| {
+        try testing.expectApproxEqAbs(alpha, composite(cx, probe[0], probe[1], 1), 1.0e-5);
+    }
+    try testing.expect(composite_max(cx) <= 1);
+    cx.reset();
+    var ending = white;
+    ending.dash = .{ .on = 20, .off = 10 };
+    _ = polyline(cx, &corner, ending, window).?;
+    try testing.expectApproxEqAbs(@as(f32, 0.3787), composite(cx, 71.5, 48.5, 1), 1.0e-4);
+    try testing.expectEqual(@as(f32, 0), composite(cx, 70, 52.5, 1));
+    try testing.expectEqual(@as(f32, 0), composite(cx, 72, 55, 1));
+}
+
+// Locks a dashed fold inside a chunk and at a seam (sections 4a and 4b): the hairpin of "every
+// chunk's oriented quad contains its stroke" blends once on 6, off 4, and the combs of "a stroke
+// that turns back at a seam draws once", dashed, draw as one dashed stroke with the chunks'
+// fragments moved apart: ownership is the solid rule's, so the dashes split the same way.
+test "a dashed fold draws once" {
+    const cx = new_context();
+    const hairpin = [_]Point{ .{ 10, 10 }, .{ 50, 10 }, .{ 70, 16 }, .{ 50, 22 }, .{ 10, 22 } };
+    _ = polyline(cx, &hairpin, dashed_stroke(2, .{ .on = 6, .off = 4 }), window).?;
+    try testing.expect(composite_max(cx) <= 0.85 + 1.0e-4);
+    const shifts = [_]Point{ .{ 2.0e-3, 1.4e-3 }, .{ -2.0e-3, 1.0e-3 }, .{ 5.0e-4, -2.0e-3 } };
+    var misses: u32 = 0;
+    for ([_]f32{ 0, 2.5, 7 }) |offset| {
+        for ([_][2]f32{ .{ 2, 0 }, .{ 3, 0.05 }, .{ 5, 0 } }) |row| {
+            cx.reset();
+            const width = row[0];
+            var comb: [9]Point = undefined;
+            for (0..3) |spike| {
+                const x = 40.25 + @as(f32, @floatFromInt(spike)) * 40;
+                comb[3 * spike] = .{ x, 100.25 };
+                comb[3 * spike + 1] = .{ x, 60.25 };
+                comb[3 * spike + 2] = .{ x + row[1], 100.25 };
+            }
+            const dash: Dash = .{ .on = 6, .off = 4, .offset = offset };
+            _ = polyline(cx, &comb, dashed_stroke(width, dash), window).?;
+            try testing.expectEqual(@as(f32, 5), cx.items(types.Path)[0].point_count);
+            const phase = @mod(offset, 10);
+            // The spike from above its cap to above the corner at its foot, as in step 62's
+            // test: at the foot the next arm is two segments from the seam (section 4).
+            var y: f32 = 60.25 - width - 2 + 0.25;
+            while (y < 100.25 - width - 3) : (y += 0.5) {
+                var x: f32 = comb[4][0] - width - 2 + 0.25;
+                while (x < comb[4][0] + width + 2 + row[1]) : (x += 0.5) {
+                    const d = distance_to_dashes(&comb, phase, 6, 10, x, y);
+                    const want = 0.85 * std.math.clamp(0.5 - (d - 0.5 * width), 0, 1);
+                    for (shifts) |shift| {
+                        if (@abs(composite_shifted(cx, x, y, 1, shift) - want) > 0.01) {
+                            misses += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), misses);
+}
+
+// Locks polygon fitting (section 4b): the 64-gon of radius 200 is 25600 sin(pi / 64) = 1256.13
+// px round, so on 10, off 5 fits 84 periods of 14.9540 with dashes of 9.9693 in every record;
+// it blends once, and at the closure the first chunk's phase for the segment before it equals
+// the last chunk's phase there.
+test "a dashed polygon fits its pattern to the ring" {
+    const cx = new_context();
+    var points: [64]Point = undefined;
+    for (&points, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.tau / 64;
+        point.* = .{ 300 + 200 * @cos(turn), 300 + 200 * @sin(turn) };
+    }
+    _ = polygon(cx, &points, dashed_stroke(2, .{ .on = 10, .off = 5 }), window).?;
+    const chunks = cx.items(types.Path);
+    try testing.expect(chunks.len >= 2);
+    for (chunks) |chunk| {
+        try testing.expectApproxEqAbs(@as(f32, 14.9540), chunk.dash_period, 1.0e-3);
+        try testing.expectApproxEqAbs(@as(f32, 9.9693), chunk.dash_on, 1.0e-3);
+    }
+    try testing.expect(composite_max(cx) <= 0.85 + 1.0e-4);
+    const stored = cx.point_items();
+    const first = chunks[0];
+    const head: u32 = @intFromFloat(first.first_point);
+    const before = first.dash_phase - length(stored[head - 1], stored[head]);
+    const last = chunks[chunks.len - 1];
+    const last_head: u32 = @intFromFloat(last.first_point);
+    const last_tail = last_head + @as(u32, @intFromFloat(last.point_count)) - 1;
+    const own_length: f32 = @floatCast(arc_length(stored[last_head..last_tail]));
+    const at_last = last.dash_phase + own_length;
+    const period = first.dash_period;
+    try testing.expectApproxEqAbs(@mod(at_last, period), @mod(before, period), 1.0e-3);
+}
+
+// Locks the wrap (section 4b): an offset of -1,000,000.5, about 4.6 hours of flow at 60 px/s,
+// writes the phase 4.5 exactly, since the wrap is computed in f64.
+test "a dash phase wraps however far the offset has run" {
+    const cx = new_context();
+    const line = [_]Point{ .{ 0, 0 }, .{ 100, 0 } };
+    const dash: Dash = .{ .on = 10, .off = 5, .offset = -1_000_000.5 };
+    _ = polyline(cx, &line, dashed_stroke(2, dash), window).?;
+    try testing.expectEqual(@as(f32, 4.5), cx.items(types.Path)[0].dash_phase);
+}
+
+// Locks the solid stroke (section 4b): a solid cable writes zeros in all four dash fields, and
+// `chunk_alpha` is the solid formula of `min(own, before, after)` bit for bit at every half
+// pixel of every chunk's rect.
+test "a solid stroke is unchanged by dashes" {
+    const cx = new_context();
+    _ = cubic(cx, sagging(.{ 100, 100 }, .{ 800, 700 }, 160), cable_stroke, window).?;
+    const points = cx.point_items();
+    for (cx.items(types.Path)) |*chunk| {
+        try testing.expectEqual(@as(f32, 0), chunk.dash_on);
+        try testing.expectEqual(@as(f32, 0), chunk.dash_period);
+        try testing.expectEqual(@as(f32, 0), chunk.dash_phase);
+        try testing.expectEqual(@as(f32, 0), chunk.dash_inverse);
+        const head: u32 = @intFromFloat(chunk.first_point);
+        const tail: u32 = head + @as(u32, @intFromFloat(chunk.point_count)) - 1;
+        var y = chunk.rect[1] + 0.25;
+        while (y < chunk.rect[1] + chunk.rect[3]) : (y += 0.5) {
+            var x = chunk.rect[0] + 0.25;
+            while (x < chunk.rect[0] + chunk.rect[2]) : (x += 0.5) {
+                const got = chunk_alpha(points, chunk, x, y, 1);
+                if (got == 0) continue;
+                const qx = x - chunk.rect[0] - chunk.anchor_x;
+                const qy = y - chunk.rect[1] - chunk.anchor_y;
+                var near = distance_to_polyline(points[head .. tail + 1], qx, qy);
+                if (chunk.prev > 0.5) near = @min(near, segment_at(points, head - 1, qx, qy));
+                if (chunk.next > 0.5) near = @min(near, segment_at(points, tail, qx, qy));
+                const alpha = std.math.clamp(0.5 - (near - 0.5 * chunk.width) / 1, 0, 1);
+                try testing.expectEqual(alpha * chunk.color[3], got);
+            }
+        }
+    }
 }

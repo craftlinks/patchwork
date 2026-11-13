@@ -27,10 +27,12 @@
 //!   the bitmap is rasterized at device size, so each fragment center samples one texel center
 //!   and bilinear filtering returns that texel unchanged (`text/layout.zig`, section 3).
 //! - `Image` (64 bytes): `uv` and `tint`; samples an `rgba8` texture, multiplied by `tint`.
-//! - `Path` (80 bytes): one chunk of a stroked polyline whose points live in the context's
+//! - `Path` (96 bytes): one chunk of a stroked polyline whose points live in the context's
 //!   point buffer (`reads_points`). `color`, then `anchor_x`, `anchor_y`, `width`, `hover`,
-//!   then `first_point`, `point_count`, `prev`, `next`. `draw/path.zig` writes these records
-//!   and its guide explains the fields, the seam rule, and the fragment loop.
+//!   then `first_point`, `point_count`, `prev`, `next`, then the dash pattern `dash_on`,
+//!   `dash_period`, `dash_phase`, `dash_inverse` (all zero for a solid stroke).
+//!   `draw/path.zig` writes these records and its guide explains the fields, the seam rule,
+//!   the dashes, and the fragment loop.
 //!
 //! ## 3. Hover, Down, and Theme Colors
 //! ```text
@@ -413,6 +415,14 @@ pub const Path = extern struct {
     prev: f32,
     /// 1 when a later chunk shares this chunk's last point, else 0.
     next: f32,
+    /// The dash pattern's on length, in logical pixels; 0 for a solid stroke (and for dots).
+    dash_on: f32,
+    /// On plus off, in logical pixels; 0 is a solid stroke, the shader's switch.
+    dash_period: f32,
+    /// The pattern's phase at the chunk's first point, in `[0, dash_period)`.
+    dash_phase: f32,
+    /// `1 / dash_period`, or 0 for a solid stroke: a multiply in place of a divide per segment.
+    dash_inverse: f32,
 
     pub const texture: ?textures.Format = null;
     pub const reads_points: bool = true;
@@ -453,17 +463,30 @@ pub const Path = extern struct {
     // belongs to that chunk. Where the two segments meeting at the seam are within `tie` of
     // each other, the side of a line through the seam decides, and the owner draws the nearest
     // of the three distances (`draw/path.zig`, section 4a). The literals are `path.seam_tie` and
-    // `path.seam_bias`, which `path.zig` asserts. CPU twins: `path.chunk_alpha` and
-    // `path.seam_side`.
+    // `path.seam_bias`, which `path.zig` asserts. A dashed chunk (`dash_period > 0`, instance
+    // data) decides ownership the same way and draws the distance to the dashes' on-parts instead
+    // (section 4b). CPU twins: `path.chunk_alpha`, `path.seam_side`, and `path.distance_to_dashes`.
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
         \\    let pixel_size = max(fwidth(px.local.x), 1.0e-5);
         \\    let q = px.local - vec2<f32>(px.anchor_x, px.anchor_y);
         \\    let head = u32(px.first_point);
         \\    let tail = head + u32(px.point_count) - 1u;
+        \\    let dashed = px.dash_period > 0.0;
         \\    var own = 3.0e38;
-        \\    for (var i = head; i < tail; i = i + 1u) {
-        \\        own = min(own, sdf_segment(q, points[i], points[i + 1u]));
+        \\    var dash = 3.0e38;
+        \\    var s = px.dash_phase;
+        \\    if (dashed) {
+        \\        for (var i = head; i < tail; i = i + 1u) {
+        \\            own = min(own, sdf_segment(q, points[i], points[i + 1u]));
+        \\            let m = path_dash_segment(q, points[i], points[i + 1u], s, px);
+        \\            dash = min(dash, m.x);
+        \\            s = s + m.y;
+        \\        }
+        \\    } else {
+        \\        for (var i = head; i < tail; i = i + 1u) {
+        \\            own = min(own, sdf_segment(q, points[i], points[i + 1u]));
+        \\        }
         \\    }
         \\    // A seam is a tie only where its two segments are within `tie` of each other, and
         \\    // the side test runs only there (`draw/path.zig`, section 4a).
@@ -499,10 +522,54 @@ pub const Path = extern struct {
         \\        }
         \\    }
         \\    let owned = select(0.0, 1.0, wins_before && wins_after);
-        \\    let near = min(own, min(before, after));
+        \\    var near = min(own, min(before, after));
+        \\    if (dashed) {
+        \\        // The neighbour segments' dashes at the phases their own chunks draw them.
+        \\        if (px.prev > 0.5) {
+        \\            let a = points[head - 1u];
+        \\            let b = points[head];
+        \\            let s_before = px.dash_phase - length(b - a);
+        \\            dash = min(dash, path_dash_segment(q, a, b, s_before, px).x);
+        \\        }
+        \\        if (px.next > 0.5) {
+        \\            let b = points[tail];
+        \\            let c = points[tail + 1u];
+        \\            dash = min(dash, path_dash_segment(q, b, c, s, px).x);
+        \\        }
+        \\        near = dash;
+        \\    }
         \\    let alpha = clamp(0.5 - (near - 0.5 * px.width) / pixel_size, 0.0, 1.0);
         \\    let rgb = mix(px.color.rgb, frame.theme.lighten.rgb, px.hover);
         \\    return vec4<f32>(rgb, px.color.a * alpha * owned);
+        \\}
+        \\
+        \\// The distance from `q` to the on-parts of the segment a-b, whose dash phase at `a` is
+        \\// `s0`, and the segment's length. In a dash the nearest on-point is the projection, so
+        \\// the distance is `sdf_segment`'s; in a gap it is the nearer end of the dash before or
+        \\// after on the segment, and none when the whole segment lies in the gap.
+        \\fn path_dash_segment(
+        \\    q: vec2<f32>,
+        \\    a: vec2<f32>,
+        \\    b: vec2<f32>,
+        \\    s0: f32,
+        \\    px: Pixel,
+        \\) -> vec2<f32> {
+        \\    let pa = q - a;
+        \\    let ba = b - a;
+        \\    let span = length(ba);
+        \\    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0);
+        \\    let t = h * span;
+        \\    let u = (s0 + t) - px.dash_period * floor((s0 + t) * px.dash_inverse);
+        \\    let back = t - (u - px.dash_on);
+        \\    let ahead = t + (px.dash_period - u);
+        \\    let back_ok = back >= 0.0;
+        \\    let ahead_ok = ahead <= span;
+        \\    let take_back = back_ok && (!ahead_ok || u - px.dash_on <= px.dash_period - u);
+        \\    let inside = u <= px.dash_on;
+        \\    let end = select(ahead, back, take_back) / max(span, 1.0e-6);
+        \\    let along = select(end, h, inside);
+        \\    let reached = inside || back_ok || ahead_ok;
+        \\    return vec2<f32>(select(3.0e38, length(pa - ba * along), reached), span);
         \\}
         \\
         \\// The signed distance from `q` to the line through `b` that splits a tie at the seam
@@ -762,12 +829,14 @@ comptime {
     assert(@offsetOf(Glyph, "color") == 48);
     assert(@sizeOf(Image) == 64);
     assert(@offsetOf(Image, "tint") == 48);
-    assert(@sizeOf(Path) == 80);
+    assert(@sizeOf(Path) == 96);
     assert(@offsetOf(Path, "color") == 32);
     assert(@offsetOf(Path, "anchor_x") == 48);
     assert(@offsetOf(Path, "hover") == 60);
     assert(@offsetOf(Path, "first_point") == 64);
     assert(@offsetOf(Path, "next") == 76);
+    assert(@offsetOf(Path, "dash_on") == 80);
+    assert(@offsetOf(Path, "dash_inverse") == 92);
 }
 
 // Locks the segment twin: the perpendicular foot, both end caps, and a degenerate segment.

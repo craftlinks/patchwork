@@ -1,5 +1,5 @@
 {"library":"patchwork","zig":"0.17.0","generated":"zig build describe","files":[
-{"file":"draw.json","doc":"The drawing namespace: projection, the unit quad, uploads, and the draw type modules.","bytes":49460,"draw_types":11,"types":29,"aliases":1,"constants":35,"functions":90,"contract":0,"scenario_steps":0,"widgets":0},
+{"file":"draw.json","doc":"The drawing namespace: projection, the unit quad, uploads, and the draw type modules.","bytes":51050,"draw_types":11,"types":30,"aliases":1,"constants":35,"functions":91,"contract":0,"scenario_steps":0,"widgets":0},
 {"file":"textures.json","doc":"Sampled textures: a fixed table of ids, with creates and writes queued until the next stream.","bytes":11280,"draw_types":0,"types":11,"aliases":0,"constants":3,"functions":22,"contract":0,"scenario_steps":0,"widgets":0},
 {"file":"text.json","doc":"Text: embedded faces, measurement, and glyph placement through the glyph cache.","bytes":19440,"draw_types":0,"types":13,"aliases":0,"constants":11,"functions":36,"contract":0,"scenario_steps":0,"widgets":0},
 {"file":"ui.json","doc":"The UI layer: layout while drawing, hit areas, views, and the three calls hosts make.","bytes":43718,"draw_types":0,"types":44,"aliases":0,"constants":1,"functions":90,"contract":0,"scenario_steps":0,"widgets":0},
