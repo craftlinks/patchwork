@@ -269,7 +269,7 @@ patchwork/
 │   │   ├── app.zig             # Workspace App: files, editor, log, appearance in a Dock
 │   │   ├── c.zig               # The C language recipe, copied from the gallery
 │   │   └── sample.c            # The editor's sample
-│   └── session/                # A live-coding music screen rebuilt from photos (step 47)
+│   ├── session/                # A live-coding music screen rebuilt from photos (step 47)
 │       ├── app.zig             # Session App: the document's rows, mixer, sidebar, card
 │       ├── patch.zig           # The patch as a language: faces, headings, and channel colours
 │       ├── bindings.zig        # The mix's numbers: parsed from the text, written back to it
@@ -279,8 +279,15 @@ patchwork/
 │       ├── keys.zig            # Keyboard: a piano played by pointer and tracker keys
 │       ├── plots.zig           # Transfer curve, envelope, response, bars, spectrum fills
 │       ├── signal.zig          # Four made-up channels as pure functions of time
-│       ├── faces.zig           # The serif faces' ranges (build.zig imports it)
-│       └── fonts/              # Noto Serif Regular, Italic, Bold, pre-subset (OFL)
+│   │   ├── faces.zig           # The serif faces' ranges (build.zig imports it)
+│   │   └── fonts/              # Noto Serif Regular, Italic, Bold, pre-subset (OFL)
+│   └── skins/                  # Four looks over one set of widgets (step 66)
+│       ├── app.zig             # Skins App: layout, events, restyle, decorations, scenarios
+│       ├── looks.zig           # Look, the Paper, Codex, Patch, and HUD schemes, and Skin
+│       ├── patch.zig           # The object boxes' ports, route(), dashed cables, pills, flow
+│       ├── ground.zig          # Paper's map and Patch's dot grid, generated at init
+│       ├── faces.zig           # The five faces' ranges (build.zig imports it)
+│       └── fonts/              # Noto Sans Medium, Sans Mono Bold and Light, pre-subset (OFL)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
@@ -393,8 +400,13 @@ zig build run-touch       # Build and run the multi-touch pads and sliders nativ
 zig build wasm-touch      # Compile it to zig-out/bin/touch.wasm
 zig build serve-touch     # Serve it on localhost (prints the address)
 
+# Examples (Skins)
+zig build run-skins       # Paper, Codex, Patch, and HUD over the same widgets; keys 1 to 4
+zig build wasm-skins      # Compile it to zig-out/bin/skins.wasm
+zig build serve-skins     # Serve it on localhost (prints the address)
+
 # Validation
-zig build test            # Run unit tests across the library and the twelve examples
+zig build test            # Run unit tests across the library and the thirteen examples
 zig build test-contract   # Verify compile errors for a missing `draw`, a ragged draw type,
                           # a type that reads time without declaring `animated`, an
                           # producer without `drain`, a theme color of 1.5, a
@@ -922,6 +934,15 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   higher one, then restore the layer, as the gallery's hardware skin does.
 - **Check the shaders.** `zig build check` compiles every draw type's WGSL before a window
   opens and names the broken type.
+- **One skin for many schemes.** A skin is a type and a scheme a value, so one skin can draw
+  many looks: read `cx.theme()` (colours, accents, the `name`, `value`, and `heading` styles,
+  and `form`) on every call and keep nothing, and `cx.set_theme` restyles it on the next frame.
+  What differs per look but per widget (a button's face, a box's fill) goes in the widget's own
+  paint and style, which the app restyles on a switch. Leave what one look adds, and the scheme
+  cannot say, to the app, which knows the look: `examples/skins/looks.zig` (`Skin`, `Object`)
+  draws parameter cells, bar meters, section headers, a tooltip card, a slider, object boxes,
+  and buttons under four schemes, and `examples/skins/app.zig` draws one look's viewport
+  brackets and another's object ports itself.
 
 ## Popups
 
@@ -1516,6 +1537,35 @@ scales, a two-finger pan moves, a two-finger tap resets, and a long-press turns 
 the live, most, and refused contacts. The mouse works on all of it, because the app never sees a
 touch event. Scenarios `still`, `sliders` (two fingers land on two sliders and move), `chord` (ten
 fingers in one step), `pinch`, `two-tap`, `long-press`, and `cancel` (the system takes one finger).
+
+### 14. Skins (`examples/skins/app.zig`)
+
+Four looks over one set of widgets, switched live by a tab bar or keys 1 to 4: Paper (grey
+paper, black ink, a serif title, bold spaced capitals, square hairline boxes, filled dark accent
+buttons, a pale street map behind everything that shows through the patch), Codex (the same
+layout on near-black: dark object buttons with grey hairlines and white ports, accent buttons
+tinted by their colour, coloured dashed cables), Patch (Max-like: a bare dark canvas with a dot
+grid, dark object boxes with mint mono text and a value bar along their bottom, dashed mint
+cables and one solid grey), and HUD (navy, cyan spaced headers with counts, the selected tab
+filled, bars with their labels inside, thin brackets inside the viewport). Each look is a
+`theme.Scheme` with its `form` and spaced `heading`, plus text styles for the title, status,
+toolbar, and objects, the objects' fill, how accent buttons show their colour, three cable
+colours, a ground, the patch panel's opacity, and its decorations (`looks.Look`). A switch is
+`cx.set_theme` and a restyle of the paints the widgets store. The tabs, panels, toggle,
+checkboxes, dropdown, number box, and text field are `skins.Default` drawing the scheme's form.
+Two example skins draw the rest from the scheme and the widgets' own paints: `looks.Skin`
+(parameter cells with an underline, meters as bars with their label inside and a tick at 0.8,
+section headers with a rule and a right-hand count after a tab, a tooltip card with a spaced
+caption beside a large title and a line under them, a slider with a thin track and a dot) and
+`looks.Object` (object boxes and every button). The app draws Paper's and Codex's object ports,
+HUD's brackets, and the card's leader, since only it knows the look. The patch is three object
+boxes (dragged vertically) wired by two dashed cubics with value pills and one cable routed at
+right angles with rounded corners; the flow toggle runs a 16 ms timer that moves the dashes 20
+px a second, and with flow off the screen is idle. The grounds are textures generated at init.
+Scenarios `still`; `paper`, `codex`, `patch`, `hud` (the card over box A); `paper-menu` to
+`hud-menu` (the dropdown open); `switch` and `switching` (round trips whose lines equal
+`still`'s); `drag`; and `flow`. Long runs are measured offscreen: `skins --render flow --frames
+36000 --out -` against 3,600.
 
 ## Touch
 
@@ -2584,7 +2634,7 @@ worked numbers (the rasterizer is checked against a polygon-clipping reference).
 ## Fonts
 
 An app adds faces of its own beside the library's three with `AppOptions.fonts`, at most
-`patchwork.app_face_max` (5), so eight in all. Each goes through the same build-time path as
+`patchwork.app_face_max` (5), so eight in all; `examples/skins` uses all five. Each goes through the same build-time path as
 the Noto faces: subset by `tools/subset.zig`, embedded by the generated `patchwork_fonts`
 module, parsed at compile time. `text.Face` is generated per app: the library's `.sans`,
 `.sans_bold`, and `.mono` at 0, 1, and 2, then the app's names in order, so `.{ .face =

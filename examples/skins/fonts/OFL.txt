@@ -1,0 +1,5 @@
+NotoSans-Medium.ttf, NotoSansMono-Bold.ttf, NotoSansMono-Light.ttf (subset to examples/skins/faces.zig's ranges with tools/subset.zig, from Arch Linux noto-fonts 1:2026.10.01-1: Noto Sans 2.015, Noto Sans Mono 2.014)
+
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL
