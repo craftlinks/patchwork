@@ -6,4 +6,4 @@ scenario  hash
 pan       41eba3ac82642617
 still     41eba3ac82642617
 zoom      41eba3ac82642617
-zoomed    20312246a9eda549
+zoomed    5a3e45c2949e85a7

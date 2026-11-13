@@ -1489,14 +1489,18 @@ fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call
 stroke in its hole, the region under a plotted curve with its stroke on top, a glyph from
 `ttf.load` beside the same glyph from the atlas, a translucent comb tall enough to split into
 bands over a bright bar, so a row blended twice would show, and a shape morphing from a circle
-to a rounded square on the `frame` event's delta. Space runs the clock, and 1, 2, 3, and 4 pick a
+to a rounded square on the `frame` event's delta. Space runs the clock, and 1 to 5 pick a
 page: the shapes, one `&` an em of the window's height / 1.08, a single band at the
-48-segment cap over the whole window, and display text as outlines. Pressing 4 again steps its
-three views: `title` ("Patchwork" at 200 px, each letter rocking and pulsing on its own
-`Transform`), `write` (a wrapped paragraph written on glyph by glyph, one every 3 frames, which
-Space starts over), and `sizes` (a word as outlines beside atlas text at 16, 64, and 512 px,
-where the atlas stretches its 160 px raster). Scenarios `still`, `morph`, `glyph`, `curtain`,
-`title`, `write`, and `sizes`.
+48-segment cap over the whole window, display text as outlines, and folds. Pressing 4 again
+steps the display page's three views: `title` ("Patchwork" at 200 px, each letter rocking and
+pulsing on its own `Transform`), `write` (a wrapped paragraph written on glyph by glyph, one
+every 3 frames, which Space starts over), and `sizes` (a word as outlines beside atlas text at
+16, 64, and 512 px, where the atlas stretches its 160 px raster). The folds page (step 62) is
+36 of Tapestry's combs, three spikes as one polyline whose middle spike turns back at a chunk
+seam (exactly, or landing 0.05 or 0.4 px off), in six rows of width and six sub-pixel offsets,
+each above the same spike drawn as one chunk: the two must match pixel for pixel, and before
+step 62 up to 387 pixels did not. Scenarios `still`, `morph`, `glyph`, `curtain`,
+`folds`, `title`, `write`, and `sizes`.
 
 ### 13. Touch (`examples/touch/app.zig`)
 
@@ -2240,6 +2244,15 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   segment, so a translucent stroke shows no dots at seams. Parts of one path closer than the
   width, more than a segment apart across a seam, still blend twice; the path tests measure
   it.
+- **Ties at seams.** Where the two segments meeting at a seam are within `seam_tie` (0.08 px)
+  of each other, the side of one line through the seam point decides: the bisector of the turn, or past a right
+  angle the line across the earlier segment, moved `seam_bias` (0.025 px) off. Both chunks
+  compute that line from the same points, so they agree where their distances cannot: the
+  rasterizer places one fragment a few thousandths of a pixel apart in two chunks. Before
+  step 62 a path that turned straight back at a seam (a comb drawn up and down each tooth, a
+  plotted |sin| at its zeros) lost single pixels inside its stroke, and sharp seam corners
+  dropped or doubled pixels beyond the seam point. A fragment within that placement
+  difference of the line can still miss, at the rate the bisector had before.
 - **Oriented quads.** A chunk's `rect` is its axis-aligned bounds, but it rasterizes a
   rectangle along its chord (first to last point), padded by half the width plus one logical
   pixel (`Path.vertex`). On the live screen's stress text the curves' boxes covered 0.98
@@ -2254,10 +2267,13 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
 - **Closed strokes.** `polygon` joins the last point to the first with the seam rule, so a
-  translucent ring shows no dot at its start. A ring of one chunk has no seam.
+  translucent ring shows no dot at its start. A ring of one chunk has no seam. A ring is never
+  two chunks of which the second is one segment: up to 15 segments it is one chunk, beyond that
+  its first chunk ends a point earlier (step 62).
 
-The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `draw.sdf_segment`)
-check the shader's math, the chunk rects and quads, and the seam blending without a GPU.
+The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `seam_side`,
+`draw.sdf_segment`) check the shader's math, the chunk rects and quads, and the seam blending
+without a GPU.
 
 ## Fills
 

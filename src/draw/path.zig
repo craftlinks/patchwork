@@ -17,7 +17,8 @@
 //!   -> reserve_points: the path's points, relative to its origin (the bounds' top-left)
 //!   -> one Path instance per chunk, indexing the shared point buffer
 //! GPU: own   = min over the chunk's segments of sdf_segment(q, p[i], p[i + 1])
-//!      alpha = color.a * coverage(own - width / 2) * owned * clip_mask
+//!      owned = the seam rule against `before` and `after` (sections 4 and 4a)
+//!      alpha = color.a * coverage(min(own, before, after) - width / 2) * owned * clip_mask
 //! ```
 //! The point buffer is the context's point pool (`draw/pools.zig`, section 5b), uploaded by
 //! dirty range like the instance pools and bound once per pass (`draw/renderer.zig`).
@@ -40,18 +41,57 @@
 //! of `s` segments has at most `ceil(s / 4)` chunks (`chunks_max`).
 //!
 //! Two chunks share a point, so their round caps would overlap there. The seam rule removes
-//! that: a chunk with `prev` also measures the previous chunk's last segment and one with
-//! `next` the next chunk's first, and a fragment belongs to the chunk whose segment is
-//! nearest, ties to the earlier chunk. A smooth or folded path therefore blends once
-//! everywhere. What remains is two parts of a path that come within the stroke width of each
-//! other more than one segment apart across a seam, or that cross: there both chunks draw.
-//! Test "seams blend once and crossings twice" measures both.
+//! that: a chunk with `prev` also measures the previous chunk's last segment (`before`) and one
+//! with `next` the next chunk's first (`after`), and a fragment belongs to the chunk whose
+//! segment is nearest, ties decided as section 4a says. A smooth or folded path therefore
+//! blends once everywhere. What remains is two parts of a path that come within the stroke
+//! width of each other more than one segment apart across a seam, or that cross: there both
+//! chunks draw. Test "seams blend once and close folds twice" measures both.
 //!
 //! `polygon` closes the path: its last chunk's `next` joins its first, so the rule holds at the
 //! closure too. The stored points are the ring of `n` points with its last point before it and
 //! its first two after it, so `points[head - 1]` and `points[tail + 1]` exist; a chunk measures
 //! the same indices as anywhere else, and the closure's tie goes to the last chunk. A ring of one
-//! chunk has no seam and sets neither flag.
+//! chunk has no seam and sets neither flag. A ring never splits into two chunks of which the
+//! second is one segment (`ring_first_end`): that segment would be both of the first chunk's
+//! neighbours (section 4a).
+//!
+//! ## 4a. Ties at a Seam
+//! Where the two seam segments are equally near, the plain rule asks each chunk to break the tie
+//! on its own, and the two do not agree: the rasterizer snaps each chunk's quad to its own
+//! sub-pixel grid, so the chunks place one fragment a few thousandths of a pixel apart, and
+//! `sdf_segment` rounds a reversed segment differently. A tie is a line at a gentle bend, but an
+//! area beyond the seam point at a sharp one, and the whole stroke where a path turns straight
+//! back on itself: there each pixel was dropped by both chunks or drawn by both (Patchwork step
+//! 62, Tapestry's comb). The rule is therefore, at each seam, with `adjacent` the chunk's own
+//! segment at that seam:
+//! ```text
+//! own < neighbour - seam_tie                 this chunk's
+//! |adjacent - neighbour| <= seam_tie         a tie: this chunk's if seam_side is on its side
+//! otherwise                                  the plain rule, ties to the earlier chunk
+//! seam_side = signed distance from the line through the seam point b: the bisector of the
+//!             turn up to a right angle, past one the line across the earlier segment at b;
+//!             the earlier chunk keeps seam_side <= seam_bias
+//! ```
+//! The tie is the two segments that meet at the seam, not `own`: a ring of two chunks meets at
+//! two seams, and near one of them the neighbour segment is within the tie of `own` while the
+//! other seam's side test means nothing there.
+//! Both chunks compute the line from the same three stored points, so it is the same bits in
+//! each, and inside a tie neither distance decides. `seam_bias` keeps the line off the bisector,
+//! where a symmetric shape puts whole rows of pixel centres, and `seam_tie` exceeds twice the
+//! bias by more than the chunks' placement differs, so the side test and the distance agree at
+//! the tie's edge. A fold, or a near fold whose arms stay within the tie, goes to the earlier
+//! chunk whole. The owner draws `min(own, before, after)`, so a fragment a tie hands across
+//! draws the alpha of the nearest segment, and a fragment the plain rule gave the same chunk
+//! draws exactly as before.
+//!
+//! What a tie cannot remove is the line where ownership changes: a fragment within the
+//! placement difference of it can still be dropped or drawn twice. That line crosses the stroke
+//! once at each seam, as the bisector did before, and runs along a near fold whose arms part by
+//! more than the tie. Computing `q` from the fragment's device position instead of the
+//! interpolated `local` would make every chunk's `q` the same bits and remove it; that needs the
+//! device mapping in the frame uniform. Test "a stroke that turns back at a seam draws once"
+//! locks the rule with the chunks moved apart.
 //!
 //! ## 5. Coordinates
 //! Points are stored relative to the path's origin, the top-left of its unpadded bounds, and
@@ -122,6 +162,16 @@ pub const chunk_area_max: f32 = 1024;
 
 /// Padding past the half width that holds the antialiased edge (section 5).
 pub const aa_pad: f32 = 1;
+
+/// Seam distances closer than this, in logical pixels, are a tie, which the side of the seam
+/// decides (section 4a). Twice it must clear `seam_bias` by more than the few thousandths of a
+/// pixel by which two chunks place one fragment.
+pub const seam_tie: f32 = 8.0e-2;
+
+/// Within a tie the earlier chunk keeps a fragment whose `seam_side` is at most this many
+/// logical pixels: a line off the bisector, because a symmetric shape puts whole rows of pixel
+/// centres on the bisector itself (section 4a).
+pub const seam_bias: f32 = 2.5e-2;
 
 /// Hit distance past the half width (section 6).
 pub const hit_slop: f32 = 3;
@@ -367,17 +417,71 @@ pub fn chunk_alpha(
     const own_points = points[head .. tail + 1];
     if (!quad_contains(oriented_quad(own_points, chunk.width), .{ qx, qy })) return 0;
     const own = distance_to_polyline(own_points, qx, qy);
+    const q: Point = .{ qx, qy };
     var before: f32 = std.math.floatMax(f32);
-    if (chunk.prev > 0.5) before = segment_at(points, head - 1, qx, qy);
+    var before_side: f32 = 1;
+    if (chunk.prev > 0.5) {
+        before = segment_at(points, head - 1, qx, qy);
+        before_side = seam_side(q, points[head - 1], points[head], points[head + 1]);
+    }
     var after: f32 = std.math.floatMax(f32);
-    if (chunk.next > 0.5) after = segment_at(points, tail, qx, qy);
-    if (!(own < before)) return 0;
-    if (!(own <= after)) return 0;
+    var after_side: f32 = -1;
+    if (chunk.next > 0.5) {
+        after = segment_at(points, tail, qx, qy);
+        after_side = seam_side(q, points[tail - 1], points[tail], points[tail + 1]);
+    }
+    if (chunk.prev > 0.5) {
+        const first = segment_at(points, head, qx, qy);
+        if (!seam_wins(own, first, before, before_side > seam_bias, false)) return 0;
+    }
+    if (chunk.next > 0.5) {
+        const last = segment_at(points, tail - 1, qx, qy);
+        if (!seam_wins(own, last, after, after_side <= seam_bias, true)) return 0;
+    }
     const clip = chunk.clip;
     if (x < clip[0] or y < clip[1] or x > clip[2] or y > clip[3]) return 0;
-    const alpha = std.math.clamp(0.5 - (own - 0.5 * chunk.width) / pixel_size, 0, 1);
+    const near = @min(own, @min(before, after));
+    const alpha = std.math.clamp(0.5 - (near - 0.5 * chunk.width) / pixel_size, 0, 1);
     assert(alpha >= 0);
     return chunk.color[3] * alpha;
+}
+
+/// True when a chunk keeps a fragment against the neighbour segment at distance `neighbour`
+/// across one seam (section 4a). `own` is the chunk's distance, `adjacent` its segment at the
+/// seam's: within `seam_tie` of the neighbour that is a tie, which `own_side` decides; else the
+/// plain rule, ties to the earlier chunk (`earlier`).
+fn seam_wins(own: f32, adjacent: f32, neighbour: f32, own_side: bool, earlier: bool) bool {
+    assert(own >= 0);
+    assert(adjacent >= own);
+    if (own < neighbour - seam_tie) return true;
+    if (@abs(adjacent - neighbour) <= seam_tie) return own_side;
+    if (earlier) return own <= neighbour;
+    return own < neighbour;
+}
+
+/// The signed distance from `q` to the line through `b` that splits a tie at the seam between
+/// the segments a-b and b-c: negative on a-b's side, positive on b-c's. Up to a right angle it
+/// is the bisector of the turn; past one, the line across a-b at `b`, so a fold goes to a-b
+/// whole (section 4a). CPU twin of `path_seam_side` in `types.Path.pixel`.
+pub fn seam_side(q: Point, a: Point, b: Point, c: Point) f32 {
+    assert(q[0] == q[0]);
+    assert(b[0] == b[0]);
+    const into = unit_or_zero(.{ b[0] - a[0], b[1] - a[1] });
+    const out = unit_or_zero(.{ c[0] - b[0], c[1] - b[1] });
+    const bisector = unit_or_zero(.{ into[0] + out[0], into[1] + out[1] });
+    const turned_back = into[0] * out[0] + into[1] * out[1] < 0;
+    const normal = if (turned_back) into else bisector;
+    return (q[0] - b[0]) * normal[0] + (q[1] - b[1]) * normal[1];
+}
+
+/// `v` scaled to unit length as the shader's `v * inverseSqrt(max(dot(v, v), 1e-24))` does: a
+/// zero vector stays zero.
+fn unit_or_zero(v: Point) Point {
+    const scale = 1 / @sqrt(@max(v[0] * v[0] + v[1] * v[1], 1.0e-24));
+    assert(scale > 0);
+    const unit: Point = .{ v[0] * scale, v[1] * scale };
+    assert(unit[0] * unit[0] + unit[1] * unit[1] <= 1.0001);
+    return unit;
 }
 
 fn segment_at(points: []const Point, index: u32, x: f32, y: f32) f32 {
@@ -498,7 +602,11 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
     @memcpy(closed[0..count], points);
     closed[count] = points[0];
     const ring = closed[0 .. count + 1];
-    const chunks = chunk_count(ring, stroke.width);
+    const first_end = ring_first_end(ring, stroke.width);
+    var chunks: u32 = 1;
+    var counted = first_end;
+    while (counted < count) : (chunks += 1) counted = chunk_end(ring, counted, stroke.width);
+    assert(chunks <= chunk_count(ring, stroke.width));
     if (cx.room(types.Path) < chunks) {
         cx.refuse();
         return null;
@@ -517,7 +625,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
     const first = reserved + 1;
     var start: u32 = 0;
     while (start < count) {
-        const end = chunk_end(ring, start, stroke.width);
+        const end = if (start == 0) first_end else chunk_end(ring, start, stroke.width);
         var instance = chunk_of(ring, start, end, first, origin, stroke, clip);
         if (chunks > 1) {
             if (start == 0) instance.prev = 1;
@@ -535,6 +643,20 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
         start = end;
     }
     return .{ .first = first, .count = count + 1, .bounds = bounds };
+}
+
+/// The last point of a closed ring's first chunk: `chunk_end`'s, unless the ring would then be
+/// two chunks of which the second is one segment. That segment would be both the first chunk's
+/// neighbours, and each seam's rule would judge the other seam's pixels (section 4a), so such a
+/// ring is one chunk when it fits and otherwise ends its first chunk a point earlier.
+fn ring_first_end(ring: []const Point, width: f32) u32 {
+    assert(ring.len >= 4);
+    const last: u32 = @intCast(ring.len - 1);
+    const end = chunk_end(ring, 0, width);
+    if (end + 1 != last) return end;
+    if (last <= chunk_segments_max) return last;
+    assert(end - 1 >= chunk_segments_min);
+    return end - 1;
 }
 
 /// The instance of the chunk `points[start..end + 1]`; `first` is the path's first pool index
@@ -603,6 +725,11 @@ fn length(a: Point, b: Point) f32 {
 comptime {
     // `types.Path.vertex` writes this pad as the literal `1.0`.
     assert(aa_pad == 1);
+    // `types.Path.pixel` writes the seam tie and bias as the literals `8.0e-2` and `2.5e-2`.
+    assert(seam_tie == 8.0e-2);
+    assert(seam_bias == 2.5e-2);
+    // The tie zone holds the side line with room for two chunks' placement to differ.
+    assert(seam_tie > 2 * seam_bias + 0.02);
     assert(chunk_points_max == 16);
     assert(chunk_segments_min <= chunk_segments_max);
     assert(segments_min >= 1);
@@ -878,6 +1005,145 @@ test "seams blend once and close folds twice" {
     const folded = composite_max(cx);
     try testing.expect(folded <= twice);
     try testing.expectApproxEqAbs(@as(f32, 0.0956), folded - alpha, 1.0e-4);
+}
+
+/// Source-over of every chunk at `(x, y)` with each chunk's fragment moved by `shift` (odd
+/// chunks) or `-shift` (even ones): the rasterizer snaps every quad's corners to its own sub-pixel
+/// grid, so two chunks interpolate one pixel's position a few thousandths of a pixel apart.
+fn composite_shifted(cx: *const TestContext, x: f32, y: f32, pixel_size: f32, shift: Point) f32 {
+    var clear: f32 = 1;
+    for (cx.items(types.Path), 0..) |*chunk, index| {
+        const sign: f32 = if (index % 2 == 0) -1 else 1;
+        const at: Point = .{ x + sign * shift[0], y + sign * shift[1] };
+        clear *= 1 - chunk_alpha(cx.point_items(), chunk, at[0], at[1], pixel_size);
+    }
+    return 1 - clear;
+}
+
+/// Pixels of `box` (centres at 1x and 2x) where the chunks, moved apart by each of `shifts`,
+/// draw other than one stroke of `width` through `points` would: a hole or a double blend.
+fn seam_misses(cx: *const TestContext, points: []const Point, width: f32, box: Rect) u32 {
+    const shifts = [_]Point{ .{ 2.0e-3, 1.4e-3 }, .{ -2.0e-3, 1.0e-3 }, .{ 5.0e-4, -2.0e-3 } };
+    var misses: u32 = 0;
+    for ([_]f32{ 1, 0.5 }) |pixel_size| {
+        var y = @floor(box.y) + 0.5 * pixel_size;
+        while (y < box.y + box.height) : (y += pixel_size) {
+            var x = @floor(box.x) + 0.5 * pixel_size;
+            while (x < box.x + box.width) : (x += pixel_size) {
+                const d = distance_to_polyline(points, x, y);
+                const want = std.math.clamp(0.5 - (d - 0.5 * width) / pixel_size, 0, 1);
+                for (shifts) |shift| {
+                    const got = composite_shifted(cx, x, y, pixel_size, shift);
+                    if (@abs(got - want) > 0.01) {
+                        misses += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return misses;
+}
+
+// Locks section 4a, Patchwork step 62: a stroke that turns straight back at a chunk seam (the
+// middle spike of Tapestry's comb, exactly and with its way down landing 0.05 or 0.4 px off)
+// and a quarter circle whose seam lies on its own axis of symmetry draw as one stroke, with
+// the chunks' fragments placed up to 4.9e-3 px apart. Under the rule before step 62 (ties to
+// the earlier chunk by plain distance) the same check missed 46 pixels: the fold's
+// body and cap, and the arc's axis, are ties that each chunk broke on its own placement.
+test "a stroke that turns back at a seam draws once" {
+    const cx = new_context();
+    // Width and how far the way down lands from the way up, as on `examples/vector`'s page 5.
+    const rows = [_][2]f32{
+        .{ 2, 0 }, .{ 3, 0 }, .{ 5, 0 }, .{ 2.5, 0.05 }, .{ 3, 0.4 }, .{ 5, 0.05 },
+    };
+    var misses: u32 = 0;
+    for (rows) |row| {
+        for ([_]f32{ 0, 0.25, 0.5, 0.125 }) |phase| {
+            // Arms 0.4 px apart at the foot are more than a tie apart, so their owners meet on
+            // a line along the spike; at 0.125 it crosses a column of pixel centres (section 4a).
+            if (row[1] > seam_tie and phase == 0.125) continue;
+            cx.reset();
+            const width = row[0];
+            const base = 100 + phase;
+            var comb: [9]Point = undefined;
+            for (0..3) |spike| {
+                const x = 40 + phase + @as(f32, @floatFromInt(spike)) * 40;
+                comb[3 * spike] = .{ x, base };
+                comb[3 * spike + 1] = .{ x, base - 40 };
+                comb[3 * spike + 2] = .{ x + row[1], base };
+            }
+            const stroke: Stroke = .{ .color = .{ 1, 1, 1, 1 }, .width = width, .hover = 0 };
+            _ = polyline(cx, &comb, stroke, window).?;
+            // The seam is the middle spike's tip, where the stroke turns back.
+            try testing.expectEqual(@as(f32, 5), cx.items(types.Path)[0].point_count);
+            // The spike from above its cap to above the corner at its foot, where the comb's
+            // next arm runs off and the class of section 4 begins.
+            const box: Rect = .{
+                .x = comb[4][0] - width - 2,
+                .y = base - 40 - width - 2,
+                .width = 2 * width + 4 + row[1],
+                .height = 40 - 1,
+            };
+            misses += seam_misses(cx, &comb, width, box);
+        }
+    }
+    var arc: [31]Point = undefined;
+    for (&arc, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.pi / 60;
+        point.* = .{ 106 - 6 * @cos(turn), 106 - 6 * @sin(turn) };
+    }
+    for ([_]f32{ 1.5, 3 }) |width| {
+        cx.reset();
+        const stroke: Stroke = .{ .color = .{ 1, 1, 1, 1 }, .width = width, .hover = 0 };
+        _ = polyline(cx, &arc, stroke, window).?;
+        try testing.expectEqual(@as(usize, 2), cx.items(types.Path).len);
+        const box: Rect = .{ .x = 98, .y = 98, .width = 10, .height = 10 };
+        misses += seam_misses(cx, &arc, width, box);
+    }
+    try testing.expectEqual(@as(u32, 0), misses);
+}
+
+// Locks section 4a's ties in closed rings. A pentagon (Weft play's `shapes` page) used to split
+// into a chunk of four segments and one of the closing segment alone, which was then both of the
+// first chunk's neighbours: each seam's rule judged the other seam's pixels, and pixels at both
+// corners were dropped or doubled (7 under this check before step 62, 3 with only the seam
+// pair's tie). Such a ring is now one chunk. A ring of 16 segments, whose greedy split would also
+// leave one segment, ends its first chunk a point earlier and draws once with the chunks moved
+// apart.
+test "a ring never leaves one segment as its second chunk" {
+    const cx = new_context();
+    const corners = [_]Point{
+        .{ 500, 615.85 },    .{ 527.25, 507.55 }, .{ 638.68, 500 }, .{ 680.29, 603.64 },
+        .{ 594.58, 675.24 },
+    };
+    var ring: [corners.len + 1]Point = undefined;
+    @memcpy(ring[0..corners.len], &corners);
+    ring[corners.len] = corners[0];
+    const stroke: Stroke = .{ .color = .{ 1, 1, 1, 1 }, .width = 2, .hover = 0 };
+    _ = polygon(cx, &corners, stroke, window).?;
+    try testing.expectEqual(@as(usize, 1), cx.items(types.Path).len);
+    const box: Rect = .{ .x = 496, .y = 496, .width = 188, .height = 184 };
+    try testing.expectEqual(@as(u32, 0), seam_misses(cx, &ring, stroke.width, box));
+    cx.reset();
+    // Sixteen points on a thin horizontal ellipse: bounds small enough that the greedy split
+    // takes fifteen segments and leaves the closing one alone.
+    var oval: [16]Point = undefined;
+    for (&oval, 0..) |*point, index| {
+        const turn = @as(f32, @floatFromInt(index)) * std.math.tau / 16;
+        point.* = .{ 300 + 20 * @cos(turn), 300 + 3 * @sin(turn) };
+    }
+    var oval_ring: [17]Point = undefined;
+    @memcpy(oval_ring[0..16], &oval);
+    oval_ring[16] = oval[0];
+    try testing.expectEqual(@as(u32, 15), chunk_end(&oval_ring, 0, stroke.width));
+    _ = polygon(cx, &oval, stroke, window).?;
+    const chunks = cx.items(types.Path);
+    try testing.expectEqual(@as(usize, 2), chunks.len);
+    try testing.expectEqual(@as(f32, 15), chunks[0].point_count);
+    try testing.expectEqual(@as(f32, 3), chunks[1].point_count);
+    const oval_box: Rect = .{ .x = 276, .y = 293, .width = 48, .height = 14 };
+    try testing.expectEqual(@as(u32, 0), seam_misses(cx, &oval_ring, stroke.width, oval_box));
 }
 
 // Locks the closure (section 4): a translucent circle of 64 points splits into several chunks and
