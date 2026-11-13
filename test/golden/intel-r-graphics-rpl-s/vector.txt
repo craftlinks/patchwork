@@ -2,12 +2,14 @@
 # adapter: Intel(R) Graphics (RPL-S)
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
-scenario  hash
-curtain   b759d5c52295af08
-folds     e27de6722ef5599c
-glyph     91fbf1919d3d9d64
-morph     909a3ef0b523d839
-sizes     79b34c90bcbc9a4d
-still     76257cef6377576c
-title     05033bcf3321f2cb
-write     8d79d9e0996e9cff
+scenario   hash
+curtain    b759d5c52295af08
+dash-flow  816c1e52a4768001
+dashes     a3f9edb3cc11d4dc
+folds      e27de6722ef5599c
+glyph      91fbf1919d3d9d64
+morph      909a3ef0b523d839
+sizes      79b34c90bcbc9a4d
+still      76257cef6377576c
+title      05033bcf3321f2cb
+write      8d79d9e0996e9cff

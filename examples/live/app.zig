@@ -1810,7 +1810,7 @@ test "uploads of a scrolled frame and a typed key" {
 // play swaps one icon record (64 bytes); a tick while playing writes only the playhead's Box
 // record (80 bytes); after a knob moved and record was armed (one more icon), a recording
 // tick writes the playhead, that lane's one changed point (8 bytes), and the one Path record
-// holding it (80 bytes), and no other lane's points.
+// holding it (96 bytes), and no other lane's points.
 test "transport ticks upload the playhead and one recorded point" {
     const app = new_app();
     start_gpu();
@@ -1832,7 +1832,7 @@ test "transport ticks upload the playhead and one recorded point" {
     cx.redraw();
     try std.testing.expectEqual([7]u64{ 0, 0, 0, 0, 64, 64, 0 }, record(app));
     App.timer(app, cx, 0);
-    try std.testing.expectEqual([7]u64{ 80, 0, 0, 80, 0, 0, 8 }, record(app));
+    try std.testing.expectEqual([7]u64{ 80, 0, 0, 96, 0, 0, 8 }, record(app));
 }
 
 // Locks the record glow (section 5): arming record while paused draws one glow, centered on

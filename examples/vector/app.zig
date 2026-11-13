@@ -20,6 +20,11 @@
 //! one chunk, 52 px lower; the two must match pixel for pixel at any scale whose 52 px are whole
 //! device pixels. Before step 62 single pixels inside the folded spike and beside its cap did not.
 //!
+//! Page 6 is dashes (`draw.path.Dash`, step 65): a line at 10 on, 5 off, dots, an L whose dash
+//! ends at its corner, a hairpin, a sagging cable of several chunks, a right-angle route with
+//! rounded corners (the Patch look's cable), a dashed hexagon fitted to its ring, and a long cable
+//! whose dashes flow toward its end at `flow_speed` while Space runs the clock.
+//!
 //! ## 2. Pages
 //! Digit keys pick a page, so the two cost scenarios draw one thing over the whole window:
 //! ```text
@@ -28,6 +33,7 @@
 //! 3  curtain    a single band at the 48-segment cap over the whole window: the worst fragment
 //! 4  display    three views, which a further press of 4 steps through: title, write, sizes
 //! 5  folds      six rows (stroke width and miss) by six sub-pixel offsets of combs
+//! 6  dashes     dashed strokes, one of them flowing
 //! ```
 //!
 //! ## 3. The Morph and the Clock
@@ -35,8 +41,10 @@
 //! its side (a circle) and a quarter of that, on the `frame` event's delta, so it rebuilds and
 //! uploads its points on every frame while it runs. The title's letters take their angles and
 //! scales from the same clock. The write-on has its own, restarted by Space once it has finished,
-//! and takes one glyph every 3 frames at 60 Hz. The app sleeps whenever nothing on the shown
-//! page moves: stopped, on a page with no motion, or with the paragraph written.
+//! and takes one glyph every 3 frames at 60 Hz. The flowing cable lowers its dash offset by
+//! `flow_speed` per second, wrapped to its period, so its records change and its points do not.
+//! The app sleeps whenever nothing on the shown page moves: stopped, on a page with no motion, or
+//! with the paragraph written.
 //!
 //! ## 4. TigerStyle Invariants
 //! - No allocation: a `Builder` and an outline are static, and every shape is bounded by
@@ -81,7 +89,7 @@ const label_style: text.Style = .{ .face = .sans, .size = 12, .color = theme.dar
 const glyph_style: text.Style = .{ .face = .sans, .size = glyph_em, .color = pink };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
-const Page = enum { shapes, glyph, curtain, display, folds };
+const Page = enum { shapes, glyph, curtain, display, folds, dashes };
 
 /// The views of the display page, in the order key 4 steps through them.
 const View = enum { title, write, sizes };
@@ -92,6 +100,10 @@ const write_glyph_s: f32 = 0.05;
 const write_overlap: f32 = 2;
 /// The write-on's clock when its text is complete.
 const write_done_s: f32 = 1.0e6;
+
+/// The flowing cable's pattern and its speed toward the cable's end, in logical pixels.
+const flow_dash: quads.path.Dash = .{ .on = 10, .off = 5 };
+const flow_speed: f32 = 40;
 
 const title_word = "Patchwork";
 const title_em: f32 = 200;
@@ -119,6 +131,8 @@ pub const App = struct {
     clock_s: f32,
     write_s: f32,
     running: bool,
+    /// The flowing cable's dash offset, in `[0, period)` (section 3).
+    flow_offset: f32,
 
     pub const config: patchwork.app.Config = .{
         .title = "vector",
@@ -162,6 +176,21 @@ pub const App = struct {
             .frames = 10,
         },
         .{
+            .name = "dashes",
+            .setup = &.{ .{ .key = .{ .key = .other, .text = "6" } }, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 10,
+        },
+        .{
+            .name = "dash-flow",
+            .setup = &.{
+                .{ .key = .{ .key = .other, .text = "6" } },
+                .{ .key = .{ .key = .other, .text = " " } },
+            },
+            .cycle = &.{},
+            .frames = 90,
+        },
+        .{
             .name = "title",
             .setup = &.{
                 .{ .key = .{ .key = .other, .text = "4" } },
@@ -200,6 +229,7 @@ pub const App = struct {
         app.clock_s = 0;
         app.write_s = write_done_s;
         app.running = false;
+        app.flow_offset = 0;
     }
 
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
@@ -208,6 +238,10 @@ pub const App = struct {
                 if (!app.animating()) return;
                 app.clock_s += dt_ms / 1000;
                 if (app.page == .display and app.view == .write) app.write_s += dt_ms / 1000;
+                if (app.page == .dashes) {
+                    const period = flow_dash.on + flow_dash.off;
+                    app.flow_offset = @mod(app.flow_offset - flow_speed * dt_ms / 1000, period);
+                }
                 cx.redraw();
                 cx.keep_animating();
             },
@@ -222,6 +256,7 @@ pub const App = struct {
                     '2' => app.page = .glyph,
                     '3' => app.page = .curtain,
                     '5' => app.page = .folds,
+                    '6' => app.page = .dashes,
                     '4' => {
                         const next: View = if (app.page != .display) .title else switch (app.view) {
                             .title => .write,
@@ -243,7 +278,7 @@ pub const App = struct {
     fn animating(app: *const App) bool {
         if (!app.running) return false;
         return switch (app.page) {
-            .shapes => true,
+            .shapes, .dashes => true,
             .glyph, .curtain, .folds => false,
             .display => switch (app.view) {
                 .title => true,
@@ -270,6 +305,7 @@ pub const App = struct {
             .glyph => draw_big_glyph(cx, clip),
             .curtain => draw_curtain(cx, clip),
             .folds => draw_folds(cx, clip),
+            .dashes => app.draw_dashes(cx, clip),
             .display => switch (app.view) {
                 .title => app.draw_title(cx, clip),
                 .write => app.draw_write(cx, clip),
@@ -312,6 +348,55 @@ pub const App = struct {
         shape.reset();
         draw_curve(cx, .{ .x = 24, .y = 280, .width = 560, .height = 190 }, clip);
         draw_glyphs(cx, clip);
+    }
+
+    /// The dashes page (section 1): every shape at a fixed place from the top-left, labelled.
+    fn draw_dashes(app: *const App, cx: *Context, clip: Clip) void {
+        const draw_cx = cx.drawing();
+        const band: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+        const title = "dashes: draw.path.Dash, round caps, space runs the flow";
+        text.place(draw_cx, title_style, title, band, clip, left);
+        const labels = [_]struct { x: f32, y: f32, name: []const u8 }{
+            .{ .x = 40, .y = 100, .name = "line 10 / 5" },
+            .{ .x = 200, .y = 100, .name = "dots 0 / 6" },
+            .{ .x = 380, .y = 140, .name = "L, a dash ends at the corner" },
+            .{ .x = 620, .y = 100, .name = "hairpin 6 / 4" },
+            .{ .x = 840, .y = 140, .name = "hexagon, fitted" },
+            .{ .x = 40, .y = 330, .name = "cable 10 / 5, several chunks" },
+            .{ .x = 760, .y = 420, .name = "route, rounded corners" },
+            .{ .x = 40, .y = 660, .name = "flowing cable" },
+        };
+        for (labels) |item| {
+            const rect: Rect = .{ .x = item.x, .y = item.y, .width = 240, .height = 20 };
+            text.place(draw_cx, label_style, item.name, rect, clip, left);
+        }
+        const path = quads.path;
+        const mint: [4]f32 = .{ 0.55, 0.95, 0.80, 1 };
+        const line = [_]Point{ .{ 40, 80 }, .{ 140, 80 } };
+        _ = path.polyline(draw_cx, &line, dashed(orange, 2, .{ .on = 10, .off = 5 }), clip);
+        const dots = [_]Point{ .{ 200, 80 }, .{ 320, 80 } };
+        _ = path.polyline(draw_cx, &dots, dashed(blue, 4, .{ .on = 0, .off = 6 }), clip);
+        // 55 px to the corner: with offset 25 the dash [35, 55] ends exactly there.
+        const corner = [_]Point{ .{ 380, 60 }, .{ 435, 60 }, .{ 435, 115 } };
+        _ = path.polyline(draw_cx, &corner, dashed(green, 4, .{ .on = 20, .off = 10, .offset = 25 }), clip);
+        const hairpin = [_]Point{ .{ 620, 60 }, .{ 720, 60 }, .{ 744, 70 }, .{ 720, 80 }, .{ 620, 80 } };
+        _ = path.polyline(draw_cx, &hairpin, dashed(pink, 3, .{ .on = 6, .off = 4 }), clip);
+        var hexagon: [6]Point = undefined;
+        for (&hexagon, 0..) |*point, index| {
+            const turn = @as(f32, @floatFromInt(index)) * std.math.pi / 3;
+            point.* = .{ 900 + 40 * @cos(turn), 90 + 40 * @sin(turn) };
+        }
+        _ = path.polygon(draw_cx, &hexagon, dashed(violet, 3, .{ .on = 10, .off = 5 }), clip);
+        const sag = [4]Point{ .{ 40, 200 }, .{ 240, 300 }, .{ 440, 300 }, .{ 640, 200 } };
+        _ = path.cubic(draw_cx, sag, dashed(orange, 3, .{ .on = 10, .off = 5 }), clip);
+        var route: [route_points_max]Point = undefined;
+        const corners = [_]Point{ .{ 700, 200 }, .{ 920, 200 }, .{ 920, 320 }, .{ 780, 320 }, .{ 780, 400 }, .{ 1200, 400 } };
+        const count = rounded_route(&route, &corners, 16);
+        _ = path.polyline(draw_cx, route[0..count], dashed(mint, 3, .{ .on = 8, .off = 6 }), clip);
+        const flow = [4]Point{ .{ 40, 480 }, .{ 440, 640 }, .{ 840, 640 }, .{ 1240, 480 } };
+        var flowing = flow_dash;
+        flowing.offset = app.flow_offset;
+        _ = path.cubic(draw_cx, flow, dashed(mint, 4, flowing), clip);
     }
 
     /// "Patchwork" in outlines, each letter rocking and pulsing on its own transform about its
@@ -442,6 +527,59 @@ fn draw_hexagon(cx: *Context, centre: Point, clip: Clip) void {
     }
     const stroke: quads.path.Stroke = .{ .color = orange, .width = 3, .hover = 0 };
     _ = quads.path.polygon(cx.drawing(), &points, stroke, clip);
+}
+
+/// A dashed stroke of `color` and `width`.
+fn dashed(color: [4]f32, width: f32, dash: quads.path.Dash) quads.path.Stroke {
+    return .{ .color = color, .width = width, .hover = 0, .dash = dash };
+}
+
+/// Segments of each rounded corner of a route.
+const route_corner_segments: u32 = 6;
+/// Corners a route takes at most, ends included.
+const route_corners_max: u32 = 8;
+const route_points_max: u32 = 2 + (route_corners_max - 2) * (route_corner_segments + 1);
+
+/// The Patch look's cable (step 65's page): straight runs between `corners` (axis-aligned), each
+/// inner corner rounded by a quarter circle of `radius`, written into `out`. Returns the count.
+fn rounded_route(out: *[route_points_max]Point, corners: []const Point, radius: f32) u32 {
+    assert(corners.len >= 2);
+    assert(corners.len <= route_corners_max);
+    out[0] = corners[0];
+    var count: u32 = 1;
+    for (corners[1 .. corners.len - 1], 1..) |corner, index| {
+        const into = unit(corners[index - 1], corner);
+        const away = unit(corner, corners[index + 1]);
+        const start: Point = .{ corner[0] - into[0] * radius, corner[1] - into[1] * radius };
+        const end: Point = .{ corner[0] + away[0] * radius, corner[1] + away[1] * radius };
+        // A quarter circle from `start` to `end`, whose centre is `start` moved by `away`.
+        const centre: Point = .{ start[0] + away[0] * radius, start[1] + away[1] * radius };
+        var step: u32 = 0;
+        while (step <= route_corner_segments) : (step += 1) {
+            const angle = @as(f32, @floatFromInt(step)) / route_corner_segments * std.math.pi / 2;
+            const back = @cos(angle);
+            const along = @sin(angle);
+            out[count] = .{
+                centre[0] - away[0] * radius * back + into[0] * radius * along,
+                centre[1] - away[1] * radius * back + into[1] * radius * along,
+            };
+            count += 1;
+        }
+        assert(@abs(out[count - 1][0] - end[0]) < 1.0e-3);
+    }
+    out[count] = corners[corners.len - 1];
+    count += 1;
+    assert(count <= route_points_max);
+    return count;
+}
+
+/// The unit vector from `a` to `b`.
+fn unit(a: Point, b: Point) Point {
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const span = @sqrt(dx * dx + dy * dy);
+    assert(span > 0);
+    return .{ dx / span, dy / span };
 }
 
 /// The rows of the folds page: a stroke width and how far the spike's way down lands from its
@@ -744,6 +882,38 @@ test "the folds page turns every comb back at a seam" {
             try std.testing.expectEqual(@as(f32, 3), chunks[index + 2].point_count);
         }
     }
+}
+
+// Locks the dashes page: no stroke is refused at 1x or 2x, every chunk on it is dashed, the
+// route's corners are quarter circles that end on the next run, and Space flows the cable's
+// offset at `flow_speed`, wrapped to its period, until stopped.
+test "the dashes page draws dashed strokes and flows on space" {
+    const app = new_app();
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "6") });
+    try std.testing.expectEqual(Page.dashes, app.page);
+    for ([_]u32{ 120, 240 }) |scale_120| {
+        const cx = &fixture.context;
+        cx.redraw();
+        assert(ui.draw_frame(App, app, cx, 1280, 720, scale_120));
+        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+        const chunks = cx.draw.items(quads.Path);
+        try std.testing.expect(chunks.len >= 12);
+        for (chunks) |chunk| try std.testing.expect(chunk.dash_period > 0);
+    }
+    var route: [route_points_max]Point = undefined;
+    const corners = [_]Point{ .{ 0, 0 }, .{ 100, 0 }, .{ 100, 100 } };
+    const count = rounded_route(&route, &corners, 16);
+    try std.testing.expectEqual(@as(u32, 2 + route_corner_segments + 1), count);
+    try std.testing.expectEqual(Point{ 84, 0 }, route[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), route[count - 2][0], 1.0e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 16), route[count - 2][1], 1.0e-4);
+    const cx = &fixture.context;
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
+    send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+    try std.testing.expect(ui.animate(App, app, cx, 16));
+    try std.testing.expectApproxEqAbs(@as(f32, 15 - 0.64), app.flow_offset, 1.0e-4);
+    send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
+    try std.testing.expect(!ui.animate(App, app, cx, 16));
 }
 
 // Locks the comb's bands, the seam the translucent golden shows: at least three, whose rects meet.

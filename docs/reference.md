@@ -1335,12 +1335,15 @@ A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, 
 zoom) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
 rung (2^(1/4)) about the pointer from 25% to 400%, dragging the background pans, pressing a
 module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
-center, and `0` resets. Modules and cables are culled in world pixels, below 50% a module is
+center, and `0` resets; `d` dashes every cable at 8 on, 4 off, and `f` makes the dashes flow at
+40 world pixels a second (step 65). Modules and cables are culled in world pixels, below 50% a module is
 its face and header, and text below a 6-pixel on-screen em is not placed, so the zoomed-out
 canvas (408 modules visible) places no glyphs. The status line shows the zoom, the offset,
 the visible modules and cables, and the glyph cache's epoch, which a full zoom sweep leaves
-at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), and `zoomed`
-(three rungs in and five steps right, for the browser compare).
+at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), `zoomed`
+(three rungs in and five steps right, for the browser compare), `dashed-zoom` (`zoom` with
+dashed cables, the dashed shader's worst case), and `flow` (3,600 frames of flowing cables;
+`--render flow --frames 36000 --out -` measures 600 s of it offscreen).
 
 ### 9. Widget Gallery (`examples/gallery/app.zig`)
 
@@ -1489,9 +1492,9 @@ fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call
 stroke in its hole, the region under a plotted curve with its stroke on top, a glyph from
 `ttf.load` beside the same glyph from the atlas, a translucent comb tall enough to split into
 bands over a bright bar, so a row blended twice would show, and a shape morphing from a circle
-to a rounded square on the `frame` event's delta. Space runs the clock, and 1 to 5 pick a
+to a rounded square on the `frame` event's delta. Space runs the clock, and 1 to 6 pick a
 page: the shapes, one `&` an em of the window's height / 1.08, a single band at the
-48-segment cap over the whole window, display text as outlines, and folds. Pressing 4 again
+48-segment cap over the whole window, display text as outlines, folds, and dashes. Pressing 4 again
 steps the display page's three views: `title` ("Patchwork" at 200 px, each letter rocking and
 pulsing on its own `Transform`), `write` (a wrapped paragraph written on glyph by glyph, one
 every 3 frames, which Space starts over), and `sizes` (a word as outlines beside atlas text at
@@ -1499,8 +1502,11 @@ every 3 frames, which Space starts over), and `sizes` (a word as outlines beside
 36 of Tapestry's combs, three spikes as one polyline whose middle spike turns back at a chunk
 seam (exactly, or landing 0.05 or 0.4 px off), in six rows of width and six sub-pixel offsets,
 each above the same spike drawn as one chunk: the two must match pixel for pixel, and before
-step 62 up to 387 pixels did not. Scenarios `still`, `morph`, `glyph`, `curtain`,
-`folds`, `title`, `write`, and `sizes`.
+step 62 up to 387 pixels did not. The dashes page (step 65) draws a line at 10 on, 5 off,
+dots, an L whose dash ends at its corner, a hairpin, a sagging cable of several chunks, a
+right-angle route with rounded corners, a dashed hexagon fitted to its ring, and a long cable
+whose dashes flow at 40 px a second while Space runs the clock. Scenarios `still`, `morph`,
+`glyph`, `curtain`, `folds`, `dashes`, `dash-flow`, `title`, `write`, and `sizes`.
 
 ### 13. Touch (`examples/touch/app.zig`)
 
@@ -1683,7 +1689,9 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
 - **Pixel cache.** A viewed batch maps its bounds through the view and folds the view into
   its key, so a pan or zoom dirties exactly the canvas's tiles; a still canvas is skipped or
   cached like anything else.
-- **Paths.** `draw.path.cubic` flattens by the on-screen length (`view_zoom`).
+- **Paths.** `draw.path.cubic` flattens by the on-screen length (`view_zoom`). Widths and dash
+  lengths are world pixels, so dashes scale with the zoom; a pattern that shimmers far out is
+  the app's level of detail to drop.
 
 ## Data From Another Thread
 
@@ -1973,7 +1981,8 @@ buffer, and texture bind group sets are skipped when the previous batch already 
 exact op sequences are locked by the tests in `src/draw/renderer.zig` and "rack frames record
 the step 16 op sequences" in `examples/sound/rack.zig`. The path point pool follows the same
 rule with its own shadow: a rebuilt path whose shape is unchanged writes no points, and a
-recolored one writes its `Path` records only.
+recolored one writes its `Path` records only, as does a dashed one whose dash offset moved
+(flow).
 
 ### Pixel Cache
 
@@ -2225,6 +2234,7 @@ areas, 32 turtle entries, and, in safe builds only, a duplicate-id table of 12 b
 
 ```zig
 const stroke: draw.path.Stroke = .{ .color = color, .width = 4, .hover = 0 };
+const dashed: draw.path.Stroke = .{ .color = color, .width = 3, .hover = 0, .dash = .{ .on = 10, .off = 5 } };
 const placed = draw.path.cubic(cx.drawing(), .{ p0, p1, p2, p3 }, stroke, clip);  // ?Placed
 _ = draw.path.polyline(cx.drawing(), &points, stroke, clip);
 _ = draw.path.plot(cx.drawing(), &samples, rect, .{ lo, hi }, stroke, clip);
@@ -2235,7 +2245,7 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 
 - **Flattening.** A cubic gets `clamp(ceil(((chord + control polygon) / 2) / 6), 4, 64)`
   segments.
-- **Chunks.** Each `Path` instance (80 bytes) covers a chunk of at most 16 points of the point
+- **Chunks.** Each `Path` instance (96 bytes) covers a chunk of at most 16 points of the point
   pool, and its fragment takes the minimum distance over the chunk's segments, so joints
   inside a chunk blend once. Chunks share their end point by index (no point is stored
   twice), hold at least four segments, and stop growing past `chunk_area_max` square pixels
@@ -2253,6 +2263,18 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   plotted |sin| at its zeros) lost single pixels inside its stroke, and sharp seam corners
   dropped or doubled pixels beyond the seam point. A fragment within that placement
   difference of the line can still miss, at the rate the bisector had before.
+- **Dashes.** `Stroke.dash` (`draw.path.Dash`: `on`, `off`, `offset`, in logical pixels, world
+  pixels on a canvas) draws the on-parts of the pattern along the flattened polyline: at arc
+  length `s` the phase is `mod(s + offset, on + off)`, on where it is at most `on`. Dashes
+  have round caps, as the stroke has, so a dash of `on` covers `on + width`, `on = 0` draws dots
+  `off` apart, and a dash across a corner is one round join. `offset` shifts the pattern toward
+  the start as SVG's `stroke-dashoffset` does; lowering it on each `frame` event (wrapped to the
+  period) makes the dashes flow toward the path's end, and rewrites the chunks' records only.
+  `polygon` scales the pattern so a whole number of periods fits the ring, so a ring has no
+  short dash at its start and flows seamlessly. Ownership at seams is the solid rule, and each
+  chunk measures its neighbours' dashes, so a dash across a seam draws once. A null `dash` is
+  the solid stroke, drawn exactly as before (step 65); `widgets.kit.stroke` draws solid. Hit
+  areas measure the whole polyline, so a gap hits.
 - **Oriented quads.** A chunk's `rect` is its axis-aligned bounds, but it rasterizes a
   rectangle along its chord (first to last point), padded by half the width plus one logical
   pixel (`Path.vertex`). On the live screen's stress text the curves' boxes covered 0.98
@@ -2271,8 +2293,8 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   two chunks of which the second is one segment: up to 15 segments it is one chunk, beyond that
   its first chunk ends a point earlier (step 62).
 
-The CPU twins (`distance_to_polyline`, `oriented_quad`, `chunk_alpha`, `seam_side`,
-`draw.sdf_segment`) check the shader's math, the chunk rects and quads, and the seam blending
+The CPU twins (`distance_to_polyline`, `distance_to_dashes`, `oriented_quad`, `chunk_alpha`,
+`seam_side`, `draw.sdf_segment`) check the shader's math, the chunk rects and quads, and the seam blending
 without a GPU.
 
 ## Fills

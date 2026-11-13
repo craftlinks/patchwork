@@ -2,8 +2,10 @@
 # adapter: Intel(R) Graphics (RPL-S)
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
-scenario  hash
-pan       41eba3ac82642617
-still     41eba3ac82642617
-zoom      41eba3ac82642617
-zoomed    5a3e45c2949e85a7
+scenario     hash
+dashed-zoom  4099dbde80dc1226
+flow         e3cdae73e72c833a
+pan          41eba3ac82642617
+still        41eba3ac82642617
+zoom         41eba3ac82642617
+zoomed       5a3e45c2949e85a7

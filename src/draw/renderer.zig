@@ -3258,6 +3258,22 @@ const PathFixture = struct {
         } };
         _ = draw.path.cubic(cx, control, stroke, clip).?;
     }
+
+    /// The cable at `end_x` 700, dashed on 10, off 5 at `offset`.
+    fn dashed_cable(offset: f32) void {
+        const cx = &context;
+        cx.text.scale_120 = 120;
+        cx.reset();
+        const stroke: draw.path.Stroke = .{
+            .color = .{ 1, 0.5, 0, 0.85 },
+            .width = 4,
+            .hover = 0,
+            .dash = .{ .on = 10, .off = 5, .offset = offset },
+        };
+        const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+        const control = [4]draw.Point{ .{ 100, 100 }, .{ 300, 260 }, .{ 500, 260 }, .{ 700, 100 } };
+        _ = draw.path.cubic(cx, control, stroke, clip).?;
+    }
 };
 
 // Locks the point buffer's setup: a registry with a `reads_points` type creates a storage
@@ -3342,6 +3358,30 @@ test "points upload by range and a recolor writes no points" {
     PathFixture.record();
     const moved = writes(&PathFixture.buffer, &write_storage);
     try testing.expectEqual(r.points_buffer, moved[moved.len - 1].id);
+}
+
+// Locks flow (`draw/path.zig`, section 4b): moving a dashed cable's offset rewrites its chunks'
+// records, one range of the Path instance buffer covering every chunk, and no point, and `Path`
+// is not an animated type, so a still dashed path lets the app go idle.
+test "a dash offset writes records, not points" {
+    comptime assert(!registry.animated(types.Path));
+    PathFixture.context.init();
+    PathFixture.renderer.init();
+    PathFixture.buffer = .init();
+    PathFixture.renderer.setup(&PathFixture.buffer, &PathFixture.context);
+    const r = &PathFixture.renderer.resources;
+    var write_storage: [8]commands.BufferWrite = undefined;
+    PathFixture.dashed_cable(0);
+    PathFixture.record();
+    try testing.expectEqual(@as(usize, 3), writes(&PathFixture.buffer, &write_storage).len);
+    const chunks = PathFixture.context.items(types.Path).len;
+    try testing.expect(chunks >= 2);
+    PathFixture.dashed_cable(1);
+    PathFixture.record();
+    const flowed = writes(&PathFixture.buffer, &write_storage);
+    try testing.expectEqual(@as(usize, 1), flowed.len);
+    try testing.expectEqual(r.instance_buffers[1], flowed[0].id);
+    try testing.expectEqual(chunks * @sizeOf(types.Path), flowed[0].data.len);
 }
 
 const backdrop_draw = [_]registry.DrawType{
