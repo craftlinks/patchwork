@@ -1,10 +1,13 @@
 //! The consumer's tool: its own `main` over `Offscreen(App)`, which draws the app at a time it is
 //! given and measures the frame. `addTool` links only libwgpu_native, so `linked.keysym` can
-//! resolve only through the peer's module, and the run proves the link.
+//! resolve only through the peer's module, and the run proves the link. The app's 500 ms timer
+//! runs, and the one frame is drawn with `.ticks = .collapse`, so a time far into the app owes
+//! no ticks and the timer is called once.
 //!
 //! ```text
 //! consumer-tool <time_ms> [high|low]
-//! consumer-tool: t=1500 ms, 640x360, bar 150 px, keysym 0x71
+//! consumer-tool: t=1500 ms, 640x360, bar 150 px, keysym 0x71, timer calls 1
+//! consumer-tool: t=600000 ms, 640x360, bar 624 px, keysym 0x71, timer calls 1
 //! ```
 
 const std = @import("std");
@@ -33,26 +36,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try Off.start(.{});
     // The tool sets the app's time itself. A scrub owes a draw, as an event would.
     Off.app().time_ms = time_ms;
+    Off.context().set_timer(true);
     Off.context().redraw();
-    try Off.frame(.{ .time_ms = time_ms, .dt_ms = 0 });
+    // One frame at a time the tool picks: the ticks owed since 0 collapse into one call.
+    try Off.frame(.{ .time_ms = time_ms, .dt_ms = 0, .ticks = .collapse });
     const frame = try Off.read(.rgba, &pixels);
-    std.debug.print("consumer-tool: t={d} ms, {d}x{d}, bar {d} px, keysym 0x{x}\n", .{
+    const format = "consumer-tool: t={d} ms, {d}x{d}, bar {d} px, keysym 0x{x}, timer calls {d}\n";
+    std.debug.print(format, .{
         time_ms,
         frame.width,
         frame.height,
         bar_length(frame.bytes),
         linked.keysym("q"),
+        Off.app().timer_calls,
     });
 }
 
-/// The bar's length in device pixels: pixels of its row that differ from the row's last pixel, the
-/// background.
+/// The bar's length in device pixels: pixels of its row that differ from the background, the
+/// last pixel of the row just above the bar (a bar may run to the edge).
 fn bar_length(bytes: []const u8) u32 {
     assert(bytes.len == pixels.len);
     const row: u32 = @intFromFloat(consumer.bar_y + consumer.bar_height / 2);
     const start = row * width * 4;
     const line = bytes[start..][0 .. width * 4];
-    const background = line[line.len - 4 ..];
+    const above: u32 = @intFromFloat(consumer.bar_y - 1);
+    assert(above < row);
+    const background = bytes[(above + 1) * width * 4 - 4 ..][0..4];
     var length: u32 = 0;
     for (0..width) |x| {
         const pixel = line[x * 4 ..][0..4];
