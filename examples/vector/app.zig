@@ -14,6 +14,12 @@
 //! pulse each on its own transform, a paragraph written on glyph by glyph, and one word in outlines
 //! beside the atlas at 16, 64, and 512 px.
 //!
+//! Page 5 is folds (`draw.Path`, step 62): Tapestry's comb, three spikes as one polyline, up each
+//! and back down, so the middle spike's tip is a chunk seam where the stroke turns straight back
+//! (or lands 0.05 or 0.4 px off). Below each comb its middle spike is drawn again on its own, as
+//! one chunk, 52 px lower; the two must match pixel for pixel at any scale whose 52 px are whole
+//! device pixels. Before step 62 single pixels inside the folded spike and beside its cap did not.
+//!
 //! ## 2. Pages
 //! Digit keys pick a page, so the two cost scenarios draw one thing over the whole window:
 //! ```text
@@ -21,6 +27,7 @@
 //! 2  glyph      one '&', em = window height / 1.08: 1,000 logical px in 1920 x 1080
 //! 3  curtain    a single band at the 48-segment cap over the whole window: the worst fragment
 //! 4  display    three views, which a further press of 4 steps through: title, write, sizes
+//! 5  folds      six rows (stroke width and miss) by six sub-pixel offsets of combs
 //! ```
 //!
 //! ## 3. The Morph and the Clock
@@ -74,7 +81,7 @@ const label_style: text.Style = .{ .face = .sans, .size = 12, .color = theme.dar
 const glyph_style: text.Style = .{ .face = .sans, .size = glyph_em, .color = pink };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
-const Page = enum { shapes, glyph, curtain, display };
+const Page = enum { shapes, glyph, curtain, display, folds };
 
 /// The views of the display page, in the order key 4 steps through them.
 const View = enum { title, write, sizes };
@@ -119,7 +126,7 @@ pub const App = struct {
         .draw = &.{
             .{ .type = quads.Box, .cap = 16 },
             .{ .type = quads.Fill, .cap = 512 },
-            .{ .type = quads.Path, .cap = 96 },
+            .{ .type = quads.Path, .cap = 128 },
             .{ .type = quads.Glyph, .cap = 256 },
         },
         .batch_order = .registered,
@@ -147,6 +154,12 @@ pub const App = struct {
             .setup = &.{ .{ .key = .{ .key = .other, .text = "3" } }, .{ .wait = 3 } },
             .cycle = &.{.{ .wait = 1 }},
             .frames = 300,
+        },
+        .{
+            .name = "folds",
+            .setup = &.{ .{ .key = .{ .key = .other, .text = "5" } }, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 10,
         },
         .{
             .name = "title",
@@ -208,6 +221,7 @@ pub const App = struct {
                     '1' => app.page = .shapes,
                     '2' => app.page = .glyph,
                     '3' => app.page = .curtain,
+                    '5' => app.page = .folds,
                     '4' => {
                         const next: View = if (app.page != .display) .title else switch (app.view) {
                             .title => .write,
@@ -230,7 +244,7 @@ pub const App = struct {
         if (!app.running) return false;
         return switch (app.page) {
             .shapes => true,
-            .glyph, .curtain => false,
+            .glyph, .curtain, .folds => false,
             .display => switch (app.view) {
                 .title => true,
                 .write => app.write_s < write_end_s(),
@@ -255,6 +269,7 @@ pub const App = struct {
             .shapes => app.draw_shapes(cx, clip),
             .glyph => draw_big_glyph(cx, clip),
             .curtain => draw_curtain(cx, clip),
+            .folds => draw_folds(cx, clip),
             .display => switch (app.view) {
                 .title => app.draw_title(cx, clip),
                 .write => app.draw_write(cx, clip),
@@ -427,6 +442,53 @@ fn draw_hexagon(cx: *Context, centre: Point, clip: Clip) void {
     }
     const stroke: quads.path.Stroke = .{ .color = orange, .width = 3, .hover = 0 };
     _ = quads.path.polygon(cx.drawing(), &points, stroke, clip);
+}
+
+/// The rows of the folds page: a stroke width and how far the spike's way down lands from its
+/// way up, 0 turning straight back along itself.
+const fold_rows = [_]struct { width: f32, miss: f32 }{
+    .{ .width = 2, .miss = 0 },
+    .{ .width = 3, .miss = 0 },
+    .{ .width = 5, .miss = 0 },
+    .{ .width = 2.5, .miss = 0.05 },
+    .{ .width = 3, .miss = 0.4 },
+    .{ .width = 5, .miss = 0.05 },
+};
+/// The columns' sub-pixel offsets, so a spike lies on pixel centres and between them.
+const fold_phases = [_]f32{ 0, 0.25, 0.5, 0.75, 0.125, 0.3 };
+const fold_spike: f32 = 40;
+const fold_row_pitch: f32 = 110;
+const fold_column_pitch: f32 = 140;
+/// How far below its comb a middle spike is drawn again on its own.
+const fold_alone_dy: f32 = 52;
+
+/// Tapestry's comb (Patchwork step 62): three spikes as one polyline, up and back down each,
+/// so the middle spike's tip is a chunk seam where the stroke turns back. Below each, the
+/// middle spike drawn alone as one chunk: the two must match pixel for pixel.
+fn draw_folds(cx: *Context, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    const band: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+    const title = "folds: a stroke turning back at a chunk seam, above the same spike drawn alone";
+    text.place(draw_cx, title_style, title, band, clip, left);
+    for (fold_rows, 0..) |row, row_index| {
+        for (fold_phases, 0..) |phase, column| {
+            const x0 = 40 + @as(f32, @floatFromInt(column)) * fold_column_pitch + phase;
+            const base = 96 + @as(f32, @floatFromInt(row_index)) * fold_row_pitch + phase;
+            const top = base - fold_spike;
+            var comb: [9]Point = undefined;
+            for (0..3) |spike| {
+                const x = x0 + @as(f32, @floatFromInt(spike)) * fold_spike;
+                comb[3 * spike] = .{ x, base };
+                comb[3 * spike + 1] = .{ x, top };
+                comb[3 * spike + 2] = .{ x + row.miss, base };
+            }
+            const stroke: quads.path.Stroke = .{ .color = orange, .width = row.width, .hover = 0 };
+            _ = quads.path.polyline(draw_cx, &comb, stroke, clip);
+            const below = base + fold_alone_dy;
+            const alone = [_]Point{ .{ comb[3][0], below }, .{ comb[4][0], below - fold_spike }, .{ comb[5][0], below } };
+            _ = quads.path.polyline(draw_cx, &alone, stroke, clip);
+        }
+    }
 }
 
 /// The comb, translucent over a bright bar, so a row blended twice shows as a stripe.
@@ -658,6 +720,30 @@ test "the write-on runs, finishes, and sleeps" {
     try std.testing.expect(ui.animate(App, app, cx, 16));
     send(app, .{ .key_down = input.key_press(.other, .none, false, "4") });
     try std.testing.expect(!ui.animate(App, app, cx, 16));
+}
+
+// Locks the folds page: no stroke is refused at 1x or 2x, and each comb's first chunk ends at
+// its middle spike's tip (5 points), so the stroke turns back at a seam, while the spike drawn
+// alone below it is one chunk of 3 points.
+test "the folds page turns every comb back at a seam" {
+    const app = new_app();
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "5") });
+    try std.testing.expectEqual(Page.folds, app.page);
+    for ([_]u32{ 120, 240 }) |scale_120| {
+        const cx = &fixture.context;
+        cx.redraw();
+        assert(ui.draw_frame(App, app, cx, 1280, 720, scale_120));
+        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+        const chunks = cx.draw.items(quads.Path);
+        try std.testing.expectEqual(fold_rows.len * fold_phases.len * 3, chunks.len);
+        var index: usize = 0;
+        while (index < chunks.len) : (index += 3) {
+            try std.testing.expectEqual(@as(f32, 5), chunks[index].point_count);
+            try std.testing.expectEqual(@as(f32, 1), chunks[index].next);
+            try std.testing.expectEqual(@as(f32, 1), chunks[index + 1].prev);
+            try std.testing.expectEqual(@as(f32, 3), chunks[index + 2].point_count);
+        }
+    }
 }
 
 // Locks the comb's bands, the seam the translucent golden shows: at least three, whose rects meet.

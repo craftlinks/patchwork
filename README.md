@@ -54,7 +54,7 @@ zig build serve-audio         # the meters and scope in the browser; Space plays
 | `column` | One scrolling view of mixed controls |
 | `live` | Code editor with syntax colors |
 | `session` | Live-coding screen, rebuilt from photos with the public API only |
-| `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph; text as outlines |
+| `vector` | Filled shapes on the GPU: stars, a ring, a glyph outline, a morph; text as outlines; strokes folded at a seam |
 | `touch` | Multi-touch: ten fingers on pads and sliders, a pinch box |
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
 | `audio` | Audio meters, scope, and XY trace of Thrum's test tone (in `examples/sound`) |
