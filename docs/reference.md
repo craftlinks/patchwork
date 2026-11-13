@@ -1847,6 +1847,24 @@ ticks fire only as time passes the next multiple of the period, and the app is n
 a caller that scrubs keeps its state outside the app timer. `read` is separate because a caller
 may draw many frames and read one; it blocks until the GPU has caught up.
 
+**Timer ticks.** A frame fires the app timer's ticks owed since the last frame as its `.ticks`
+says:
+
+- `.each` (the default, and what `--regress` and `--render` use): one `App.timer` call per period
+  passed, each at its own multiple of the period, so frames at a steady rate replay the same way
+  every run. At most `bench.ticks_per_frame_max` (128) may be owed to one frame. More is
+  `error.TooManyTicks`, refused before any tick fires or anything draws, so the app is as it was,
+  with a log line that names the ticks owed, the limit, and `.collapse`.
+- `.collapse`: a window's rule. A window's timer is a wake, not a count: after missed periods it
+  calls `App.timer` once, at the current time. So does this frame, at its `time_ms`, however
+  many ticks are owed, and none is owed after. A tool that draws one frame at a time it picks
+  uses it: with a 500 ms timer, a first frame at 600 s owes 1,200 ticks, which `.each` refuses
+  and `.collapse` draws in one call.
+
+```zig
+try Off.frame(.{ .time_ms = 600_000, .dt_ms = 0, .ticks = .collapse });
+```
+
 ## Time for a Transport
 
 A transport, a timeline that plays and stops, follows frames, not `timer_period_ms`: period 0,
