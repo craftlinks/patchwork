@@ -32,7 +32,9 @@
 //! `TextFieldOf(skins.Default)`); the selection band, the glyphs offset by `-scroll_x` and
 //! clipped to the inner box, and while focused a steady caret one device pixel wide snapped to
 //! the device grid. It never blinks, so a focused field keeps the host asleep. Measuring the
-//! caret is O(bytes), at most 256 per drawn frame.
+//! caret is O(bytes), at most 256 per drawn frame. The caret and the band's edges are
+//! `origin + measure(prefix)`, and `measure` is additive with tracking too (the pen after the
+//! prefix), so over letter-spaced text the caret still lands where the next glyph starts.
 //!
 //! ## 5a. Hint and Icon
 //! `hint` is drawn in the field's `style` at `hint_alpha` while the field is empty, focused or
@@ -735,4 +737,37 @@ test "an icon moves the text start" {
         .{ .x = 0, .y = 0, .width = 106, .height = 24 },
         field_icon_w,
     ).width);
+}
+
+// Locks a field over tracked text (section 5): mono 10 at 0.25 holding "abc" in a 106 px field
+// (inner x 6) steps 8.5 px a codepoint, so a press at 18.8 puts the caret at 2 and one at 18.7
+// at 1; the caret drawn at 2 is at x 23 (6 + 17), the pen of "c"; Shift+Home then selects a
+// band from x 6 to 23.
+test "a tracked field's caret and press agree with its glyphs" {
+    const cx = test_context();
+    const spaced: text.Style = .{
+        .face = .mono,
+        .size = 10,
+        .color = .{ 1, 1, 1, 1 },
+        .tracking = 0.25,
+    };
+    var field = TextField.init(ui.id("field", 0), edit.field_cap, spaced);
+    field.load("abc");
+    focused_field(cx, &field);
+    _ = send(cx, &field, click_at(18.7, 0));
+    _ = send(cx, &field, release_at(18.7, 0));
+    try testing.expectEqual(@as(u32, 1), field.edit.caret);
+    _ = send(cx, &field, click_at(18.8, 1000));
+    _ = send(cx, &field, release_at(18.8, 1000));
+    try testing.expectEqual(@as(u32, 2), field.edit.caret);
+    drawn_field(cx, &field);
+    const boxes = cx.draw.items(quads.Box);
+    try testing.expectEqual(@as(f32, 23), boxes[boxes.len - 1].rect[0]);
+    var shift = input.Mods.none;
+    shift.shift = true;
+    _ = send(cx, &field, chord(.home, shift));
+    drawn_field(cx, &field);
+    const band = cx.draw.items(quads.Box)[1];
+    try testing.expectEqual(@as(f32, field_padding_x), band.rect[0]);
+    try testing.expectEqual(@as(f32, 23), band.rect[0] + band.rect[2]);
 }

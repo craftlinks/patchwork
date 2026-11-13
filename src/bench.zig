@@ -841,6 +841,31 @@ pub const Clock = struct {
         self.next_ms += self.period_ms;
         return at;
     }
+
+    /// How many ticks `due` would return by `t_ms`: 0 while the timer is off, since `due` skips
+    /// those, and 0 for a time before the next tick.
+    pub fn owed(self: *const Clock, t_ms: u64, on: bool) u64 {
+        if (self.period_ms == 0) return 0;
+        assert(self.next_ms % self.period_ms == 0);
+        if (!on) return 0;
+        if (self.next_ms > t_ms) return 0;
+        const count = (t_ms - self.next_ms) / self.period_ms + 1;
+        assert(count >= 1);
+        return count;
+    }
+
+    /// Moves past every tick due by `t_ms`, as one: true when any was due while the timer is
+    /// on, so the caller makes one timer call for all of them (`host/offscreen.zig`,
+    /// `Ticks.collapse`). While the timer is off they are skipped as `due` skips them.
+    pub fn collapse(self: *Clock, t_ms: u64, on: bool) bool {
+        if (self.period_ms == 0) return false;
+        assert(self.next_ms % self.period_ms == 0);
+        if (self.next_ms > t_ms) return false;
+        self.next_ms = (t_ms / self.period_ms + 1) * self.period_ms;
+        assert(self.next_ms > t_ms);
+        assert(self.next_ms % self.period_ms == 0);
+        return on;
+    }
 };
 
 /// Which adapter the native host asks wgpu for.
@@ -1991,6 +2016,28 @@ test "the simulated clock fires timers at multiples of their period" {
     try testing.expectEqual(@as(?u64, 132), paused.due(133, true));
     var none: Clock = .init(0);
     try testing.expectEqual(@as(?u64, null), none.due(1000, true));
+}
+
+// Locks the count of ticks owed and their collapse: a 500 ms clock owes 1,200 ticks by 600 s,
+// none while it is off or before its first tick; collapsing them at 600 s reports one call and
+// leaves the next tick at 600.5 s, and collapsing again at 600 s reports none. Off, a collapse
+// skips the ticks and reports no call, as `due` skips them.
+test "a clock counts and collapses the ticks owed" {
+    var clock: Clock = .init(500);
+    try testing.expectEqual(@as(u64, 0), clock.owed(499, true));
+    try testing.expectEqual(@as(u64, 1), clock.owed(500, true));
+    try testing.expectEqual(@as(u64, 1_200), clock.owed(600_000, true));
+    try testing.expectEqual(@as(u64, 0), clock.owed(600_000, false));
+    try testing.expect(clock.collapse(600_000, true));
+    try testing.expectEqual(@as(u64, 0), clock.owed(600_000, true));
+    try testing.expect(!clock.collapse(600_000, true));
+    try testing.expectEqual(@as(?u64, 600_500), clock.due(600_700, true));
+    try testing.expect(!clock.collapse(601_200, false));
+    try testing.expectEqual(@as(?u64, null), clock.due(601_499, true));
+    try testing.expectEqual(@as(?u64, 601_500), clock.due(601_500, true));
+    var none: Clock = .init(0);
+    try testing.expectEqual(@as(u64, 0), none.owed(600_000, true));
+    try testing.expect(!none.collapse(600_000, true));
 }
 
 comptime {

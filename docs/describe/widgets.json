@@ -19,8 +19,8 @@
 {"name":"widgets.kit.down_duration_ms","doc":"Wall time for the press darken to travel the unit range.","file":"src/widgets/kit.zig","type":"f32","value":"50"},
 {"name":"widgets.kit.hover_rate_per_ms","doc":"Fraction of the unit range covered in one millisecond of hover.","file":"src/widgets/kit.zig","type":"f32","value":"0.01"},
 {"name":"widgets.kit.down_rate_per_ms","doc":"Fraction of the unit range covered in one millisecond of press.","file":"src/widgets/kit.zig","type":"f32","value":"0.02"},
-{"name":"widgets.kit.name_style","doc":"The dark scheme's control names beside a ring, meter, or pill.","file":"src/widgets/kit.zig","type":"text.Style","value":".{.face=.sans,.size=16,.color=.{0.86,0.87,0.84,1}}"},
-{"name":"widgets.kit.value_style","doc":"The dark scheme's knob value readouts: monospace, so the digits do not shift as the value changes.","file":"src/widgets/kit.zig","type":"text.Style","value":".{.face=.mono,.size=16,.color=.{0.86,0.87,0.84,1}}"},
+{"name":"widgets.kit.name_style","doc":"The dark scheme's control names beside a ring, meter, or pill.","file":"src/widgets/kit.zig","type":"text.Style","value":".{.face=.sans,.size=16,.color=.{0.86,0.87,0.84,1},.tracking=0}"},
+{"name":"widgets.kit.value_style","doc":"The dark scheme's knob value readouts: monospace, so the digits do not shift as the value changes.","file":"src/widgets/kit.zig","type":"text.Style","value":".{.face=.mono,.size=16,.color=.{0.86,0.87,0.84,1},.tracking=0}"},
 {"name":"widgets.kit.centered","doc":"Text centered on both axes, without an ellipsis.","file":"src/widgets/kit.zig","type":"text.Options","value":".{.align_x=.center,.align_y=.center,.ellipsis=false}"},
 {"name":"widgets.kit.chevron_width","doc":"A chevron's stroke width.","file":"src/widgets/kit.zig","type":"f32","value":"2"}],
 "functions":[

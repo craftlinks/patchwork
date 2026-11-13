@@ -1158,8 +1158,8 @@ pub const Default = struct {
     }
 
     /// The header in `colors.track` (lightened by hover) with a one-pixel `colors.focus` border
-    /// while focused, the chevron in its left cell turned by `turn`, and the label in the name
-    /// style's bold face. The header is the hit shape.
+    /// while focused, the chevron in its left cell turned by `turn`, and the label in the
+    /// scheme's heading style. The header is the hit shape.
     pub fn disclosure(cx: anytype, look: DisclosureLook) ?Shape {
         assert(look.turn >= 0 and look.turn <= 1);
         assert(look.rect.width > 0);
@@ -1187,10 +1187,8 @@ pub const Default = struct {
             .width = @max(0, look.rect.width - start),
             .height = look.rect.height,
         };
-        var style = scheme.name;
-        style.face = .sans_bold;
         if (label.width > 0) {
-            kit.label(cx, style, look.label, label, look.clip, checkbox_text_options);
+            kit.label(cx, scheme.heading, look.label, label, look.clip, checkbox_text_options);
         }
         return .{ .rect = look.rect, .radius = radius };
     }
