@@ -39,7 +39,8 @@
 //! widgets/kit.zig         append, face, arc, label, paragraph, step, aim, weight, clicked,
 //!                         Interaction, Paint, the hover and press constants, the shared text
 //!                         styles
-//! widgets/skin.zig        the look structs, Shape, skins.check, and skins.Default
+//! widgets/skin.zig        the look structs, Shape, skins.check, skins.Default, and
+//!                         skins.Segmented
 //! widgets/label.zig       Label
 //! widgets/paragraph.zig   Paragraph: text wrapped to its width, a fit height for that width
 //! widgets/panel.zig       Panel
@@ -52,7 +53,8 @@
 //! widgets/text_field.zig  TextField
 //! widgets/menu.zig        Menu and ContextMenu: a list in a popup (`ui/popup.zig`)
 //! widgets/dropdown.zig    Dropdown: a face and its Menu
-//! widgets/tooltip.zig     Tooltip: one line after a hover dwell, on the tooltip layer
+//! widgets/tooltip.zig     Tooltip and TooltipOf: one line after a hover dwell, on the tooltip
+//!                         layer, its face and text drawn by the skin
 //! widgets/tabs.zig        Tabs: a bar of tabs over a page the app draws, or alone (Segmented)
 //! widgets/splitter.zig    Splitter: two panes and a draggable divider, begin/next/end
 //! widgets/dock.zig        Dock: panels in a tree of splits and tab sets; drop zones, save/load
@@ -87,8 +89,10 @@
 //! Every widget but `Label` is generic over a skin, a struct of draw functions passed at
 //! compile time (`widgets/skin.zig`): `KnobOf(Skin)`, `ButtonOf`, `SliderOf`, `ToggleOf`,
 //! `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face only), `MenuOf`, `DropdownOf`,
-//! `TabsOf`, `SplitterOf`, `ListBoxOf`, and `NumberBoxOf`. The plain names are the default
-//! skin, `Knob = KnobOf(skins.Default)`, and draw exactly what they drew before skins. A skin
+//! `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TooltipOf`, and the later ones in
+//! `widgets/skin.zig`'s table. The plain names are the default skin, `Knob =
+//! KnobOf(skins.Default)`, and draw exactly what they drew before skins. `skins.Default` takes
+//! its corners and strokes from the scheme's form (`theme.zig`, section 8). A skin
 //! gets a look struct of values and returns the hit shape; a missing or mistyped function is
 //! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
 //!
@@ -186,6 +190,7 @@ pub const HeaderCellLook = skins.HeaderCellLook;
 pub const WindowButtonLook = skins.WindowButtonLook;
 pub const WindowButtonKind = skins.WindowButtonKind;
 pub const MenuTitleLook = skins.MenuTitleLook;
+pub const TooltipLook = skins.TooltipLook;
 
 pub const Label = label.Label;
 pub const Paragraph = paragraph.Paragraph;
@@ -276,6 +281,7 @@ pub const Dropdown = dropdown.Dropdown;
 pub const DropdownOf = dropdown.DropdownOf;
 
 pub const Tooltip = tooltip.Tooltip;
+pub const TooltipOf = tooltip.TooltipOf;
 pub const Tip = tooltip.Tip;
 pub const tooltip_delay_ms = tooltip.tooltip_delay_ms;
 pub const tooltip_text_cap = tooltip.tooltip_text_cap;

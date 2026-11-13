@@ -29,6 +29,7 @@ const Walk = kit.Walk;
 pub const meter_height: f32 = 160;
 pub const meter_track_w: f32 = 12;
 pub const meter_track_h: f32 = 144;
+/// The default form's corner (`meter_track_w * capsule`); the default skin reads the app's.
 pub const meter_radius: f32 = 6;
 
 /// The default meter: `MeterOf(skins.Default)`, a capsule level column.

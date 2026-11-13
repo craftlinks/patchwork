@@ -9,19 +9,29 @@
 //! exactly once and a loop over a slice is bounded by its length.
 //!
 //! ## 2. Line Algebra (logical pixels)
-//! For runs `R_i` with em sizes `s_i` and faces of `units_per_em` `u_i`:
+//! For runs `R_i` with em sizes `s_i`, faces of `units_per_em` `u_i`, and tracking `k_i` (ems):
 //! ```text
-//! width    = sum over codepoints of advance_units * s_i / u_i
+//! t_i      = k_i * s_i                                text.tracking_px, per run
+//! step     = advance + t_i                            every codepoint, spaces and the ellipsis
+//! measure  = (sum of advance_units) * s_i / u_i + count * t_i       per run: the pen after it,
+//!                                                     so measure(a ++ b) = measure(a) + measure(b)
+//! width    = sum_i measure(R_i)
+//! extent   = width - t_last                           (0 when empty) the last gap hangs
 //! ascent   = max_i(ascent_units_i * s_i / u_i)       descent likewise (positive)
-//! pen_x    = rect.x + offset(align_x, rect.width - width)
+//! pen_x    = rect.x + offset(align_x, rect.width - extent)
 //! top      = rect.y + offset(align_y, rect.height - (ascent + descent))
 //! baseline = top + ascent
 //! offset(start, gap) = 0, offset(center, gap) = gap / 2, offset(end, gap) = gap
 //! ```
-//! Mixed sizes share the one baseline. With `ellipsis` and `width > rect.width`, the line is
-//! cut before the first codepoint at which the kept width plus the ellipsis advance (in the
-//! style of the run being cut) would exceed `rect.width`, and U+2026 is appended; the cut
-//! width replaces `width` in the alignment. If not even the ellipsis fits, nothing is drawn.
+//! `t_last` is the tracking of the run holding the line's last codepoint (`Extent.hang`), so
+//! spaced text centres on its ink run. `measure` sums whole font units and converts once, then
+//! adds `count * t`: at tracking 0 every term added is `+ 0.0`, and every width is the
+//! untracked one bit for bit. Tracking is never negative (`[0, text.tracking_max]`), so every
+//! step is at least 0 and the pen never goes back. Mixed sizes share the one baseline. With
+//! `ellipsis` and `extent > rect.width`, the line is cut before the first codepoint at which
+//! the kept pen (tracked) plus the ellipsis advance (in the style of the run being cut, its own
+//! gap hanging) would exceed `rect.width`, and U+2026 is appended; the cut width replaces
+//! `extent` in the alignment. If not even the ellipsis fits, nothing is drawn.
 //!
 //! ## 2b. Wrapping
 //! `Lines` walks runs and cuts them into lines no wider than `width` (at least 0), greedily.
@@ -34,7 +44,9 @@
 //! U+000A ends the line (U+000D directly before it is dropped with it); a text ending in it
 //! ends with one empty line, and empty text has no lines. A line takes every segment (text up
 //! to and including the next opportunity) that fits, comparing with `<=`. Trailing spaces
-//! hang: they are in neither the line's `end` nor its width. A segment that does not fit an
+//! hang: they are in neither the line's `end` nor its width. A tracked line's last gap hangs
+//! with them: the fit compares the pen plus the next advance, without its gap, and
+//! `Line.width` ends at the last codepoint's ink advance. A segment that does not fit an
 //! empty line breaks before the first codepoint that does not fit, after at least one, so
 //! every line consumes a byte and `next` is bounded by the bytes.
 //!
@@ -60,7 +72,11 @@
 //! rect  = (x_dev, y_dev, width * k, height * k) / s
 //! uv    = (atlas_x, atlas_y, atlas_x + width, atlas_y + height) / atlas_side
 //! ```
-//! The pen itself advances unsnapped, so `place` and `measure` agree. Because the projection
+//! The pen itself advances unsnapped, so `place` and `measure` agree. The tracking gap adds to
+//! that unsnapped pen and is not snapped itself, so `measure` stays independent of the scale and
+//! a tracked label shares every cache entry with an untracked one (the key holds no tracking);
+//! at a fractional `t * s` the gaps differ by at most one device pixel, as fractional advances
+//! already do. Because the projection
 //! maps logical pixels to device pixels by exactly `s` (`draw.ortho_y_down`), every quad edge
 //! lands on a device pixel edge and each fragment center samples one texel center: the UVs
 //! need no half-texel inset and the gutter is never read.
@@ -87,7 +103,10 @@
 //! ```text
 //! pen[0]  = Pen.x                                  pen[1] = the baseline, unsnapped
 //! round(pen[1] * s) = Pen.baseline_px
+//! next pen[0] = pen[0] + (advance + text.tracking_px(style))     on the same line
 //! ```
+//! `Glyph.advance` is the font's advance, untracked: what an outline or a caller centring on a
+//! glyph wants.
 //! `contours` adds one glyph's outline to a `draw.fill.Builder` at `size / units_per_em`, and the
 //! `place_*_outlines` family fills each glyph as its own shape, so one refused glyph costs only
 //! itself. Neither path hints or kerns, so their advances agree. A glyph is skipped before its
@@ -153,30 +172,37 @@ pub fn decode(bytes: []const u8, index: *u32) u21 {
     return @intCast(value);
 }
 
-/// Width of `utf8` in `style`, in logical pixels. See the module guide, section 2.
+/// Width of `utf8` in `style`, in logical pixels: the pen after the text, every advance plus
+/// one tracking gap per codepoint. The font units are summed before converting, so the width
+/// at tracking 0 is the untracked one bit for bit. See the module guide, section 2.
 pub fn measure(style: text.Style, utf8: []const u8) f32 {
     assert(utf8.len <= text.byte_cap);
     assert(style.size > 0);
     const font = text.font_of(style.face);
-    const units = advance_units(font, utf8);
-    const width = units_to_logical(units, style.size, font.units_per_em);
+    const sum = advance_units(font, utf8);
+    assert(sum.count <= utf8.len);
+    const count: f32 = @floatFromInt(sum.count);
+    const width = units_to_logical(sum.units, style.size, font.units_per_em) +
+        count * text.tracking_px(style);
     assert(width >= 0);
     return width;
 }
 
 /// The codepoint boundary of `utf8` nearest to `x` logical pixels from the pen start: the
-/// index of the first codepoint whose midpoint lies right of `x`, or the end. O(bytes).
+/// index of the first codepoint whose tracked step (`advance + tracking_px`) has its midpoint
+/// right of `x`, or the end. O(bytes).
 pub fn index_at(style: text.Style, utf8: []const u8, x: f32) u32 {
     assert(utf8.len <= text.byte_cap);
     assert(x == x);
     const font = text.font_of(style.face);
+    const gap = text.tracking_px(style);
     var pen: f32 = 0;
     var index: u32 = 0;
     while (index < utf8.len) {
         const start = index;
-        const width = glyph_width(font, decode(utf8, &index), style.size);
-        if (x < pen + width * 0.5) return start;
-        pen += width;
+        const step = glyph_width(font, decode(utf8, &index), style.size) + gap;
+        if (x < pen + step * 0.5) return start;
+        pen += step;
     }
     assert(index == utf8.len);
     return index;
@@ -319,8 +345,9 @@ pub const Lines = struct {
             }
             const style = self.runs[step.at.run].style;
             const advance = glyph_width(text.font_of(style.face), codepoint, style.size);
+            const gap = text.tracking_px(style);
             if (codepoint == ' ') {
-                pen += advance;
+                pen += advance + gap;
                 consumed = true;
                 after_space = previous != null;
                 after_hyphen = false;
@@ -350,9 +377,10 @@ pub const Lines = struct {
                 0x2010, 0x2013, 0x2014 => previous != null,
                 else => false,
             };
-            pen += advance;
+            // The content ends at the ink; the gap after it hangs like a trailing space.
+            content_width = pen + advance;
+            pen = content_width + gap;
             content_end = step.next;
-            content_width = pen;
             consumed = true;
             previous = codepoint;
             after_space = false;
@@ -469,7 +497,8 @@ fn emit_span(
         const size_q = cx.text.size_key_of(run.style.size);
         var index = position.byte;
         const codepoint = decode(run.bytes, &index);
-        pen.x += emit(cx, run.style, font, size_q, codepoint, pen, clip);
+        const gap = text.tracking_px(run.style);
+        pen.x += emit(cx, run.style, font, size_q, codepoint, pen, clip) + gap;
         position.byte = index;
     }
 }
@@ -503,9 +532,10 @@ pub fn place_runs(
     assert(clip.y1 > clip.y0);
     const line = line_of(runs);
     var cut: ?Cut = null;
-    var width = line.width;
+    // The last codepoint's tracking gap hangs: it is in neither the fit nor the alignment.
+    var width = line.width - line.hang;
     if (options.ellipsis) {
-        if (line.width > rect.width) {
+        if (width > rect.width) {
             cut = cut_of(runs, rect.width);
             width = cut.?.width;
             if (!cut.?.fits) return;
@@ -524,29 +554,35 @@ pub fn place_runs(
 }
 
 const Extent = struct {
+    /// The pen after the line: the sum of the runs' `measure`.
     width: f32,
+    /// The tracking gap after the last codepoint (the last non-empty run's), which hangs.
+    hang: f32,
     ascent: f32,
     descent: f32,
 };
 
-/// Width and the shared vertical metrics of `runs`, in logical pixels.
+/// Width, hanging gap, and the shared vertical metrics of `runs`, in logical pixels.
 fn line_of(runs: []const text.Run) Extent {
-    var line: Extent = .{ .width = 0, .ascent = 0, .descent = 0 };
+    var line: Extent = .{ .width = 0, .hang = 0, .ascent = 0, .descent = 0 };
     var bytes: u32 = 0;
     for (runs) |run| {
         const font = text.font_of(run.style.face);
         const em = run.style.size / @as(f32, @floatFromInt(font.units_per_em));
         line.width += measure(run.style, run.bytes);
+        if (run.bytes.len > 0) line.hang = text.tracking_px(run.style);
         line.ascent = @max(line.ascent, @as(f32, @floatFromInt(font.ascent)) * em);
         line.descent = @max(line.descent, @as(f32, @floatFromInt(font.descent)) * em);
         bytes += @intCast(run.bytes.len);
     }
     assert(bytes <= text.byte_cap);
     assert(line.ascent > 0);
+    assert(line.hang <= line.width);
     return line;
 }
 
-/// Where a cut line stops: before byte `byte` of run `run`. `width` includes the ellipsis.
+/// Where a cut line stops: before byte `byte` of run `run`. `width` includes the ellipsis's
+/// advance but not its tracking gap, which hangs.
 const Cut = struct {
     run: u32,
     byte: u32,
@@ -554,13 +590,15 @@ const Cut = struct {
     fits: bool,
 };
 
-/// The last position whose kept width plus the ellipsis fits `limit`. See section 2.
+/// The last position whose kept width plus the ellipsis fits `limit`. The kept width is the
+/// tracked pen, so the last kept glyph's gap sits before the ellipsis. See section 2.
 fn cut_of(runs: []const text.Run, limit: f32) Cut {
     var best: Cut = .{ .run = 0, .byte = 0, .width = 0, .fits = false };
     var kept: f32 = 0;
     for (runs, 0..) |run, run_index| {
         const font = text.font_of(run.style.face);
         const ellipsis = glyph_width(font, ellipsis_char, run.style.size);
+        const gap = text.tracking_px(run.style);
         var index: u32 = 0;
         while (index < run.bytes.len) {
             if (kept + ellipsis <= limit) {
@@ -572,7 +610,7 @@ fn cut_of(runs: []const text.Run, limit: f32) Cut {
                 };
             }
             const codepoint = decode(run.bytes, &index);
-            kept += glyph_width(font, codepoint, run.style.size);
+            kept += glyph_width(font, codepoint, run.style.size) + gap;
         }
     }
     if (best.fits) assert(best.width <= limit);
@@ -592,6 +630,7 @@ fn emit_runs(cx: anytype, runs: []const text.Run, start: Pen, clip: draw.Clip, c
     for (runs, 0..) |run, run_index| {
         const font = text.font_of(run.style.face);
         const size_q = cx.text.size_key_of(run.style.size);
+        const gap = text.tracking_px(run.style);
         var index: u32 = 0;
         while (index < run.bytes.len) {
             if (cut) |c| {
@@ -601,13 +640,14 @@ fn emit_runs(cx: anytype, runs: []const text.Run, start: Pen, clip: draw.Clip, c
                 }
             }
             const codepoint = decode(run.bytes, &index);
-            pen.x += emit(cx, run.style, font, size_q, codepoint, pen, clip);
+            pen.x += emit(cx, run.style, font, size_q, codepoint, pen, clip) + gap;
         }
     }
     assert(cut == null);
 }
 
-/// Appends the glyph for `codepoint` at `pen` and returns its advance in logical pixels.
+/// Appends the glyph for `codepoint` at `pen` and returns the font's advance in logical pixels;
+/// callers add the run's tracking gap.
 fn emit(
     cx: anytype,
     style: text.Style,
@@ -661,6 +701,8 @@ pub const Glyph = struct {
     style: text.Style,
     /// The unsnapped pen and baseline, logical px.
     pen: [2]f32,
+    /// The font's advance, untracked: the next pen on the line is
+    /// `pen[0] + (advance + text.tracking_px(style))`.
     advance: f32,
     line: u32,
     /// The nth codepoint yielded, from 0.
@@ -700,8 +742,8 @@ pub const Glyphs = struct {
         assert(runs.len <= text.run_cap);
         const extent = line_of(runs);
         var self = Glyphs.empty(runs);
-        var width = extent.width;
-        if (options.ellipsis and extent.width > rect.width) {
+        var width = extent.width - extent.hang;
+        if (options.ellipsis and width > rect.width) {
             const cut = cut_of(runs, rect.width);
             if (!cut.fits) {
                 self.done = true;
@@ -813,7 +855,7 @@ pub const Glyphs = struct {
             .line = self.line_count -| 1,
             .index = self.index,
         };
-        self.pen_x += advance;
+        self.pen_x += advance + text.tracking_px(style);
         self.index += 1;
         return result;
     }
@@ -1018,16 +1060,24 @@ fn offset(alignment: text.Align, gap: f32) f32 {
     };
 }
 
-/// Sum of the advances of `utf8` in font units.
-fn advance_units(font: *const ttf.Font, utf8: []const u8) u32 {
-    var units: u32 = 0;
+/// The advances of `utf8` summed in font units, and its codepoints.
+const AdvanceSum = struct {
+    units: u32,
+    count: u32,
+};
+
+/// Sum of the advances of `utf8` in font units, and the codepoints counted.
+fn advance_units(font: *const ttf.Font, utf8: []const u8) AdvanceSum {
+    var sum: AdvanceSum = .{ .units = 0, .count = 0 };
     var index: u32 = 0;
     while (index < utf8.len) {
         const codepoint = decode(utf8, &index);
-        units += ttf.advance(font, ttf.glyph_id(font, codepoint));
+        sum.units += ttf.advance(font, ttf.glyph_id(font, codepoint));
+        sum.count += 1;
     }
     assert(index == utf8.len);
-    return units;
+    assert(sum.count <= utf8.len);
+    return sum;
 }
 
 fn glyph_width(font: *const ttf.Font, codepoint: u21, size: f32) f32 {
@@ -1171,21 +1221,27 @@ test "ellipsis cuts the line so it fits the rect" {
 }
 
 // Locks device snapping at scale 1.5: every quad edge lands on a device pixel edge, and each
-// UV rect spans exactly the quad's device size in texels (no half-texel inset).
+// UV rect spans exactly the quad's device size in texels (no half-texel inset); the same holds
+// for tracked text (sans 16 at 0.1, a 1.6 px gap, 2.4 device px), whose gap adds to the
+// unsnapped pen (section 3).
 test "glyph quads snap to the device grid at a fractional scale" {
-    const cx = test_context(180);
-    const rect: draw.Rect = .{ .x = 10.3, .y = 7.1, .width = 300, .height = 30 };
-    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
-    place(cx, sans_16, "Snap \u{e9}", rect, window, options);
-    const glyphs = cx.items(types.Glyph);
-    try testing.expectEqual(@as(usize, 5), glyphs.len);
-    for (glyphs) |glyph| {
-        for (glyph.rect) |edge| {
-            const device = edge * 1.5;
-            try testing.expectApproxEqAbs(@round(device), device, 0.001);
+    var tracked = sans_16;
+    tracked.tracking = 0.1;
+    for ([_]text.Style{ sans_16, tracked }) |style| {
+        const cx = test_context(180);
+        const rect: draw.Rect = .{ .x = 10.3, .y = 7.1, .width = 300, .height = 30 };
+        const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
+        place(cx, style, "Snap \u{e9}", rect, window, options);
+        const glyphs = cx.items(types.Glyph);
+        try testing.expectEqual(@as(usize, 5), glyphs.len);
+        for (glyphs) |glyph| {
+            for (glyph.rect) |edge| {
+                const device = edge * 1.5;
+                try testing.expectApproxEqAbs(@round(device), device, 0.001);
+            }
+            const texels_wide = (glyph.uv[2] - glyph.uv[0]) * cache.atlas_side;
+            try testing.expectApproxEqAbs(glyph.rect[2] * 1.5, texels_wide, 0.001);
         }
-        const texels_wide = (glyph.uv[2] - glyph.uv[0]) * cache.atlas_side;
-        try testing.expectApproxEqAbs(glyph.rect[2] * 1.5, texels_wide, 0.001);
     }
 }
 
@@ -1270,7 +1326,16 @@ test "line height rounds the face's line up to a whole pixel" {
 const Expected = [3]f32;
 
 fn expect_lines(utf8: []const u8, width: f32, expected: []const Expected) !void {
-    const runs = [1]text.Run{.{ .style = mono_10, .bytes = utf8 }};
+    try expect_lines_in(mono_10, utf8, width, expected);
+}
+
+fn expect_lines_in(
+    style: text.Style,
+    utf8: []const u8,
+    width: f32,
+    expected: []const Expected,
+) !void {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
     var lines = Lines.init(&runs, width);
     for (expected) |want| {
         const line = lines.next() orelse return error.TooFewLines;
@@ -1456,6 +1521,182 @@ test "a one-line wrapped text places like place" {
     }
 }
 
+/// Mono 10 at tracking 0.25: 6 px advances, a 2.5 px gap, an 8.5 px step.
+const spaced_10: text.Style = .{
+    .face = .mono,
+    .size = 10,
+    .color = .{ 1, 1, 1, 1 },
+    .tracking = 0.25,
+};
+
+/// The pens of every record `Glyphs` yields over `glyphs`, and how many.
+fn pens_of(glyphs: *Glyphs, out: []f32) !u32 {
+    var count: u32 = 0;
+    while (glyphs.next()) |glyph| {
+        if (count == out.len) return error.TooManyGlyphs;
+        out[count] = glyph.pen[0];
+        count += 1;
+    }
+    return count;
+}
+
+// Locks the rule of section 2: sans 16 "ABC" at tracking 0.1 measures the untracked width
+// (about 30.736) plus three 1.6 px gaps, about 35.536; mono 10 "abc" at 0.25 measures exactly
+// 25.5; the empty text measures 0; and `measure` is additive: "ab" 17 plus "c" 8.5.
+test "measure adds one gap per codepoint" {
+    var tracked = sans_16;
+    tracked.tracking = 0.1;
+    try testing.expectEqual(@as(f32, 1.6), text.tracking_px(tracked));
+    const want = measure(sans_16, "ABC") + 3 * text.tracking_px(tracked);
+    try testing.expectEqual(want, measure(tracked, "ABC"));
+    try testing.expectApproxEqAbs(@as(f32, 35.536), want, 0.001);
+    try testing.expectEqual(@as(f32, 25.5), measure(spaced_10, "abc"));
+    try testing.expectEqual(@as(f32, 0), measure(spaced_10, ""));
+    try testing.expectEqual(@as(f32, 17), measure(spaced_10, "ab"));
+    try testing.expectEqual(@as(f32, 8.5), measure(spaced_10, "c"));
+    try testing.expectEqual(measure(spaced_10, "ab") + measure(spaced_10, "c"), 25.5);
+}
+
+// Locks the caret hit on tracked text: mono 10 at 0.25 over "abc" has boundaries at 0, 8.5,
+// 17, and 25.5, and each step splits at its middle (4.25, 12.75, 21.25).
+test "index_at splits each tracked step at its middle" {
+    const cases = [_]struct { x: f32, index: u32 }{
+        .{ .x = 4.2, .index = 0 },  .{ .x = 4.3, .index = 1 },
+        .{ .x = 12.7, .index = 1 }, .{ .x = 12.8, .index = 2 },
+        .{ .x = 21.2, .index = 2 }, .{ .x = 21.3, .index = 3 },
+        .{ .x = 100, .index = 3 },
+    };
+    for (cases) |case| try testing.expectEqual(case.index, index_at(spaced_10, "abc", case.x));
+}
+
+// Locks prefix additivity: the caret after "AB" in sans 16 at 0.1 (`measure`, about 20.624 +
+// 3.2 = 23.824) is the pen of the third record of `Glyphs.line` over "ABC" from x = 0.
+test "a caret at byte 2 is where the third glyph starts" {
+    var tracked = sans_16;
+    tracked.tracking = 0.1;
+    const runs = [_]text.Run{.{ .style = tracked, .bytes = "ABC" }};
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 200, .height = 30 };
+    var glyphs: Glyphs = .line(&runs, rect, .{
+        .align_x = .start,
+        .align_y = .center,
+        .ellipsis = false,
+    });
+    var pens: [4]f32 = undefined;
+    try testing.expectEqual(@as(u32, 3), try pens_of(&glyphs, &pens));
+    try testing.expectApproxEqAbs(measure(tracked, "AB"), pens[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 23.824), pens[2], 0.001);
+}
+
+// Locks the hanging gap (section 2): mono 10 at 0.25, "abc" centred in 100 px has pens 38.5,
+// 47, and 55.5, its last advance ends at 61.5, so both margins are 38.5; untracked the first
+// pen is 41. `place` writes the instances of those pens.
+test "spaced text centres on its ink run" {
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 };
+    const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellipsis = false };
+    const runs = [_]text.Run{.{ .style = spaced_10, .bytes = "abc" }};
+    var glyphs: Glyphs = .line(&runs, rect, options);
+    var pens: [4]f32 = undefined;
+    try testing.expectEqual(@as(u32, 3), try pens_of(&glyphs, &pens));
+    try testing.expectEqualSlices(f32, &.{ 38.5, 47, 55.5 }, pens[0..3]);
+    try testing.expectEqual(@as(f32, 100 - 38.5), pens[2] + 6);
+    const plain = [_]text.Run{.{ .style = mono_10, .bytes = "abc" }};
+    var untracked: Glyphs = .line(&plain, rect, options);
+    try testing.expectEqual(@as(f32, 41), untracked.next().?.pen[0]);
+    const cx = test_context(120);
+    place(cx, spaced_10, "abc", rect, window, options);
+    var again: Glyphs = .line(&runs, rect, options);
+    try expect_pens(cx, &again, 1);
+}
+
+// Locks the fit on the extent (section 2): mono 10 at 0.25, "abcdef" measures 51 with extent
+// 48.5. In 48.5 px it is not cut (6 records, the last pen 42.5); in 48 px it cuts at byte 4
+// with `Cut.width` 40 ("abcd" kept, 34, plus the ellipsis's untracked 6), the ellipsis pen at
+// 34. Untracked (36 wide) it fits 48.
+test "the ellipsis cuts on the extent" {
+    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
+    const runs = [_]text.Run{.{ .style = spaced_10, .bytes = "abcdef" }};
+    try testing.expectEqual(@as(f32, 51), measure(spaced_10, "abcdef"));
+    var pens: [8]f32 = undefined;
+    var fits: Glyphs = .line(&runs, .{ .x = 0, .y = 0, .width = 48.5, .height = 20 }, options);
+    try testing.expectEqual(@as(u32, 6), try pens_of(&fits, &pens));
+    try testing.expectEqual(@as(f32, 42.5), pens[5]);
+    const cut = cut_of(&runs, 48);
+    try testing.expect(cut.fits);
+    try testing.expectEqual(@as(u32, 4), cut.byte);
+    try testing.expectEqual(@as(f32, 40), cut.width);
+    var cut_line: Glyphs = .line(&runs, .{ .x = 0, .y = 0, .width = 48, .height = 20 }, options);
+    var codepoints: [8]u21 = undefined;
+    var count: u32 = 0;
+    while (cut_line.next()) |glyph| : (count += 1) {
+        codepoints[count] = glyph.codepoint;
+        pens[count] = glyph.pen[0];
+    }
+    const kept = [_]u21{ 'a', 'b', 'c', 'd', ellipsis_char };
+    try testing.expectEqualSlices(u21, &kept, codepoints[0..count]);
+    try testing.expectEqual(@as(f32, 34), pens[4]);
+    const plain = [_]text.Run{.{ .style = mono_10, .bytes = "abcdef" }};
+    var untracked: Glyphs = .line(&plain, .{ .x = 0, .y = 0, .width = 48, .height = 20 }, options);
+    try testing.expectEqual(@as(u32, 6), try pens_of(&untracked, &pens));
+}
+
+// Locks `Extent.hang`: mono 10 runs "ab" (0.25) + "c" (0) measure 23 with extent 23, and "ab"
+// (0) + "c" (0.25) measure 20.5 with extent 18; end-aligned in 100 px, the last advance ends
+// at 100 in both. An empty last run leaves the hang to the run before it.
+test "mixed runs hang the last run's gap" {
+    const options: text.Options = .{ .align_x = .end, .align_y = .center, .ellipsis = false };
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 100, .height = 20 };
+    const first_spaced = [_]text.Run{
+        .{ .style = spaced_10, .bytes = "ab" },
+        .{ .style = mono_10, .bytes = "c" },
+    };
+    const last_spaced = [_]text.Run{
+        .{ .style = mono_10, .bytes = "ab" },
+        .{ .style = spaced_10, .bytes = "c" },
+        .{ .style = mono_10, .bytes = "" },
+    };
+    const cases = [_]struct { runs: []const text.Run, width: f32, extent: f32 }{
+        .{ .runs = &first_spaced, .width = 23, .extent = 23 },
+        .{ .runs = &last_spaced, .width = 20.5, .extent = 18 },
+    };
+    for (cases) |case| {
+        const extent = line_of(case.runs);
+        try testing.expectEqual(case.width, extent.width);
+        try testing.expectEqual(case.extent, extent.width - extent.hang);
+        var glyphs: Glyphs = .line(case.runs, rect, options);
+        var last: Glyph = glyphs.next().?;
+        while (glyphs.next()) |glyph| last = glyph;
+        try testing.expectEqual(@as(f32, 100), last.pen[0] + last.advance);
+    }
+}
+
+// Locks section 2b on tracked text, mono 10 at 0.25 as [start, end, width]: the fox at 60
+// breaks into four lines (two untracked), each width ending at its last ink advance; "ab cd"
+// fits 40 exactly (its last gap hangs) and breaks at 39; the fox at 60 is 4 lines of 14 px.
+test "tracked lines break on the extent" {
+    const fox = "the quick brown fox";
+    try expect_lines_in(spaced_10, fox, 60, &.{
+        .{ 0, 3, 23 }, .{ 4, 9, 40 }, .{ 10, 15, 40 }, .{ 16, 19, 23 },
+    });
+    try expect_lines(fox, 60, &.{ .{ 0, 9, 54 }, .{ 10, 19, 54 } });
+    try expect_lines_in(spaced_10, "ab cd", 40, &.{.{ 0, 5, 40 }});
+    try expect_lines_in(spaced_10, "ab cd", 39, &.{ .{ 0, 2, 14.5 }, .{ 3, 5, 14.5 } });
+    try testing.expectEqual(@as(f32, 56), measure_wrapped(spaced_10, fox, 60));
+}
+
+// Locks the cache key (section 3): "Hello" placed untracked and then at tracking 0.3 in one
+// frame rasterizes its 4 distinct glyphs once, not 8; tracking never reaches the cache.
+test "tracking adds no cache entry" {
+    const cx = test_context(120);
+    const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 300, .height = 30 };
+    const options: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = false };
+    var tracked = sans_16;
+    tracked.tracking = 0.3;
+    place(cx, sans_16, "Hello", rect, window, options);
+    place(cx, tracked, "Hello", rect, window, options);
+    try testing.expectEqual(@as(u32, 4), cx.text.new_count);
+    try testing.expectEqual(@as(usize, 10), cx.items(types.Glyph).len);
+}
+
 const outline_draw = [_]registry.DrawType{
     .{ .type = types.Glyph, .cap = 64 },
     .{ .type = draw.Fill, .cap = 256 },
@@ -1484,7 +1725,8 @@ fn expect_pens(cx: *TestContext, glyphs: *Glyphs, scale: f32) !void {
     while (glyphs.next()) |glyph| {
         if (previous) |before| {
             if (before.line == glyph.line) {
-                try testing.expectEqual(before.pen[0] + before.advance, glyph.pen[0]);
+                const step = before.advance + text.tracking_px(before.style);
+                try testing.expectEqual(before.pen[0] + step, glyph.pen[0]);
                 try testing.expectEqual(before.pen[1], glyph.pen[1]);
             }
             try testing.expectEqual(before.index + 1, glyph.index);
@@ -1508,14 +1750,18 @@ fn expect_pens(cx: *TestContext, glyphs: *Glyphs, scale: f32) !void {
 
 // Locks the pens of `Glyphs.line` against `place_runs` (section 3b): over a mixed run with every
 // alignment, at scales 1, 1.25, and 2, each inked record's instance is the one `place_runs`
-// appended; the ellipsis record sits where `place_runs` puts it, and a line that cannot fit even
+// appended, the last run tracked at 0.2 (each record's next pen is its untracked `advance` plus
+// the gap); the ellipsis record sits where `place_runs` puts it, and a line that cannot fit even
 // its ellipsis yields nothing.
 test "Glyphs.line walks the pens place_runs walks" {
     const big: text.Style = .{ .face = .sans_bold, .size = 21, .color = .{ 1, 0, 0, 1 } };
+    var spaced = sans_16;
+    spaced.tracking = 0.2;
     const runs = [_]text.Run{
         .{ .style = sans_16, .bytes = "Pens, " },
         .{ .style = big, .bytes = "and h\u{e9}ights " },
         .{ .style = mono_10, .bytes = "ok" },
+        .{ .style = spaced, .bytes = " SPACED" },
     };
     const rects = [_]draw.Rect{
         .{ .x = 3.3, .y = 7.1, .width = 400, .height = 40 },
@@ -1549,12 +1795,18 @@ test "Glyphs.line walks the pens place_runs walks" {
     try testing.expect(last.pen[0] < narrow.width);
     var none: Glyphs = .line(&runs, .{ .x = 0, .y = 0, .width = 1, .height = 20 }, cut);
     try testing.expectEqual(@as(?Glyph, null), none.next());
+    const tracked = [_]text.Run{.{ .style = spaced, .bytes = "AB" }};
+    var pair: Glyphs = .line(&tracked, narrow, cut);
+    const first = pair.next().?;
+    try testing.expectEqual(glyph_width(text.font_of(.sans), 'A', 16), first.advance);
+    try testing.expectEqual(first.pen[0] + (first.advance + 3.2), pair.next().?.pen[0]);
 }
 
 // Locks the pens of `Glyphs.wrapped` against `place_runs_wrapped` over the fox's four lines,
 // with start, center, and end alignment at scales 1 and 1.25 (baselines 11, 25, 39, 53 and 14,
-// 31, 49, 66 at the line); the `line` counts are 0 to 3; a trailing space hangs and a hard break
-// is dropped, so "ab cd " yields 5 records.
+// 31, 49, 66 at the line), and over the fox tracked at 0.25 in 60 px at scales 1, 1.25, and 2;
+// the `line` counts are 0 to 3; a trailing space hangs and a hard break is dropped, so
+// "ab cd " yields 5 records.
 test "Glyphs.wrapped walks the pens place_runs_wrapped walks" {
     const rect: draw.Rect = .{ .x = 0, .y = 0, .width = 30, .height = 100 };
     const runs = [_]text.Run{.{ .style = mono_10, .bytes = "nnn nnnnn nnnnn nnn" }};
@@ -1568,6 +1820,20 @@ test "Glyphs.wrapped walks the pens place_runs_wrapped walks" {
                 var glyphs: Glyphs = .wrapped(&runs, rect, options);
                 try expect_pens(cx, &glyphs, scale);
             }
+        }
+    }
+    var tracked_fox = mono_10;
+    tracked_fox.tracking = 0.25;
+    const spaced = [_]text.Run{.{ .style = tracked_fox, .bytes = "the quick brown fox" }};
+    const wide: draw.Rect = .{ .x = 0.7, .y = 0, .width = 60, .height = 100 };
+    for ([_]u32{ 120, 150, 240 }) |scale_120| {
+        const scale = @as(f32, @floatFromInt(scale_120)) / 120;
+        for ([_]text.Align{ .start, .center, .end }) |align_x| {
+            const options: text.WrapOptions = .{ .align_x = align_x, .align_y = .center };
+            const cx = test_context(scale_120);
+            place_runs_wrapped(cx, &spaced, wide, window, options);
+            var glyphs: Glyphs = .wrapped(&spaced, wide, options);
+            try expect_pens(cx, &glyphs, scale);
         }
     }
     var glyphs: Glyphs = .wrapped(&runs, rect, .{});

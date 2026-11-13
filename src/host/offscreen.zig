@@ -25,10 +25,10 @@
 //! ## 2. The Frame
 //! `frame(at)` is the windowed bench's order of work (`linux_window.zig`, sections 4 and 5c')
 //! with the time given instead of measured:
-//! 1. every app timer tick due by `at.time_ms` (`bench.Clock.due`, shared with the browser
-//!    replay): with period `p`, a tick at every multiple of `p` up to the time, oldest first,
-//!    while `cx.timer_on`, each one `App.timer` call with the tick's own time, at most
-//!    `bench.ticks_per_frame_max`; ticks that fall while the timer is off are skipped;
+//! 1. the app timer's ticks owed by `at.time_ms` (`bench.Clock`, shared with the browser
+//!    replay): with period `p`, a tick at every multiple of `p` up to the time, while
+//!    `cx.timer_on`, fired as `at.ticks` says (section 5); ticks that fall while the timer is
+//!    off are skipped;
 //! 2. `ui.animate` with `at.dt_ms`;
 //! 3. with a producer (`app.zig`, section 4e), `App.produce` with
 //!    `bench.producer_frames_at(k, fps)` frames when the app declares it, then `App.drain`, `k`
@@ -55,11 +55,27 @@
 //! caller's, and `Offscreen` never rewinds the app. The shader clock is the only thing that
 //! follows the time exactly. `fps` paces a producer only.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. What a Timer Means Offscreen
+//! A window's timer is a wake, not a count: when the loop was late, `drain_timer` makes one
+//! `App.timer` call at the current time for all the periods missed (`linux_window.zig`, section
+//! 1), and a browser's `setInterval` does not catch up either. So an app that steps a playhead
+//! per call already runs slow under load, and an app that polls (a watched file) polls once. A
+//! frame fires the ticks owed since the last one in either of two ways, `At.ticks`:
+//! - `.each` (the default, and every replay's): one call per tick at the tick's own time, so a
+//!   run of frames at a steady rate is the same run every time. At most
+//!   `bench.ticks_per_frame_max` are owed to one frame, which bounds the frame's work; more is
+//!   `error.TooManyTicks`, refused before any tick fires or anything draws, with a log line
+//!   naming the ticks owed, the limit, and `.collapse`. The app is left as it was.
+//! - `.collapse`: the window's rule. At most one call, at `at.time_ms`, however many ticks are
+//!   owed, and none owed after. A tool that draws one frame at a time it picks (a still, a sheet,
+//!   a first frame at 600 s) owes the ticks between its frames nothing.
+//! The limit is not raised: it bounds a frame's loop, and no limit covers a time a caller picks.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation: every buffer is static and sized by `App.config`; pixels go to the caller's
 //!   `out`.
-//! - Bounded loops: timer ticks by `bench.ticks_per_frame_max`; a producer's frames by
-//!   `bench.producer_frames_max`.
+//! - Bounded loops: timer ticks by `bench.ticks_per_frame_max` (`.collapse` makes one call); a
+//!   producer's frames by `bench.producer_frames_max`.
 //! - `open` and every call after it check the instance's state with asserts, and a size or scale
 //!   out of range is refused with an error before a device exists.
 
@@ -84,10 +100,22 @@ pub const Pixels = struct {
     bytes: []const u8,
 };
 
-/// When a frame happens: the shader clock's time and `ui.animate`'s delta (0 allowed).
+/// When a frame happens: the shader clock's time, `ui.animate`'s delta (0 allowed), and how the
+/// app timer's ticks owed by then fire (module guide, section 5).
 pub const At = struct {
     time_ms: u64,
     dt_ms: f32,
+    ticks: Ticks = .each,
+};
+
+/// How a frame fires the app timer's ticks owed since the last frame (module guide, section 5).
+pub const Ticks = enum(u8) {
+    /// One `App.timer` call per tick, at the tick's own time, as the replay clock fires them;
+    /// `error.TooManyTicks` before any fires when more than `bench.ticks_per_frame_max` are owed.
+    each,
+    /// At most one `App.timer` call, at the frame's time, for all the ticks owed, as a window
+    /// calls it after missed periods (`linux_window.zig`, section 1); none is owed after.
+    collapse,
 };
 
 /// Frame `n` of a clock at `fps` (module guide, section 4).
@@ -248,16 +276,25 @@ pub fn Offscreen(comptime App: type) type {
             bench.serve_window(App, &app_state, &ui_context);
         }
 
-        /// One frame at the given time (module guide, section 2). `error.TooManyTicks` when more
-        /// than `bench.ticks_per_frame_max` timer ticks are due, and the GPU's errors.
+        /// One frame at the given time (module guide, section 2). With `.ticks = .each`,
+        /// `error.TooManyTicks` when more than `bench.ticks_per_frame_max` timer ticks are owed,
+        /// before any fires or anything draws (section 5); and the GPU's errors.
         pub fn frame(at: At) !void {
             assert(started);
             assert(at.dt_ms >= 0);
-            var ticks: u32 = 0;
-            while (clock.due(at.time_ms, ui_context.timer_on)) |tick| : (ticks += 1) {
-                if (ticks == bench.ticks_per_frame_max) return error.TooManyTicks;
-                App.timer(&app_state, &ui_context, tick);
-            }
+            _ = fire_ticks(App, &app_state, &ui_context, &clock, at) catch |err| {
+                std.log.err(
+                    "offscreen frame at {d} ms owes {d} timer ticks of {d} ms, more than " ++
+                        "bench.ticks_per_frame_max ({d}): draw it with .ticks = .collapse",
+                    .{
+                        at.time_ms,
+                        clock.owed(at.time_ms, ui_context.timer_on),
+                        App.config.timer_period_ms,
+                        bench.ticks_per_frame_max,
+                    },
+                );
+                return err;
+            };
             _ = ui.animate(App, &app_state, &ui_context, at.dt_ms);
             if (has_producer) produce();
             const logical_w = size.width_logical;
@@ -302,6 +339,39 @@ pub fn Offscreen(comptime App: type) type {
             return gpu_wgpu.adapter_text(&device);
         }
     };
+}
+
+/// Fires the app timer's ticks owed by `at.time_ms` as `at.ticks` says (module guide, sections 2
+/// and 5) and returns the `App.timer` calls made. A refusal changes nothing: no tick fires and
+/// the clock keeps them owed.
+fn fire_ticks(
+    comptime App: type,
+    app_state: *App,
+    ui_context: *app_contract.Context(App),
+    clock: *bench.Clock,
+    at: At,
+) error{TooManyTicks}!u32 {
+    assert(clock.period_ms == App.config.timer_period_ms);
+    if (App.config.timer_period_ms == 0) assert(!ui_context.timer_on);
+    switch (at.ticks) {
+        .collapse => {
+            if (!clock.collapse(at.time_ms, ui_context.timer_on)) return 0;
+            App.timer(app_state, ui_context, at.time_ms);
+            assert(clock.owed(at.time_ms, true) == 0);
+            return 1;
+        },
+        .each => {
+            const owed = clock.owed(at.time_ms, ui_context.timer_on);
+            if (owed > bench.ticks_per_frame_max) return error.TooManyTicks;
+            var calls: u32 = 0;
+            while (clock.due(at.time_ms, ui_context.timer_on)) |tick| : (calls += 1) {
+                assert(calls < owed);
+                App.timer(app_state, ui_context, tick);
+            }
+            assert(calls <= bench.ticks_per_frame_max);
+            return calls;
+        },
+    }
 }
 
 const testing = std.testing;
@@ -378,6 +448,85 @@ const TinyApp = struct {
         _ = cx;
     }
 };
+
+/// A 500 ms timer that counts its calls and keeps the last one's time.
+const TimerApp = struct {
+    calls: u32,
+    last_ms: u64,
+
+    const Cx = app_contract.Context(TimerApp);
+
+    pub const config: app_contract.Config = .{
+        .title = "timer",
+        .timer_period_ms = 500,
+        .draw = &.{.{ .type = @import("../draw.zig").Box, .cap = 4 }},
+    };
+
+    pub fn init(app: *TimerApp, pool: *@import("../draw/textures.zig").Textures) void {
+        _ = pool;
+        app.calls = 0;
+        app.last_ms = 0;
+    }
+    pub fn event(app: *TimerApp, cx: *Cx, event_value: input.Event) void {
+        _ = app;
+        _ = cx;
+        _ = event_value;
+    }
+    pub fn timer(app: *TimerApp, cx: *Cx, now_ms: u64) void {
+        _ = cx;
+        app.calls += 1;
+        app.last_ms = now_ms;
+    }
+    pub fn draw(app: *TimerApp, cx: *Cx) void {
+        _ = app;
+        _ = cx;
+    }
+};
+
+// Locks a first frame far into a film: with a 500 ms timer, a frame at 600 s owes 1,200 ticks.
+// `.each` refuses it with no call made and the ticks still owed; `.collapse` makes one call, at
+// 600,000 ms, and owes nothing after, so the next `.each` frame at 600.5 s makes one call at
+// 600,500 ms. A frame at an earlier time makes none; a stopped timer is called by neither.
+test "a first frame at 600 s fires one tick when collapsed" {
+    const static = struct {
+        var app: TimerApp = undefined;
+        var cx: TimerApp.Cx = undefined;
+        var clock: bench.Clock = undefined;
+
+        fn fire(at: At) !u32 {
+            return fire_ticks(TimerApp, &app, &cx, &clock, at);
+        }
+    };
+    static.cx.init();
+    app_contract.start(TimerApp, &static.cx);
+    TimerApp.init(&static.app, &static.cx.draw.textures);
+    static.clock = .init(TimerApp.config.timer_period_ms);
+    const clock = &static.clock;
+    const late: At = .{ .time_ms = 600_000, .dt_ms = 0 };
+    try testing.expectError(error.TooManyTicks, static.fire(late));
+    try testing.expectEqual(@as(u32, 0), static.app.calls);
+    try testing.expectEqual(@as(u64, 1_200), clock.owed(late.time_ms, true));
+    var collapsed = late;
+    collapsed.ticks = .collapse;
+    try testing.expectEqual(@as(u32, 1), try static.fire(collapsed));
+    try testing.expectEqual(@as(u32, 1), static.app.calls);
+    try testing.expectEqual(@as(u64, 600_000), static.app.last_ms);
+    try testing.expectEqual(@as(u32, 0), try static.fire(late));
+    const next: At = .{ .time_ms = 600_500, .dt_ms = 0 };
+    try testing.expectEqual(@as(u32, 1), try static.fire(next));
+    try testing.expectEqual(@as(u64, 600_500), static.app.last_ms);
+    var early = collapsed;
+    early.time_ms = 1_000;
+    try testing.expectEqual(@as(u32, 0), try static.fire(early));
+    static.cx.set_timer(false);
+    var stopped = collapsed;
+    stopped.time_ms = 700_000;
+    try testing.expectEqual(@as(u32, 0), try static.fire(stopped));
+    stopped.ticks = .each;
+    stopped.time_ms = 800_000;
+    try testing.expectEqual(@as(u32, 0), try static.fire(stopped));
+    try testing.expectEqual(@as(u32, 2), static.app.calls);
+}
 
 // Locks that the calls no bundled client makes compile: `app`, `context`, and `dispatch` are
 // generic, so an unused one is otherwise never analysed.

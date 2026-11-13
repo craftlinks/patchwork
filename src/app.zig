@@ -119,8 +119,12 @@
 //! into the context, and `cx.theme()` reads it in any phase (`ui/cx.zig`, section 9b).
 //! `cx.set_theme(scheme)` in an event or a timer call switches it: the renderer writes the
 //! frame uniform once and repaints every tile (`draw/renderer.zig`, section 4). `check`
-//! refuses a color component outside `[0, 1]`, a weight outside `[0, 1]`, or a text size
-//! outside `(0, text.size_max]`, naming the field (`theme.problem`).
+//! refuses a color component outside `[0, 1]`, a weight outside `[0, 1]`, a text size outside
+//! `(0, text.size_max]`, a material or form field out of its range (a corner outside
+//! `[0, theme.radius_max]`, a capsule outside `[0, 0.5]`, a hairline outside
+//! `[0, theme.stroke_max]`, a mark outside `(0, theme.stroke_max]`, or outlined controls with
+//! no hairline), naming the field (`theme.problem`). A scheme built at run time is checked by
+//! asserts in `cx.set_theme` instead.
 //!
 //! ## 4c. Window Decorations
 //! `config.decorations` is the app's preference for who draws the window's title bar and
@@ -568,6 +572,20 @@ const BrightTheme = struct {
     };
 };
 
+/// A theme whose control corner is 100, past `theme.radius_max`.
+const RoundTheme = struct {
+    pub const config: Config = .{
+        .title = "round",
+        .timer_period_ms = 0,
+        .draw = &test_draw,
+        .theme = blk: {
+            var scheme = theme.dark;
+            scheme.form.radius.control = 100;
+            break :blk scheme;
+        },
+    };
+};
+
 const BadScenarios = struct {
     pub const config: Config = .{ .title = "bad", .timer_period_ms = 0, .draw = &test_draw };
     pub const scenarios: []const bench.Scenario = &.{
@@ -820,11 +838,14 @@ test "a ragged draw type and an oversized batch cap are rejected" {
 }
 
 // Locks the theme rule (section 4b): a panel component of 1.5 is refused with the field's full
-// name, and the default theme is `theme.dark`.
+// name, as is a form's control corner of 100, and the default theme is `theme.dark`.
 test "a theme color out of range is rejected by name" {
     const bright = comptime conformance(BrightTheme).?;
     const expected = "App.config.theme.colors.panel: a component is outside [0, 1]";
     try std.testing.expectEqualStrings(expected, bright);
+    const round = comptime conformance(RoundTheme).?;
+    const corner = "App.config.theme.form.radius.control: must be in [0, 64]";
+    try std.testing.expectEqualStrings(corner, round);
     try std.testing.expect(std.meta.eql(theme.dark, GoodApp.config.theme));
 }
 

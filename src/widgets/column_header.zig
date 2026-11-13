@@ -51,7 +51,6 @@ pub const columns_max: u32 = 16;
 pub const header_h: f32 = 28;
 pub const header_pad_x: f32 = 8;
 pub const header_divider_w: f32 = 8;
-pub const header_line_px: f32 = 1;
 /// The salt divider ids start from (section 3).
 pub const divider_salt: u64 = 0x636f6c73 << 32;
 

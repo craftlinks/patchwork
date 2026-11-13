@@ -138,8 +138,9 @@
 //! ## 9. The Boundary, Tested
 //! `test/consumer` is a package of its own, with `.patchwork = .{ .path = "../.." }`, so it sees
 //! this file only as a consumer does. `test-consumer` runs `zig build` there for `install`, `wasm`,
-//! `test`, and `regress`, one after another, then the tool at a chosen time on each adapter and
-//! the app with an argument. It needs a GPU, so it is not part of `test`.
+//! `test`, and `regress`, one after another, then the tool at a chosen time on each adapter, the
+//! tool's first frame at 600 s with the app's 500 ms timer running, and the app with an argument.
+//! It needs a GPU, so it is not part of `test`.
 //!
 //! `examples/sound`, the audio and rack examples, is a package of its own for the same reason
 //! seen from the other side: it takes Thrum as a path dependency (`../../../thrum`), and this file
@@ -885,7 +886,11 @@ fn add_consumer_step(b: *std.Build, optimize: std.lang.Optimize) void {
     for ([_][]const u8{ "high", "low" }) |adapter| {
         const argv = [_][]const u8{ "zig-out/bin/consumer-tool", "1500", adapter };
         const run = add_package_run(b, "test/consumer", &argv, &last);
-        run.expectStdErrMatch("t=1500 ms, 640x360, bar 150 px, keysym 0x71");
+        run.expectStdErrMatch("t=1500 ms, 640x360, bar 150 px, keysym 0x71, timer calls 1");
+        // A first frame at 600 s with a 500 ms timer, drawn in one call (step 61).
+        const late = [_][]const u8{ "zig-out/bin/consumer-tool", "600000", adapter };
+        const late_run = add_package_run(b, "test/consumer", &late, &last);
+        late_run.expectStdErrMatch("t=600000 ms, 640x360, bar 624 px, keysym 0x71, timer calls 1");
     }
     const print = [_][]const u8{ "zig-out/bin/consumer", "song.txt", "--print" };
     const file = add_package_run(b, "test/consumer", &print, &last);

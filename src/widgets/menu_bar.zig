@@ -52,9 +52,8 @@ const Walk = kit.Walk;
 pub const menubar_menus_max: u32 = 8;
 /// Space left and right of a title's label.
 pub const menubar_pad_x: f32 = 10;
-/// The title band's height, centred in the row, and its corner radius.
+/// The title band's height, centred in the row.
 pub const menubar_band_h: f32 = 28;
-pub const menubar_band_radius: f32 = 4;
 /// Added to a menu's index for its id: "menu" in the high word, clear of the title indices.
 pub const menubar_menu_salt: u64 = 0x6d656e75 << 32;
 

@@ -47,7 +47,8 @@
 //! it for the centre). While any drag is in flight, `end` records four `dock_edge_px` strips
 //! along the dock's edges after everything else (so they win near the edges, and never block
 //! a press otherwise); over one, the overlay is that quarter of the dock. The overlay is
-//! `colors.focus` at `dock_overlay_alpha` with a border, on `Layer.popup`, under the ghost.
+//! `colors.focus` at `dock_overlay_alpha` with a `mark`-wide border and `radius.band` corners
+//! (the scheme's form, `theme.zig` section 8), on `Layer.popup`, under the ghost.
 //!
 //! ## 5. Events and Moving a Panel
 //! `handle` gives every split's `Splitter` (moved or reset: `resized`) and every set's `Tabs`
@@ -656,7 +657,8 @@ pub fn DockOf(comptime Skin: type) type {
                 }
             }
             const shown = self.overlay(drag) orelse return;
-            const colors = &cx.theme().colors;
+            const scheme = cx.theme();
+            const colors = &scheme.colors;
             var fill = colors.focus;
             fill[3] *= dock_overlay_alpha;
             const clip = ui.cx.clip_of(cx.window);
@@ -664,8 +666,8 @@ pub fn DockOf(comptime Skin: type) type {
             kit.face(cx, shown, clip, .{
                 .fill = fill,
                 .border_color = colors.focus,
-                .border_width = 2,
-                .radius = 4,
+                .border_width = scheme.form.mark,
+                .radius = scheme.form.radius.band,
             });
             _ = cx.drawing().layer(previous);
         }
@@ -1259,7 +1261,8 @@ test "a full dock refuses a split and keeps the tab" {
 // Locks a drop by events (section 5): log's tab pressed, dragged off its bar, and released
 // over the right zone of the editor's page splits the editor's set; the source bar's
 // `dragged_out` is ignored and the move reported once; the overlay showed the zone's half on
-// the popup layer while in flight, and the edge strips were targets.
+// the popup layer while in flight, outlined `mark` (2) wide with `radius.band` (4) corners
+// (theme.zig, section 8), and the edge strips were targets.
 test "dragging a tab onto a page's side splits it" {
     const cx = fresh_context();
     const dock = default_dock();
@@ -1278,6 +1281,8 @@ test "dragging a tab onto a page's side splits it" {
     for (cx.draw.items(draw.Box), 0..) |box, index| {
         if (cx.draw.layer_at(draw.Box, @intCast(index)) != .popup) continue;
         try testing.expectEqualSlices(f32, &.{ 501, 32, 296, 384 }, &box.rect);
+        try testing.expectEqual(@as(f32, 2), box.border_width);
+        try testing.expectEqual(@as(f32, 4), box.radius);
         overlay = true;
     }
     try testing.expect(overlay);

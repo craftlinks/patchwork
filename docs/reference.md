@@ -146,7 +146,7 @@ patchwork/
 │   ├── widgets/paragraph.zig   # Paragraph: text wrapped to its width; a fit height for that width
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
-│   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
+│   ├── widgets/tooltip.zig     # Tooltip, TooltipOf: one line after a hover dwell, on the tooltip layer, drawn by its skin
 │   ├── widgets/tabs.zig        # Tabs: a bar over a page; close, reorder, drag out; Segmented
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
 │   ├── widgets/dock.zig        # Dock: a tree of splits and tab sets; drop zones, save and load
@@ -186,7 +186,7 @@ patchwork/
 │   ├── animator.zig            # Scalar animator transitions and animation time (Animator, Clock, Time)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
-│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles
+│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles, Material, Form
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
@@ -817,14 +817,19 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 
 - **What is themed.** The chrome colors (`colors.panel`, `text`, `track`, `value`, `control`,
   `meter`), the window `background`, the text field's `focus` border and `selection` band,
-  `lighten` and `darken` (what hover and press mix toward), four `accents`, the two text
-  styles widgets label with (`name`, `value`), and the hover and press weights
-  (`hover_lighten`, `down_darken`). Every library widget, the scrollbar thumb, and the clear
-  color read it at draw time.
+  `lighten` and `darken` (what hover and press mix toward), four `accents`, the three text
+  styles widgets label with (`name`, `value`, and `heading` for section titles: a disclosure
+  header's label and an app's own section headings), and the hover and press weights
+  (`hover_lighten`, `down_darken`); and, in its `form`, the corners and strokes of the
+  default skins, whether controls are filled or outlined, how the selected tab is marked, and
+  whether panels are framed. Every library widget, the scrollbar thumb, the dock's drop
+  overlay, and the clear color read it at draw time.
 - **What is not.** Sizes (they are per instance: `Knob.sized`, `Meter.track_h`, a `Walk`),
   the open ring's angles (the CPU hit tests use the constants), and colors an app stored in
   a widget (`Button.paint`, `Slider.track`, `Knob.accent`, `Panel.paint`, a style), which
-  win; `widgets.kit.accent(cx, i)` gives the scheme's accent for an app that wants it.
+  win; so do those paints' radii, so a square scheme squares an app's `Button` only when the
+  app builds its paint from `cx.theme().form.radius.control`. `widgets.kit.accent(cx, i)`
+  gives the scheme's accent for an app that wants it.
 - **Presets.** `theme.dark` is the look of steps 1 to 30 and the default; `theme.light` is
   its light counterpart. `theme.chrome` is `dark.record()`, the GPU record.
 - **Choosing and switching.** `config.theme` picks the scheme the app starts with;
@@ -832,8 +837,10 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
   it. A switch is one frame: the renderer writes the 256-byte frame uniform once and repaints
   every tile, and the same scheme again costs nothing.
 - **Making one.** Copy a preset and change fields: `var s = theme.dark; s.colors.panel =
-  .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, and text
-  sizes are at most `text.size_max`; `app.check` refuses anything else and names the field.
+  .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, text
+  sizes are at most `text.size_max`, and text tracking is in `[0, 0.5]`; `app.check` refuses
+  anything else and names the field. `heading` has no default, so a scheme literal names its
+  section-title style and colour.
 - **Material.** `scheme.material` (`theme.Material`) is what the default skins make panels and
   popups of: `.solid` (the default of both presets, the faces of steps 1 to 39), or glass,
   `.clear`, `.frosted`, or `.tinted`: a backdrop blur (sigma, logical pixels), how far glass
@@ -841,6 +848,21 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
   `saturation`, a lit `rim`, and `refraction` at the edge. A `Panel` or `Menu` (so a
   `Dropdown`'s list) may set its own `material`. Glass needs `draw.Glass` registered and a
   backdrop under the face (see Backdrops and Glass); without one the skin draws the solid face.
+- **Form.** `scheme.form` (`theme.Form`) is the shape of the default skins' faces, CPU state
+  like the material (a switch is a redraw). `Form{}` is the default of both presets and draws
+  exactly what the library drew before forms. Six settings: `radius.control` (fields, number
+  boxes, checkboxes, tabs, the disclosure header, the scroll thumb; 4), `radius.popup` (menus,
+  the dropdown face, tooltips; 6), `radius.band` (highlight bands and the drop overlay; 4),
+  each in `[0, theme.radius_max]`; `capsule` (0.5 rounds the toggle, meter, checkbox mixed bar,
+  divider, and `Segmented` into capsules, 0 squares them); `hairline` (every border and rule,
+  `[0, theme.stroke_max]`; 1); `mark` (the tab underline and insertion marker, the divider,
+  the drop outline, `(0, theme.stroke_max]`; 2). And three choices: `controls = .outlined`
+  draws buttons, dropdowns, number boxes, fields, checkboxes, toggles' pills, and tabs as a
+  hairline in their ink (a button's paint, which its label takes too, or `colors.control`)
+  with a tint of it on hover and press; `tab_mark = .filled` fills the selected tab in
+  `accents[0]` with its label in `colors.panel` instead of underlining it; `framed` borders
+  solid panels with a hairline in `colors.control`. `app.check` refuses a field out of range
+  ("App.config.theme.form.capsule: must be in [0, 0.5]"), and `cx.set_theme` asserts it.
 
 ## Make a Skin
 
@@ -850,8 +872,9 @@ where it takes presses belong to a skin, a struct of draw functions passed at co
 `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`,
 `DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TreeViewOf` (its bands are
 the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, `ColumnHeaderOf`,
-`WindowButtonsOf` (`window_button`), and `MenuBarOf` (`menu_title`, and its menus' `menu_face`
-and `menu_row`) work the same way. A
+`WindowButtonsOf` (`window_button`), `MenuBarOf` (`menu_title`, and its menus' `menu_face`
+and `menu_row`), and `TooltipOf` (`tooltip`, handed a `widgets.TooltipLook`: the placed box,
+the clip, the text, and the app's fill or null) work the same way. A
 `TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
@@ -885,12 +908,15 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
 
 - **The contract.** `button`, `slider` (with `slider_travel(area) [2]f32`, the x span a press
   maps onto `[0, 1]`), `knob`, `toggle`, `dropdown`, `tab`, `divider`, and `number_face` return
-  `?widgets.Shape`; `meter`, `panel`, `field`, `menu_face`, `menu_row`, `tab_bar`, and
-  `list_row` return nothing. A number box skin also needs `field`, for its editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
+  `?widgets.Shape`; `meter`, `panel`, `field`, `menu_face`, `menu_row`, `tab_bar`,
+  `list_row`, and `tooltip` return nothing. A number box skin also needs `field`, for its
+  editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
   fails the build with a message naming the skin and the function, for example
   "hardware.Skin: missing `pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`".
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
+  A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
+  `skins.Default` does.
 - **Draw order.** A batch draws where its type first appeared in its layer. A skin with its
   own face type should append faces on one layer and what goes on top (arcs, labels) on a
   higher one, then restore the layer, as the gallery's hardware skin does.
@@ -926,8 +952,8 @@ pub fn draw(app: *App, cx: *Context) void {
   Tab dismisses), `widgets.ContextMenu` (a menu opened by a right press on a target id),
   `widgets.Dropdown` (a face and its menu, `Action.changed` only for a different item), and
   `widgets.Tooltip` (the app says what is hovered as a `widgets.Tip`; it shows after
-  `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)` and
-  `DropdownOf(Skin)` are skinnable like the other widgets.
+  `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)`,
+  `DropdownOf(Skin)`, and `TooltipOf(Skin)` are skinnable like the other widgets.
 - **Forgetting `ui.overlays`.** Opening a popup calls `cx.request_popup(id)`; in safe builds
   the next draw panics naming the id if no `draw_overlay` drew it, and `ui.overlays` on a target
   with no overlay at all is a compile error.
@@ -1032,7 +1058,8 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
 - **Disclosure.** `if (group.begin(cx, ui.sized(.fill, .fit), .{ .flow = .down })) { ... }`
   then `group.end(cx)`: a 28 px header with a chevron that eases between closed and open, over
   a section the app draws only while open; with a fit height it folds. A click, or Space or
-  Enter while focused, flips it (`Action.toggled`).
+  Enter while focused, flips it (`Action.toggled`). The default skin draws its label in the
+  scheme's `heading`.
 - **ColumnHeader.** Up to 16 labelled columns, each with a width and a minimum; the last spans
   the rest. A click on a label sorts by it (again flips the direction, `Action.sorted`), the
   right edge of every column but the last drags to resize within its minimum and the room the
@@ -1851,6 +1878,24 @@ ticks fire only as time passes the next multiple of the period, and the app is n
 a caller that scrubs keeps its state outside the app timer. `read` is separate because a caller
 may draw many frames and read one; it blocks until the GPU has caught up.
 
+**Timer ticks.** A frame fires the app timer's ticks owed since the last frame as its `.ticks`
+says:
+
+- `.each` (the default, and what `--regress` and `--render` use): one `App.timer` call per period
+  passed, each at its own multiple of the period, so frames at a steady rate replay the same way
+  every run. At most `bench.ticks_per_frame_max` (128) may be owed to one frame. More is
+  `error.TooManyTicks`, refused before any tick fires or anything draws, so the app is as it was,
+  with a log line that names the ticks owed, the limit, and `.collapse`.
+- `.collapse`: a window's rule. A window's timer is a wake, not a count: after missed periods it
+  calls `App.timer` once, at the current time. So does this frame, at its `time_ms`, however
+  many ticks are owed, and none is owed after. A tool that draws one frame at a time it picks
+  uses it: with a 500 ms timer, a first frame at 600 s owes 1,200 ticks, which `.each` refuses
+  and `.collapse` draws in one call.
+
+```zig
+try Off.frame(.{ .time_ms = 600_000, .dt_ms = 0, .ticks = .collapse });
+```
+
 ## Time for a Transport
 
 A transport, a timeline that plays and stops, follows frames, not `timer_period_ms`: period 0,
@@ -2412,6 +2457,18 @@ text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline fo
 `text.WrapOptions` defaults both alignments to `.start`. A `text.Run` is `.style`, a
 `text.Style`, and `.bytes`, its UTF-8.
 
+- **Letter spacing.** `Style.tracking` (default 0) is extra advance after every codepoint,
+  spaces and the ellipsis included, in ems of `size`, in `[0, text.tracking_max]` (0.5):
+  `text.tracking_px(style)` is `tracking * size`. `measure` is the pen after the text, so it
+  includes every gap and stays additive (a caret at `measure(prefix)` lands where the next
+  glyph starts). The gap after a line's last codepoint hangs: alignment, the ellipsis fit, and
+  wrapping use the extent, `measure - tracking_px` for non-empty text, so spaced capitals
+  centre on their ink. Tracking never reaches the glyph cache, and upper-casing is the app's.
+
+```zig
+const caps: text.Style = .{ .face = .sans_bold, .size = 11, .color = ink, .tracking = 0.12 };
+```
+
 **Wrapped text.** `text.place_wrapped` and `text.place_runs_wrapped` break text into lines no
 wider than `rect.width`; `text.measure_wrapped` and `measure_runs_wrapped` give the height
 (lines times `text.line_height`, the face's line rounded up to a whole logical pixel), and
@@ -2488,6 +2545,8 @@ if (text.contours(&shape, .sans, id, size, pen)) { // pen: the baseline's left e
   for a time that is not this frame. A `Glyph` has the glyph id, codepoint, style, the pen and
   baseline in logical pixels (`place`'s before snapping, so `round(pen[1] * scale)` is its
   baseline row), the advance, the `line`, and the `index` among the codepoints yielded.
+  `advance` is the font's advance, untracked; the next pen on the line is
+  `pen[0] + advance + text.tracking_px(glyph.style)`.
 - **One shape per glyph,** so a refused glyph (a full point pool: about 800 to 1,400 glyphs
   fill it) is counted in `overflow_count` and the next still draws. A glyph whose box misses the
   clip is skipped before its outline loads. A glyph costs about 0.6 microseconds on the CPU, so

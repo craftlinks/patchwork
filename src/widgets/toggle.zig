@@ -33,6 +33,7 @@ const Id = kit.Id;
 pub const toggle_height: f32 = 40;
 pub const pill_w: f32 = 44;
 pub const pill_h: f32 = 24;
+/// The default form's corner (`pill_h * capsule`); the default skin reads the app's.
 pub const pill_radius: f32 = 12;
 pub const thumb_side: f32 = 20;
 pub const thumb_inset: f32 = 2;

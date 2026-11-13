@@ -238,9 +238,13 @@
 //! 1). `theme_setup(scheme)` (from `app.start`, once) copies `App.config.theme`; until then
 //! both are `theme.dark`. `theme()` returns it in any phase, and widgets read their colors,
 //! text styles, and hover and press weights from it at draw time; the scrollbar thumb is
-//! `colors.control`. `set_theme(scheme)` during an event or a timer call stores a different
-//! scheme, writes its record into `draw.theme`, and calls `redraw`; the same scheme again is
-//! no change and owes nothing. The renderer sees the new record as a uniform change.
+//! `colors.control` with the form's `radius.control` corners (`theme.zig`, section 8).
+//! `set_theme(scheme)` during an event or a timer call stores a different scheme, writes its
+//! record into `draw.theme`, and calls `redraw`; the same scheme again is no change and owes
+//! nothing. The renderer sees the new record as a uniform change; a scheme that differs only
+//! in its material or form leaves the record as it was and is a redraw. Both calls assert the
+//! scheme's material and form are in range, since a scheme built at run time escapes
+//! `theme.problem`.
 //!
 //! ## 10. TigerStyle Invariants
 //! - All storage is fixed: `turtle.depth_max` entries, `area_cap` areas, the clipboard, and the
@@ -816,6 +820,9 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         pub fn theme_setup(self: *Self, scheme: theme_module.Scheme) void {
             assert(self.phase == .idle);
             assert(self.dirty);
+            // A scheme built at run time is not checked at compile time (`theme.problem`).
+            assert(scheme.material.problem() == null);
+            assert(scheme.form.problem() == null);
             self.scheme = scheme;
             self.draw.theme = scheme.record();
         }
@@ -832,6 +839,9 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// 9b). The current scheme again does nothing. Not during a draw.
         pub fn set_theme(self: *Self, scheme: theme_module.Scheme) void {
             assert(self.phase != .draw);
+            // A scheme built at run time is not checked at compile time (`theme.problem`).
+            assert(scheme.material.problem() == null);
+            assert(scheme.form.problem() == null);
             if (std.meta.eql(scheme, self.scheme)) return;
             self.scheme = scheme;
             self.draw.theme = scheme.record();
@@ -1177,7 +1187,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             const outer = parent.clip orelse return;
             const look: draw.BoxLook = .{
                 .fill = self.scheme.colors.control,
-                .radius = view.thumb_radius,
+                .radius = self.scheme.form.radius.control,
             };
             self.append(draw.Box, null, .of(thumb, outer, look)) catch |err| switch (err) {
                 error.PoolFull, error.BatchFull => {},

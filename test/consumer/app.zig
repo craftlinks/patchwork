@@ -5,7 +5,9 @@
 //! ## 1. What It Proves
 //! `pure` reaches both targets through one module. `linked` is a module per target, and its answer
 //! is the same on both, so the native and browser pictures match. The screen shows each peer's
-//! answer, the file named on the command line, and a bar as long as the app's time.
+//! answer, the file named on the command line, and a bar as long as the app's time. Its 500 ms
+//! timer starts stopped, so a window and the browser never wake for it; the tool turns it on and
+//! draws a first frame far into the app's time in one call (`Offscreen`'s `.collapse`).
 //!
 //! ## 2. Arguments
 //! `consumer <file>` reads the file in `args`, which runs before the display is connected. `Io`
@@ -55,10 +57,13 @@ pub const App = struct {
     name: [name_cap]u8,
     name_len: u32,
     size: ?u64,
+    /// `timer` calls so far, which the tool reports; nothing on screen shows them.
+    timer_calls: u32,
 
     pub const config: patchwork.app.Config = .{
         .title = "consumer",
-        .timer_period_ms = 0,
+        .timer_period_ms = 500,
+        .timer_armed = false,
         .draw = &.{
             .{ .type = quads.Box, .cap = 4 },
             .{ .type = quads.Glyph, .cap = 256 },
@@ -75,6 +80,7 @@ pub const App = struct {
         app.time_ms = 0;
         app.name_len = 0;
         app.size = null;
+        app.timer_calls = 0;
     }
 
     /// Module guide, section 2.
@@ -100,9 +106,9 @@ pub const App = struct {
     }
 
     pub fn timer(app: *App, cx: *Context, now_ms: u64) void {
-        _ = app;
         _ = cx;
-        _ = now_ms;
+        assert(now_ms > 0);
+        app.timer_calls += 1;
     }
 
     pub fn draw(app: *App, cx: *Context) void {
