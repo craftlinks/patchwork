@@ -817,8 +817,9 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
 
 - **What is themed.** The chrome colors (`colors.panel`, `text`, `track`, `value`, `control`,
   `meter`), the window `background`, the text field's `focus` border and `selection` band,
-  `lighten` and `darken` (what hover and press mix toward), four `accents`, the two text
-  styles widgets label with (`name`, `value`), and the hover and press weights
+  `lighten` and `darken` (what hover and press mix toward), four `accents`, the three text
+  styles widgets label with (`name`, `value`, and `heading` for section titles: a disclosure
+  header's label and an app's own section headings), and the hover and press weights
   (`hover_lighten`, `down_darken`). Every library widget, the scrollbar thumb, and the clear
   color read it at draw time.
 - **What is not.** Sizes (they are per instance: `Knob.sized`, `Meter.track_h`, a `Walk`),
@@ -832,8 +833,10 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
   it. A switch is one frame: the renderer writes the 256-byte frame uniform once and repaints
   every tile, and the same scheme again costs nothing.
 - **Making one.** Copy a preset and change fields: `var s = theme.dark; s.colors.panel =
-  .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, and text
-  sizes are at most `text.size_max`; `app.check` refuses anything else and names the field.
+  .{ 0.2, 0.1, 0.1, 1 };`. Colors are straight RGBA with components in `[0, 1]`, text
+  sizes are at most `text.size_max`, and text tracking is in `[0, 0.5]`; `app.check` refuses
+  anything else and names the field. `heading` has no default, so a scheme literal names its
+  section-title style and colour.
 - **Material.** `scheme.material` (`theme.Material`) is what the default skins make panels and
   popups of: `.solid` (the default of both presets, the faces of steps 1 to 39), or glass,
   `.clear`, `.frosted`, or `.tinted`: a backdrop blur (sigma, logical pixels), how far glass
@@ -1032,7 +1035,8 @@ skinnable (`TabsOf(Skin)`, and so on; see Make a Skin).
 - **Disclosure.** `if (group.begin(cx, ui.sized(.fill, .fit), .{ .flow = .down })) { ... }`
   then `group.end(cx)`: a 28 px header with a chevron that eases between closed and open, over
   a section the app draws only while open; with a fit height it folds. A click, or Space or
-  Enter while focused, flips it (`Action.toggled`).
+  Enter while focused, flips it (`Action.toggled`). The default skin draws its label in the
+  scheme's `heading`.
 - **ColumnHeader.** Up to 16 labelled columns, each with a width and a minimum; the last spans
   the rest. A click on a label sorts by it (again flips the direction, `Action.sorted`), the
   right edge of every column but the last drags to resize within its minimum and the room the
@@ -2416,6 +2420,18 @@ text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline fo
 `text.WrapOptions` defaults both alignments to `.start`. A `text.Run` is `.style`, a
 `text.Style`, and `.bytes`, its UTF-8.
 
+- **Letter spacing.** `Style.tracking` (default 0) is extra advance after every codepoint,
+  spaces and the ellipsis included, in ems of `size`, in `[0, text.tracking_max]` (0.5):
+  `text.tracking_px(style)` is `tracking * size`. `measure` is the pen after the text, so it
+  includes every gap and stays additive (a caret at `measure(prefix)` lands where the next
+  glyph starts). The gap after a line's last codepoint hangs: alignment, the ellipsis fit, and
+  wrapping use the extent, `measure - tracking_px` for non-empty text, so spaced capitals
+  centre on their ink. Tracking never reaches the glyph cache, and upper-casing is the app's.
+
+```zig
+const caps: text.Style = .{ .face = .sans_bold, .size = 11, .color = ink, .tracking = 0.12 };
+```
+
 **Wrapped text.** `text.place_wrapped` and `text.place_runs_wrapped` break text into lines no
 wider than `rect.width`; `text.measure_wrapped` and `measure_runs_wrapped` give the height
 (lines times `text.line_height`, the face's line rounded up to a whole logical pixel), and
@@ -2492,6 +2508,8 @@ if (text.contours(&shape, .sans, id, size, pen)) { // pen: the baseline's left e
   for a time that is not this frame. A `Glyph` has the glyph id, codepoint, style, the pen and
   baseline in logical pixels (`place`'s before snapping, so `round(pen[1] * scale)` is its
   baseline row), the advance, the `line`, and the `index` among the codepoints yielded.
+  `advance` is the font's advance, untracked; the next pen on the line is
+  `pen[0] + advance + text.tracking_px(glyph.style)`.
 - **One shape per glyph,** so a refused glyph (a full point pool: about 800 to 1,400 glyphs
   fill it) is counted in `overflow_count` and the next still draws. A glyph whose box misses the
   clip is skipped before its outline loads. A glyph costs about 0.6 microseconds on the CPU, so
