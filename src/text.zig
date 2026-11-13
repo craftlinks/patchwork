@@ -52,6 +52,8 @@
 //! ## 3. Units
 //! `Style.size` is the em size in logical pixels; `measure` and the pen advance in logical
 //! pixels, independent of the display scale, so a scale change never needs a layout pass.
+//! `Style.tracking` is in ems, so letter spacing scales with the size: the pen advance of a
+//! codepoint is its advance plus `tracking_px(style)`, and `measure` is the pen after the text.
 //! Placement snaps each glyph origin to the device pixel grid; see `text/layout.zig`.
 //!
 //! ## 4. Scope
@@ -83,6 +85,9 @@ pub const byte_cap: u32 = 4096;
 pub const run_cap: u32 = 64;
 /// Largest `Style.size` in logical pixels.
 pub const size_max: f32 = 512;
+/// Largest `Style.tracking` in ems: wider than a Noto Sans space, so more would be a layout of
+/// single letters rather than letter spacing.
+pub const tracking_max: f32 = 0.5;
 
 /// The faces' bytes: the build's subsets of `text/fonts/` and of the app's faces (section 2b).
 pub const font_data = @import("patchwork_fonts");
@@ -108,7 +113,23 @@ pub const Style = struct {
     face: Face,
     size: f32,
     color: [4]f32,
+    /// Extra advance after every codepoint, in ems of `size`, in `[0, tracking_max]`. The gap
+    /// after the last codepoint of a line hangs: it counts in `measure` and in the pen, but not
+    /// in alignment or in the fit (`text/layout.zig`, section 2).
+    tracking: f32 = 0,
 };
+
+/// The extra advance after each codepoint of `style`, in logical pixels: `tracking * size`.
+/// Every tracked step of the layout reads it here; an app takes it off `measure` for the
+/// extent of a non-empty text (`measure(style, s) - tracking_px(style)`).
+pub fn tracking_px(style: Style) f32 {
+    assert(style.tracking >= 0);
+    assert(style.tracking <= tracking_max);
+    assert(style.size > 0);
+    const gap = style.tracking * style.size;
+    assert(gap >= 0);
+    return gap;
+}
 
 /// Placement of the text's extent inside the rect on one axis.
 pub const Align = enum {
@@ -151,8 +172,8 @@ pub const Line = struct {
     width: f32,
 };
 
-/// Width of `utf8` in `style`, in logical pixels: the sum of its advances. O(bytes); never
-/// touches the cache.
+/// Width of `utf8` in `style`, in logical pixels: the pen after the text, the sum of its
+/// advances plus one tracking gap per codepoint. O(bytes); never touches the cache.
 pub const measure = layout.measure;
 
 /// The codepoint boundary of `utf8` nearest to `x` logical pixels from the pen start. Pure.
@@ -239,6 +260,8 @@ comptime {
     assert(@backingInt(Face.mono) == 2);
     assert(byte_cap == 4096);
     assert(size_max * 1920 / 30 <= cache.size_q_max);
+    assert(tracking_max > 0);
+    assert(tracking_max <= 1);
     for (fonts) |font| {
         assert(font.units_per_em >= 16);
         assert(font.units_per_em <= 16384);
