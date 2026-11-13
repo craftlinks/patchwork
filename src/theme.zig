@@ -4,9 +4,10 @@
 //!
 //! ## 1. Two Values: the Scheme and Its Record
 //! A `Scheme` is the whole-app look an app owns: the chrome colors, the window background,
-//! the focus ring and selection band, four accents, the two text styles widgets label with,
-//! and the hover and press mix weights. Widgets read it on the CPU at draw time through
-//! `cx.theme()` (`ui/cx.zig`, section 9b) to fill per-instance colors. `Theme` is the part the
+//! the focus ring and selection band, four accents, the three text styles widgets label with
+//! (`name`, `value`, and `heading` for section titles), and the hover and press mix weights.
+//! Widgets read it on the CPU at draw time through `cx.theme()` (`ui/cx.zig`, section 9b) to
+//! fill per-instance colors. `Theme` is the part the
 //! GPU needs, `Scheme.record()`: the colors the shaders mix toward (`lighten`, `darken`), the
 //! background the passes clear to, the chrome slots, and the arc angles. Sizes are not themed;
 //! they stay per instance (`Knob.sized`, `Meter.track_h`).
@@ -51,14 +52,16 @@
 //!
 //! ## 5. Making a Scheme
 //! Start from a preset and change what differs: `var s = theme.dark; s.colors.panel = ...;`.
-//! Colors are straight (non-premultiplied) RGBA with every component in `[0, 1]`, and the text
-//! sizes are within `text.size_max`; `app.check` refuses a `config.theme` that breaks either
-//! and names the field (`conformance`). Keep each `background` component off an 8-bit
-//! rounding tie (`c * 255` a half, such as 0.90): the background reaches the screen both as a
-//! pass's clear value and as the clear pipeline's output, which some GPUs round apart, so a
-//! cached frame would differ from a direct one by one step. Instance colors an app sets (`Button.paint`,
-//! `Knob.accent`, a `Label`'s style) win over the scheme; `widgets.kit.accent(cx, i)` reads the
-//! scheme's accents for an app that wants them themed.
+//! Colors are straight (non-premultiplied) RGBA with every component in `[0, 1]`, the three text
+//! styles' sizes are within `text.size_max`, and their tracking is in `[0, text.tracking_max]`;
+//! `app.check` refuses a `config.theme` that breaks any of these and names the field
+//! (`conformance`). `heading` has no default: a scheme literal states its section-title style,
+//! colour included, so a light scheme never inherits dark's text colour. Keep each `background`
+//! component off an 8-bit rounding tie (`c * 255` a half, such as 0.90): the background reaches
+//! the screen both as a pass's clear value and as the clear pipeline's output, which some GPUs
+//! round apart, so a cached frame would differ from a direct one by one step. Instance colors
+//! an app sets (`Button.paint`, `Knob.accent`, a `Label`'s style) win over the scheme;
+//! `widgets.kit.accent(cx, i)` reads the scheme's accents for an app that wants them themed.
 //!
 //! ## 6. Upload Flow
 //! `draw/renderer.zig` keeps a `Uniform` record of the projection matrix at offset 0, the time
@@ -232,6 +235,8 @@ pub const Scheme = struct {
     name: text.Style,
     /// Knob value readouts.
     value: text.Style,
+    /// Section titles: a disclosure header's label, and an app's own section headings.
+    heading: text.Style,
     /// Shader mix toward `colors.lighten` at hover animator value 1, `[0, 1]`.
     hover_lighten: f32,
     /// Shader mix toward `colors.darken` at press animator value 1, `[0, 1]`.
@@ -286,6 +291,7 @@ pub const dark: Scheme = .{
     },
     .name = .{ .face = .sans, .size = 16, .color = .{ 0.86, 0.87, 0.84, 1 } },
     .value = .{ .face = .mono, .size = 16, .color = .{ 0.86, 0.87, 0.84, 1 } },
+    .heading = .{ .face = .sans_bold, .size = 16, .color = .{ 0.86, 0.87, 0.84, 1 } },
     .hover_lighten = 0.18,
     .down_darken = 0.30,
 };
@@ -314,6 +320,7 @@ pub const light: Scheme = .{
     },
     .name = .{ .face = .sans, .size = 16, .color = .{ 0.12, 0.13, 0.15, 1 } },
     .value = .{ .face = .mono, .size = 16, .color = .{ 0.12, 0.13, 0.15, 1 } },
+    .heading = .{ .face = .sans_bold, .size = 16, .color = .{ 0.12, 0.13, 0.15, 1 } },
     .hover_lighten = 0.10,
     .down_darken = 0.15,
 };
@@ -329,13 +336,20 @@ pub fn color_valid(color: [4]f32) bool {
     return true;
 }
 
-/// Null when every color of `scheme` is in `[0, 1]`, both weights are, and both text sizes are
-/// in `(0, text.size_max]`; otherwise a message naming the first field that is not, relative
-/// to the scheme (`colors.panel`, `accents[2]`, `name.size`). `app.conformance` prefixes it.
+/// Null when every color of `scheme` is in `[0, 1]`, both weights are, and the three text
+/// styles' sizes and tracking are in `(0, text.size_max]` and `[0, text.tracking_max]`;
+/// otherwise a message naming the first field that is not, relative to the scheme
+/// (`colors.panel`, `accents[2]`, `name.size`, `heading.tracking`). `app.conformance`
+/// prefixes it.
 pub fn problem(comptime scheme: Scheme) ?[]const u8 {
     comptime {
         const color_rule = ": a component is outside [0, 1]";
         const size_rule = std.fmt.comptimePrint(": must be in (0, {d}]", .{text.size_max});
+        const tracking_rule = std.fmt.comptimePrint(
+            ": must be in [0, {d}]",
+            .{text.tracking_max},
+        );
+        const styles = [_][]const u8{ "name", "value", "heading" };
         for (@typeInfo(Colors).@"struct".field_names) |field_name| {
             const color = @field(scheme.colors, field_name);
             if (!color_valid(color)) return "colors." ++ field_name ++ color_rule;
@@ -345,13 +359,21 @@ pub fn problem(comptime scheme: Scheme) ?[]const u8 {
                 return std.fmt.comptimePrint("accents[{d}]", .{index}) ++ color_rule;
             }
         }
-        if (!color_valid(scheme.name.color)) return "name.color" ++ color_rule;
-        if (!color_valid(scheme.value.color)) return "value.color" ++ color_rule;
-        if (!(scheme.name.size > 0 and scheme.name.size <= text.size_max)) {
-            return "name.size" ++ size_rule;
+        for (styles) |style_name| {
+            const style: text.Style = @field(scheme, style_name);
+            if (!color_valid(style.color)) return style_name ++ ".color" ++ color_rule;
         }
-        if (!(scheme.value.size > 0 and scheme.value.size <= text.size_max)) {
-            return "value.size" ++ size_rule;
+        for (styles) |style_name| {
+            const style: text.Style = @field(scheme, style_name);
+            if (!(style.size > 0 and style.size <= text.size_max)) {
+                return style_name ++ ".size" ++ size_rule;
+            }
+        }
+        for (styles) |style_name| {
+            const style: text.Style = @field(scheme, style_name);
+            if (!(style.tracking >= 0 and style.tracking <= text.tracking_max)) {
+                return style_name ++ ".tracking" ++ tracking_rule;
+            }
         }
         if (!(scheme.hover_lighten >= 0 and scheme.hover_lighten <= 1)) {
             return "hover_lighten: must be in [0, 1]";
@@ -480,7 +502,8 @@ test "preset backgrounds are off an 8-bit rounding tie" {
 }
 
 // Locks `problem`: a component of 1.5 names its color, a negative accent its index, a text
-// size past `text.size_max` (512) its style, and a weight above 1 its name.
+// size past `text.size_max` (512) or of 0 its style, tracking outside `[0, 0.5]` its style, a
+// heading alpha of 2 the heading's color, and a weight above 1 its name.
 test "problem names the first field out of range" {
     comptime var bad = dark;
     bad.colors.panel[1] = 1.5;
@@ -494,8 +517,39 @@ test "problem names the first field out of range" {
     bad.value.size = text.size_max + 1;
     try std.testing.expectEqualStrings("value.size: must be in (0, 512]", comptime problem(bad).?);
     bad = dark;
+    bad.heading.size = 0;
+    const size = "heading.size: must be in (0, 512]";
+    try std.testing.expectEqualStrings(size, comptime problem(bad).?);
+    bad = dark;
+    bad.name.tracking = 0.6;
+    const name = "name.tracking: must be in [0, 0.5]";
+    try std.testing.expectEqualStrings(name, comptime problem(bad).?);
+    bad = dark;
+    bad.value.tracking = -0.1;
+    const value = "value.tracking: must be in [0, 0.5]";
+    try std.testing.expectEqualStrings(value, comptime problem(bad).?);
+    bad = dark;
+    bad.heading.color[3] = 2;
+    const heading = "heading.color: a component is outside [0, 1]";
+    try std.testing.expectEqualStrings(heading, comptime problem(bad).?);
+    bad = dark;
     bad.down_darken = 2;
     try std.testing.expectEqualStrings("down_darken: must be in [0, 1]", comptime problem(bad).?);
+}
+
+// Locks byte-identity of the disclosure header: `heading` is the style `Default.disclosure` built
+// before it read the scheme's, its `name` with `face = .sans_bold` (bold sans 16 in the text
+// colour, tracking 0), in `dark` and `light`.
+test "heading is the disclosure's style" {
+    for ([_]Scheme{ dark, light }) |scheme| {
+        var before = scheme.name;
+        before.face = .sans_bold;
+        try std.testing.expectEqual(before, scheme.heading);
+        try std.testing.expectEqual(text.Face.sans_bold, scheme.heading.face);
+        try std.testing.expectEqual(@as(f32, 16), scheme.heading.size);
+        try std.testing.expectEqual(scheme.colors.text, scheme.heading.color);
+        try std.testing.expectEqual(@as(f32, 0), scheme.heading.tracking);
+    }
 }
 
 // Locks the open-ring geometry: a three-quarter sweep leaves a quarter-turn gap, and the
