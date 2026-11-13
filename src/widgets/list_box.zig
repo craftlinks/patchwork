@@ -67,9 +67,6 @@ pub const list_rows_max: u32 = 1 << 20;
 /// The salt row ids start from: row `i` is `id.derive(row_salt + i)` (section 2).
 pub const row_salt: u64 = 0x726f7773 << 32;
 
-/// The default band's corner radius.
-pub const list_row_radius: f32 = 4;
-
 /// The view's area: it takes the wheel and focus.
 pub const list_flags: ui.Flags = .{
     .wheel = true,

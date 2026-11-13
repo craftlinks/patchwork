@@ -79,8 +79,7 @@ pub const wheel_fraction: f64 = 0.01;
 /// The salt of the editing field's id: `id.derive(field_salt)`.
 pub const field_salt: u64 = 0x6669656c64;
 
-/// The default face's corner radius, text inset, and the unit's alpha.
-pub const number_radius: f32 = 4;
+/// The default face's text inset, and the unit's alpha.
 pub const number_pad_x: f32 = 8;
 pub const number_unit_alpha: f32 = 0.6;
 

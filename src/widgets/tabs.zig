@@ -107,6 +107,7 @@ const assert = std.debug.assert;
 const text = @import("../text.zig");
 const input = @import("../input.zig");
 const ui = @import("../ui.zig");
+const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 
@@ -129,10 +130,8 @@ pub const tab_min_w: f32 = 48;
 /// Space between two tabs.
 pub const tab_gap: f32 = 2;
 
-/// The default look's corner radius, its bar line, and the selected tab's underline.
-pub const tab_radius: f32 = 4;
+/// The default look's bar line; the tab heights leave room for it.
 pub const tab_line_px: f32 = 1;
-pub const tab_underline_px: f32 = 2;
 
 /// How a bar lays out its tabs (section 2a); a skin picks one with `tab_arrange`.
 pub const TabArrange = enum { natural, even };
@@ -546,7 +545,10 @@ pub fn TabsOf(comptime Skin: type) type {
                     .close_hovered = self.hover_close != null and self.hover_close.? == at,
                 }) orelse continue;
                 cx.area(self.tab_id(at), shape.rect, shape.radius, ui.cx.primary_flag);
-                if (close) |button| cx.area(self.close_id(at), button, 4, ui.cx.primary_flag);
+                if (close) |button| {
+                    const radius = cx.theme().form.radius.control;
+                    cx.area(self.close_id(at), button, radius, ui.cx.primary_flag);
+                }
             }
             self.draw_ghost(cx);
         }
@@ -805,13 +807,13 @@ fn gap_x(rects: []const Rect, index: u32, strip: Rect) f32 {
 
 comptime {
     assert(tab_min_w >= 2 * tab_pad_x);
-    assert(tab_bar_h > tab_underline_px + tab_line_px);
+    // The default skin's underline is the scheme's `mark`, at most `stroke_max`.
+    assert(tab_bar_h > theme.stroke_max + tab_line_px);
     assert(tabs_max <= 32);
 }
 
 const testing = std.testing;
 const draw = @import("../draw.zig");
-const theme = @import("../theme.zig");
 const fixture = @import("fixture.zig");
 const Dragging = ui.Dragging;
 

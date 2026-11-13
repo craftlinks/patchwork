@@ -146,7 +146,7 @@ patchwork/
 │   ├── widgets/paragraph.zig   # Paragraph: text wrapped to its width; a fit height for that width
 │   ├── widgets/menu.zig        # Menu and ContextMenu: a list in a popup, keys and pointer
 │   ├── widgets/dropdown.zig    # Dropdown: a face showing the selection and its Menu
-│   ├── widgets/tooltip.zig     # Tooltip: one line after a hover dwell, on the tooltip layer
+│   ├── widgets/tooltip.zig     # Tooltip, TooltipOf: one line after a hover dwell, on the tooltip layer, drawn by its skin
 │   ├── widgets/tabs.zig        # Tabs: a bar over a page; close, reorder, drag out; Segmented
 │   ├── widgets/splitter.zig    # Splitter: two panes and a draggable divider, begin/next/end
 │   ├── widgets/dock.zig        # Dock: a tree of splits and tab sets; drop zones, save and load
@@ -186,7 +186,7 @@ patchwork/
 │   ├── animator.zig            # Scalar animator transitions and animation time (Animator, Clock, Time)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
-│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles
+│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles, Material, Form
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
@@ -820,12 +820,16 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
   `lighten` and `darken` (what hover and press mix toward), four `accents`, the three text
   styles widgets label with (`name`, `value`, and `heading` for section titles: a disclosure
   header's label and an app's own section headings), and the hover and press weights
-  (`hover_lighten`, `down_darken`). Every library widget, the scrollbar thumb, and the clear
-  color read it at draw time.
+  (`hover_lighten`, `down_darken`); and, in its `form`, the corners and strokes of the
+  default skins, whether controls are filled or outlined, how the selected tab is marked, and
+  whether panels are framed. Every library widget, the scrollbar thumb, the dock's drop
+  overlay, and the clear color read it at draw time.
 - **What is not.** Sizes (they are per instance: `Knob.sized`, `Meter.track_h`, a `Walk`),
   the open ring's angles (the CPU hit tests use the constants), and colors an app stored in
   a widget (`Button.paint`, `Slider.track`, `Knob.accent`, `Panel.paint`, a style), which
-  win; `widgets.kit.accent(cx, i)` gives the scheme's accent for an app that wants it.
+  win; so do those paints' radii, so a square scheme squares an app's `Button` only when the
+  app builds its paint from `cx.theme().form.radius.control`. `widgets.kit.accent(cx, i)`
+  gives the scheme's accent for an app that wants it.
 - **Presets.** `theme.dark` is the look of steps 1 to 30 and the default; `theme.light` is
   its light counterpart. `theme.chrome` is `dark.record()`, the GPU record.
 - **Choosing and switching.** `config.theme` picks the scheme the app starts with;
@@ -844,6 +848,21 @@ The look of the whole app is a value it owns: `theme.Scheme` (`src/theme.zig`).
   `saturation`, a lit `rim`, and `refraction` at the edge. A `Panel` or `Menu` (so a
   `Dropdown`'s list) may set its own `material`. Glass needs `draw.Glass` registered and a
   backdrop under the face (see Backdrops and Glass); without one the skin draws the solid face.
+- **Form.** `scheme.form` (`theme.Form`) is the shape of the default skins' faces, CPU state
+  like the material (a switch is a redraw). `Form{}` is the default of both presets and draws
+  exactly what the library drew before forms. Six settings: `radius.control` (fields, number
+  boxes, checkboxes, tabs, the disclosure header, the scroll thumb; 4), `radius.popup` (menus,
+  the dropdown face, tooltips; 6), `radius.band` (highlight bands and the drop overlay; 4),
+  each in `[0, theme.radius_max]`; `capsule` (0.5 rounds the toggle, meter, checkbox mixed bar,
+  divider, and `Segmented` into capsules, 0 squares them); `hairline` (every border and rule,
+  `[0, theme.stroke_max]`; 1); `mark` (the tab underline and insertion marker, the divider,
+  the drop outline, `(0, theme.stroke_max]`; 2). And three choices: `controls = .outlined`
+  draws buttons, dropdowns, number boxes, fields, checkboxes, toggles' pills, and tabs as a
+  hairline in their ink (a button's paint, which its label takes too, or `colors.control`)
+  with a tint of it on hover and press; `tab_mark = .filled` fills the selected tab in
+  `accents[0]` with its label in `colors.panel` instead of underlining it; `framed` borders
+  solid panels with a hairline in `colors.control`. `app.check` refuses a field out of range
+  ("App.config.theme.form.capsule: must be in [0, 0.5]"), and `cx.set_theme` asserts it.
 
 ## Make a Skin
 
@@ -853,8 +872,9 @@ where it takes presses belong to a skin, a struct of draw functions passed at co
 `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face and border only), `MenuOf`,
 `DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TreeViewOf` (its bands are
 the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, `ColumnHeaderOf`,
-`WindowButtonsOf` (`window_button`), and `MenuBarOf` (`menu_title`, and its menus' `menu_face`
-and `menu_row`) work the same way. A
+`WindowButtonsOf` (`window_button`), `MenuBarOf` (`menu_title`, and its menus' `menu_face`
+and `menu_row`), and `TooltipOf` (`tooltip`, handed a `widgets.TooltipLook`: the placed box,
+the clip, the text, and the app's fill or null) work the same way. A
 `TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
@@ -888,12 +908,15 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
 
 - **The contract.** `button`, `slider` (with `slider_travel(area) [2]f32`, the x span a press
   maps onto `[0, 1]`), `knob`, `toggle`, `dropdown`, `tab`, `divider`, and `number_face` return
-  `?widgets.Shape`; `meter`, `panel`, `field`, `menu_face`, `menu_row`, `tab_bar`, and
-  `list_row` return nothing. A number box skin also needs `field`, for its editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
+  `?widgets.Shape`; `meter`, `panel`, `field`, `menu_face`, `menu_row`, `tab_bar`,
+  `list_row`, and `tooltip` return nothing. A number box skin also needs `field`, for its
+  editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
   fails the build with a message naming the skin and the function, for example
   "hardware.Skin: missing `pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`".
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
+  A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
+  `skins.Default` does.
 - **Draw order.** A batch draws where its type first appeared in its layer. A skin with its
   own face type should append faces on one layer and what goes on top (arcs, labels) on a
   higher one, then restore the layer, as the gallery's hardware skin does.
@@ -929,8 +952,8 @@ pub fn draw(app: *App, cx: *Context) void {
   Tab dismisses), `widgets.ContextMenu` (a menu opened by a right press on a target id),
   `widgets.Dropdown` (a face and its menu, `Action.changed` only for a different item), and
   `widgets.Tooltip` (the app says what is hovered as a `widgets.Tip`; it shows after
-  `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)` and
-  `DropdownOf(Skin)` are skinnable like the other widgets.
+  `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)`,
+  `DropdownOf(Skin)`, and `TooltipOf(Skin)` are skinnable like the other widgets.
 - **Forgetting `ui.overlays`.** Opening a popup calls `cx.request_popup(id)`; in safe builds
   the next draw panics naming the id if no `draw_overlay` drew it, and `ui.overlays` on a target
   with no overlay at all is a compile error.

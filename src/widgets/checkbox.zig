@@ -37,9 +37,8 @@ const Id = kit.Id;
 
 /// A checkbox row's height in logical pixels.
 pub const checkbox_height: f32 = 28;
-/// The box's side, its corner radius, and the space between the box and the label.
+/// The box's side, and the space between the box and the label.
 pub const box_side: f32 = 16;
-pub const box_radius: f32 = 4;
 pub const box_gap: f32 = 8;
 /// The longest label, in bytes.
 pub const checkbox_label_max: u32 = 32;
@@ -207,7 +206,6 @@ pub const mixed_h: f32 = 2;
 comptime {
     assert(checkbox_height >= box_side);
     assert(mark_square < box_side and mixed_w < box_side);
-    assert(box_radius * 2 < box_side);
 }
 
 const testing = std.testing;
