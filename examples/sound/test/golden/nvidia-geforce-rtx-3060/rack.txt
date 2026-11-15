@@ -3,4 +3,4 @@
 # driver: 615.78.08
 # size: 1280x720 @120
 scenario  hash
-still     fcd3a59510920caf
+still     523e2a3ffefc31b1

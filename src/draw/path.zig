@@ -61,8 +61,9 @@
 //! ## 4a. Ties at a Seam
 //! Where the two seam segments are equally near, the plain rule asks each chunk to break the tie
 //! on its own, and the two do not agree: the rasterizer snaps each chunk's quad to its own
-//! sub-pixel grid, so the chunks place one fragment a few thousandths of a pixel apart, and
-//! `sdf_segment` rounds a reversed segment differently. A tie is a line at a gentle bend, but an
+//! sub-pixel grid, so the chunks (before step 71 computed `q` from that interpolation) place one
+//! fragment a few thousandths of a pixel apart, and `sdf_segment` rounds a reversed segment
+//! differently. A tie is a line at a gentle bend, but an
 //! area beyond the seam point at a sharp one, and the whole stroke where a path turns straight
 //! back on itself: there each pixel was dropped by both chunks or drawn by both (Patchwork step
 //! 62, Tapestry's comb). The rule is therefore, at each seam, with `adjacent` the chunk's own
@@ -87,13 +88,13 @@
 //! draws the alpha of the nearest segment, and a fragment the plain rule gave the same chunk
 //! draws exactly as before.
 //!
-//! What a tie cannot remove is the line where ownership changes: a fragment within the
+//! //! What a tie cannot remove is the line where ownership changes: a fragment within the
 //! placement difference of it can still be dropped or drawn twice. That line crosses the stroke
 //! once at each seam, as the bisector did before, and runs along a near fold whose arms part by
-//! more than the tie. Computing `q` from the fragment's device position instead of the
-//! interpolated `local` would make every chunk's `q` the same bits and remove it; that needs the
-//! device mapping in the frame uniform. Test "a stroke that turns back at a seam draws once"
-//! locks the rule with the chunks moved apart.
+//! more than the tie. Where every chunk computes the same `q` for a fragment, the placement
+//! difference is zero and the two decisions are complements, so no pixel is dropped or drawn
+//! twice (section 5b). Test "a stroke that turns back at a seam draws once" locks the tie rule
+//! with the chunks moved apart by hand, which is what the exceptions of section 5b leave.
 //!
 //! ## 4b. Dashes
 //! A `Stroke` with a `Dash` draws only the on-parts of its pattern: at arc length `s` along the
@@ -124,6 +125,11 @@
 //! the width of a fragment the other chunk owns; flattened cubics' segments are near
 //! `flatten_px`, so it needs a polyline with segments shorter than half the width.
 //!
+//! The test that the end of the dash before a point lies on the segment (`back >= 0`) allows
+//! `dash_edge_tolerance`, because with `on = 0` that end and the start of the next dash coincide
+//! and a dot centred on a path's first point is reached with `back` of either sign by rounding
+//! (Patchwork step 71: a changed `q` dropped the first dot's first column on one adapter).
+//!
 //! `polygon` fits the pattern to the ring: with ring length `T` and
 //! `k = max(1, round(T / (on + off)))` it scales `on`, `off`, and `offset` by
 //! `T / (k * (on + off))`, so a ring has no short dash at its start, flow round it loops
@@ -134,10 +140,11 @@
 //! because an animated type keeps every path tile dirty and the app awake, solid or not.
 //!
 //! ## 5. Coordinates
-//! Points are stored relative to the path's origin, the top-left of its unpadded bounds, and
-//! each chunk carries `anchor = origin - rect.xy`. `polyline_at` takes the origin from the
-//! caller instead: a lane anchored at its rect keeps the stored value of every point that did
-//! not move when its bounds change, so a changed sample uploads one point. A container's
+//! Points are stored relative to the path's origin, the top-left of its unpadded bounds taken
+//! down to the grid of section 5b, and each chunk carries `anchor = origin - rect.xy`.
+//! `polyline_at` takes the origin from the caller instead: a lane anchored at its rect keeps
+//! the stored value of every point that did not move when its bounds change, so a changed
+//! sample uploads one point. A container's
 //! alignment shift (`Context.shift`) moves `rect.xy` only and `anchor` is a difference, so the
 //! stroke moves with the rect and the registry rule "geometry is relative to `rect`" holds. A
 //! chunk's rect is its bounds padded by `width / 2 + aa_pad`, which holds every fragment with
@@ -157,6 +164,27 @@
 //! the points and the box of the points contains the hull. `rect`, chunking, capacities, and
 //! hit areas do not change. `oriented_quad` is the CPU twin, `chunk_alpha` applies it, and test
 //! "every chunk's oriented quad contains its stroke" locks the containment.
+//!
+//! ## 5b. One `q` for Every Chunk
+//! The fragment stage measures from `q = frag_position(frag) - origin` (`draw.frag_position`,
+//! the prelude's section 7), not from `local`, which each chunk's own quad interpolates and the
+//! rasterizer snaps to its own sub-pixel grid. `frag_position` inverts the pass's projection
+//! from the frame uniform's `device_to_ndc`, so it is a function of the pixel alone. The origin
+//! is `rect.xy + anchor`, and it is the same bits in every chunk of a path because every path
+//! origin and every chunk rect's x and y are multiples of `1 / origin_grid` (`grid_down`): then
+//! `origin - rect.xy` is exact in `f32` below `origin_exact_max`, and so is the sum that
+//! rebuilds it. A rect moves up and left by less than `1 / origin_grid` and keeps its width and
+//! height, and the padding of section 5 holds the move. `Placed.bounds` starts at the gridded
+//! origin and grows by what the origin moved, so a path area hit-tests as before. Two chunks that
+//! cover a pixel then read the same three points, the same segment expressions, and the same
+//! side test, and `zig build seams` counts the result on the GPU.
+//!
+//! What stays outside it, and what the tie rule of section 4a still decides: a container's
+//! alignment shift moves `rect.xy` by a whole number of device pixels, which is on the grid at
+//! scales that are powers of two and off it at others (1.25, 1.5, 3), where the chunks' rebuilt
+//! origins may differ by an `f32` rounding; and coordinates of `origin_exact_max` or more.
+//! Section 4's class (two parts of a path within the stroke's width, more than one segment
+//! apart across a seam) is not about placement and stays.
 //!
 //! ## 6. Hit Testing
 //! `distance_to_polyline` is the CPU twin of the stroke distance. `ui.Context.path_area`
@@ -213,6 +241,22 @@ pub const seam_tie: f32 = 8.0e-2;
 /// logical pixels: a line off the bisector, because a symmetric shape puts whole rows of pixel
 /// centres on the bisector itself (section 4a).
 pub const seam_bias: f32 = 2.5e-2;
+
+/// Every path origin and every chunk rect's x and y is a multiple of `1 / origin_grid` logical
+/// pixels, so `origin - rect.xy` is exact in `f32` and every chunk rebuilds the path's origin to
+/// the bit (section 5b).
+pub const origin_grid: f32 = 256;
+
+/// Coordinates below this keep the grid exact: a multiple of `1 / origin_grid` below `2^15` needs
+/// at most 23 bits (section 5b).
+pub const origin_exact_max: f32 = 32768;
+
+/// How far behind the projection, in logical pixels, the end of the previous dash may lie and
+/// still count as on the segment (section 4b). With `on = 0` that end and the start of the next
+/// dash coincide, and where a dot sits at the first point of a path the projection reaches it
+/// with `back` exactly 0 in theory and either sign by rounding, so the dot's first column was
+/// kept or dropped by the last bits of `q`. The shader writes the literal `1.0e-4`.
+pub const dash_edge_tolerance: f32 = 1.0e-4;
 
 /// Hit distance past the half width (section 6).
 pub const hit_slop: f32 = 3;
@@ -464,8 +508,12 @@ pub fn chunk_alpha(
     const rect = chunk.rect;
     if (x < rect[0] or x >= rect[0] + rect[2]) return 0;
     if (y < rect[1] or y >= rect[1] + rect[3]) return 0;
-    const qx = x - rect[0] - chunk.anchor_x;
-    const qy = y - rect[1] - chunk.anchor_y;
+    // The shader's order (section 5b): the origin the chunk rebuilds, then the position's
+    // offset from it.
+    const origin_x = rect[0] + chunk.anchor_x;
+    const origin_y = rect[1] + chunk.anchor_y;
+    const qx = x - origin_x;
+    const qy = y - origin_y;
     const head: u32 = @intFromFloat(chunk.first_point);
     const tail: u32 = head + @as(u32, @intFromFloat(chunk.point_count)) - 1;
     assert(tail < points.len);
@@ -640,7 +688,7 @@ fn dash_segment(q: Point, a: Point, b: Point, phase: f32, pattern: Pattern) Meas
     const u = s - pattern.period * @floor(s * pattern.inverse);
     const back = t - (u - pattern.on);
     const ahead = t + (pattern.period - u);
-    const back_ok = back >= 0;
+    const back_ok = back >= -dash_edge_tolerance;
     const ahead_ok = ahead <= span;
     const take_back = back_ok and (!ahead_ok or u - pattern.on <= pattern.period - u);
     const target = if (take_back) back else ahead;
@@ -667,15 +715,33 @@ fn segment_at(points: []const Point, index: u32, x: f32, y: f32) f32 {
 /// counted in `cx.overflow_count`.
 pub fn polyline(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?Placed {
     const bounds = bounds_of(points);
-    const first = append_from(cx, points, .{ bounds.x, bounds.y }, stroke, clip) orelse {
+    const origin = grid_origin(.{ bounds.x, bounds.y });
+    const first = append_from(cx, points, origin, stroke, clip) orelse {
         return null;
     };
-    return .{ .first = first, .count = @intCast(points.len), .bounds = bounds };
+    return .{ .first = first, .count = @intCast(points.len), .bounds = gridded(bounds, origin) };
+}
+
+/// `bounds` grown to start at the gridded `origin` (section 5b): it holds what it held, and a
+/// path area measured from it hits where it did.
+fn gridded(bounds: Rect, origin: Point) Rect {
+    assert(origin[0] <= bounds.x);
+    assert(origin[1] <= bounds.y);
+    const out: Rect = .{
+        .x = origin[0],
+        .y = origin[1],
+        .width = bounds.width + (bounds.x - origin[0]),
+        .height = bounds.height + (bounds.y - origin[1]),
+    };
+    assert(out.x + out.width >= bounds.x + bounds.width);
+    assert(out.y + out.height >= bounds.y + bounds.height);
+    return out;
 }
 
 /// Appends the stroke through `points` like `polyline`, but stores the points relative to
-/// `origin` instead of their bounds' top-left (section 5). With a fixed origin, a path whose
-/// bounds change keeps every unmoved point's stored value, so moving one point uploads one
+/// `origin` taken down to the grid (`origin_grid`) instead of their bounds' top-left (section
+/// 5). The same origin always gives the same stored values, so with a fixed origin a path whose
+/// bounds change keeps every unmoved point's stored value, and moving one point uploads one
 /// point (an automation lane). Returns false when refused. A path placed this way has no
 /// `Placed` and cannot take a path area, whose points must be relative to their bounds.
 pub fn polyline_at(
@@ -695,10 +761,13 @@ pub fn polyline_at(
 fn append_from(
     cx: anytype,
     points: []const Point,
-    origin: Point,
+    origin_given: Point,
     stroke: Stroke,
     clip: Clip,
 ) ?u32 {
+    const origin = grid_origin(origin_given);
+    assert(origin_given[0] - origin[0] < 1 / origin_grid);
+    assert(origin_given[1] - origin[1] < 1 / origin_grid);
     assert(points.len >= 2);
     assert(stroke.width > 0);
     assert(clip.x1 > clip.x0);
@@ -787,7 +856,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
         return null;
     }
     const bounds = bounds_of(points);
-    const origin: Point = .{ bounds.x, bounds.y };
+    const origin = grid_origin(.{ bounds.x, bounds.y });
     // The ring, its last point before it, and its second point after it (section 4).
     const stored = count + 3;
     const reserved = cx.reserve_points(stored) orelse return null;
@@ -822,7 +891,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
         if (stroke.dash != null) arc += arc_length(relative[1 + start .. 1 + end + 1]);
         start = end;
     }
-    return .{ .first = first, .count = count + 1, .bounds = bounds };
+    return .{ .first = first, .count = count + 1, .bounds = gridded(bounds, origin) };
 }
 
 /// The last point of a closed ring's first chunk: `chunk_end`'s, unless the ring would then be
@@ -857,8 +926,10 @@ fn chunk_of(
     const dash = dash_fields(stroke.dash, arc);
     const box = bounds_of(points[start .. end + 1]);
     const pad = stroke.width * 0.5 + aa_pad;
-    const x = box.x - pad;
-    const y = box.y - pad;
+    // The rect moves down to the grid and keeps its size, so the padding still holds the stroke
+    // and `origin - rect.xy` is exact (section 5b).
+    const x = grid_down(box.x - pad);
+    const y = grid_down(box.y - pad);
     const instance: types.Path = .{
         .rect = .{ x, y, box.width + 2 * pad, box.height + 2 * pad },
         .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
@@ -878,6 +949,14 @@ fn chunk_of(
     };
     assert(instance.rect[2] > 0);
     assert(instance.rect[3] > 0);
+    assert(grid_origin(origin)[0] == origin[0]);
+    assert(grid_origin(origin)[1] == origin[1]);
+    if (@abs(x) < origin_exact_max and @abs(origin[0]) < origin_exact_max) {
+        assert(instance.rect[0] + instance.anchor_x == origin[0]);
+    }
+    if (@abs(y) < origin_exact_max and @abs(origin[1]) < origin_exact_max) {
+        assert(instance.rect[1] + instance.anchor_y == origin[1]);
+    }
     return instance;
 }
 
@@ -955,6 +1034,22 @@ fn bounds_of(points: []const Point) Rect {
     return box;
 }
 
+/// `value` taken down to a multiple of `1 / origin_grid`. A power-of-two scale and `@floor`
+/// round nothing else, so the result is within `1 / origin_grid` below `value` and the same
+/// value always gives the same bits (section 5b).
+fn grid_down(value: f32) f32 {
+    assert(std.math.isFinite(value));
+    const down = @floor(value * origin_grid) / origin_grid;
+    assert(down <= value);
+    assert(value - down < 1 / origin_grid);
+    return down;
+}
+
+/// `origin` with both coordinates taken down to the grid (section 5b).
+fn grid_origin(origin: Point) Point {
+    return .{ grid_down(origin[0]), grid_down(origin[1]) };
+}
+
 fn length(a: Point, b: Point) f32 {
     const dx = b[0] - a[0];
     const dy = b[1] - a[1];
@@ -967,6 +1062,8 @@ comptime {
     // `types.Path.pixel` writes the seam tie and bias as the literals `8.0e-2` and `2.5e-2`.
     assert(seam_tie == 8.0e-2);
     assert(seam_bias == 2.5e-2);
+    // `types.Path.pixel` writes the dash edge tolerance as the literal `1.0e-4`.
+    assert(dash_edge_tolerance == 1.0e-4);
     // The tie zone holds the side line with room for two chunks' placement to differ.
     assert(seam_tie > 2 * seam_bias + 0.02);
     assert(chunk_points_max == 16);
@@ -1289,7 +1386,10 @@ fn seam_misses(cx: *const TestContext, points: []const Point, width: f32, box: R
 // and a quarter circle whose seam lies on its own axis of symmetry draw as one stroke, with
 // the chunks' fragments placed up to 4.9e-3 px apart. Under the rule before step 62 (ties to
 // the earlier chunk by plain distance) the same check missed 46 pixels: the fold's
-// body and cap, and the arc's axis, are ties that each chunk broke on its own placement.
+// body and cap, and the arc's axis, are ties that each chunk broke on its own placement. Since
+// step 71 the chunks' placement no longer differs on the grid (section 5b), so this locks the
+// tie rule for the exceptions that remain: a container's shift off the grid and coordinates of
+// 2^15 and more.
 test "a stroke that turns back at a seam draws once" {
     const cx = new_context();
     // Width and how far the way down lands from the way up, as on `examples/vector`'s page 5.
@@ -1349,7 +1449,8 @@ test "a stroke that turns back at a seam draws once" {
 // corners were dropped or doubled (7 under this check before step 62, 3 with only the seam
 // pair's tie). Such a ring is now one chunk. A ring of 16 segments, whose greedy split would also
 // leave one segment, ends its first chunk a point earlier and draws once with the chunks moved
-// apart.
+// apart. Since step 71 that placement difference no longer occurs on the grid (section 5b), so
+// this locks the tie rule for the exceptions that remain.
 test "a ring never leaves one segment as its second chunk" {
     const cx = new_context();
     const corners = [_]Point{
@@ -1518,6 +1619,73 @@ test "a path anchored at a fixed origin stores points relative to it" {
     try testing.expect(flat > 0.4);
 }
 
+/// Asserts every `Path` record in `cx` rebuilds `origin` to the bit as `rect.xy + anchor`, and
+/// returns how many there are.
+fn expect_origin(cx: *TestContext, origin: Point) !usize {
+    const chunks = cx.items(types.Path);
+    for (chunks) |chunk| {
+        try testing.expectEqual(origin[0], chunk.rect[0] + chunk.anchor_x);
+        try testing.expectEqual(origin[1], chunk.rect[1] + chunk.anchor_y);
+        // The rect's corner is on the grid too.
+        try testing.expectEqual(@floor(chunk.rect[0] * origin_grid), chunk.rect[0] * origin_grid);
+        try testing.expectEqual(@floor(chunk.rect[1] * origin_grid), chunk.rect[1] * origin_grid);
+    }
+    return chunks.len;
+}
+
+// Locks the grid (section 5b): for a cubic, a plot, a polygon of 64 points, and a polyline at the
+// off-grid offset (0.3, 0.7), and for `polyline_at` at the off-grid origin (20.1, 30.2), every
+// chunk's `rect.xy + anchor` is the gridded origin to the bit and `Placed.bounds` starts there,
+// the origin within 1/256 below the bounds' own corner (floor of 0.3 * 256 = 76 and of 0.7 * 256 =
+// 179 over 256 are 0.296875 and 0.69921875); a container shift by (0.5, 2), on the grid, keeps
+// the equality. A shift by (1/3, 0) is off the grid, the documented exception: it is not asserted.
+test "every chunk rebuilds its path's origin to the bit" {
+    const cx = new_context();
+    const wide = Stroke{ .color = .{ 1, 1, 1, 0.5 }, .width = 3, .hover = 0 };
+    const control = [4]Point{
+        .{ 10.3, 20.7 },
+        .{ 60.1, 120.9 },
+        .{ 160.7, -40.3 },
+        .{ 260.9, 70.1 },
+    };
+    const placed = cubic(cx, control, wide, window).?;
+    try testing.expect(try expect_origin(cx, .{ placed.bounds.x, placed.bounds.y }) >= 2);
+    cx.reset();
+    var samples: [48]f32 = undefined;
+    for (&samples, 0..) |*sample, index| sample.* = @sin(@as(f32, @floatFromInt(index)) * 0.4);
+    const lane: Rect = .{ .x = 5.7, .y = 9.3, .width = 220.1, .height = 40.9 };
+    const plotted = plot(cx, &samples, lane, .{ -1, 1 }, wide, window).?;
+    try testing.expect(try expect_origin(cx, .{ plotted.bounds.x, plotted.bounds.y }) >= 2);
+    cx.reset();
+    var ring: [64]Point = undefined;
+    for (&ring, 0..) |*point, index| {
+        const turn = 2 * std.math.pi * @as(f32, @floatFromInt(index)) / 64;
+        point.* = .{ 100.3 + 50 * @cos(turn), 80.7 + 50 * @sin(turn) };
+    }
+    const closed = polygon(cx, &ring, wide, window).?;
+    try testing.expect(try expect_origin(cx, .{ closed.bounds.x, closed.bounds.y }) >= 2);
+    cx.reset();
+    var line: [40]Point = undefined;
+    for (&line, 0..) |*point, index| {
+        const step: f32 = @floatFromInt(index);
+        point.* = .{ 0.3 + 5 * step, 0.7 + @as(f32, @floatFromInt(index % 3)) };
+    }
+    const starts = cx.counts();
+    const dropped = polyline(cx, &line, wide, window).?;
+    try testing.expectEqual(@as(f32, 0.296875), dropped.bounds.x);
+    try testing.expectEqual(@as(f32, 0.69921875), dropped.bounds.y);
+    try testing.expect(try expect_origin(cx, .{ 0.296875, 0.69921875 }) >= 2);
+    cx.shift(starts, 0.5, 2);
+    _ = try expect_origin(cx, .{ 0.796875, 2.69921875 });
+    cx.reset();
+    try testing.expect(polyline_at(cx, &line, .{ 20.1, 30.2 }, wide, window));
+    const at = 20.1 - grid_down(20.1);
+    try testing.expect(at >= 0 and at < 1 / origin_grid);
+    _ = try expect_origin(cx, .{ grid_down(20.1), grid_down(30.2) });
+    const stored: Point = .{ line[0][0] - grid_down(20.1), line[0][1] - grid_down(30.2) };
+    try testing.expectEqual(stored, cx.point_items()[0]);
+}
+
 /// The test stroke of section 4b's tests: width 2, alpha 0.85, dashed as `dash`.
 fn dashed_stroke(width: f32, dash: Dash) Stroke {
     return .{ .color = .{ 1, 1, 1, 0.85 }, .width = width, .hover = 0, .dash = dash };
@@ -1562,6 +1730,28 @@ test "on zero draws dots off apart" {
     for (xs, want) |x, alpha| {
         try testing.expectApproxEqAbs(alpha, composite(cx, 50 + x, 50, 1), 1.0e-4);
     }
+}
+
+// Locks the dot at a path's start (section 4b): on 0, off 6 on a line from (0, 0), the first dot
+// is centred on the first point, so the pixel centre 0.5 px along it measures 0.5 from the dot
+// at any `q` within a few ulps of 0.5 (the knife edge: `back = t - (u - on)` is exactly 0 and its
+// sign is a rounding). The dot's phase moved up to 9e-5 along (`dash_edge_tolerance` is 1e-4)
+// still reaches it; 2e-4 along does not, and the next dot is then 5.99980 - 0.5 away.
+test "the first dot of an on-zero dash survives rounding of q" {
+    const line = [_]Point{ .{ 0, 0 }, .{ 30, 0 } };
+    const ulp: f32 = std.math.floatEps(f32) * 0.5;
+    const shifts = [_]f32{ -8 * ulp, -ulp, 0, ulp, 8 * ulp };
+    for ([_]f32{ 0, 3.0e-5, 9.0e-5 }) |phase| {
+        for (shifts) |shift| {
+            const x = 0.5 + shift;
+            const near = distance_to_dashes(&line, phase, 0, 6, x, 0);
+            try testing.expectApproxEqAbs(@as(f32, 0.5), near, 2.0e-4);
+            const above = distance_to_dashes(&line, phase, 0, 6, x, 1.5);
+            try testing.expectApproxEqAbs(@as(f32, @sqrt(0.5 * 0.5 + 1.5 * 1.5)), above, 2.0e-4);
+        }
+    }
+    const missed = distance_to_dashes(&line, 2.0e-4, 0, 6, 0.5, 0);
+    try testing.expect(missed > 5);
 }
 
 /// 101 points 1 px apart on y = 50 from x = 50: chunks of 15 segments, seams 15, 30, ..., 90
@@ -1674,7 +1864,9 @@ test "a dash across a corner is one round join" {
 // Locks a dashed fold inside a chunk and at a seam (sections 4a and 4b): the hairpin of "every
 // chunk's oriented quad contains its stroke" blends once on 6, off 4, and the combs of "a stroke
 // that turns back at a seam draws once", dashed, draw as one dashed stroke with the chunks'
-// fragments moved apart: ownership is the solid rule's, so the dashes split the same way.
+// fragments moved apart: ownership is the solid rule's, so the dashes split the same way. Since
+// step 71 that placement difference no longer occurs on the grid (section 5b), so this locks the
+// tie rule for the exceptions that remain.
 test "a dashed fold draws once" {
     const cx = new_context();
     const hairpin = [_]Point{ .{ 10, 10 }, .{ 50, 10 }, .{ 70, 16 }, .{ 50, 22 }, .{ 10, 22 } };

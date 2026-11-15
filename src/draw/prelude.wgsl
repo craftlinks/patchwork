@@ -55,10 +55,19 @@
 // below; the registry rejects any other (`draw/registry.zig`, section 2b), because the pixel
 // cache would keep its stale pixels. `time_pulse(hz)` rises from 0 to 1 and back once per
 // period, and wraps seamlessly for any `hz` that is a multiple of 1/3600.
+//
+// ## 7. The Pass's Size
+// `frame.device_to_ndc` is `2 / width` and `2 / height` of the pass's target in device pixels: a
+// window's, a target's own, a view's the window's (a view draws into a window-sized pass).
+// `frag_position` takes a fragment's `frag` back to the pass's logical (world, through a view)
+// position by inverting `frame.ortho`, which is a scale and a translation, so it reads no
+// interpolated value: two quads that cover one pixel get the same bits from it. It reads no
+// time either, so a type that uses it stays unanimated. CPU twin: `draw.frag_position`.
 
 struct Frame {
     ortho: mat4x4<f32>,
-    time: vec4<f32>,
+    time: vec2<f32>,
+    device_to_ndc: vec2<f32>,
     theme: Theme,
 }
 
@@ -78,6 +87,13 @@ fn fs_main(varyings: Varyings) -> @location(0) vec4<f32> {
     let px = unpack(varyings);
     let color = pixel(px);
     return blend_out(vec4<f32>(color.rgb, color.a * clip_mask(px.pos, px.clip)));
+}
+
+// The pass's logical position (world, through a view) of the fragment at device position `frag`:
+// the inverse of `frame.ortho`, which is a scale and a translation.
+fn frag_position(frag: vec2<f32>) -> vec2<f32> {
+    let ndc = vec2<f32>(frag.x * frame.device_to_ndc.x - 1.0, 1.0 - frag.y * frame.device_to_ndc.y);
+    return (ndc - frame.ortho[3].xy) / vec2<f32>(frame.ortho[0][0], frame.ortho[1][1]);
 }
 
 fn clip_mask(pos: vec2<f32>, clip: vec4<f32>) -> f32 {

@@ -459,17 +459,27 @@ pub const Path = extern struct {
     ;
     // `fwidth` runs before the loop, whose bound is instance data, so the derivative stays in
     // uniform control flow (prelude, section 3). For an exact distance it is one device pixel
-    // in logical pixels. A fragment that a neighbouring chunk's seam segment is nearer to
-    // belongs to that chunk. Where the two segments meeting at the seam are within `tie` of
-    // each other, the side of a line through the seam decides, and the owner draws the nearest
-    // of the three distances (`draw/path.zig`, section 4a). The literals are `path.seam_tie` and
-    // `path.seam_bias`, which `path.zig` asserts. A dashed chunk (`dash_period > 0`, instance
-    // data) decides ownership the same way and draws the distance to the dashes' on-parts instead
-    // (section 4b). CPU twins: `path.chunk_alpha`, `path.seam_side`, and `path.distance_to_dashes`.
+    // in logical pixels. `q` is the fragment's position from `frag_position` (prelude, section
+    // 7) minus the path's origin, which is `rect.xy + anchor` to the bit in every chunk
+    // (`draw/path.zig`, section 5b): two chunks that cover a pixel get the same `q`, so a
+    // translucent stroke covers it once at a seam. The read is of `frame.device_to_ndc`, not of
+    // the clock, so `Path` stays an unanimated type. A fragment that a neighbouring chunk's seam
+    // segment is nearer to belongs to that chunk. Where the two segments meeting at the seam are
+    // within `tie` of each other, the side of a line through the seam decides, and the owner
+    // draws the nearest of the three distances (`draw/path.zig`, section 4a). The literals are
+    // `path.seam_tie` and `path.seam_bias`, which `path.zig` asserts. A dashed chunk
+    // (`dash_period > 0`, instance data) decides ownership the same way and draws the distance to
+    // the dashes' on-parts instead (section 4b). CPU twins: `path.chunk_alpha`, `path.seam_side`,
+    // and `path.distance_to_dashes`.
     pub const pixel: []const u8 =
         \\fn pixel(px: Pixel) -> vec4<f32> {
         \\    let pixel_size = max(fwidth(px.local.x), 1.0e-5);
-        \\    let q = px.local - vec2<f32>(px.anchor_x, px.anchor_y);
+        \\    // `q` comes from the fragment's device position, not from `local`, which each chunk's
+        \\    // own quad interpolates to its own sub-pixel grid. The origin is rebuilt exactly: the
+        \\    // grid of `draw/path.zig`, section 5b. Not `px.pos`, and no clock read: a path is not
+        \\    // an animated type.
+        \\    let origin = px.rect.xy + vec2<f32>(px.anchor_x, px.anchor_y);
+        \\    let q = frag_position(px.frag) - origin;
         \\    let head = u32(px.first_point);
         \\    let tail = head + u32(px.point_count) - 1u;
         \\    let dashed = px.dash_period > 0.0;
@@ -562,7 +572,7 @@ pub const Path = extern struct {
         \\    let u = (s0 + t) - px.dash_period * floor((s0 + t) * px.dash_inverse);
         \\    let back = t - (u - px.dash_on);
         \\    let ahead = t + (px.dash_period - u);
-        \\    let back_ok = back >= 0.0;
+        \\    let back_ok = back >= -1.0e-4;
         \\    let ahead_ok = ahead <= span;
         \\    let take_back = back_ok && (!ahead_ok || u - px.dash_on <= px.dash_period - u);
         \\    let inside = u <= px.dash_on;

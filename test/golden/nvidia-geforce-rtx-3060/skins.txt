@@ -3,16 +3,16 @@
 # driver: 615.78.08
 # size: 1280x720 @120
 scenario    hash
-codex       c86fc8b1fb82553f
-codex-menu  3a293cd2e6aa022b
-drag        e7e838ae0655876f
-flow        a4c77c35d50c89ea
-hud         6dd12bbe8def9878
-hud-menu    40d76f04b44d2d91
-paper       918de63bb8f1e128
-paper-menu  f322eb5ceb071bdc
-patch       d014564fe2469440
-patch-menu  072dc93f9a6e83aa
-still       144e97ad04869d0b
-switch      144e97ad04869d0b
-switching   144e97ad04869d0b
+codex       0953a55c5bb3dde7
+codex-menu  90ca34516c535f0e
+drag        77d216b330dddb3f
+flow        ff27578fa7440bc4
+hud         c7ce4c557ac362c7
+hud-menu    e4ef0bcf5d1ec8a8
+paper       691b3f784c0a4b79
+paper-menu  dc47bb477c1cc1ca
+patch       6bb6cfcc32cf7615
+patch-menu  58b4ecbaacb81c24
+still       e16801a512c2fb82
+switch      e16801a512c2fb82
+switching   e16801a512c2fb82

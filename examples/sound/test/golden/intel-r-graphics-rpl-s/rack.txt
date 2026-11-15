@@ -3,4 +3,4 @@
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
 scenario  hash
-still     3cc230207eeb80f1
+still     0520cf57b2baafb1

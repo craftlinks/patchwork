@@ -95,6 +95,10 @@
 //! - `zig build compare -- a.ppm b.ppm [--diff d.png] [--crop x y w h --png out.png]`
 //!   compares two frame dumps, and writes a diff picture or a cropped PNG of the first
 //!   (`tools/compare.zig`).
+//! - `zig build seams -- [--adapter high|low|both] [--scale 1|2|3] [--strict]` draws translucent
+//!   strokes through `addTool` and counts the pixels two chunks of one stroke cover twice or not
+//!   at all (`tools/seams.zig`). It needs a GPU, so it is in no part of `test`, `check`, or
+//!   `regress`; `test` runs its pure parts.
 //!
 //! ## 6. Fonts
 //! `add_font_module(patchwork_builder, ranges, fonts)` builds `tools/subset.zig` for the host,
@@ -897,8 +901,47 @@ pub fn build(b: *std.Build) void {
     add_check_step(b, &examples);
     add_regress_step(b, &examples);
     add_compare_step(b, library);
+    add_seams_step(b, vector, library, target, optimize);
     add_consumer_step(b, optimize);
     add_sound_step(b, optimize);
+}
+
+/// `seams`: `tools/seams.zig`, which counts a translucent stroke's pixels covered twice or not at
+/// all where two chunks meet (step 71), with the arguments after `--`. It needs a GPU, so it is
+/// in no part of `test`, `check`, or `regress`; its pure parts are tested by `test`. The
+/// installed binary runs, for its RUNPATH (`add_run`).
+fn add_seams_step(
+    b: *std.Build,
+    steps: AppSteps,
+    library: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) void {
+    const tool = addTool(b, .{
+        .name = "seams",
+        .root_source_file = b.path("tools/seams.zig"),
+        .target = target,
+        .optimize = optimize,
+        .app = steps,
+    });
+    const install = b.addInstallArtifact(tool, .{});
+    const run_cmd = std.Build.Step.Run.create(b, "run seams");
+    run_cmd.addFileArg(b.graph.path(.install_bin, "seams"));
+    run_cmd.addPassthruArgs();
+    run_cmd.step.dependOn(&install.step);
+    run_cmd.stdio = .inherit;
+    const step = b.step("seams", "Count a stroke's seam faults on the GPU: -- [--adapter A] [--scale S] [--strict]");
+    step.dependOn(&run_cmd.step);
+    // The pure parts, which need no GPU.
+    const root = b.createModule(.{
+        .root_source_file = b.path("tools/seams.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root.addImport("patchwork", library);
+    const tests = b.addTest(.{ .root_module = root });
+    const test_step = b.top_level_steps.get("test").?;
+    test_step.step.dependOn(&b.addRunArtifact(tests).step);
 }
 
 /// `test-consumer`: `test/consumer`, a package outside this build graph, through its own `zig

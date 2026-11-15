@@ -3,9 +3,9 @@
 # driver: 615.78.08
 # size: 1280x720 @120
 scenario          hash
-idle              99df6fc02b6430a7
-pulse             5d332debc482f693
-transport         98233511cb033074
-transport-stress  1f18278ea2ca0b2c
-typing            711106f66c0b56d2
-typing-stress     d22e6de691222527
+idle              a464c09e9cd350c1
+pulse             ff232d1b9ec261ac
+transport         13a5094192038d37
+transport-stress  cbdf00b1856ba8f1
+typing            afeeaaeba9eb2d15
+typing-stress     5e20e58b7dd5819e

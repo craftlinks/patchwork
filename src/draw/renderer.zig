@@ -38,7 +38,7 @@
 //! buffer_write pool[i] [range]    per pool whose revision moved and whose records changed, up
 //!                                 to `draw.upload_range_cap` ranges (section 4)
 //! buffer_write points [range]     when the point revision moved and points changed, likewise
-//! buffer_write uniform time       16 bytes at `draw.time_offset`, while animating and the
+//! buffer_write uniform time       8 bytes at `draw.time_offset`, while animating and the
 //!                                 time moved (section 4b)
 //! [buffer_create, bind_group_create] per viewed layer at its first view (section 4d)
 //! buffer_write view uniform       per viewed layer whose uniform changed (section 4d)
@@ -129,7 +129,7 @@
 //! forced tiles dirty, and `animating` keeps its value (`hashed` is false). That is the idle
 //! frame (skipped) and the animation-only frame (the animated tiles, cached).
 //! ```text
-//! animation-only frame:  buffer_write uniform time (16 B)
+//! animation-only frame:  buffer_write uniform time (8 B)
 //!                        pass_begin kept target, load
 //!                          per rect: scissor_set, clear, every batch
 //!                        pass_end, present_copy
@@ -250,11 +250,14 @@ pub const clear_color: Color = .{
     .a = 1.0,
 };
 
-/// The frame uniform: projection, time, and the theme, `draw.uniform_bytes` in all.
-/// `time[0]` is the animation time in seconds; the other lanes stay zero.
+/// The frame uniform: projection, time, the pass's size, and the theme, `draw.uniform_bytes` in
+/// all. `time[0]` is the animation time in seconds; `time[1]` stays zero.
 pub const Uniform = extern struct {
     ortho: [16]f32,
-    time: [4]f32,
+    time: [2]f32,
+    /// 2 / width and 2 / height of the pass's target in device pixels: a fragment's device
+    /// position to normalized device coordinates (prelude, `frag_position`).
+    device_to_ndc: [2]f32,
     theme: theme.Theme,
 };
 
@@ -393,7 +396,8 @@ const clear_wgsl: []const u8 = registry.theme_wgsl() ++
     \\
     \\struct Frame {
     \\    ortho: mat4x4<f32>,
-    \\    time: vec4<f32>,
+    \\    time: vec2<f32>,
+    \\    device_to_ndc: vec2<f32>,
     \\    theme: Theme,
     \\}
     \\
@@ -610,7 +614,12 @@ pub fn Renderer(comptime Cx: type) type {
         /// Out-pointer init so a static renderer needs no stack copy.
         pub fn init(self: *Self) void {
             self.ids = .init();
-            self.uniform = .{ .ortho = undefined, .time = @splat(0), .theme = theme.chrome };
+            self.uniform = .{
+                .ortho = undefined,
+                .time = @splat(0),
+                .device_to_ndc = @splat(0),
+                .theme = theme.chrome,
+            };
             self.width_px = 0;
             self.height_px = 0;
             self.scale_120 = 0;
@@ -997,6 +1006,7 @@ pub fn Renderer(comptime Cx: type) type {
                     size.height_px,
                     size.scale_120,
                 );
+                self.uniform.device_to_ndc = draw.device_to_ndc(size.width_px, size.height_px);
                 buffer.push(.{ .buffer_write = .{
                     .id = self.resources.uniform_buffer,
                     .offset = 0,
@@ -1535,6 +1545,9 @@ pub fn Renderer(comptime Cx: type) type {
                 target.uniform.theme = self.uniform.theme;
                 target.uniform.time = self.uniform.time;
                 target.uniform.time[0] = time_s;
+                // After the copy: a target is its own pass, so its fragments' device positions
+                // are in its own size, not the window's.
+                target.uniform.device_to_ndc = draw.device_to_ndc(device.width, device.height);
                 buffer.push(.{ .buffer_write = .{
                     .id = target.uniform_buffer,
                     .offset = 0,
@@ -2286,6 +2299,7 @@ comptime {
     assert(clear_color.a == theme.dark.colors.background[3]);
     assert(@sizeOf(Uniform) == draw.uniform_bytes);
     assert(@offsetOf(Uniform, "time") == draw.time_offset);
+    assert(@offsetOf(Uniform, "device_to_ndc") == draw.device_to_ndc_offset);
     assert(@offsetOf(Uniform, "theme") == draw.theme_offset);
     assert(draw.quad_bytes == draw.vertex_count * 2 * @sizeOf(f32));
     assert(batch_op_cap == 4);
@@ -2676,6 +2690,63 @@ test "a viewed layer draws with its own uniform and a pan repaints its tiles" {
     try testing.expectEqual(scissor, first_op(.scissor_set).?);
 }
 
+/// The pass-size slot a recorded uniform write holds, from the bytes at its offset.
+fn recorded_to_ndc(write: commands.BufferWrite) [2]f32 {
+    assert(write.offset == 0);
+    assert(write.data.len == draw.uniform_bytes);
+    const bytes = write.data.slice();
+    return .{
+        @bitCast(bytes[draw.device_to_ndc_offset..][0..4].*),
+        @bitCast(bytes[draw.device_to_ndc_offset + 4 ..][0..4].*),
+    };
+}
+
+// Locks the pass's size in the frame uniform (module guide, section 4): the first frame's whole
+// write at 1280 by 720 holds (2 / 1280, 2 / 720) at offset 72 and time lane 1 zero; at scale 1.5
+// the 1920 by 1080 pass holds (2 / 1920, 2 / 1080); a viewed layer's uniform holds the window's,
+// where a target's own uniform holds 2 over its device width and height (100 by 50 for the
+// rect (10, 10, 100, 50) at scale 1), after the window's time is copied into it.
+test "the uniform carries the pass's size" {
+    Fixture.start();
+    try scene(0);
+    Fixture.record(120);
+    var write_storage: [16]commands.BufferWrite = undefined;
+    const first = writes(&Fixture.buffer, &write_storage);
+    const window = recorded_to_ndc(first[0]);
+    try testing.expectEqual(@as(f32, 2.0 / 1280.0), window[0]);
+    try testing.expectEqual(@as(f32, 2.0 / 720.0), window[1]);
+    try testing.expectEqual(@as(f32, 0), Fixture.renderer.uniform.time[1]);
+    try testing.expectEqual(draw.device_to_ndc_offset, @offsetOf(Uniform, "device_to_ndc"));
+    Fixture.record(180);
+    const scaled = recorded_to_ndc(writes(&Fixture.buffer, &write_storage)[0]);
+    try testing.expectEqual(@as(f32, 2.0 / 1920.0), scaled[0]);
+    try testing.expectEqual(@as(f32, 2.0 / 1080.0), scaled[1]);
+    Fixture.start();
+    try viewed_scene(200);
+    Fixture.record(120);
+    const slot = Fixture.renderer.view_slots[1];
+    try testing.expectEqual(window, slot.uniform.device_to_ndc);
+    const view_write = writes(&Fixture.buffer, &write_storage);
+    const last = view_write[view_write.len - 1];
+    try testing.expectEqual(slot.uniform_buffer, last.id);
+    try testing.expectEqual(window, recorded_to_ndc(last));
+    Targets.start();
+    Targets.scene(Targets.single, .{ 10, 10, 100, 50 }, 0, false);
+    Targets.record();
+    const target = &Targets.renderer.targets[0];
+    try testing.expectEqual([2]f32{ 2.0 / 100.0, 2.0 / 50.0 }, target.uniform.device_to_ndc);
+    const target_writes = writes(&Targets.buffer, &write_storage);
+    var found = false;
+    for (target_writes) |write| {
+        if (write.id != target.uniform_buffer) continue;
+        try testing.expectEqual(target.uniform.device_to_ndc, recorded_to_ndc(write));
+        found = true;
+    }
+    try testing.expect(found);
+    const main_pass: [2]f32 = .{ 2.0 / 640.0, 2.0 / 480.0 };
+    try testing.expectEqual(main_pass, Targets.renderer.uniform.device_to_ndc);
+}
+
 // Locks the unchanged fast path (module guide, section 4b): an undrawn frame repeats the last
 // frame's tiles without hashing, while a texture create or write on an otherwise undrawn frame
 // hashes again; a registry without animated types never animates or writes time.
@@ -2772,7 +2843,7 @@ const Animated = struct {
 };
 
 // Locks the animation-only frame (module guide, section 4b): with a pulse on screen and no
-// draw, a frame writes 16 bytes of time at offset 64, hashes nothing, and repaints the pulse's
+// draw, a frame writes 8 bytes of time at offset 64, hashes nothing, and repaints the pulse's
 // tile under a scissor; a frame at the same time writes no time but still repaints; dropping
 // the pulse repaints its tile once and stops animating, and the next frame is skipped.
 test "an animation-only frame writes the time and repaints the animated tiles" {

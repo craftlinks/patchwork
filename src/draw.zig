@@ -75,7 +75,9 @@
 //!
 //! ## 4. Uniform Size
 //! The frame uniform holds the projection matrix, the time slot (`time_offset`, read by
-//! animated draw types), and `theme.Theme`; `uniform_bytes` is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
+//! animated draw types), the pass's size (`device_to_ndc_offset`, which `frag_position` turns a
+//! fragment's device position back into logical pixels with), and `theme.Theme`; `uniform_bytes`
+//! is their sum, enforced by the `comptime` block below. WebGPU requires dynamic uniform
 //! offsets to be multiples of the `minUniformBufferOffsetAlignment` limit (WebGPU "Limits"
 //! table, default 256). The buffer size is kept a multiple of that limit so the record stays
 //! valid if it is ever bound at an offset. `draw/renderer.zig` owns the record and its uploads.
@@ -250,17 +252,25 @@ pub const matrix_bytes: u32 = 64;
 /// WebGPU `minUniformBufferOffsetAlignment` default (WebGPU "Limits" table).
 const min_uniform_offset_alignment: u32 = 256;
 
-/// Byte size of the frame uniform's time slot, one `vec4<f32>` whose `x` is the animation time
-/// in seconds (`animator.Time`).
-pub const time_bytes: u32 = 16;
+/// Byte size of the frame uniform's time slot, a `vec2<f32>` whose `x` is the animation time
+/// in seconds (`animator.Time`) and whose `y` stays zero.
+pub const time_bytes: u32 = 8;
 
 /// Offset of the time slot: right after the projection, so it does not move with the theme.
 pub const time_offset: u32 = matrix_bytes;
 
-/// Offset of `theme.Theme` in the frame uniform.
-pub const theme_offset: u32 = time_offset + time_bytes;
+/// Byte size of the pass's size slot: `2 / width` and `2 / height` of the pass's target in device
+/// pixels, as a `vec2<f32>` (`frag_position`).
+pub const device_to_ndc_bytes: u32 = 8;
 
-/// Byte size of the frame uniform: the projection matrix, the time slot, and `theme.Theme`.
+/// Offset of the pass's size slot: right after the time slot, so a time write does not touch it.
+pub const device_to_ndc_offset: u32 = time_offset + time_bytes;
+
+/// Offset of `theme.Theme` in the frame uniform.
+pub const theme_offset: u32 = device_to_ndc_offset + device_to_ndc_bytes;
+
+/// Byte size of the frame uniform: the projection matrix, the time slot, the pass's size slot,
+/// and `theme.Theme`.
 /// Asserted to equal their sum and to be a multiple of `min_uniform_offset_alignment`.
 pub const uniform_bytes: u32 = 256;
 
@@ -414,6 +424,32 @@ pub fn ortho_y_down(out: *[16]f32, width_px: u32, height_px: u32, scale_120: u32
     assert(out[5] < 0);
 }
 
+/// The pass-size slot of a target `width_px` by `height_px` device pixels: `2 / width` and
+/// `2 / height`, which take a fragment's device position to normalized device coordinates.
+pub fn device_to_ndc(width_px: u32, height_px: u32) [2]f32 {
+    assert(width_px != 0);
+    assert(height_px != 0);
+    const out: [2]f32 = .{
+        2.0 / @as(f32, @floatFromInt(width_px)),
+        2.0 / @as(f32, @floatFromInt(height_px)),
+    };
+    assert(out[0] > 0);
+    assert(out[1] > 0);
+    return out;
+}
+
+/// The logical position (world, through a view) of the fragment at device position `frag`, in
+/// the order the prelude's `frag_position` computes it: the inverse of `ortho`, which is a scale
+/// and a translation, after the device position's own scale to normalized coordinates. CPU twin
+/// of that function.
+pub fn frag_position(ortho: *const [16]f32, to_ndc: [2]f32, frag: [2]f32) [2]f32 {
+    assert(ortho[0] > 0);
+    assert(ortho[5] < 0);
+    const ndc_x = frag[0] * to_ndc[0] - 1.0;
+    const ndc_y = 1.0 - frag[1] * to_ndc[1];
+    return .{ (ndc_x - ortho[12]) / ortho[0], (ndc_y - ortho[13]) / ortho[5] };
+}
+
 /// Writes the projection of a layer drawn through `view`: `ortho · T`, where `T` maps world
 /// points to logical screen points (`View.apply`). See the module guide, section 3a.
 pub fn view_ortho(out: *[16]f32, ortho: *const [16]f32, view: View) void {
@@ -433,7 +469,7 @@ comptime {
     assert(quad_bytes == @sizeOf(@TypeOf(unit_quad)));
     assert(unit_quad.len == 2 * vertex_count);
     assert(matrix_bytes == @sizeOf([16]f32));
-    assert(matrix_bytes + time_bytes + theme.bytes == uniform_bytes);
+    assert(matrix_bytes + time_bytes + device_to_ndc_bytes + theme.bytes == uniform_bytes);
     assert(theme_offset + theme.bytes == uniform_bytes);
     assert(uniform_bytes % min_uniform_offset_alignment == 0);
     // The relations above hold for any consistent change; these pin the values the hosts
@@ -442,6 +478,10 @@ comptime {
     assert(vertex_count == 6);
     assert(matrix_bytes == 64);
     assert(time_offset == 64);
+    assert(time_bytes == 8);
+    assert(device_to_ndc_offset == 72);
+    assert(device_to_ndc_bytes == 8);
+    assert(theme_offset == 80);
     assert(uniform_bytes == 256);
     // Layout geometry is four packed `f32`s, so a `Rect` copies like one instance field.
     assert(@sizeOf(Rect) == 16);
@@ -696,4 +736,100 @@ test "rect and clip arrays and inset constructors" {
         Inset{ .left = 1, .top = 2, .right = 3, .bottom = 4 },
         Inset.sides(1, 2, 3, 4),
     );
+}
+
+/// One projection under test for `frag_position`: its matrix, its pass size slot, the pass's
+/// device size, and the logical position of device pixel `(i, j)`'s centre in the pass.
+const FragCase = struct {
+    ortho: [16]f32,
+    to_ndc: [2]f32,
+    width_px: u32,
+    height_px: u32,
+    view: View,
+    offset: [2]f32,
+    scale: f32,
+
+    fn expected(self: FragCase, i: u32, j: u32) [2]f32 {
+        const sx = (@as(f32, @floatFromInt(i)) + 0.5 + self.offset[0]) / self.scale;
+        const sy = (@as(f32, @floatFromInt(j)) + 0.5 + self.offset[1]) / self.scale;
+        return self.view.invert(sx, sy);
+    }
+
+    fn check(self: FragCase) !void {
+        const columns = [_]u32{ 0, self.width_px / 2, self.width_px - 1 };
+        const rows = [_]u32{ 0, self.height_px / 2, self.height_px - 1 };
+        for (rows) |j| {
+            for (0..self.width_px) |i| try self.near(@intCast(i), j);
+        }
+        for (columns) |i| {
+            for (0..self.height_px) |j| try self.near(i, @intCast(j));
+        }
+    }
+
+    fn near(self: FragCase, i: u32, j: u32) !void {
+        const frag: [2]f32 = .{
+            @as(f32, @floatFromInt(i)) + 0.5,
+            @as(f32, @floatFromInt(j)) + 0.5,
+        };
+        const got = frag_position(&self.ortho, self.to_ndc, frag);
+        const want = self.expected(i, j);
+        try std.testing.expectApproxEqAbs(want[0], got[0], 2.0e-4);
+        try std.testing.expectApproxEqAbs(want[1], got[1], 2.0e-4);
+    }
+};
+
+// Locks `frag_position` as the inverse of the projection at every pixel centre of the first,
+// middle, and last row and column: within 2e-4 logical px for the window at 1280 by 720 scale 1
+// and at 3840 by 2160 scale 3, for that window through a view at zoom 1.7 from (13.25, -40) (the
+// world position under the pixel), and for a 151 by 75 target at device (40, 30) at scale 1.5,
+// whose pass counts device pixels from its own corner.
+test "a fragment's position is the inverse of the projection" {
+    var window: [16]f32 = undefined;
+    ortho_y_down(&window, 1280, 720, 120);
+    try (FragCase{
+        .ortho = window,
+        .to_ndc = device_to_ndc(1280, 720),
+        .width_px = 1280,
+        .height_px = 720,
+        .view = View.identity,
+        .offset = .{ 0, 0 },
+        .scale = 1,
+    }).check();
+    const slot = device_to_ndc(1280, 720);
+    try std.testing.expectEqual(@as(f32, 2.0 / 1280.0), slot[0]);
+    try std.testing.expectEqual(@as(f32, 2.0 / 720.0), slot[1]);
+    ortho_y_down(&window, 3840, 2160, 360);
+    const big = device_to_ndc(3840, 2160);
+    try (FragCase{
+        .ortho = window,
+        .to_ndc = big,
+        .width_px = 3840,
+        .height_px = 2160,
+        .view = View.identity,
+        .offset = .{ 0, 0 },
+        .scale = 3,
+    }).check();
+    const view: View = .{ .x = 13.25, .y = -40, .zoom = 1.7 };
+    var viewed: [16]f32 = undefined;
+    view_ortho(&viewed, &window, view);
+    try (FragCase{
+        .ortho = viewed,
+        .to_ndc = big,
+        .width_px = 3840,
+        .height_px = 2160,
+        .view = view,
+        .offset = .{ 0, 0 },
+        .scale = 3,
+    }).check();
+    var target: [16]f32 = undefined;
+    fx.ortho(&target, .{ .x = 40, .y = 30, .width = 151, .height = 75 }, 180);
+    try (FragCase{
+        .ortho = target,
+        .to_ndc = device_to_ndc(151, 75),
+        .width_px = 151,
+        .height_px = 75,
+        .view = View.identity,
+        .offset = .{ 40, 30 },
+        .scale = 1.5,
+    }).check();
 }
