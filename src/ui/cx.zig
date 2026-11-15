@@ -117,6 +117,16 @@
 //! it is dropped; a bench run simulates it (`bench.serve_window`). `window_state` events store
 //! the window's state, which `window_state()` reports in any phase, and owe a draw.
 //!
+//! The title is the app's to set in any call that gets a context (`set_title`). The context keeps
+//! it in `title_max` bytes and a NUL, cleaned as a dropped file's name is (`drop.clean_name`:
+//! whole codepoints that fit, each byte that is not valid UTF-8 shown as `?`) and cut at its first
+//! NUL; the same title again changes nothing. A title is not a request the host takes once: the
+//! context counts its changes (`title_serial`, never 0 once changed), and a host applies the
+//! title whenever the count differs from the one it applied last. Natively that is the
+//! toplevel's title, in a browser `document.title`; a host with no window leaves it in the
+//! context, where `title()` reads it. Until the first `set_title` the title is empty and the
+//! window keeps `config.title` (natively) or the page its own (browser).
+//!
 //! ## 5b. Touch
 //! A finger is a contact: `touch_down` claims one of `input.contact_cap` slots, which holds its
 //! own pointer state (`PointerSlot`: pointer, hot, hover, capture, the press flags). The mouse's
@@ -264,6 +274,7 @@ const areas = @import("areas.zig");
 const view = @import("view.zig");
 const canvas = @import("canvas.zig");
 const popup = @import("popup.zig");
+const drop = @import("../drop.zig");
 
 pub const Rect = draw.Rect;
 pub const Clip = draw.Clip;
@@ -273,6 +284,9 @@ pub const Flags = areas.Flags;
 pub const Cursor = areas.Cursor;
 pub const ViewState = view.ViewState;
 pub const CanvasState = canvas.CanvasState;
+
+/// Bytes of the title `set_title` keeps (module guide, section 5a).
+pub const title_max: u32 = 255;
 
 /// Bytes `copy` keeps for the host to offer: one paste-sized buffer per context.
 pub const clipboard_cap: u32 = 65536;
@@ -706,6 +720,10 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         /// (section 5a).
         window_state_value: input.WindowState,
         window_request: ?WindowRequest,
+        /// The window's title, NUL-terminated, and the count of its changes (section 5a).
+        title_bytes: [title_max + 1]u8,
+        title_len: u32,
+        title_serial_value: u32,
         /// The app's scheme (section 9b); `draw.theme` is its record.
         scheme: theme_module.Scheme,
         /// What `overflow_report` last returned or saw (section 10).
@@ -790,6 +808,9 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.overflow_seen = .zero;
             self.window_state_value = .{};
             self.window_request = null;
+            self.title_bytes = @splat(0);
+            self.title_len = 0;
+            self.title_serial_value = 0;
             self.scheme = theme_module.dark;
             self.draw.theme = self.scheme.record();
             assert(self.phase == .idle);
@@ -2410,6 +2431,40 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.window_request == null or self.window_request.? != .close);
         }
 
+        /// Sets the window's title: the toplevel's natively, `document.title` in a browser, kept
+        /// and not shown where there is no window. Cleaned as section 5a says. The same title
+        /// again changes nothing. Any phase.
+        pub fn set_title(self: *Self, text_new: []const u8) void {
+            assert(self.title_len <= title_max);
+            assert(self.title_bytes[self.title_len] == 0);
+            const nul = std.mem.indexOfScalar(u8, text_new, 0) orelse text_new.len;
+            var cleaned: [title_max]u8 = undefined;
+            const len = drop.clean_name(text_new[0..nul], &cleaned);
+            assert(len <= title_max);
+            if (std.mem.eql(u8, cleaned[0..len], self.title_bytes[0..self.title_len])) return;
+            @memcpy(self.title_bytes[0..len], cleaned[0..len]);
+            // Zero the rest so no stale bytes of a longer title stay behind the NUL.
+            @memset(self.title_bytes[len..], 0);
+            self.title_len = len;
+            self.title_serial_value +%= 1;
+            if (self.title_serial_value == 0) self.title_serial_value = 1;
+            assert(self.title_serial_value != 0);
+        }
+
+        /// The title last set, cleaned; empty until the first `set_title`. Any phase.
+        pub fn title(self: *const Self) [:0]const u8 {
+            assert(self.title_len <= title_max);
+            assert(self.title_bytes[self.title_len] == 0);
+            return self.title_bytes[0..self.title_len :0];
+        }
+
+        /// Host side: a count that changes exactly when the title does; 0 until the first change.
+        pub fn title_serial(self: *const Self) u32 {
+            assert(self.title_len <= title_max);
+            if (self.title_len > 0) assert(self.title_serial_value != 0);
+            return self.title_serial_value;
+        }
+
         fn request_window(self: *Self, request: WindowRequest) void {
             assert(self.phase == .event);
             assert(request != .move and request != .resize and request != .menu);
@@ -2969,6 +3024,63 @@ test "right presses are secondary and never end a left capture" {
     send(context, button_event(120, 10, .left, false), &ids, &out);
     try testing.expect(!out[0].up.inside);
     try testing.expectEqual(Id.none, context.capture);
+}
+
+// Locks a title kept once and counted when it changes: a fresh context is empty at serial 0,
+// "Paper" is serial 1 with a NUL after it, again is still 1, "Codex" is 2, "" is 3, and on a
+// fresh context "" leaves serial 0.
+test "a title is kept once and counted when it changes" {
+    var context: TestContext = undefined;
+    context.init();
+    try testing.expectEqualStrings("", context.title());
+    try testing.expectEqual(@as(u32, 0), context.title_serial());
+    context.set_title("");
+    try testing.expectEqual(@as(u32, 0), context.title_serial());
+    context.set_title("Paper");
+    try testing.expectEqualStrings("Paper", context.title());
+    try testing.expectEqual(@as(u32, 1), context.title_serial());
+    try testing.expectEqual(@as(u8, 0), context.title().ptr[5]);
+    context.set_title("Paper");
+    try testing.expectEqual(@as(u32, 1), context.title_serial());
+    context.set_title("Codex");
+    try testing.expectEqualStrings("Codex", context.title());
+    try testing.expectEqual(@as(u32, 2), context.title_serial());
+    context.set_title("");
+    try testing.expectEqualStrings("", context.title());
+    try testing.expectEqual(@as(u32, 3), context.title_serial());
+}
+
+// Locks the cleaning: 300 bytes keep 255; 254 bytes then a two-byte character keep 254; "a\xffb"
+// is "a?b"; "ab\x00cd" is "ab"; every result is valid UTF-8.
+test "a title is cleaned to valid UTF-8 within its room" {
+    var context: TestContext = undefined;
+    context.init();
+    const long: [300]u8 = @splat('a');
+    context.set_title(&long);
+    try testing.expectEqual(@as(usize, 255), context.title().len);
+    try testing.expect(std.unicode.utf8ValidateSlice(context.title()));
+    var edge: [256]u8 = @splat('a');
+    edge[254] = 0xc3;
+    edge[255] = 0xa9;
+    context.set_title(&edge);
+    try testing.expectEqual(@as(usize, 254), context.title().len);
+    try testing.expect(std.unicode.utf8ValidateSlice(context.title()));
+    context.set_title("a\xffb");
+    try testing.expectEqualStrings("a?b", context.title());
+    try testing.expect(std.unicode.utf8ValidateSlice(context.title()));
+    context.set_title("ab\x00cd");
+    try testing.expectEqualStrings("ab", context.title());
+    try testing.expect(std.unicode.utf8ValidateSlice(context.title()));
+}
+
+// Locks the wrap: with the serial at its largest value a new title makes it 1, never 0.
+test "the serial skips zero when it wraps" {
+    var context: TestContext = undefined;
+    context.init();
+    context.set_title("x");
+    context.title_serial_value = std.math.maxInt(u32);
+    context.set_title("y");
+    try testing.expectEqual(@as(u32, 1), context.title_serial());
 }
 
 // Locks the cursor: the hot area's shape, `default` off every area and outside the window,

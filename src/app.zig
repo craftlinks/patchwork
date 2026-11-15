@@ -167,7 +167,8 @@ const theme = @import("theme.zig");
 
 /// Per-app settings the hosts read at compile time. Comptime-only, because `draw` names types.
 pub const Config = struct {
-    /// Window title on native. The browser page sets its own title.
+    /// The window's title natively until `cx.set_title` sets another; the browser page keeps its
+    /// own title until then.
     title: [:0]const u8,
     /// Host timer period in milliseconds. 0 means no timer.
     timer_period_ms: u32,

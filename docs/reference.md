@@ -1136,6 +1136,12 @@ closes the window; the app's areas only ask it to.
   close arrives as `close_requested`, which closes unless the app calls `cx.keep_open()`.
   Natively each becomes an `xdg_toplevel` request with the press's serial. The browser drops
   them, and a bench replay simulates them (`bench.serve_window`: maximize flips the state).
+- **Title.** `cx.set_title(text)` in any call that gets a context (`event`, `timer`, `draw`,
+  `drain`); `cx.title()` reads it back. At most 255 bytes (`ui.title_max`), cleaned as a dropped
+  file's name is: whole codepoints that fit, each invalid byte as `?`, cut at the first NUL. The
+  same title again changes nothing, so calling it from `draw` every frame is fine. Natively it
+  is the toplevel's title, in the browser `document.title`; until the first call the window keeps
+  `config.title` and the page its own. The hosts with no window keep it in the context.
 - **WindowButtons.** Minimize (where the window manager offers it), maximize or restore, and
   close, 46 px each in a row; nothing under server decorations (`width(cx)` says how wide).
 - **MenuBar.** `widgets.MenuBar.init(id, titles, items)`: titles side by side, each opening its
@@ -1701,7 +1707,8 @@ switch (cx.drag_hit(bar, event)) {
 ## File Drops
 
 A drag of files from a file manager (natively) or from the desktop (in the browser) reaches
-the app as events, and the files' bytes follow in chunks; the app never sees a path.
+the app as events, and the files' bytes follow in chunks. Natively the app also gets each
+file's path, for opening or watching it (see Paths); in the browser there is none.
 
 ```zig
 const zone = ui.id("zone", 0);
@@ -1723,8 +1730,22 @@ switch (cx.drop_hit(zone, event)) {
   target, so a popup blocks drops beneath it. The pointer, hover, and focus are untouched;
   `cx.hit` answers `none` for the four drop events and `cx.drop_hit` answers them.
 - **The drop** lists up to 16 files by base name (cut to 255 bytes), size, and whether they can
-  be read (a folder or a special file cannot); more are counted in `skipped`. During the `drop`
-  event the app calls `cx.accept_files(id, mask)` once; `id` then receives the chunks.
+  be read (a folder or a special file cannot), and natively its `path`; more are counted in
+  `skipped`. During the `drop` event the app calls `cx.accept_files(id, mask)` once; `id` then
+  receives the chunks.
+- **Paths.** `input.DropFile.path` is the file's full path, natively only: the bytes the
+  dropping program sent, percent-decoded and nothing more, so perhaps not UTF-8 and never cut.
+  It is for opening, not for showing (`name` is the text; clean a path with `drop.clean_name`
+  before it is shown). It is empty in the browser and in a replay, so a scenario's frames never
+  depend on where a file was, and it is valid only while the `drop` event is dispatched: copy it.
+  A path too long for the app's buffer must be dropped, not cut: a cut path is another path.
+  ```zig
+  my_path_len = 0; // 0 means no path
+  if (file.path.len <= my_path.len) { // one that does not fit is no path
+      @memcpy(my_path[0..file.path.len], file.path);
+      my_path_len = file.path.len;
+  }
+  ```
 - **Chunks.** Accepted files arrive in order, never interleaved, in chunks of exactly 64 KiB
   but the last; the chunk that reaches the file's size is `done`, and every accepted file ends
   with exactly one of `done`, `failed`, or `cancelled`. An empty file is one empty `done`. The

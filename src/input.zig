@@ -80,7 +80,9 @@
 //! A drag that carries files reports `drop_over` while it is over the window and
 //! `drop_leave` when it leaves or is cancelled; the pointer, hover, and capture are not
 //! involved (the drag holds the pointer). `drop` lists up to `drop_files_max` files by base
-//! name, size, and whether they can be read; the app accepts some of them during that event,
+//! name, size, and whether they can be read, and natively each file's `path`: the bytes the
+//! dropping program sent (percent-decoded, perhaps not UTF-8), for opening and not for showing,
+//! empty in the browser and in a replay; the app accepts some of them during that event,
 //! and the host then delivers their bytes as `file` events (`Chunk`, `src/drop.zig`):
 //! - Accepted files arrive in index order, never interleaved; each file's chunks have
 //!   increasing offsets, back to back, and end with exactly one terminal chunk (`done`,
@@ -354,6 +356,11 @@ pub const KeyPress = struct {
 pub const DropFile = struct {
     /// The base name, valid UTF-8; path bytes that are not are shown as '?'.
     name: []const u8,
+    /// The file's full path where the host has one: natively, the bytes the dropping program
+    /// sent, percent-decoded and otherwise as they are, so perhaps not UTF-8. For opening, not
+    /// for showing: `name` is the text. Empty in the browser and in a replay. Valid only while
+    /// the `drop` event is dispatched.
+    path: [:0]const u8 = "",
     /// The bytes the transfer delivers: the size when the files were dropped.
     size: u64,
     /// False for a directory, a special file, or a path that could not be examined.
