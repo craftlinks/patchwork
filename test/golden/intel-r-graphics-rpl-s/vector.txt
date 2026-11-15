@@ -11,5 +11,6 @@ glyph      91fbf1919d3d9d64
 morph      909a3ef0b523d839
 sizes      79b34c90bcbc9a4d
 still      76257cef6377576c
+thin       09fd562b3617fe73
 title      05033bcf3321f2cb
 write      8d79d9e0996e9cff

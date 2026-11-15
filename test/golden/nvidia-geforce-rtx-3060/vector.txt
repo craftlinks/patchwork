@@ -11,5 +11,6 @@ glyph      d0c5eb1326e8508e
 morph      1e43ce800f17eacd
 sizes      804d816a446352fc
 still      16e11eaf43bd1d12
+thin       a5037db141e7fadf
 title      bf5bfc0ede0e08bd
 write      98001d077d1537aa
