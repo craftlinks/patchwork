@@ -45,6 +45,19 @@
 //! resolver cannot follow (a function's own parameter, as in `Draw`, or a call on one) is
 //! unchecked, and more than `unchecked_max` of them fail the run.
 //!
+//! ## 4a. The Root's Namespaces
+//! A public declaration of the library's root whose value is a type is printed when an entry of
+//! `namespaces` has its name as the whole path or as the path's first segment (`editor`,
+//! `editor.literal`), or has it as its `T` (the root's `Wake` is `wake.Wake`). Every other one is
+//! in `left_out` with the reason it is not printed, so a new root namespace fails the build of
+//! the tool until it is added to one list or the other, and a row that names something the root
+//! does not have, or that is printed, fails it too.
+//!
+//! A type of the standard library a printed signature names is printed as the source writes it
+//! (`std.Io.Writer`), from the hand-kept `foreign` list: it is never printed in a types section
+//! or followed, and the cross-check compares the source's text with the listed name. A std type
+//! not in the list stays a compile error, so the next one is a decision.
+//!
 //! ## 5. Layout
 //! Keys in a fixed order, one declaration a line, no other whitespace, so a diff of the golden
 //! shows the declaration that changed, and two runs give the same bytes. A declaration's file is
@@ -139,12 +152,21 @@ const namespaces = [_]Namespace{
     .{ .path = "ui.Context()", .T = UiContext, .cx = .ui },
     .{ .path = "widgets.kit", .T = widgets.kit, .cx = .ui },
     .{ .path = "app", .T = patchwork.app, .cx = .none },
+    .{ .path = "png", .T = patchwork.png, .cx = .none },
+    .{ .path = "wake.Wake", .T = patchwork.wake.Wake, .cx = .none },
+    .{ .path = "editor.literal", .T = patchwork.editor.literal, .cx = .none },
+    .{ .path = "editor", .T = patchwork.editor, .cx = .none },
+    .{ .path = "editor.Editor", .T = patchwork.editor.Editor, .cx = .ui },
+    .{ .path = "editor.buffer.Buffer", .T = patchwork.editor.buffer.Buffer, .cx = .none },
+    .{ .path = "editor.language", .T = patchwork.editor.language, .cx = .none },
+    .{ .path = "editor.tokenizer", .T = patchwork.editor.tokenizer, .cx = .none },
 };
 
 /// The library's namespaces the public-name walk starts from, in order of preference.
 const roots = [_][]const u8{
     "draw",  "text",     "theme", "ui",   "widgets", "app",    "bench",
     "input", "animator", "frame", "wake", "drop",    "editor", "commands",
+    "png",
 };
 
 /// Depth of the public-name walk: `widgets.Knob.Action` is depth 2.
@@ -182,6 +204,109 @@ fn check_namespace(comptime entry: Namespace) void {
     }
     if (!called and current != entry.T) {
         @compileError("describe: namespace " ++ entry.path ++ " is not the type listed");
+    }
+}
+
+// ------------------------------------------------------------------ 1a. The root's namespaces
+
+/// A namespace of the library's root that no entry of `namespaces` prints, and why.
+const LeftOut = struct { name: []const u8, why: []const u8 };
+
+/// Every public namespace of the root that is not printed, each with the reason an agent can
+/// read here; `first_unlisted` makes a new one choose between the list and this table.
+const left_out = [_]LeftOut{
+    .{
+        .name = "frame",
+        .why = "the window's size and scale; the hosts keep it and an app reads it through " ++
+            "its context",
+    },
+    .{
+        .name = "input",
+        .why = "its event types are printed in ui.json where a printed function names them; " ++
+            "its functions build events for hosts and tests",
+    },
+    .{
+        .name = "animator",
+        .why = "a widget's own motion; animator.Animator is printed in widgets.json where a " ++
+            "widget names it",
+    },
+    .{ .name = "gpu", .why = "the GPU layer under draw; an app makes no call into it" },
+    .{
+        .name = "commands",
+        .why = "the GPU command stream under draw; an app makes no call into it",
+    },
+    .{ .name = "renderer", .why = "the renderer the hosts drive; an app makes no call into it" },
+    .{
+        .name = "bench",
+        .why = "scenario steps and their types are printed in app.json; its functions are the " ++
+            "replay hosts' and test helpers",
+    },
+    .{
+        .name = "drop",
+        .why = "the hosts' transfer machinery; an app's side is input.Drop and the context's " ++
+            "drop calls in ui.json",
+    },
+    .{
+        .name = "host",
+        .why = "the platform hosts, which an app's build wires and a tool's main calls; the " ++
+            "reference describes them",
+    },
+};
+
+/// The text of `path` before its first `.`.
+fn first_segment(comptime path: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return path;
+    return path[0..dot];
+}
+
+/// Whether an entry of `namespaces` prints the root's declaration `name`: its path is `name` or
+/// starts with it as a segment (`editor`, `editor.literal`), or its `T` is the declaration.
+fn is_printed(comptime Root: type, comptime name: []const u8) bool {
+    const value = @field(Root, name);
+    for (namespaces) |entry| {
+        if (std.mem.eql(u8, first_segment(entry.path), name)) return true;
+        if (entry.T == value) return true;
+    }
+    return false;
+}
+
+fn is_left_out(comptime name: []const u8) bool {
+    for (left_out) |row| {
+        if (std.mem.eql(u8, row.name, name)) return true;
+    }
+    return false;
+}
+
+/// The first public namespace of `Root` that is neither printed nor in `left_out`, or null.
+/// A public declaration counts when its value is a `type`.
+fn first_unlisted(comptime Root: type) ?[]const u8 {
+    @setEvalBranchQuota(100_000);
+    for (decls_of(Root)) |decl| {
+        if (@TypeOf(@field(Root, decl)) != type) continue;
+        if (is_printed(Root, decl)) continue;
+        if (!is_left_out(decl)) return decl;
+    }
+    return null;
+}
+
+/// The first `left_out` name that is not a type declaration of `Root`, or is printed (a stale
+/// row), or null.
+fn first_stale(comptime Root: type) ?[]const u8 {
+    for (left_out) |row| {
+        if (!@hasDecl(Root, row.name)) return row.name;
+        if (@TypeOf(@field(Root, row.name)) != type) return row.name;
+        if (is_printed(Root, row.name)) return row.name;
+    }
+    return null;
+}
+
+comptime {
+    if (first_unlisted(patchwork)) |name| {
+        @compileError("describe: root namespace `" ++ name ++ "` is neither printed nor left out");
+    }
+    if (first_stale(patchwork)) |name| {
+        @compileError("describe: left-out name `" ++ name ++
+            "` is not an unprinted root namespace");
     }
 }
 
@@ -248,6 +373,25 @@ const public: []const Public = walk: {
     break :walk &final;
 };
 
+/// A type of the standard library that a printed signature names. It is printed by `name`, as
+/// the source writes it, and is neither printed in a types section nor followed (section 2).
+const Foreign = struct { T: type, name: []const u8 };
+
+/// The standard library's types the printed signatures name. A std type not listed here stays a
+/// compile error, so the next one is a decision and not an accident.
+const foreign = [_]Foreign{
+    .{ .T = std.Io.Writer, .name = "std.Io.Writer" },
+    .{ .T = std.Io.Writer.Error, .name = "std.Io.Writer.Error" },
+};
+
+/// The name the source writes for `T` when it is in `foreign`, else null.
+fn foreign_of(comptime T: type) ?[]const u8 {
+    for (foreign) |entry| {
+        if (entry.T == T) return entry.name;
+    }
+    return null;
+}
+
 fn index_of(comptime list: []const Public, comptime T: type) ?u32 {
     for (list, 0..) |entry, index| {
         if (entry.T == T) return index;
@@ -298,7 +442,10 @@ fn peel(comptime T: type) Peeled {
                 current = a.child;
             },
             .error_union => |e| {
-                const set = if (public_of(e.error_set)) |found| found.name else "";
+                const set = if (public_of(e.error_set)) |found|
+                    found.name
+                else
+                    foreign_of(e.error_set) orelse "";
                 if (set.len > 0) error_set = e.error_set;
                 prefix = prefix ++ set ++ "!";
                 current = e.payload;
@@ -319,6 +466,7 @@ fn type_text(comptime T: type) []const u8 {
 fn base_text(comptime T: type) []const u8 {
     if (public_of(T)) |found| return found.name;
     if (anonymous_of(T)) |name| return name;
+    if (foreign_of(T)) |name| return name;
     if (@typeInfo(T) == .@"fn") return fn_text(T);
     return @typeName(T);
 }
@@ -527,6 +675,7 @@ const Collected = struct { types: []const Public, anonymous: []const Anonymous }
 fn add_base(comptime list: []const type, comptime T: type) []const type {
     const base = peel(T).base;
     if (!is_container(base)) return list;
+    if (foreign_of(base) != null) return list;
     for (list) |known| {
         if (known == base) return list;
     }
@@ -1183,6 +1332,10 @@ const Expected = struct {
     primitive: ?[]const u8,
     /// The public path of the error set in the wrappers, if any.
     error_path: ?[]const u8,
+    /// The base's name when it is a std type of `foreign`, checked by the source's text.
+    foreign: ?[]const u8,
+    /// The name of the error set in the wrappers when it is a std type of `foreign`.
+    error_foreign: ?[]const u8,
 };
 
 fn expected_of(comptime T: ?type) Expected {
@@ -1193,17 +1346,22 @@ fn expected_of(comptime T: ?type) Expected {
         .path = null,
         .primitive = null,
         .error_path = null,
+        .foreign = null,
+        .error_foreign = null,
     };
     const peeled = peel(known);
     const named = public_of(peeled.base);
     const primitive = !is_container(peeled.base) and @typeInfo(peeled.base) != .@"fn";
-    const error_path = if (peeled.error_set) |set| public_of(set).?.path else null;
+    const error_public = if (peeled.error_set) |set| public_of(set) else null;
+    const error_foreign = if (peeled.error_set) |set| foreign_of(set) else null;
     return .{
         .text = comptime type_text(known),
         .prefix = peeled.prefix,
         .path = if (named) |entry| entry.path else null,
         .primitive = if (primitive) @typeName(peeled.base) else null,
-        .error_path = error_path,
+        .error_path = if (error_public) |entry| entry.path else null,
+        .foreign = foreign_of(peeled.base),
+        .error_foreign = error_foreign,
     };
 }
 
@@ -1325,8 +1483,14 @@ fn check_type(
             },
             .error_union => {
                 const set, const payload = tree.nodeData(node).node_and_node;
-                const path = expected.error_path orelse return mismatch(what, "an error set");
-                try check_same(current_file, set, current_scope, path, what);
+                if (expected.error_foreign) |name| {
+                    // A std error set is checked by the text the source writes.
+                    const written = tree.getNodeSource(set);
+                    if (!std.mem.eql(u8, written, name)) return mismatch(what, written);
+                } else {
+                    const path = expected.error_path orelse return mismatch(what, "an error set");
+                    try check_same(current_file, set, current_scope, path, what);
+                }
                 prefix.print("{s}!", .{error_name(expected.prefix)}) catch return error.Capacity;
                 node = payload;
             },
@@ -1340,6 +1504,15 @@ fn check_type(
                         return;
                     }
                 }
+                if (expected.foreign) |name| {
+                    // A std type is checked by text; an alias is followed to what it stands for.
+                    const written = tree.getNodeSource(node);
+                    if (std.mem.eql(u8, written, name)) {
+                        try check_prefix(prefix.buffered(), expected.prefix, what);
+                        return;
+                    }
+                    if (std.mem.startsWith(u8, written, "std.")) return mismatch(what, written);
+                }
                 const found = try resolve_expression(current_file, node, current_scope);
                 switch (found.result) {
                     .value => |value| {
@@ -1352,6 +1525,7 @@ fn check_type(
                     },
                     .container => |container| {
                         try check_prefix(prefix.buffered(), expected.prefix, what);
+                        if (expected.foreign != null) return mismatch(what, "a library type");
                         const path = expected.path orelse return note_unchecked(what);
                         const wanted = try resolve_path(path);
                         const same = switch (wanted.result) {
@@ -1362,12 +1536,16 @@ fn check_type(
                         if (!same) return mismatch(what, path);
                         return;
                     },
-                    else => return note_unchecked(what),
+                    else => {
+                        if (expected.foreign != null) return mismatch(what, "a library type");
+                        return note_unchecked(what);
+                    },
                 }
             },
             else => {
                 const tag = tree.nodeTag(node);
                 if (tag == .error_set_decl) return; // Checked by `check_same`'s caller.
+                if (expected.foreign != null) return mismatch(what, "a library type");
                 return note_unchecked(what);
             },
         }
@@ -1689,7 +1867,7 @@ fn write_params(
 // ------------------------------------------------------------------ 7a. Parts
 
 /// One file of `docs/describe/`: an area an app author thinks in (section 5a).
-const Part = enum { draw, textures, text, ui, widgets, theme, app };
+const Part = enum { draw, textures, text, ui, widgets, editor, theme, app };
 
 /// The part each public name belongs to, by its first segments. A name no prefix takes is a
 /// compile error, so a new root cannot fall out of every file.
@@ -1705,9 +1883,12 @@ const part_prefixes = [_]struct { prefix: []const u8, part: Part }{
     .{ .prefix = "input.", .part = .ui },
     .{ .prefix = "widgets.", .part = .widgets },
     .{ .prefix = "animator.", .part = .widgets },
+    .{ .prefix = "editor.", .part = .editor },
     .{ .prefix = "theme.", .part = .theme },
     .{ .prefix = "app.", .part = .app },
     .{ .prefix = "bench.", .part = .app },
+    .{ .prefix = "png.", .part = .app },
+    .{ .prefix = "wake.", .part = .app },
 };
 
 /// The module whose first `//!` sentence says what a part holds, in the index.
@@ -1717,6 +1898,7 @@ const part_modules = std.enums.EnumArray(Part, []const u8).init(.{
     .text = "text.zig",
     .ui = "ui.zig",
     .widgets = "widgets.zig",
+    .editor = "editor.zig",
     .theme = "theme.zig",
     .app = "app.zig",
 });
@@ -2254,12 +2436,31 @@ fn test_setup() void {
 }
 
 // Locks that the list of namespaces is checked at comptime (a missing one is a compile error,
-// `check_namespace`) and holds the 22 namespaces, with `draw.path` expecting the draw context.
+// `check_namespace`) and holds the 30 namespaces, with `draw.path` expecting the draw context.
 test "every namespace in the list exists" {
-    comptime assert(namespaces.len == 22);
+    comptime assert(namespaces.len == 30);
     comptime check_namespace(namespaces[0]);
     try testing.expectEqual(Cx.draw, namespaces[7].cx);
     try testing.expectEqualStrings("draw.path", namespaces[7].path);
+}
+
+// Locks the root's namespaces: the real root has none in neither list; a stand-in root with
+// public `draw` (printed), `host` (left out), and `stray` (neither) names `stray`, and without
+// `stray` names nothing.
+test "a root namespace in neither list is named" {
+    const Stray = struct {
+        pub const draw = struct {};
+        pub const host = struct {};
+        pub const stray = struct {};
+    };
+    const Clean = struct {
+        pub const draw = struct {};
+        pub const host = struct {};
+    };
+    comptime assert(first_unlisted(patchwork) == null);
+    comptime assert(first_stale(patchwork) == null);
+    try testing.expectEqualStrings("stray", comptime first_unlisted(Stray).?);
+    try testing.expect(comptime first_unlisted(Clean) == null);
 }
 
 // Locks the cross-check: writing everything finds every printed function's declaration, and
@@ -2332,7 +2533,112 @@ test "each public name belongs to one part" {
     comptime assert(part_of("input.Event") == .ui);
     comptime assert(part_of("bench.Step") == .app);
     comptime assert(part_of("draw.Textures.create") == .textures);
-    try testing.expectEqual(7, part_count);
+    try testing.expectEqual(8, part_count);
+}
+
+// Locks the new parts: the editor part starts at `editor.literal.parse` and names the six
+// namespaces' functions; the app part names the PNG writer and `Wake`; and a name's prefix picks
+// its part.
+test "the editor has a part and the PNG writer is in app" {
+    test_setup();
+    const output = try write_all();
+    const editor_part = output.parts[@backingInt(Part.editor)];
+    const app_part = output.parts[@backingInt(Part.app)];
+    const first = std.mem.indexOf(u8, editor_part, "{\"name\":\"editor.literal.parse\",").?;
+    const functions_key = std.mem.indexOf(u8, editor_part, "\"functions\":[\n").?;
+    try testing.expectEqual(functions_key + "\"functions\":[\n".len, first);
+    const editor_names = [_][]const u8{
+        "editor.literal.write",            "editor.literal.shift",  "editor.Editor.rect_of",
+        "editor.buffer.Buffer.line_range", "editor.language.check", "editor.tokenizer.next",
+    };
+    for (editor_names) |name| try testing.expect(function_line(editor_part, name) != null);
+    const app_names = [_][]const u8{
+        "png.size", "png.write", "png.read_stored", "wake.Wake.notify",
+    };
+    for (app_names) |name| try testing.expect(function_line(app_part, name) != null);
+    comptime assert(part_of("png.write") == .app);
+    comptime assert(part_of("editor.literal.parse") == .editor);
+}
+
+/// The line of `part` that prints the function `name`, or null.
+fn function_line(part: []const u8, name: []const u8) ?[]const u8 {
+    var needle: [128]u8 = undefined;
+    const key = std.fmt.bufPrint(&needle, "{{\"name\":\"{s}\",", .{name}) catch unreachable;
+    const start = std.mem.indexOf(u8, part, key) orelse return null;
+    const end = std.mem.indexOfScalarPos(u8, part, start, '\n') orelse part.len;
+    const line = part[start..end];
+    if (std.mem.indexOf(u8, line, "\"params\"") == null) return null;
+    return line;
+}
+
+// Locks the std types: `png.write` prints `*std.Io.Writer` and `std.Io.Writer.Error!void`; no
+// part prints a type named after them; the cross-check by text passes `std.Io.Writer` and fails
+// `std.Io.Reader` for the same parameter, and passes the return type `std.Io.Writer.Error!void`
+// and fails it when the error set is `std.Io.Reader.Error`.
+test "a std type is printed by its name and not followed" {
+    test_setup();
+    const output = try write_all();
+    const app_part = output.parts[@backingInt(Part.app)];
+    const line = function_line(app_part, "png.write").?;
+    const writer_param = "{\"name\":\"writer\",\"type\":\"*std.Io.Writer\"}";
+    const returns = "\"returns\":\"std.Io.Writer.Error!void\"";
+    try testing.expect(std.mem.indexOf(u8, line, writer_param) != null);
+    try testing.expect(std.mem.indexOf(u8, line, returns) != null);
+    for (output.parts) |part| {
+        try testing.expect(std.mem.indexOf(u8, part, "{\"name\":\"Io.Writer") == null);
+        try testing.expect(std.mem.indexOf(u8, part, "{\"name\":\"std.Io.Writer") == null);
+    }
+    const found = try resolve_path("png.write");
+    const function = found.result.function;
+    const tree = tree_of(function.file);
+    var buffer: [1]Node = undefined;
+    const proto = tree.fullFnProto(&buffer, tree.nodeData(function.node).node_and_node[0]).?;
+    var iterator = proto.iterate(tree);
+    const node = iterator.next().?.type_expr.?;
+    const scope = container_of(function);
+    var expected = comptime expected_of(*std.Io.Writer);
+    try check_type(function.file, node, scope, expected, "test");
+    expected.foreign = "std.Io.Reader";
+    quiet = true;
+    defer quiet = false;
+    const wrong = check_type(function.file, node, scope, expected, "test");
+    try testing.expectError(error.Mismatch, wrong);
+    // The error set is checked by its text too: the return type passes as written and fails when
+    // reflection's set is named differently.
+    quiet = false;
+    const return_node = proto.ast.return_type.unwrap().?;
+    var returned = comptime expected_of(std.Io.Writer.Error!void);
+    try check_type(function.file, return_node, scope, returned, "test");
+    returned.error_foreign = "std.Io.Reader.Error";
+    quiet = true;
+    const wrong_set = check_type(function.file, return_node, scope, returned, "test");
+    try testing.expectError(error.Mismatch, wrong_set);
+}
+
+// Locks the sentences: no function of the editor part, and no `png.` or `wake.` function of the
+// app part, has an empty `doc`; a printed function without one has no `"doc"` key at all.
+test "every function of the new namespaces has a sentence" {
+    test_setup();
+    const output = try write_all();
+    const parts = [_]struct { text: []const u8, prefix: []const u8 }{
+        .{ .text = output.parts[@backingInt(Part.editor)], .prefix = "" },
+        .{ .text = output.parts[@backingInt(Part.app)], .prefix = "png." },
+        .{ .text = output.parts[@backingInt(Part.app)], .prefix = "wake." },
+    };
+    var checked: u32 = 0;
+    for (parts) |part| {
+        var lines = std.mem.splitScalar(u8, part.text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "\"params\"") == null) continue;
+            const key = "{\"name\":\"";
+            if (!std.mem.startsWith(u8, line, key)) continue;
+            if (!std.mem.startsWith(u8, line[key.len..], part.prefix)) continue;
+            try testing.expect(std.mem.indexOf(u8, line, "\"doc\":\"") != null);
+            try testing.expect(std.mem.indexOf(u8, line, "\"doc\":\"\"") == null);
+            checked += 1;
+        }
+    }
+    try testing.expect(checked > 70);
 }
 
 // Locks the golden directory's rules: a `.json` file the index does not list fails the check, a

@@ -174,6 +174,8 @@ pub fn steps(lo: Fixed, value: Fixed, hi: Fixed) ?Steps {
     return result;
 }
 
+/// Ten to the power `exponent` as an integer; `exponent` is at most `decimals_max` plus
+/// `integer_digits_max`.
 pub fn pow10(exponent: u8) u64 {
     assert(exponent <= decimals_max + integer_digits_max);
     var result: u64 = 1;
@@ -182,11 +184,13 @@ pub fn pow10(exponent: u8) u64 {
     return result;
 }
 
+/// The value of `fixed` as an `f32`: its units divided by ten to its decimals.
 pub fn to_f32(fixed: Fixed) f32 {
     const scale: f32 = @floatFromInt(pow10(fixed.decimals));
     return @as(f32, @floatFromInt(fixed.units)) / scale;
 }
 
+/// The value of `fixed` as an `f64`: its units divided by ten to its decimals.
 pub fn to_f64(fixed: Fixed) f64 {
     const scale: f64 = @floatFromInt(pow10(fixed.decimals));
     return @as(f64, @floatFromInt(fixed.units)) / scale;

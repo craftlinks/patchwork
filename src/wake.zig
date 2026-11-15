@@ -41,6 +41,7 @@ pub const Wake = struct {
     /// Writes made so far, for tests and the exit line.
     notified: std.atomic.Value(u32),
 
+    /// Makes a wake that is not armed, has notified nothing, and holds `fd` as its descriptor.
     pub fn init(fd: i32) Wake {
         const wake: Wake = .{ .armed = .init(false), .fd = fd, .notified = .init(0) };
         assert(!wake.armed.raw);
