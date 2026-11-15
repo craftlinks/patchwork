@@ -3,9 +3,9 @@
 # driver: Mesa 26.2.5-arch1.1
 # size: 1280x720 @120
 scenario          hash
-idle              707750b4a67609c0
-pulse             c3e75a2683f70308
-transport         35a708c619df94ad
-transport-stress  910ed0d50f33ef78
-typing            ca40468e10784230
-typing-stress     6d1b8e8eff6e94c4
+idle              946e37afe652f498
+pulse             008b1fd858e7fceb
+transport         36fb443668b3519e
+transport-stress  aa661a2514711f52
+typing            052db29990c8990f
+typing-stress     4f9d7a3966121ca4
