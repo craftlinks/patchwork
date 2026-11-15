@@ -66,6 +66,9 @@ test "a received uri list becomes a drop of examined files" {
     try testing.expectEqualStrings("a b.raw", files.files[0].name);
     try testing.expectEqual(@as(u64, 70000), files.files[0].size);
     try testing.expect(files.files[0].readable);
+    try testing.expectEqualStrings(file, files.files[0].path);
+    try testing.expectEqualStrings(dir, files.files[1].path);
+    try testing.expectEqualStrings(fifo, files.files[2].path);
     try testing.expect(!files.files[1].readable);
     try testing.expectEqualStrings("pipe", files.files[2].name);
     try testing.expect(!files.files[2].readable);

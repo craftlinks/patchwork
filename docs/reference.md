@@ -1703,7 +1703,8 @@ switch (cx.drag_hit(bar, event)) {
 ## File Drops
 
 A drag of files from a file manager (natively) or from the desktop (in the browser) reaches
-the app as events, and the files' bytes follow in chunks; the app never sees a path.
+the app as events, and the files' bytes follow in chunks. Natively the app also gets each
+file's path, for opening or watching it (see Paths); in the browser there is none.
 
 ```zig
 const zone = ui.id("zone", 0);
@@ -1725,8 +1726,22 @@ switch (cx.drop_hit(zone, event)) {
   target, so a popup blocks drops beneath it. The pointer, hover, and focus are untouched;
   `cx.hit` answers `none` for the four drop events and `cx.drop_hit` answers them.
 - **The drop** lists up to 16 files by base name (cut to 255 bytes), size, and whether they can
-  be read (a folder or a special file cannot); more are counted in `skipped`. During the `drop`
-  event the app calls `cx.accept_files(id, mask)` once; `id` then receives the chunks.
+  be read (a folder or a special file cannot), and natively its `path`; more are counted in
+  `skipped`. During the `drop` event the app calls `cx.accept_files(id, mask)` once; `id` then
+  receives the chunks.
+- **Paths.** `input.DropFile.path` is the file's full path, natively only: the bytes the
+  dropping program sent, percent-decoded and nothing more, so perhaps not UTF-8 and never cut.
+  It is for opening, not for showing (`name` is the text; clean a path with `drop.clean_name`
+  before it is shown). It is empty in the browser and in a replay, so a scenario's frames never
+  depend on where a file was, and it is valid only while the `drop` event is dispatched: copy it.
+  A path too long for the app's buffer must be dropped, not cut: a cut path is another path.
+  ```zig
+  my_path_len = 0; // 0 means no path
+  if (file.path.len <= my_path.len) { // one that does not fit is no path
+      @memcpy(my_path[0..file.path.len], file.path);
+      my_path_len = file.path.len;
+  }
+  ```
 - **Chunks.** Accepted files arrive in order, never interleaved, in chunks of exactly 64 KiB
   but the last; the chunk that reaches the file's size is `done`, and every accepted file ends
   with exactly one of `done`, `failed`, or `cancelled`. An empty file is one empty `done`. The

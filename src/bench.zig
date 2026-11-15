@@ -2066,15 +2066,21 @@ const DropApp = struct {
     chunks: [32][4]u64,
     count: u32,
     cancel_file: ?u8,
+    /// The `path.len` of each file of the last `drop` event, 0xff where none was listed.
+    path_lens: [input.drop_files_max]u32,
 
     pub fn init(app: *DropApp, pool: *textures.Textures) void {
         _ = pool;
         app.count = 0;
+        app.path_lens = @splat(0xff);
         app.cancel_file = null;
     }
     pub fn event(app: *DropApp, cx: *Cx, event_value: input.Event) void {
         switch (cx.drop_hit(zone, event_value)) {
             .dropped => |dropped| {
+                for (dropped.files.listed(), 0..) |file, index| {
+                    app.path_lens[index] = @intCast(file.path.len);
+                }
                 const listed: u16 = @intCast((@as(u32, 1) << @intCast(dropped.files.count)) - 1);
                 cx.accept_files(zone, listed);
             },
@@ -2205,6 +2211,31 @@ test "a drop step delivers the accepted files in exact chunks" {
     try testing.expectEqualStrings("FFabab", &bytes);
     fill_parts(files[0].parts, 69999, bytes[0..1]);
     try testing.expectEqualStrings("b", bytes[0..1]);
+}
+
+// Locks that a replayed drop gives no path: two files dropped by `replay_drop` list with a
+// path of 0 bytes each, so a scenario's frames cannot depend on where a file was.
+test "a replayed drop gives no path" {
+    const files = [_]File{
+        .{ .name = "a.raw", .parts = &.{.{ .bytes = "a" }} },
+        .{ .name = "b.raw", .parts = &.{.{ .bytes = "b" }} },
+    };
+    const scenario: Scenario = .{
+        .name = "drop",
+        .setup = &.{.{ .drop = .{ .target = comptime area("zone", 0), .files = &files } }},
+        .cycle = &.{},
+        .frames = 1,
+    };
+    var app: DropApp = undefined;
+    DropApp.init(&app, undefined);
+    const static = struct {
+        var context: DropApp.Cx = undefined;
+    };
+    static.context.init();
+    _ = try replay_headless(DropApp, &app, &static.context, &scenario, .{ 200, 200 }, 8);
+    try testing.expectEqual(@as(u32, 0), app.path_lens[0]);
+    try testing.expectEqual(@as(u32, 0), app.path_lens[1]);
+    try testing.expectEqual(@as(u32, 0xff), app.path_lens[2]);
 }
 
 // Locks a cancel during a drop step: the app cancels file 0 after its first chunk, which ends
