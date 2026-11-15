@@ -55,7 +55,8 @@
 //! - `wasm` installs `<name>.wasm` (freestanding, `export_memory`, `rdynamic`).
 //! - `serve` serves the page, `shell.js`, the wasm, and `app.js`, the app's web
 //!   module (`AppOptions.web_module`, or `web/app.js`, which exports nothing), and the app's own
-//!   `web_files`, through `src/serve.zig`, which owns the address and port (step 54).
+//!   `web_files`, and the folders in `web_dirs`, each served under its route and read when a
+//!   request comes (step 70), through `src/serve.zig`, which owns the address and port (step 54).
 //! - `bench` runs the installed native executable with `--bench` and the arguments after
 //!   `--`: a scenario name, `--frames`, `--adapter`, `--dump`, `--csv` (`src/bench.zig`).
 //!   Build with `-Doptimize=ReleaseFast` for numbers that mean something; the report names
@@ -183,6 +184,10 @@ pub const Import = struct { name: []const u8, module: *std.Build.Module };
 /// (`web/shell.js`, section 9a).
 pub const WebFile = struct { route: []const u8, path: std.Build.LazyPath };
 
+/// A folder the app's page fetches from, served under `route`, which starts and ends with `/`.
+/// A file added to it while the server runs is served (`src/serve.zig`, section 2).
+pub const WebDir = struct { route: []const u8, path: std.Build.LazyPath };
+
 /// Options for `addApp`. `target` applies to the native executable and the tests, and
 /// `optimize` applies to every artifact. The wasm module always targets `wasm32-freestanding`.
 pub const AppOptions = struct {
@@ -211,6 +216,8 @@ pub const AppOptions = struct {
     web_module: ?std.Build.LazyPath = null,
     /// Files the app's page fetches, each served at its route.
     web_files: []const WebFile = &.{},
+    /// Folders the app's page fetches from, each served under its route.
+    web_dirs: []const WebDir = &.{},
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -719,6 +726,9 @@ fn add_serve(
     serve_run.addPrefixedFileArg("/app.js=", module);
     for (options.web_files) |file| {
         serve_run.addPrefixedFileArg(b.fmt("{s}=", .{file.route}), file.path);
+    }
+    for (options.web_dirs) |dir| {
+        serve_run.addPrefixedDirectoryArg(b.fmt("{s}=", .{dir.route}), dir.path);
     }
     return &serve_run.step;
 }
