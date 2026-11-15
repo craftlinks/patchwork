@@ -108,6 +108,8 @@
 //! - `cursor()` is the `ui.Cursor` value to show, and `cursor_names_ptr/len` a JSON array of
 //!   the CSS names by value, generated from the enum at compile time, so `shell.js` holds no
 //!   cursor table.
+//! - `title_serial()`, `title_ptr()`, and `title_len()` give the app's title (`cx.set_title`):
+//!   `shell.js` assigns `document.title` when the serial differs from the one it applied.
 //! - Pointer presses and releases carry the button (0 left, 1 middle, 2 right: the DOM
 //!   numbering), the modifiers, and `event.timeStamp` in whole milliseconds, which the
 //!   library's click counting compares.
@@ -246,6 +248,9 @@ pub fn export_app(comptime App: type) void {
     @export(&Web.chunk_ptr, .{ .name = "chunk_ptr" });
     @export(&Web.read_done, .{ .name = "read_done" });
     @export(&Web.cursor, .{ .name = "cursor" });
+    @export(&Web.title_serial, .{ .name = "title_serial" });
+    @export(&Web.title_ptr, .{ .name = "title_ptr" });
+    @export(&Web.title_len, .{ .name = "title_len" });
     @export(&Web.timer_period_ms, .{ .name = "timer_period_ms" });
     @export(&Web.timer_on, .{ .name = "timer_on" });
     @export(&Web.timer, .{ .name = "timer" });
@@ -638,6 +643,24 @@ fn WebApp(comptime App: type) type {
         fn cursor() callconv(.c) u32 {
             assert(state.frame.running);
             return @backingInt(context.cursor());
+        }
+
+        /// The count of the app's title changes; 0 until the first (`cx.title_serial`).
+        fn title_serial() callconv(.c) u32 {
+            assert(state.frame.running);
+            return context.title_serial();
+        }
+
+        /// The title's bytes, valid UTF-8 and NUL-terminated after `title_len()`.
+        fn title_ptr() callconv(.c) [*]const u8 {
+            assert(state.frame.running);
+            return context.title().ptr;
+        }
+
+        /// The title's length in bytes, without the NUL.
+        fn title_len() callconv(.c) u32 {
+            assert(state.frame.running);
+            return @intCast(context.title().len);
         }
 
         /// Pointer left the canvas or the gesture was cancelled. A press in progress

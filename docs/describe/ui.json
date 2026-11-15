@@ -46,6 +46,7 @@
 {"name":"ui.cx.TouchPlan","doc":"The pointer events a touch event means (module guide, section 5b): one, or two for a lift.","file":"src/ui/cx.zig","kind":"struct","size":56,"fields":[{"name":"events","type":"[2]input.Event"},{"name":"count","type":"u32"}]},
 {"name":"ui.edit.Range","doc":"A byte range `start .. end` of the text.","file":"src/ui/edit.zig","kind":"struct","size":8,"fields":[{"name":"start","type":"u32"},{"name":"end","type":"u32"}]}],
 "constants":[
+{"name":"ui.title_max","doc":"Bytes of the title `set_title` keeps (module guide, section 5a).","file":"src/ui/cx.zig","type":"u32","value":"255"},
 {"name":"ui.zero_inset","file":"src/ui/turtle.zig","type":"draw.Inset","value":".{.left=0,.top=0,.right=0,.bottom=0}"}],
 "functions":[
 {"name":"ui.Context","doc":"The UI context over the draw context type `Draw`.","file":"src/ui/cx.zig","params":[{"name":"Draw","type":"type","comptime":true},{"name":"area_cap","type":"u32","comptime":true}],"returns":"type"},
@@ -137,4 +138,7 @@
 {"name":"ui.Context(...).toggle_maximize","doc":"Asks the window manager to maximize the window, or to restore it while maximized.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"void"},
 {"name":"ui.Context(...).close","doc":"Ends the app after the current event (natively; the browser ignores it).","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"void"},
 {"name":"ui.Context(...).keep_open","doc":"Cancels a pending close: during `close_requested`, the window stays.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"void"},
+{"name":"ui.Context(...).set_title","doc":"Sets the window's title: the toplevel's natively, `document.title` in a browser, kept and not shown where there is no window.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"},{"name":"text_new","type":"[]const u8"}],"returns":"void"},
+{"name":"ui.Context(...).title","doc":"The title last set, cleaned; empty until the first `set_title`.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*const app.Context(App)"}],"returns":"[:0]const u8"},
+{"name":"ui.Context(...).title_serial","doc":"Host side: a count that changes exactly when the title does; 0 until the first change.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*const app.Context(App)"}],"returns":"u32"},
 {"name":"ui.Context(...).take_window_request","doc":"Host side: the request the last dispatches left, once (section 5a).","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"?ui.WindowRequest"}]}
