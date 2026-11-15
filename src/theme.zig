@@ -29,9 +29,9 @@
 //! write: the fragment shaders read `lighten`, `darken`, and `arc`, and the renderer's clear
 //! pipeline reads `background` (`draw/renderer.zig`, section 4a).
 //!
-//! The frame record is `draw.matrix_bytes + draw.time_bytes + bytes` long and must equal
-//! `draw.uniform_bytes`; see the `comptime` block in `draw.zig` and the alignment rationale on
-//! `draw.uniform_bytes`.
+//! The frame record is `draw.matrix_bytes + draw.time_bytes + draw.device_to_ndc_bytes + bytes`
+//! long and must equal `draw.uniform_bytes`; see the `comptime` block in `draw.zig` and the
+//! alignment rationale on `draw.uniform_bytes`.
 //!
 //! ## 3. Angle Convention
 //! Angles come from `atan2(y, x)` in Y-down pixel space: 0 points along +X, and increasing
@@ -70,10 +70,11 @@
 //!
 //! ## 6. Upload Flow
 //! `draw/renderer.zig` keeps a `Uniform` record of the projection matrix at offset 0, the time
-//! slot at `draw.time_offset`, and `Theme` at `draw.theme_offset`. When the device size, the
-//! scale, or `draw.Context.theme` changed it records one `buffer_write` of the whole record,
-//! which both hosts replay, and repaints every tile; view and target uniforms are rebuilt from
-//! it. Nothing is allocated: a scheme is a value.
+//! slot at `draw.time_offset`, the pass's size at `draw.device_to_ndc_offset`, and `Theme` at
+//! `draw.theme_offset`. When the device size, the scale, or `draw.Context.theme` changed it
+//! records one `buffer_write` of the whole record, which both hosts replay, and repaints every
+//! tile; view and target uniforms are rebuilt from it. Nothing is allocated: a scheme is a
+//! value.
 //!
 //! ## 7. Materials
 //! `Scheme.material` says what the default skins make panels and popups of: `solid` (the

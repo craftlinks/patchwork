@@ -65,7 +65,10 @@
 //! (`draw/backdrop.zig`), so its `texture` must be `.target`, and a registry that holds one
 //! (`any_backdrop`) gives its context backdrops and its renderer the chain's pipelines;
 //! without one, neither exists. `draw.Glass` declares it. `Pixel.frag` is the fragment's
-//! position in device pixels of the pass's target, which a backdrop type reads its pack by.
+//! position in device pixels of the pass's target, which a backdrop type reads its pack by and
+//! `draw.Path` reads, through the prelude's `frag_position`, to measure from the same bits in
+//! every chunk (`draw/path.zig`, section 5b). It is not the clock: the time check of section 2b
+//! scans for `frame.time` and the time helpers, so reading the pass's size animates nothing.
 //!
 //! ## 2a. The Vertex Contract
 //! By default a type's quad is its `rect`: the shared `vs_main` places the unit quad's corner
@@ -583,6 +586,7 @@ fn io_wgsl(comptime T: type) []const u8 {
 }
 
 const testing = std.testing;
+const draw_types = @import("types.zig");
 
 const Probe = extern struct {
     rect: [4]f32,
@@ -826,6 +830,17 @@ test "only an animated type may read time" {
     try testing.expectEqual([2]bool{ false, true }, Both.animates);
     try testing.expect(Both.any_animated);
     try testing.expect(!Registry(&.{.{ .type = Probe, .cap = 4 }}).any_animated);
+}
+
+// Locks that the pass's size is not the clock (section 2b): `draw.Path` reads
+// `frame.device_to_ndc` through `frag_position`, which no time name matches, so it stays an
+// unanimated type and keeps its tiles clean and the app asleep.
+test "a type reading the pass's size is not animated" {
+    try testing.expect(std.mem.find(u8, draw_types.Path.pixel, "frag_position(") != null);
+    try testing.expect(comptime !reads_time(draw_types.Path));
+    try testing.expect(comptime !animated(draw_types.Path));
+    try testing.expect(comptime check(draw_types.Path) == null);
+    try testing.expect(!Registry(&.{.{ .type = draw_types.Path, .cap = 4 }}).any_animated);
 }
 
 // Locks blending and textures (sections 2c and 3): a multiply type gets the mix toward white

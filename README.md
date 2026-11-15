@@ -133,7 +133,7 @@ web/            browser shell: shell.js, app.js, index.html
 examples/       thirteen apps, and sound/: rack and audio on Thrum, a package of its own
 test/golden/    frame hashes per adapter
 test/consumer/  a package outside this build: two peers, a tool, its own goldens
-tools/          frame comparison, font subsetting, describe (the library as JSON)
+tools/          frame comparison, font subsetting, describe (the library as JSON), seams (a stroke's seam faults)
 docs/           reference manual; describe/, the library as JSON (generated, checked)
 ```
 

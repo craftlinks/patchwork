@@ -33,7 +33,8 @@
 //! `Path` record with `prev` set; a fault near no seam is `elsewhere`. A pixel of a polyline that
 //! two segments cover which are more than one segment apart across the seam is `fold`
 //! (`fold_at`): the class the seam rule leaves, where both chunks draw by design (section 4 of
-//! the module guide). It is counted apart and `--strict` ignores it; at 135 and 170 degrees a
+//! the module guide). It is counted apart and `--strict` ignores it, so `--strict` cannot see a
+//! seam fault that sits inside a fold; at 135 and 170 degrees a
 //! stroke of 5 or 8 px folds onto itself over the whole of its two short runs.
 //!
 //! ## 4. Cache

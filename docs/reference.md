@@ -2344,8 +2344,17 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
   rasterizer places one fragment a few thousandths of a pixel apart in two chunks. Before
   step 62 a path that turned straight back at a seam (a comb drawn up and down each tooth, a
   plotted |sin| at its zeros) lost single pixels inside its stroke, and sharp seam corners
-  dropped or doubled pixels beyond the seam point. A fragment within that placement
-  difference of the line can still miss, at the rate the bisector had before.
+  dropped or doubled pixels beyond the seam point. Since step 71 the fragment's position
+  comes from its device position (`frag_position`, which inverts the pass's projection from the
+  frame uniform's `device_to_ndc`), not from the quad's interpolated `local`, and every path
+  origin and chunk rect corner is a multiple of 1/256 px (`path.origin_grid`), so every chunk
+  that covers a pixel computes the same distances to the bit and exactly one of two chunks keeps
+  it: a translucent stroke covers each pixel once at a seam, which `zig build seams` counts on
+  the GPU. Two exceptions remain, where the chunks' positions can still differ by a few
+  thousandths of a pixel and the tie rule above decides: inside a container whose alignment
+  shift is off the 1/256 grid (a shift is snapped to whole device pixels, which lands on the
+  grid at scales that are powers of two, and not at 1.25, 1.5, or 3), and at coordinates of
+  32768 or more.
 - **Dashes.** `Stroke.dash` (`draw.path.Dash`: `on`, `off`, `offset`, in logical pixels, world
   pixels on a canvas) draws the on-parts of the pattern along the flattened polyline: at arc
   length `s` the phase is `mod(s + offset, on + off)`, on where it is at most `on`. Dashes
@@ -2368,7 +2377,9 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 - **Coordinates.** Points are stored relative to the path's origin, and each chunk carries
   `anchor = origin - rect.xy`, so a container's alignment shift moves strokes with their
   rects. The origin is the bounds' top-left, or the caller's with `polyline_at`, which keeps
-  every unmoved point's stored value when the bounds change (an automation lane).
+  every unmoved point's stored value when the bounds change (an automation lane); either is
+  taken down to a multiple of 1/256 px, and so is every chunk rect's corner (its size is kept),
+  so a chunk rebuilds the origin exactly and `Placed.bounds` starts at the gridded origin.
 - **Appends are atomic.** A path whose chunks or points do not fit is refused whole and counted
   in `overflow_count`.
 - **Closed strokes.** `polygon` joins the last point to the first with the seam rule, so a
