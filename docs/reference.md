@@ -1546,9 +1546,10 @@ fader rewrites its digits), `bind-undo`, `bind-toggle`, and `bind-break` (a call
 stroke in its hole, the region under a plotted curve with its stroke on top, a glyph from
 `ttf.load` beside the same glyph from the atlas, a translucent comb tall enough to split into
 bands over a bright bar, so a row blended twice would show, and a shape morphing from a circle
-to a rounded square on the `frame` event's delta. Space runs the clock, and 1 to 6 pick a
+to a rounded square on the `frame` event's delta. Space runs the clock, and 1 to 7 pick a
 page: the shapes, one `&` an em of the window's height / 1.08, a single band at the
-48-segment cap over the whole window, display text as outlines, folds, and dashes. Pressing 4 again
+48-segment cap over the whole window, display text as outlines, folds, dashes, and thin shapes.
+Pressing 4 again
 steps the display page's three views: `title` ("Patchwork" at 200 px, each letter rocking and
 pulsing on its own `Transform`), `write` (a wrapped paragraph written on glyph by glyph, one
 every 3 frames, which Space starts over), and `sizes` (a word as outlines beside atlas text at
@@ -1559,8 +1560,11 @@ each above the same spike drawn as one chunk: the two must match pixel for pixel
 step 62 up to 387 pixels did not. The dashes page (step 65) draws a line at 10 on, 5 off,
 dots, an L whose dash ends at its corner, a hairpin, a sagging cable of several chunks, a
 right-angle route with rounded corners, a dashed hexagon fitted to its ring, and a long cable
-whose dashes flow at 40 px a second while Space runs the clock. Scenarios `still`, `morph`,
-`glyph`, `curtain`, `folds`, `dashes`, `dash-flow`, `title`, `write`, and `sizes`.
+whose dashes flow at 40 px a second while Space runs the clock. The thin page (step 72, key 7)
+draws a circle of 256 points of radius 10, one of 64 points of radius 1.3, an ellipse 200 by
+20, and a flat waveform of 256 samples, each at half opacity beside its opaque twin: bands alone
+refuse all four, and the fill cuts them across into cells with no seam. Scenarios `still`,
+`morph`, `glyph`, `curtain`, `folds`, `dashes`, `thin`, `dash-flow`, `title`, `write`, and `sizes`.
 
 ### 13. Touch (`examples/touch/app.zig`)
 
@@ -1705,7 +1709,8 @@ switch (cx.drag_hit(bar, event)) {
 ## File Drops
 
 A drag of files from a file manager (natively) or from the desktop (in the browser) reaches
-the app as events, and the files' bytes follow in chunks; the app never sees a path.
+the app as events, and the files' bytes follow in chunks. Natively the app also gets each
+file's path, for opening or watching it (see Paths); in the browser there is none.
 
 ```zig
 const zone = ui.id("zone", 0);
@@ -1727,8 +1732,22 @@ switch (cx.drop_hit(zone, event)) {
   target, so a popup blocks drops beneath it. The pointer, hover, and focus are untouched;
   `cx.hit` answers `none` for the four drop events and `cx.drop_hit` answers them.
 - **The drop** lists up to 16 files by base name (cut to 255 bytes), size, and whether they can
-  be read (a folder or a special file cannot); more are counted in `skipped`. During the `drop`
-  event the app calls `cx.accept_files(id, mask)` once; `id` then receives the chunks.
+  be read (a folder or a special file cannot), and natively its `path`; more are counted in
+  `skipped`. During the `drop` event the app calls `cx.accept_files(id, mask)` once; `id` then
+  receives the chunks.
+- **Paths.** `input.DropFile.path` is the file's full path, natively only: the bytes the
+  dropping program sent, percent-decoded and nothing more, so perhaps not UTF-8 and never cut.
+  It is for opening, not for showing (`name` is the text; clean a path with `drop.clean_name`
+  before it is shown). It is empty in the browser and in a replay, so a scenario's frames never
+  depend on where a file was, and it is valid only while the `drop` event is dispatched: copy it.
+  A path too long for the app's buffer must be dropped, not cut: a cut path is another path.
+  ```zig
+  my_path_len = 0; // 0 means no path
+  if (file.path.len <= my_path.len) { // one that does not fit is no path
+      @memcpy(my_path[0..file.path.len], file.path);
+      my_path_len = file.path.len;
+  }
+  ```
 - **Chunks.** Accepted files arrive in order, never interleaved, in chunks of exactly 64 KiB
   but the last; the chunk that reaches the file's size is `done`, and every accepted file ends
   with exactly one of `done`, `failed`, or `cancelled`. An empty file is one empty `done`. The
@@ -2424,15 +2443,36 @@ const placed = draw.fill.append(cx.drawing(), &shape, .{ .color = color, .rule =
 - **Bands.** A shape is cut into horizontal bands, halved until each lists at most 48 segments
   (`segments_max`), and each band is one `Fill` instance (80 bytes) whose fragment loops over
   its list. Points are 2 per segment per band it meets. Neighbouring bands share one edge, so a
-  translucent shape blends once. A Builder holds 1,024 segments.
+  translucent shape blends once. A band one logical pixel tall that still lists more is cut
+  across into cells, each an ordinary instance with a narrower rect, so a small or flat shape of
+  many points draws. Bands and cells together are at most 256 (`bands_max`). A Builder holds
+  1,024 segments.
+- **Limits.** The smallest shape of many points that draws, measured with `plan` by bisection on
+  a circle or ellipse centred at (100, 50):
+
+  | Shape | Smallest drawn before | Smallest drawn now |
+  | --- | --- | --- |
+  | 256 points on a circle | radius 15.0 px | radius 3.2 px |
+  | 64 points on a circle | radius 1.41 px | radius 1.13 px |
+  | 256 points on an ellipse ten times wider than tall | half-width 150 px | half-width 15.1 px |
+
+  More than 48 segments within about 3 by 3 logical pixels cannot be drawn at all.
 - **Coverage.** A fragment sums, over its band's segments, the signed part of its pixel left of
   each: the exact area, as `text/raster.zig` writes it. So corners and hairlines are exact, and
   an edge between two inside regions (the arms of a star) draws nothing. `.non_zero` is
   `min(|sum|, 1)` and `.even_odd` folds the sum. Regions of opposite winding that meet inside one
   pixel stay approximate.
-- **Appends are atomic.** A shape over the Builder's cap, a band under 1 logical pixel still over
-  48 segments, or a full pool is refused whole and counted in `overflow_count`. A shape with no
-  area appends nothing and counts nothing.
+- **Appends are atomic.** A shape over the Builder's cap, a cell at both floors (1 logical pixel
+  each way) still over 48 segments, more than 256 pieces, or a full pool is refused whole and
+  counted in `overflow_count`. A shape with no area appends nothing and counts nothing.
+  `append` returns null for all of these; `append_checked` returns the reason as an error
+  (`BuilderFull`, `BandFull`, `PlanFull`, `PoolFull`, `PointsFull`, `BatchFull`) and null only for
+  a shape with no area. `Builder.fits()` answers the shape's own part (not the pools' room) first:
+
+  ```zig
+  if (!shape.fits()) return;                 // too dense for 48 segments a cell, or too big
+  _ = draw.fill.append(cx.drawing(), &shape, style, clip);
+  ```
 - **Paint** is one solid colour with a `hover` mix, and there are no hit areas yet: record a box or
   a path area beside it.
 

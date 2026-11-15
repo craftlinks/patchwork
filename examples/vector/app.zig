@@ -25,6 +25,11 @@
 //! rounded corners (the Patch look's cable), a dashed hexagon fitted to its ring, and a long cable
 //! whose dashes flow toward its end at `flow_speed` while Space runs the clock.
 //!
+//! Page 7 is thin shapes (`draw.fill`, step 72): a circle of 256 points of radius 10, one of 64
+//! points of radius 1.3, an ellipse ten times wider than tall, and a flat waveform of 256 samples,
+//! each at half opacity beside its opaque twin. Bands alone cannot hold them; the fill cuts the
+//! band across into cells, and the translucent shapes show no line where two cells meet.
+//!
 //! ## 2. Pages
 //! Digit keys pick a page, so the two cost scenarios draw one thing over the whole window:
 //! ```text
@@ -34,6 +39,7 @@
 //! 4  display    three views, which a further press of 4 steps through: title, write, sizes
 //! 5  folds      six rows (stroke width and miss) by six sub-pixel offsets of combs
 //! 6  dashes     dashed strokes, one of them flowing
+//! 7  thin       four shapes of many points in a thin band, half opacity and opaque
 //! ```
 //!
 //! ## 3. The Morph and the Clock
@@ -89,7 +95,7 @@ const label_style: text.Style = .{ .face = .sans, .size = 12, .color = theme.dar
 const glyph_style: text.Style = .{ .face = .sans, .size = glyph_em, .color = pink };
 const left: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
 
-const Page = enum { shapes, glyph, curtain, display, folds, dashes };
+const Page = enum { shapes, glyph, curtain, display, folds, dashes, thin };
 
 /// The views of the display page, in the order key 4 steps through them.
 const View = enum { title, write, sizes };
@@ -182,6 +188,12 @@ pub const App = struct {
             .frames = 10,
         },
         .{
+            .name = "thin",
+            .setup = &.{ .{ .key = .{ .key = .other, .text = "7" } }, .{ .wait = 3 } },
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 10,
+        },
+        .{
             .name = "dash-flow",
             .setup = &.{
                 .{ .key = .{ .key = .other, .text = "6" } },
@@ -257,6 +269,7 @@ pub const App = struct {
                     '3' => app.page = .curtain,
                     '5' => app.page = .folds,
                     '6' => app.page = .dashes,
+                    '7' => app.page = .thin,
                     '4' => {
                         const next: View = if (app.page != .display) .title else switch (app.view) {
                             .title => .write,
@@ -279,7 +292,7 @@ pub const App = struct {
         if (!app.running) return false;
         return switch (app.page) {
             .shapes, .dashes => true,
-            .glyph, .curtain, .folds => false,
+            .glyph, .curtain, .folds, .thin => false,
             .display => switch (app.view) {
                 .title => true,
                 .write => app.write_s < write_end_s(),
@@ -306,6 +319,7 @@ pub const App = struct {
             .curtain => draw_curtain(cx, clip),
             .folds => draw_folds(cx, clip),
             .dashes => app.draw_dashes(cx, clip),
+            .thin => draw_thin(cx, clip),
             .display => switch (app.view) {
                 .title => app.draw_title(cx, clip),
                 .write => app.draw_write(cx, clip),
@@ -580,6 +594,61 @@ fn unit(a: Point, b: Point) Point {
     const span = @sqrt(dx * dx + dy * dy);
     assert(span > 0);
     return .{ dx / span, dy / span };
+}
+
+/// The thin page's four shapes (step 72), as the fill tests build them, moved by `dx`, `dy`.
+fn thin_at(which: u32, dx: f32, dy: f32) void {
+    assert(which < 4);
+    shape.set_transform(.translation(dx, dy));
+    switch (which) {
+        0 => thin_ring(256, 100, 50, 10, 10),
+        1 => thin_ring(64, 100, 50, 1.3, 1.3),
+        2 => thin_ring(256, 200, 50, 100, 10),
+        else => thin_wave(),
+    }
+    shape.set_transform(.identity);
+}
+
+/// `count` points on an ellipse around (`x`, `y`), as one contour.
+fn thin_ring(count: u32, x: f32, y: f32, rx: f32, ry: f32) void {
+    assert(count >= 3);
+    for (0..count) |index| {
+        const turn = 2.0 * std.math.pi * @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(count));
+        const point: Point = .{ x + rx * @cos(turn), y + ry * @sin(turn) };
+        if (index == 0) shape.move_to(point) else shape.line_to(point);
+    }
+    shape.close();
+}
+
+/// 256 samples of a waveform two pixels tall, closed along a baseline below it.
+fn thin_wave() void {
+    for (0..256) |index| {
+        const step: f32 = @floatFromInt(index);
+        const point: Point = .{ 10 + 2 * step, 40 + 2 * @as(f32, @floatFromInt(37 * index % 101)) / 100 };
+        if (index == 0) shape.move_to(point) else shape.line_to(point);
+    }
+    shape.line_to(.{ 520, 43 });
+    shape.line_to(.{ 10, 43 });
+    shape.close();
+}
+
+/// The thin page (section 2): each shape at half opacity at the left and opaque at the right.
+fn draw_thin(cx: *Context, clip: Clip) void {
+    const draw_cx = cx.drawing();
+    const band: Rect = .{ .x = 16, .y = 0, .width = 1000, .height = 40 };
+    const title = "thin: many points in one pixel of height, cut across into cells";
+    text.place(draw_cx, title_style, title, band, clip, left);
+    const names = [4][]const u8{ "256 points, radius 10", "64 points, radius 1.3", "256 points, 200 x 20", "256 samples, 2 tall" };
+    const rows = [4]f32{ 50, 140, 220, 330 };
+    for (0..4) |which| {
+        const label: Rect = .{ .x = 16, .y = rows[which] - 14, .width = 300, .height = 20 };
+        text.place(draw_cx, label_style, names[which], label, clip, left);
+        for ([2]f32{ 0.5, 1 }, [2]f32{ 20, 660 }) |alpha, dx| {
+            thin_at(@intCast(which), dx, rows[which]);
+            _ = fill.append(draw_cx, &shape, .{ .color = .{ 0.95, 0.60, 0.25, alpha } }, clip);
+            shape.reset();
+        }
+    }
 }
 
 /// The rows of the folds page: a stroke width and how far the spike's way down lands from its
@@ -914,6 +983,23 @@ test "the dashes page draws dashed strokes and flows on space" {
     try std.testing.expectApproxEqAbs(@as(f32, 15 - 0.64), app.flow_offset, 1.0e-4);
     send(app, .{ .key_down = input.key_press(.other, .none, false, " ") });
     try std.testing.expect(!ui.animate(App, app, cx, 16));
+}
+
+// Locks the thin page (key 7): no shape is refused at 1x or 2x, the eight shapes (each twice) make
+// 36, 16, 36, and 94 pieces of which 16, 8, 16, and 92 are cells, so 182 instances over 12,572
+// points.
+test "the thin page cuts its shapes across and refuses none" {
+    const app = new_app();
+    send(app, .{ .key_down = input.key_press(.other, .none, false, "7") });
+    try std.testing.expectEqual(Page.thin, app.page);
+    for ([_]u32{ 120, 240 }) |scale_120| {
+        const cx = &fixture.context;
+        cx.redraw();
+        assert(ui.draw_frame(App, app, cx, 1280, 720, scale_120));
+        try std.testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+        try std.testing.expectEqual(@as(usize, 182), cx.draw.items(quads.Fill).len);
+        try std.testing.expectEqual(@as(u32, 12572), cx.draw.point_count);
+    }
 }
 
 // Locks the comb's bands, the seam the translucent golden shows: at least three, whose rects meet.

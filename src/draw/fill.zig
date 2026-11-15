@@ -38,7 +38,7 @@
 //! ```text
 //! start with one band over the bounds
 //! halve a band at its middle while it lists more than segments_max segments
-//! a band under band_height_min still over the cap refuses the whole shape
+//! a band under band_height_min still over the cap is cut across into cells (section 3a)
 //! ```
 //! Horizontal segments have no area and are in no list. Every segment that can reach a pixel in
 //! a band meets the band's padded range, so a band's own list gives the exact coverage: nothing
@@ -49,6 +49,42 @@
 //! stripe. For the two quads to meet exactly, every band edge sits on a `1 / band_grid` grid, where
 //! `rect.y + rect.height` is exact in `f32`. A `Context.shift` off that grid can leave them an ulp
 //! apart, far less than the rasterizer's sub-pixel snap and never on a pixel centre.
+//!
+//! ## 3a. Cells
+//! Near the top and bottom of a round shape, or anywhere in a flat one, many short segments lie
+//! within one pixel of height, and no cut in y parts them. A band at the floor that still lists
+//! more than `segments_max` is cut in x as well, into cells: a cell is an ordinary `Fill`
+//! instance with a narrower rect, `[left, right)` on the band grid, so the record and the shader
+//! do not change and neither does the plan of a shape that fits by bands. Cells halve like bands,
+//! down to `cell_width_min`; one at both floors still over the cap refuses the shape.
+//!
+//! A fragment sums, over the segments its instance lists, the part of its pixel left of each, in
+//! the rows the segment crosses, signed by direction (section 4). A segment wholly left of the
+//! pixel counts nothing. A segment wholly right of it counts the height of its rows inside the
+//! pixel, with its sign, and nothing else of it matters. A run of connected segments that all
+//! lie wholly right, from point P to point Q, therefore sums to the signed height of the pixel's
+//! rows between `P.y` and `Q.y`, however the run wanders, because every row it crosses down and
+//! up again cancels: exactly what one vertical segment from P.y to Q.y at any x right of the
+//! pixel counts. A segment that does not meet the band's rows counts nothing wherever it is, so
+//! it may join such a run. A cell lists the segments that can reach its pixels and one stand-in
+//! for each run that cannot, so its coverage equals the whole shape's.
+//!
+//! One walk makes the list, counting for the plan and writing for the append, so the two cannot
+//! part. With `pad` = `aa_pad` and at most one open run (its first and last point):
+//! ```text
+//! for each edge, in order:
+//!     an edge that does not start where the last ended closes the run
+//!     free = the edge misses the band's rows, or lies right of the cell's right + pad
+//!     gone = not free, and lies left of the cell's left - pad
+//!     free: open a run if none is open, and end it at the edge's end
+//!     gone: close the run
+//!     else: close the run, then list the edge
+//! the end closes the run
+//! closing a run lists one vertical segment at x = right + pad from the run's first y to its
+//! last y, when it meets the band's rows
+//! ```
+//! Cells of one band come out left to right, every edge on the band grid, so two neighbours' rects
+//! meet exactly as two bands' do and the fill rule draws each pixel once.
 //!
 //! ## 4. Coverage
 //! A fragment measures the pixel it stands for, not a sample. With `q` the pixel's centre and
@@ -75,11 +111,14 @@
 //! the shape with its rects.
 //!
 //! ## 6. TigerStyle Invariants
-//! - No allocation: a `Builder` is a value of `segment_cap` segments, bands are a stack array of
-//!   `bands_max`, and the splitting stack holds `split_depth_max` ranges, so nothing recurses.
+//! - No allocation: a `Builder` is a value of `segment_cap` segments, bands and cells are a stack
+//!   array of `bands_max` together, and the splitting stacks (bands, then cells of one band) hold
+//!   `split_depth_max` ranges, so nothing recurses. The cell visits of a shape are bounded by
+//!   `4 * bands_max`; past either bound the plan is `error.PlanFull`.
 //! - Appends are atomic: the plan is made and the pool's room and the points' room are checked
 //!   before anything is written; a refused first instance takes the points back. Every refusal
-//!   is counted in `overflow_count`.
+//!   is counted in `overflow_count`, and `append_checked` names it (`Refused`); `Builder.fits`
+//!   asks about a shape's own size first.
 //! - A fragment loops over at most `segments_max` segments.
 
 const std = @import("std");
@@ -102,8 +141,12 @@ pub const segments_max: u32 = 48;
 /// Segments one `Builder` holds: the longest of those glyphs flattens to 380.
 pub const segment_cap: u32 = 1024;
 
-/// Most bands one shape makes. The most of those glyphs make is 14.
-pub const bands_max: u32 = 128;
+/// Most bands and cells one shape makes together. The most of those glyphs make is 14; a
+/// waveform of 1,000 samples takes about 176.
+pub const bands_max: u32 = 256;
+
+/// A cell this wide or less is not split: logical pixels.
+pub const cell_width_min: f32 = 1;
 
 /// A band this tall or less is not split: logical pixels.
 pub const band_height_min: f32 = 1;
@@ -457,6 +500,19 @@ pub const Builder = struct {
         assert(self.count <= segment_cap);
     }
 
+    /// True when `append` would not refuse this shape for its own size: closes an open contour,
+    /// then answers false for a Builder that overflowed or a shape `plan_shape` refuses. A shape
+    /// with no area fits. The pools' room is not asked.
+    pub fn fits(self: *Builder) bool {
+        self.close();
+        if (self.overflowed) return false;
+        const edges = self.items();
+        if (!has_area(edges)) return true;
+        const result = plan_shape(edges) catch return false;
+        assert(result.count >= 1);
+        return true;
+    }
+
     /// The contours so far, closed or not.
     pub fn items(self: *const Builder) []const Edge {
         assert(self.count <= segment_cap);
@@ -473,12 +529,21 @@ fn middle(a: Point, b: Point) Point {
     return .{ (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 };
 }
 
-/// One band of a plan: `[top, bottom)` in the shape's absolute y, listing `count` segments.
+/// One piece of a plan: `[top, bottom)` in the shape's absolute y, listing `count` segments. A
+/// whole band spans the shape's padded bounds; a cell is a part of a floor band (section 3a).
 pub const Band = struct {
     top: f32,
     bottom: f32,
+    /// A cell's x-range `[left, right)`, on the band grid. Unused in a whole band.
+    left: f32,
+    right: f32,
+    /// False for a whole band, which lists what `meets` it; true for a cell.
+    cut: bool,
     count: u32,
 };
+
+/// Why a shape cannot be cut into pieces.
+pub const PlanError = error{ BandFull, PlanFull };
 
 /// A shape's bands, top to bottom (module guide, section 3).
 pub const Plan = struct {
@@ -547,18 +612,29 @@ fn bounds_of(edges: []const Edge) Rect {
     return box;
 }
 
-/// Cuts `edges` into bands (module guide, section 3). Null when a band under `band_height_min`
-/// lists more than `segments_max`, or the bands pass `bands_max`.
+/// Cuts `edges` into bands, and a band at the floor into cells (module guide, sections 3 and 3a).
+pub fn plan_shape(edges: []const Edge) PlanError!Plan {
+    return plan_with(edges, true);
+}
+
+/// `plan_shape`, with null for a shape that cannot be cut within the caps.
 pub fn plan_bands(edges: []const Edge) ?Plan {
+    return plan_shape(edges) catch null;
+}
+
+/// `plan_shape`, with cutting a floor band across switched off when `cut_across` is false: that
+/// band is then `error.BandFull`, as the plan was before cells.
+fn plan_with(edges: []const Edge, comptime cut_across: bool) PlanError!Plan {
     assert(edges.len >= 1);
     assert(edges.len <= segment_cap);
     const bounds = bounds_of(edges);
     assert(bounds.height > 0);
-    var plan: Plan = .{ .bands = undefined, .count = 0, .points = 0, .bounds = bounds };
+    var result: Plan = .{ .bands = undefined, .count = 0, .points = 0, .bounds = bounds };
     var stack: [split_depth_max][2]f32 = undefined;
     stack[0] = .{ grid_down(bounds.y - aa_pad), grid_up(bounds.y + bounds.height + aa_pad) };
     var depth: u32 = 1;
     var visits: u32 = 0;
+    var cell_visits: u32 = 0;
     while (depth > 0) : (visits += 1) {
         // Every visit makes a band or a split, so this holds for a plan that fits.
         assert(visits <= 2 * bands_max + 2);
@@ -567,8 +643,12 @@ pub fn plan_bands(edges: []const Edge) ?Plan {
         const count = band_count(edges, range[0], range[1]);
         if (count > segments_max) {
             const height = range[1] - range[0];
-            if (height <= band_height_min) return null;
-            if (depth + 2 > split_depth_max) return null;
+            if (height <= band_height_min) {
+                if (!cut_across) return error.BandFull;
+                try plan_cells(&result, edges, range, &cell_visits);
+                continue;
+            }
+            if (depth + 2 > split_depth_max) return error.PlanFull;
             const cut = grid_down((range[0] + range[1]) * 0.5);
             assert(cut > range[0] and cut < range[1]);
             stack[depth] = .{ cut, range[1] };
@@ -577,13 +657,163 @@ pub fn plan_bands(edges: []const Edge) ?Plan {
             continue;
         }
         if (count == 0) continue;
-        if (plan.count == bands_max) return null;
-        plan.bands[plan.count] = .{ .top = range[0], .bottom = range[1], .count = count };
-        plan.count += 1;
-        plan.points += 2 * count;
+        if (result.count == bands_max) return error.PlanFull;
+        result.bands[result.count] = .{
+            .top = range[0],
+            .bottom = range[1],
+            .left = 0,
+            .right = 0,
+            .cut = false,
+            .count = count,
+        };
+        result.count += 1;
+        result.points += 2 * count;
     }
-    assert(plan.count >= 1);
-    return plan;
+    assert(result.count >= 1);
+    return result;
+}
+
+/// The part of a floor band `[top, bottom)` that one fragment list covers (section 3a).
+const Cell = struct {
+    top: f32,
+    bottom: f32,
+    left: f32,
+    right: f32,
+};
+
+/// One cell's list, counted or written by the same walk (section 3a), so the plan's count and
+/// the append's points cannot part.
+const Walk = struct {
+    cell: Cell,
+    /// Subtracted from every point written.
+    origin: Point,
+    /// Where points go: empty when counting.
+    out: []Point,
+    count: u32,
+    run_open: bool,
+    run_first_y: f32,
+    run_last_y: f32,
+
+    fn emit(self: *Walk, comptime write: bool, edge: Edge) void {
+        if (write) {
+            assert(2 * self.count + 2 <= self.out.len);
+            self.out[2 * self.count] = .{ edge.a[0] - self.origin[0], edge.a[1] - self.origin[1] };
+            self.out[2 * self.count + 1] = .{
+                edge.b[0] - self.origin[0],
+                edge.b[1] - self.origin[1],
+            };
+        }
+        self.count += 1;
+    }
+
+    /// Ends the open run, if any, with its stand-in segment.
+    fn close_run(self: *Walk, comptime write: bool) void {
+        if (!self.run_open) return;
+        self.run_open = false;
+        const x = self.cell.right + aa_pad;
+        const stand: Edge = .{ .a = .{ x, self.run_first_y }, .b = .{ x, self.run_last_y } };
+        if (meets(stand, self.cell.top, self.cell.bottom)) self.emit(write, stand);
+    }
+};
+
+/// The edges one cell lists, in order, and a stand-in for each run of edges that cannot reach it
+/// from its right (section 3a). With `write`, the segments go to `out`, relative to `origin`.
+fn cell_walk(
+    edges: []const Edge,
+    cell: Cell,
+    comptime write: bool,
+    origin: Point,
+    out: []Point,
+) u32 {
+    assert(cell.right > cell.left);
+    assert(cell.bottom > cell.top);
+    var walk: Walk = .{
+        .cell = cell,
+        .origin = origin,
+        .out = out,
+        .count = 0,
+        .run_open = false,
+        .run_first_y = 0,
+        .run_last_y = 0,
+    };
+    var previous: ?Point = null;
+    for (edges) |edge| {
+        if (previous) |end| {
+            if (edge.a[0] != end[0] or edge.a[1] != end[1]) walk.close_run(write);
+        }
+        previous = edge.b;
+        const nearest = @min(edge.a[0], edge.b[0]);
+        const farthest = @max(edge.a[0], edge.b[0]);
+        const reaches = meets(edge, cell.top, cell.bottom);
+        const free = !reaches or nearest >= cell.right + aa_pad;
+        if (free) {
+            if (!walk.run_open) {
+                walk.run_open = true;
+                walk.run_first_y = edge.a[1];
+            }
+            walk.run_last_y = edge.b[1];
+        } else if (farthest <= cell.left - aa_pad) {
+            walk.close_run(write);
+        } else {
+            walk.close_run(write);
+            walk.emit(write, edge);
+        }
+    }
+    walk.close_run(write);
+    if (write) assert(2 * walk.count <= out.len);
+    assert(walk.count <= edges.len + 1);
+    return walk.count;
+}
+
+/// Cuts the floor band `range` across into cells and adds them to `result`, left to right
+/// (section 3a). `visits` counts cells looked at over the whole shape.
+fn plan_cells(
+    result: *Plan,
+    edges: []const Edge,
+    range: [2]f32,
+    visits: *u32,
+) PlanError!void {
+    assert(range[1] > range[0]);
+    const bounds = result.bounds;
+    var stack: [split_depth_max][2]f32 = undefined;
+    stack[0] = .{ grid_down(bounds.x - aa_pad), grid_up(bounds.x + bounds.width + aa_pad) };
+    var depth: u32 = 1;
+    while (depth > 0) {
+        if (visits.* == 4 * bands_max) return error.PlanFull;
+        visits.* += 1;
+        depth -= 1;
+        const span = stack[depth];
+        const cell: Cell = .{
+            .top = range[0],
+            .bottom = range[1],
+            .left = span[0],
+            .right = span[1],
+        };
+        var none: [0]Point = .{};
+        const count = cell_walk(edges, cell, false, .{ 0, 0 }, &none);
+        if (count > segments_max) {
+            if (span[1] - span[0] <= cell_width_min) return error.BandFull;
+            if (depth + 2 > split_depth_max) return error.PlanFull;
+            const cut = grid_down((span[0] + span[1]) * 0.5);
+            assert(cut > span[0] and cut < span[1]);
+            stack[depth] = .{ cut, span[1] };
+            stack[depth + 1] = .{ span[0], cut };
+            depth += 2;
+            continue;
+        }
+        if (count == 0) continue;
+        if (result.count == bands_max) return error.PlanFull;
+        result.bands[result.count] = .{
+            .top = range[0],
+            .bottom = range[1],
+            .left = span[0],
+            .right = span[1],
+            .cut = true,
+            .count = count,
+        };
+        result.count += 1;
+        result.points += 2 * count;
+    }
 }
 
 /// How a shape is filled.
@@ -602,42 +832,43 @@ pub const Placed = struct {
     bands: u32,
 };
 
+/// Why `append_checked` refused a shape (module guide, section 6).
+pub const Refused = PlanError || error{ BuilderFull, PoolFull, PointsFull, BatchFull };
+
 /// Appends the shape in `shape`, closing an open contour, to the draw context `cx` on its current
 /// layer. Returns where its points went, or null when it could not take all of it: a Builder
-/// that overflowed, a band over the cap, or a full pool, point pool, or batch list. Nothing is
-/// kept then, and the refusal is counted in `cx.overflow_count`. A shape with no area appends
-/// nothing and counts nothing, and returns null too.
+/// that overflowed, a shape `plan_shape` refuses, or a full pool, point pool, or batch list.
+/// Nothing is kept then, and the refusal is counted in `cx.overflow_count`. A shape with no area
+/// appends nothing and counts nothing, and returns null too. `append_checked` says which.
 pub fn append(cx: anytype, shape: *Builder, style: Style, clip: Clip) ?Placed {
+    return append_checked(cx, shape, style, clip) catch null;
+}
+
+/// As `append`, but a refusal is the error that names it, and null is only a shape with no area.
+pub fn append_checked(cx: anytype, shape: *Builder, style: Style, clip: Clip) Refused!?Placed {
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
     shape.close();
     if (shape.overflowed) {
         cx.refuse();
-        return null;
+        return error.BuilderFull;
     }
     const edges = shape.items();
-    var any_area = false;
-    for (edges) |edge| any_area = any_area or edge.a[1] != edge.b[1];
-    if (!any_area) return null;
-    const plan = plan_bands(edges) orelse {
+    if (!has_area(edges)) return null;
+    const plan = plan_shape(edges) catch |err| {
         cx.refuse();
-        return null;
+        return err;
     };
     if (cx.room(Fill) < plan.count) {
         cx.refuse();
-        return null;
+        return error.PoolFull;
     }
-    const first = cx.reserve_points(plan.points) orelse return null;
+    const first = cx.reserve_points(plan.points) orelse return error.PointsFull;
     const origin: Point = .{ plan.bounds.x, plan.bounds.y };
     var written: u32 = first;
     for (plan.items(), 0..) |band, index| {
         const start = written;
-        for (edges) |edge| {
-            if (!meets(edge, band.top, band.bottom)) continue;
-            cx.points[written] = .{ edge.a[0] - origin[0], edge.a[1] - origin[1] };
-            cx.points[written + 1] = .{ edge.b[0] - origin[0], edge.b[1] - origin[1] };
-            written += 2;
-        }
+        written += write_piece(&cx.points, edges, band, start, origin);
         assert(written - start == 2 * band.count);
         const instance = band_of(&plan, band, start, origin, style, clip);
         cx.append(Fill, null, instance) catch |err| switch (err) {
@@ -645,13 +876,43 @@ pub fn append(cx: anytype, shape: *Builder, style: Style, clip: Clip) ?Placed {
             error.BatchFull => {
                 assert(index == 0);
                 cx.release_points(first);
-                return null;
+                return error.BatchFull;
             },
             error.PoolFull, error.EdgeNotPositive, error.ClipUnordered => unreachable,
         };
     }
     assert(written == first + plan.points);
     return .{ .first = first, .count = plan.points, .bounds = plan.bounds, .bands = plan.count };
+}
+
+/// True when some edge is not horizontal.
+fn has_area(edges: []const Edge) bool {
+    var any_area = false;
+    for (edges) |edge| any_area = any_area or edge.a[1] != edge.b[1];
+    return any_area;
+}
+
+/// Writes the points of `band` at `out[start..]` and returns how many.
+fn write_piece(out: []Point, edges: []const Edge, band: Band, start: u32, origin: Point) u32 {
+    var written: u32 = start;
+    if (band.cut) {
+        const cell: Cell = .{
+            .top = band.top,
+            .bottom = band.bottom,
+            .left = band.left,
+            .right = band.right,
+        };
+        const count = cell_walk(edges, cell, true, origin, out[start..][0 .. 2 * band.count]);
+        assert(count == band.count);
+        return 2 * count;
+    }
+    for (edges) |edge| {
+        if (!meets(edge, band.top, band.bottom)) continue;
+        out[written] = .{ edge.a[0] - origin[0], edge.a[1] - origin[1] };
+        out[written + 1] = .{ edge.b[0] - origin[0], edge.b[1] - origin[1] };
+        written += 2;
+    }
+    return written - start;
 }
 
 /// The instance of `band`, whose points start at `first`.
@@ -665,9 +926,11 @@ fn band_of(
 ) Fill {
     assert(band.bottom > band.top);
     assert(band.count <= segments_max);
-    const x = plan.bounds.x - aa_pad;
+    // A cell is a band narrowed to its x-range; its anchor moves with it (section 5).
+    const x = if (band.cut) band.left else plan.bounds.x - aa_pad;
+    const width = if (band.cut) band.right - band.left else plan.bounds.width + 2 * aa_pad;
     const instance: Fill = .{
-        .rect = .{ x, band.top, plan.bounds.width + 2 * aa_pad, band.bottom - band.top },
+        .rect = .{ x, band.top, width, band.bottom - band.top },
         .clip = .{ clip.x0, clip.y0, clip.x1, clip.y1 },
         .color = style.color,
         .anchor_x = origin[0] - x,
@@ -1410,4 +1673,316 @@ test "the Fill record follows the draw type convention" {
     try testing.expectEqual(@as(?[]const u8, null), comptime registry.check(Fill));
     try testing.expect(comptime registry.reads_points(Fill));
     try testing.expect(comptime @hasField(Fill, "point_count"));
+}
+
+/// Adds the polygon of `n` points on an ellipse as its own contour.
+fn ring(shape: *Builder, n: u32, cx: f32, cy: f32, rx: f32, ry: f32) void {
+    assert(n >= 3);
+    var index: u32 = 0;
+    while (index < n) : (index += 1) {
+        const step: f32 = @floatFromInt(index);
+        const turn = 2.0 * std.math.pi * step / @as(f32, @floatFromInt(n));
+        const point: Point = .{ cx + rx * @cos(turn), cy + ry * @sin(turn) };
+        if (index == 0) shape.move_to(point) else shape.line_to(point);
+    }
+    shape.close();
+}
+
+/// 256 samples of a flat waveform, closed along its baseline.
+fn waveform(shape: *Builder) void {
+    var index: u32 = 0;
+    while (index < 256) : (index += 1) {
+        const x: f32 = 10 + 2 * @as(f32, @floatFromInt(index));
+        const y: f32 = 40 + 2 * @as(f32, @floatFromInt(37 * index % 101)) / 100;
+        if (index == 0) shape.move_to(.{ x, y }) else shape.line_to(.{ x, y });
+    }
+    shape.line_to(.{ 520, 43 });
+    shape.line_to(.{ 10, 43 });
+    shape.close();
+}
+
+/// The four thin shapes of the step: a small circle, a tiny one, a flat ellipse, a waveform.
+fn thin_shape(shape: *Builder, which: u32) void {
+    assert(which < 4);
+    switch (which) {
+        0 => ring(shape, 256, 100, 50, 10, 10),
+        1 => ring(shape, 64, 100, 50, 1.3, 1.3),
+        2 => ring(shape, 256, 200, 50, 100, 10),
+        else => waveform(shape),
+    }
+}
+
+/// A waveform of `n` samples `pitch` apart, `amplitude` tall, closed along its baseline.
+fn zigzag(shape: *Builder, n: u32, pitch: f32, amplitude: f32) void {
+    var index: u32 = 0;
+    while (index < n) : (index += 1) {
+        const x: f32 = 10 + pitch * @as(f32, @floatFromInt(index));
+        const y: f32 = 40 + amplitude * @as(f32, @floatFromInt(37 * index % 101)) / 100;
+        if (index == 0) shape.move_to(.{ x, y }) else shape.line_to(.{ x, y });
+    }
+    shape.line_to(.{ 10 + pitch * @as(f32, @floatFromInt(n)), 40 + amplitude * 1.1 });
+    shape.line_to(.{ 10, 40 + amplitude * 1.1 });
+    shape.close();
+}
+
+/// Fills `cx`'s batch list with Box layers, as "a refused shape keeps nothing" does.
+fn fill_batches(cx: *TestContext) !void {
+    var level: u8 = 0;
+    while (level < 4) : (level += 1) {
+        _ = cx.layer(@fromBackingInt(level));
+        const unit: draw.Rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+        const clip: draw.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 };
+        try cx.append(types.Box, null, .of(unit, clip, .{ .fill = .{ 1, 1, 1, 1 } }));
+    }
+}
+
+fn plan_equal(want: Plan, got: Plan) !void {
+    try testing.expectEqual(want.count, got.count);
+    try testing.expectEqual(want.points, got.points);
+    try testing.expectEqual(want.bounds, got.bounds);
+    for (want.items(), got.items()) |one, other| try testing.expectEqual(one, other);
+}
+
+// Locks the cut: with cutting off, A (a circle of 256 points, radius 10), B (64 points, radius
+// 1.3), C (256 points, 200 by 20), and D (a waveform of 256 samples) are `error.BandFull`; the plan
+// cuts each into 18, 8, 18, and 47 pieces, of which 8, 4, 8, and 46 are cells, over 1344, 576,
+// 1304, and 3062 points; every list is at most 48 and the points are twice the lists.
+test "a thin or small shape was refused by bands alone" {
+    const pieces = [4]u32{ 18, 8, 18, 47 };
+    const cells = [4]u32{ 8, 4, 8, 46 };
+    const points = [4]u32{ 1344, 576, 1304, 3062 };
+    for (0..4) |which| {
+        const shape = test_builder.new(1);
+        thin_shape(shape, @intCast(which));
+        try testing.expectError(error.BandFull, plan_with(shape.items(), false));
+        const cut = try plan_shape(shape.items());
+        var cut_count: u32 = 0;
+        var sum: u32 = 0;
+        for (cut.items()) |band| {
+            try testing.expect(band.count <= segments_max);
+            cut_count += @intFromBool(band.cut);
+            sum += band.count;
+        }
+        try testing.expectEqual(pieces[which], cut.count);
+        try testing.expectEqual(cells[which], cut_count);
+        try testing.expectEqual(points[which], cut.points);
+        try testing.expectEqual(2 * sum, cut.points);
+    }
+}
+
+// Locks the walk: on a rectangle of two units' width and 1 tall, a cell far to its left has the
+// whole shape to its right, and the run of its edges is one stand-in at its right edge + 1.
+// Closed, the contour goes down and up again and cancels, so the cell lists nothing; open (three
+// edges) it is one stand-in from y 0 to 1, and a cell at the right side lists that side itself.
+test "a stand-in is one segment for a run" {
+    const rect = [_]Point{ .{ 0, 0 }, .{ 10, 0 }, .{ 10, 1 }, .{ 0, 1 } };
+    const open = [_]Edge{
+        .{ .a = rect[0], .b = rect[1] },
+        .{ .a = rect[1], .b = rect[2] },
+        .{ .a = rect[2], .b = rect[3] },
+    };
+    const closed = open ++ [_]Edge{.{ .a = rect[3], .b = rect[0] }};
+    var out: [8]Point = undefined;
+    const middle_cell: Cell = .{ .top = 0, .bottom = 1, .left = 2, .right = 4 };
+    for ([_][]const Edge{ &open, &closed }) |edges| {
+        const counted = cell_walk(edges, middle_cell, false, .{ 0, 0 }, out[0..0]);
+        try testing.expectEqual(@as(u32, 1), counted);
+        try testing.expectEqual(@as(u32, 1), cell_walk(edges, middle_cell, true, .{ 0, 0 }, &out));
+        try testing.expectEqual(Point{ 5, 0 }, out[0]);
+        try testing.expectEqual(Point{ 5, 1 }, out[1]);
+    }
+    const side: Cell = .{ .top = 0, .bottom = 1, .left = 9, .right = 10 };
+    for ([_][]const Edge{ &open, &closed }) |edges| {
+        try testing.expectEqual(@as(u32, 1), cell_walk(edges, side, true, .{ 0, 0 }, &out));
+        try testing.expectEqual(Point{ 10, 0 }, out[0]);
+        try testing.expectEqual(Point{ 10, 1 }, out[1]);
+    }
+    const left_of: Cell = .{ .top = 0, .bottom = 1, .left = -3, .right = -2 };
+    try testing.expectEqual(@as(u32, 1), cell_walk(&open, left_of, true, .{ 0, 0 }, &out));
+    try testing.expectEqual(Point{ -1, 0 }, out[0]);
+    try testing.expectEqual(Point{ -1, 1 }, out[1]);
+    try testing.expectEqual(@as(u32, 0), cell_walk(&closed, left_of, false, .{ 0, 0 }, out[0..0]));
+}
+
+// Locks the cut's coverage: A, B, C, and D at half opacity, read at pixel sizes 1, 1/2, and 1/3
+// over their padded bounds. No pixel centre lies in two pieces, one in a piece wherever the shape
+// has coverage, and the sum of the pieces' alpha is half the whole shape's coverage to 1e-4.
+test "cells cover as the whole shape does, each pixel once" {
+    for (0..4) |which| {
+        for ([_]f32{ 1, 0.5, 1.0 / 3.0 }) |pixel_size| {
+            const shape = test_builder.new(1);
+            thin_shape(shape, @intCast(which));
+            const edges = shape.items();
+            const cx = new_context();
+            const placed_shape = append(cx, shape, .{ .color = .{ 1, 1, 1, 0.5 } }, window).?;
+            try testing.expect(placed_shape.bands >= 4);
+            const bounds = placed_shape.bounds;
+            var y = (@floor((bounds.y - aa_pad) / pixel_size) + 0.5) * pixel_size;
+            while (y < bounds.y + bounds.height + aa_pad) : (y += pixel_size) {
+                var x = (@floor((bounds.x - aa_pad) / pixel_size) + 0.5) * pixel_size;
+                while (x < bounds.x + bounds.width + aa_pad) : (x += pixel_size) {
+                    var owners: u32 = 0;
+                    var alpha: f32 = 0;
+                    for (cx.items(Fill)) |*piece| {
+                        const rect = piece.rect;
+                        const inside = x >= rect[0] and x < rect[0] + rect[2] and
+                            y >= rect[1] and y < rect[1] + rect[3];
+                        owners += @intFromBool(inside);
+                        alpha += band_alpha(cx.point_items(), piece, x, y, pixel_size);
+                    }
+                    const want = 0.5 * coverage(edges, .non_zero, x, y, pixel_size);
+                    try testing.expect(owners <= 1);
+                    if (want > 1.0e-3) try testing.expectEqual(@as(u32, 1), owners);
+                    try testing.expectApproxEqAbs(want, alpha, 1.0e-4);
+                }
+            }
+        }
+    }
+}
+
+// Locks that cutting is only for what was refused: the comb of "bands halve until their lists
+// fit" and every glyph from U+0021 to U+017F of the embedded faces at 16, 64, 512, and 2,000 px
+// that bands alone accept are planned with no cell, equal to the plan with cutting off.
+test "a shape that fits is planned as before" {
+    const shape = test_builder.new(1);
+    comb(shape, 100, 200, 24, 10);
+    shape.close();
+    const whole = try plan_shape(shape.items());
+    try plan_equal(try plan_with(shape.items(), false), whole);
+    for (whole.items()) |band| try testing.expect(!band.cut);
+    var accepted: u32 = 0;
+    for (&text.fonts) |*font| {
+        var code: u21 = 0x21;
+        while (code <= 0x17F) : (code += 1) {
+            const id = ttf.glyph_id(font, code);
+            if (id == 0) continue;
+            if (ttf.load(font, id, &test_raster.outline) != .ready) continue;
+            const units: f32 = @floatFromInt(font.units_per_em);
+            for ([_]f32{ 16, 64, 512, 2000 }) |size| {
+                const glyph = test_builder.new(1);
+                glyph.outline(&test_raster.outline, size / units, .{ 0, 0 });
+                if (glyph.overflowed or !has_area(glyph.items())) continue;
+                const before = plan_with(glyph.items(), false) catch continue;
+                const after = try plan_shape(glyph.items());
+                try plan_equal(before, after);
+                for (after.items()) |band| try testing.expect(!band.cut);
+                accepted += 1;
+            }
+        }
+    }
+    try testing.expect(accepted > 1000);
+}
+
+const SmallContext = pools.Context(&[_]registry.DrawType{
+    .{ .type = types.Box, .cap = 4 },
+    .{ .type = Fill, .cap = 4 },
+}, 4, 4096);
+
+const FewPointsContext = pools.Context(&test_draw, 4, 256);
+
+// Locks the refusals by name: a comb of 80 teeth in one pixel is `BandFull`, a Builder past its
+// cap `BuilderFull`, a Fill pool of 4 under A's 18 pieces `PoolFull`, a pool of 256 points under
+// A's 1,344 `PointsFull`, full batches `BatchFull`, and a waveform of 1,000 samples 6 tall (a
+// plan of more than 256 pieces or 1,024 cell visits) `PlanFull`. Each counts once and keeps
+// nothing, `append` is null for all, and a line with no area is null with no error and no count.
+test "a refusal says why" {
+    const color: Style = .{ .color = @splat(1) };
+    const teeth = test_builder.new(1);
+    comb(teeth, 0, 0, 80, 0.0125);
+    const cx = new_context();
+    try testing.expectError(error.BandFull, append_checked(cx, teeth, color, window));
+    try testing.expectEqual(@as(u32, 1), cx.overflow_count);
+    try testing.expectEqual(@as(u32, 0), cx.point_count);
+    try testing.expectEqual(@as(usize, 0), cx.items(Fill).len);
+    try testing.expectEqual(@as(?Placed, null), append(cx, teeth, color, window));
+
+    const long = test_builder.new(1);
+    long.move_to(.{ 0, 0 });
+    var index: u32 = 0;
+    while (index <= segment_cap) : (index += 1) {
+        long.line_to(.{ @floatFromInt(index % 7 + 1), @floatFromInt(index) });
+    }
+    const other = new_context();
+    try testing.expectError(error.BuilderFull, append_checked(other, long, color, window));
+    try testing.expectEqual(@as(u32, 1), other.overflow_count);
+    try testing.expectEqual(@as(?Placed, null), append(other, long, color, window));
+
+    const small: *SmallContext = &small_static.context;
+    small.init();
+    const circle = test_builder.new(1);
+    thin_shape(circle, 0);
+    try testing.expectError(error.PoolFull, append_checked(small, circle, color, window));
+    try testing.expectEqual(@as(u32, 1), small.overflow_count);
+    try testing.expectEqual(@as(u32, 0), small.point_count);
+    try testing.expectEqual(@as(usize, 0), small.items(Fill).len);
+    try testing.expectEqual(@as(?Placed, null), append(small, circle, color, window));
+
+    const few: *FewPointsContext = &few_static.context;
+    few.init();
+    try testing.expectError(error.PointsFull, append_checked(few, circle, color, window));
+    try testing.expectEqual(@as(u32, 1), few.overflow_count);
+    try testing.expectEqual(@as(u32, 0), few.point_count);
+    try testing.expectEqual(@as(usize, 0), few.items(Fill).len);
+
+    const full = new_context();
+    try fill_batches(full);
+    const triangle = test_builder.new(1);
+    triangle.polygon(&.{ .{ 0, 0 }, .{ 9, 0 }, .{ 0, 9 } });
+    try testing.expectError(error.BatchFull, append_checked(full, triangle, color, window));
+    try testing.expectEqual(@as(u32, 1), full.overflow_count);
+    try testing.expectEqual(@as(u32, 0), full.point_count);
+    try testing.expectEqual(@as(?Placed, null), append(full, triangle, color, window));
+
+    const wave = test_builder.new(1);
+    zigzag(wave, 1000, 1, 6);
+    const crowded = new_context();
+    try testing.expectError(error.PlanFull, append_checked(crowded, wave, color, window));
+    try testing.expectEqual(@as(u32, 1), crowded.overflow_count);
+    try testing.expectEqual(@as(u32, 0), crowded.point_count);
+    try testing.expectEqual(@as(?Placed, null), append(crowded, wave, color, window));
+
+    const line = test_builder.new(1);
+    line.move_to(.{ 0, 5 });
+    line.line_to(.{ 9, 5 });
+    const empty = new_context();
+    try testing.expectEqual(@as(?Placed, null), try append_checked(empty, line, color, window));
+    try testing.expectEqual(@as(u32, 0), empty.overflow_count);
+}
+
+const small_static = struct {
+    var context: SmallContext = undefined;
+};
+
+const few_static = struct {
+    var context: FewPointsContext = undefined;
+};
+
+// Locks `fits`: true for a triangle (one horizontal side, so 2 segments and 4 points), for a line
+// with no area, and for A; false for the comb of 80 teeth and for a Builder that overflowed;
+// asking first changes nothing, so the triangle then appends as it does without it.
+test "fits answers before drawing" {
+    const triangle = test_builder.new(1);
+    triangle.polygon(&.{ .{ 0, 0 }, .{ 9, 0 }, .{ 0, 9 } });
+    try testing.expect(triangle.fits());
+    const cx = new_context();
+    const placed_shape = append(cx, triangle, .{ .color = @splat(1) }, window).?;
+    try testing.expectEqual(@as(u32, 1), placed_shape.bands);
+    try testing.expectEqual(@as(u32, 4), placed_shape.count);
+    const line = test_builder.new(1);
+    line.move_to(.{ 0, 5 });
+    line.line_to(.{ 9, 5 });
+    try testing.expect(line.fits());
+    const circle = test_builder.new(1);
+    thin_shape(circle, 0);
+    try testing.expect(circle.fits());
+    const teeth = test_builder.new(1);
+    comb(teeth, 0, 0, 80, 0.0125);
+    try testing.expect(!teeth.fits());
+    const long = test_builder.new(1);
+    long.move_to(.{ 0, 0 });
+    var index: u32 = 0;
+    while (index <= segment_cap) : (index += 1) {
+        long.line_to(.{ @floatFromInt(index % 7 + 1), @floatFromInt(index) });
+    }
+    try testing.expect(!long.fits());
 }

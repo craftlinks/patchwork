@@ -30,8 +30,10 @@
 //! ## 3. The List
 //! `List` builds the `input.Drop` a host dispatches: base names cut to `input.drop_name_max`
 //! bytes on a codepoint boundary, with bytes that are not UTF-8 shown as '?', and (natively)
-//! the full paths, NUL-terminated for `open`. A file past `input.drop_files_max` or past the
-//! path room is counted in `skipped`.
+//! the full paths, NUL-terminated for `open`. Each listed file's `input.DropFile.path` is its
+//! path in that storage (raw bytes, empty when the host gave none), so it lives as long as the
+//! list and the app may use it only during the `drop` event. A file past
+//! `input.drop_files_max` or past the path room is counted in `skipped`.
 //!
 //! ## 4. URI Lists
 //! A native drag offers `text/uri-list` (RFC 2483): one URI per line, CRLF (or LF), `#` lines
@@ -113,6 +115,8 @@ pub const List = struct {
         };
         self.names_len += name_len;
         self.drop.count += 1;
+        // `path` reads a listed file, so the file's path is set once it is counted.
+        self.drop.files[index].path = self.path(index);
         assert(self.names_len <= names_cap);
         assert(self.paths_len <= paths_cap);
         return true;
@@ -580,4 +584,28 @@ test "the list keeps names, paths, and counts what does not fit" {
     try testing.expectEqual(@as(u16, 1), list.files().skipped);
     try testing.expectEqualStrings("samples", basename("/home/a/samples/"));
     try testing.expectEqualStrings("/", basename("/"));
+}
+
+// Locks that a listed file carries its path: "/home/a/My Song.wav" with a NUL after it, the
+// same bytes as `path(0)`; an empty full path gives an empty one; a 0xff byte stays in the path
+// while the name shows '?'.
+test "a listed file carries the path it was added with" {
+    const static = struct {
+        var list: List = undefined;
+    };
+    const list = &static.list;
+    list.reset(0, 0);
+    const song = "/home/a/My Song.wav";
+    try testing.expect(list.add(song, basename(song), 7, true));
+    try testing.expect(list.add("", "b.txt", 0, true));
+    const bad = "/home/a/bad\xff.wav";
+    try testing.expect(list.add(bad, basename(bad), 1, true));
+    const first = list.files().files[0];
+    try testing.expectEqualStrings(song, first.path);
+    try testing.expectEqual(@as(u8, 0), first.path.ptr[first.path.len]);
+    try testing.expectEqual(list.path(0).ptr, first.path.ptr);
+    try testing.expectEqual(@as(usize, 0), list.files().files[1].path.len);
+    const third = list.files().files[2];
+    try testing.expectEqualStrings(bad, third.path);
+    try testing.expectEqualStrings("bad?.wav", third.name);
 }
