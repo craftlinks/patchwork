@@ -545,6 +545,7 @@ pub fn EditorOf(comptime L: type) type {
             return true;
         }
 
+        /// The whole text, as the buffer holds it.
         pub fn text(self: *const Self) []const u8 {
             return self.buffer.text();
         }
@@ -630,10 +631,12 @@ pub fn EditorOf(comptime L: type) type {
             return true;
         }
 
+        /// Starts a gesture on the buffer: every edit until `gesture_end` joins one undo entry.
         pub fn gesture_begin(self: *Self) void {
             self.buffer.gesture_begin();
         }
 
+        /// Ends the open gesture, so the next edit opens an undo entry of its own.
         pub fn gesture_end(self: *Self) void {
             self.buffer.gesture_end();
         }
@@ -643,6 +646,7 @@ pub fn EditorOf(comptime L: type) type {
             return self.buffer.history_mark();
         }
 
+        /// The id of the editor's scrolling view, derived from its own id.
         pub fn view_id(self: *const Self) Id {
             return self.id.derive(view_salt);
         }

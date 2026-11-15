@@ -210,6 +210,7 @@ pub fn BufferOf(comptime L: type) type {
             return true;
         }
 
+        /// The bytes of the whole text, `len` of them.
         pub fn text(self: *const Self) []const u8 {
             assert(self.len <= buffer_cap);
             return self.bytes[0..self.len];
@@ -225,6 +226,7 @@ pub fn BufferOf(comptime L: type) type {
             return .{ .start = start, .end = end };
         }
 
+        /// The text of line `line` as a slice, LF excluded; `line_range` gives its offsets.
         pub fn line_bytes(self: *const Self, line: u32) []const u8 {
             const range = self.line_range(line);
             return self.bytes[range.start..range.end];
@@ -288,6 +290,7 @@ pub fn BufferOf(comptime L: type) type {
             assert(self.open_index() == null);
         }
 
+        /// Ends the open gesture and seals its entry; one must be open.
         pub fn gesture_end(self: *Self) void {
             assert(self.gesture);
             self.gesture = false;
