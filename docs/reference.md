@@ -291,6 +291,7 @@ patchwork/
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
+│   ├── seams.zig               # `zig build seams`: counts a translucent stroke's seam faults on the GPU
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
@@ -433,6 +434,7 @@ zig build bench-live -Doptimize=ReleaseFast -- typing-stress --adapter low
 zig build compare -- a.ppm b.ppm   # Compare two frame dumps; exit 1 when they differ
 zig build compare -- a.png b.ppm --crop 0 0 1088 704 --diff d.png   # A rect of both, diff PNG
 zig build compare -- a.ppm --crop 0 0 640 360 --png out.png         # A crop of one, as PNG
+zig build seams -Doptimize=ReleaseFast -- --adapter high --scale 2 --strict   # Pixels a stroke's chunks draw twice or not at all
 ```
 
 The `serve` steps run a development server on loopback (port 8080, or the one
