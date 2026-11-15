@@ -7,7 +7,8 @@
 //! One area flagged `drop` over a panel. `cx.drop_hovering` gives its highlight in `draw`, so
 //! the page keeps no hover state: `drop_in` and `drop_out` only owe a redraw. On `dropped` the
 //! page copies each file's name (cut to `name_cap` bytes on a codepoint) and size, and accepts
-//! every readable file; a folder is listed but not accepted.
+//! every readable file; a folder is listed but not accepted. A file's `path` (native only) is
+//! printed to stderr through `drop.clean_name` and nothing else: it is raw bytes, never drawn.
 //!
 //! ## 2. Chunks
 //! Each file's row shows its size and status: "reading 42%" as bytes arrive, then "done",
@@ -141,6 +142,7 @@ pub const Page = struct {
             self.sizes[index] = file.size;
             self.received[index] = 0;
             self.status[index] = if (file.readable) .waiting else .folder;
+            print_path(file.path);
             if (!file.readable) continue;
             mask |= @as(u16, 1) << @intCast(index);
             if (self.wav_row == null and is_wav(file.name)) self.wav_row = @intCast(index);
@@ -150,6 +152,19 @@ pub const Page = struct {
         if (mask != 0) cx.accept_files(zone_id, mask);
         cx.redraw();
         return Note.of(&.{ "drop ", count_text(files.count), if (files.count == 1) " file" else " files" });
+    }
+
+    /// Prints a dropped file's path to stderr, cleaned, where `App.note` prints its status line
+    /// (natively, in a safe build, outside tests). The path is raw bytes from another program:
+    /// it is printed, never stored or drawn (section 1).
+    fn print_path(path: []const u8) void {
+        const builtin = @import("builtin");
+        const native = builtin.os.tag == .linux and !builtin.is_test;
+        if (!native or !std.debug.runtime_safety) return;
+        if (path.len == 0) return;
+        var clean: [input.drop_name_max]u8 = undefined;
+        const length = patchwork.drop.clean_name(path, &clean);
+        std.debug.print("drop path: {s}\n", .{clean[0..length]});
     }
 
     /// One chunk of an accepted file (section 2).
