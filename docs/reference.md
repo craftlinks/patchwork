@@ -435,6 +435,14 @@ zig build compare -- a.png b.ppm --crop 0 0 1088 704 --diff d.png   # A rect of 
 zig build compare -- a.ppm --crop 0 0 640 360 --png out.png         # A crop of one, as PNG
 ```
 
+The `serve` steps run a development server on loopback (port 8080, or the one
+`PATCHWORK_SERVE_PORT` names). It has limits, and each has an answer: at most 32 routes, files and
+folders together; a request head of at most 4,096 bytes (a longer request line is a `414`, longer
+headers a `431`, a head that does not parse a `400`); a file of at most 4 MiB (`500` above it).
+A method other than GET or HEAD is a `405`, and anything it cannot find or will not serve is a
+`404`. After a `400`, `405`, `414`, or `431` it reads and discards what the client still sends (up
+to 4 MiB) before it closes, so the answer is not lost to a reset. It handles one connection at a time and has no listing, ranges, or caching.
+
 An optional override flag `-Dwgpu-lib-dir=` is available if you wish to link against a
 custom unpack directory or local build of `wgpu-native`:
 
@@ -642,6 +650,23 @@ it fetches in `web_files`, each at its route:
     .web_module = b.path("web/app.js"),
     .web_files = &.{.{ .route = "/thrum-worklet.js", .path = thrum_dep.path("web/worklet.js") }},
 ```
+
+A folder the page fetches from is a `web_dirs` entry, `route` starting and ending with `/`:
+
+```zig
+    .web_dirs = &.{.{ .route = "/scenes/", .path = b.path("scenes") }},
+```
+
+A file in it is read when it is asked for, so one added while the server runs is served.
+`/scenes/steps.scene` is `steps.scene` in the folder. A name may hold `/` between segments but
+no empty, `.`, or `..` segment, no NUL, and at most 1,024 bytes; it is not percent-decoded, so a
+file whose name needs an escape is not served. Only regular files are served, and one whose real
+path leaves the folder (a link out of it) is a `404`, as is the folder's own path: there is no
+listing. An exact `web_files` route wins over a folder, and among folders the longest route wins.
+Types by the name's extension: `.html`, `.js`, `.wasm`, `.json`, `.wav`, `.css`, else
+`application/octet-stream`. Statuses: `200`, `404` (no route, a refused name, a file that is
+missing, not a regular file, or outside the folder), `405`, `414`, `431`, `400`, and `500` with
+the reason in the body for a file over 4 MiB or cut short while read.
 
 The shell imports `/app.js` before it instantiates the wasm. Its `imports(shell)` returns
 functions the wasm imports beside Patchwork's own (a clash is an error); its `started(shell)`

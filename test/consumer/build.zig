@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) void {
         .wasm_imports = &.{.{ .name = "linked", .module = linked_wasm }},
         // A file of the consumer's own beside Patchwork's, served at its route (step 54).
         .web_files = &.{.{ .route = "/song.txt", .path = b.path("song.txt") }},
+        // A folder of the consumer's own, served under its route, read when asked for (step 70).
+        .web_dirs = &.{.{ .route = "/songs/", .path = b.path("songs") }},
     });
     b.getInstallStep().dependOn(steps.install);
     const tool = patchwork.addTool(b, .{
