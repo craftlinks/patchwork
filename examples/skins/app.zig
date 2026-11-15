@@ -586,6 +586,11 @@ pub const App = struct {
         app.restyle(&looks.all[index]);
         cx.redraw();
         app.note(cx, &.{ "look ", look_names[index] });
+        assert(look_names[index].len <= look_name_max);
+        var title: [title_prefix.len + look_name_max]u8 = undefined;
+        @memcpy(title[0..title_prefix.len], title_prefix);
+        @memcpy(title[title_prefix.len..][0..look_names[index].len], look_names[index]);
+        cx.set_title(title[0 .. title_prefix.len + look_names[index].len]);
         assert(app.switcher.selected == index);
     }
 
@@ -1058,6 +1063,11 @@ fn tab(index: u32) bench.Target {
     return .{ .id = switcher_id.derive(index), .name = "look", .index = index };
 }
 
+/// The window's title names the look: this and the look's name (`switch_to`).
+const title_prefix = "skins: ";
+/// The longest look name in `look_names` ("Codex" and "Paper"), room the title buffer keeps.
+const look_name_max: u32 = 5;
+
 /// Click look `index`, rest on box A until the card shows (40 frames: the 500 ms dwell and a
 /// margin).
 fn look_steps(index: u32) [3]bench.Step {
@@ -1461,6 +1471,17 @@ test "each look shows its buttons, and Default reads the form" {
         if (inside and box.rect[3] == 1 and std.meta.eql(box.fill, looks.paper.scheme.accents[0])) underline = true;
     }
     try std.testing.expect(underline);
+}
+
+// Locks the title (step 69): after replaying `codex` the context's title is "skins: Codex", and
+// after `still`, which never switches, it is empty.
+test "the title names the look" {
+    const app = new_app();
+    try replay(app, "codex");
+    try std.testing.expectEqualStrings("skins: Codex", fixture.context.title());
+    const quiet = new_app();
+    try replay(quiet, "still");
+    try std.testing.expectEqualStrings("", fixture.context.title());
 }
 
 // Locks the switch (section 1): replaying `switch` (keys 2, 3, 4, 1) ends on Paper's scheme with

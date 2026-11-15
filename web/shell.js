@@ -82,6 +82,8 @@
 // `paste` writes the clipboard text into the input buffer and calls `paste`. After every Wasm
 // input call and every tick, `sync_cursor` reads `cursor()` and sets `canvas.style.cursor`
 // only when it changed, using the CSS names Wasm exports (`cursor_names_ptr/len`).
+// `sync_title` runs beside it (and in the interval callback) and assigns `document.title` when
+// `title_serial()` differs from the one applied, decoding `title_ptr/len`.
 //
 // ## 7a. File Drops
 // A drag that carries files (`dataTransfer.types` includes "Files") over the canvas calls
@@ -160,6 +162,8 @@ let lastTrace = "";
 // CSS cursor names by `ui.Cursor` value, read once from Wasm, and the value last applied.
 let cursorNames = null;
 let cursorShown = -1;
+// The serial of the title last applied to `document.title`; 0 until the app sets one.
+let titleApplied = 0;
 // The app timer's interval id, or 0 while the app's timer is stopped (guide, section 5).
 let timerInterval = 0;
 // What the app's web module is handed (section 9a).
@@ -708,6 +712,7 @@ function schedule() {
         }
         log_overflow();
         sync_cursor();
+        sync_title();
         sync_timer();
         if (live === 1) {
             schedule();
@@ -738,6 +743,7 @@ function on_timer() {
     if (wasm.timer(now) === 1) {
         schedule();
     }
+    sync_title();
     sync_timer();
 }
 
@@ -803,7 +809,23 @@ function after_input(result) {
         schedule();
     }
     sync_cursor();
+    sync_title();
     sync_timer();
+}
+
+/**
+ * Assigns `document.title` when the app's title changed since the last one applied: Wasm
+ * counts changes in `title_serial()` (0 until the first), and the bytes are `title_ptr/len`
+ * (guide, section 7).
+ */
+function sync_title() {
+    const serial = wasm.title_serial();
+    if (serial === titleApplied) {
+        return;
+    }
+    titleApplied = serial;
+    const bytes = new Uint8Array(wasm.memory.buffer, wasm.title_ptr(), wasm.title_len());
+    document.title = textDecoder.decode(bytes);
 }
 
 /**
@@ -1191,6 +1213,7 @@ async function main() {
     });
     window.addEventListener("drop", (event) => event.preventDefault());
     sync_cursor();
+    sync_title();
 }
 
 main();

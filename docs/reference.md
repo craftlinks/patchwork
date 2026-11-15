@@ -1136,6 +1136,12 @@ closes the window; the app's areas only ask it to.
   close arrives as `close_requested`, which closes unless the app calls `cx.keep_open()`.
   Natively each becomes an `xdg_toplevel` request with the press's serial. The browser drops
   them, and a bench replay simulates them (`bench.serve_window`: maximize flips the state).
+- **Title.** `cx.set_title(text)` in any call that gets a context (`event`, `timer`, `draw`,
+  `drain`); `cx.title()` reads it back. At most 255 bytes (`ui.title_max`), cleaned as a dropped
+  file's name is: whole codepoints that fit, each invalid byte as `?`, cut at the first NUL. The
+  same title again changes nothing, so calling it from `draw` every frame is fine. Natively it
+  is the toplevel's title, in the browser `document.title`; until the first call the window keeps
+  `config.title` and the page its own. The hosts with no window keep it in the context.
 - **WindowButtons.** Minimize (where the window manager offers it), maximize or restore, and
   close, 46 px each in a row; nothing under server decorations (`width(cx)` says how wide).
 - **MenuBar.** `widgets.MenuBar.init(id, titles, items)`: titles side by side, each opening its

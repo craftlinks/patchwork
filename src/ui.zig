@@ -100,6 +100,7 @@ pub const Cursor = areas.Cursor;
 pub const WindowPart = areas.WindowPart;
 pub const WindowRequest = cx.WindowRequest;
 pub const WindowState = input.WindowState;
+pub const title_max = cx.title_max;
 pub const Decorations = input.Decorations;
 pub const Hit = cx.Hit;
 pub const Dragging = cx.Dragging;

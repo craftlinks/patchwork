@@ -62,7 +62,7 @@
 //!
 //! ## 4. Loop State Machine
 //! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_producer`, `bench_step`,
-//! `sync_clock`, `present_if_dirty`, `sync_timer`, `wait_for_events`.
+//! `sync_clock`, `present_if_dirty`, `sync_timer`, `sync_title`, `wait_for_events`.
 //! Callbacks only write `State`; all app calls happen in this order on the main thread. A bench
 //! frame's work runs in the order `host/offscreen.zig` states (section 2); this host adds the
 //! pacing and the presentation.
@@ -127,6 +127,9 @@
 //! - Cursor: after input is dispatched and after each present, `apply_cursor` sends the UI
 //!   context's `cursor()` through `wp_cursor_shape_v1` when it changed or a pointer `enter`
 //!   made it undefined (`wp_cursor_shape.zig`).
+//! - Title: once in each turn, before the flush that precedes the wait, `sync_title` sends
+//!   `xdg_toplevel.set_title` when the context's `title_serial()` differs from the one applied
+//!   (`State.title_applied`); `create_toplevel` still sets `config.title`.
 //! - Clipboard: after each dispatch the host turns `cx.copy` into a selection (`clipboard.zig`)
 //!   with the serial of the latest key or button, and `cx.request_paste` into a receive (or a
 //!   paste from `cx.copied()` while we own the selection). A finished receive is dispatched
@@ -325,6 +328,8 @@ pub const State = struct {
     /// Serial of the latest `wl_pointer.enter`, and the shape sent since; null owes one.
     enter_serial: u32,
     cursor_applied: ?ui.Cursor,
+    /// The serial of the context's title last sent (0: none, the window has `config.title`).
+    title_applied: u32,
     /// The clipboard state machine (static: it holds the paste buffer).
     clipboard: *clipboard_module.Clipboard,
     /// Bound `wp_viewporter` and `wp_fractional_scale_manager_v1` globals; null when absent.
@@ -688,6 +693,7 @@ fn initial_state() State {
         .cursor_device = null,
         .enter_serial = 0,
         .cursor_applied = null,
+        .title_applied = 0,
         .clipboard = &clipboard_storage,
         .viewporter = null,
         .fractional_manager = null,
@@ -1281,6 +1287,7 @@ fn Host(comptime App: type) type {
                 self.sync_clock();
                 try self.present_if_dirty();
                 self.sync_timer();
+                sync_title(state, context.title_serial(), context.title());
                 try self.wait_for_events();
             }
             assert(!state.frame.running);
@@ -2889,6 +2896,17 @@ fn timespec_of(ns: u64) std.os.linux.timespec {
     };
     assert(spec.nsec < 1_000_000_000);
     return spec;
+}
+
+/// Sends the UI context's title when its serial differs from the one last sent (section 5e).
+/// Without a toplevel nothing is sent and the serial is not stored.
+fn sync_title(state: *State, serial: u32, title: [:0]const u8) void {
+    assert(title.len <= ui.title_max);
+    assert(title.ptr[title.len] == 0);
+    if (serial == state.title_applied) return;
+    const toplevel = state.toplevel orelse return;
+    xdg.set_title(toplevel, title.ptr);
+    state.title_applied = serial;
 }
 
 /// Sends the cursor shape when it changed or an enter made it undefined. Without the shape
