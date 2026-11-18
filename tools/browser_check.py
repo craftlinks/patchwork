@@ -38,7 +38,10 @@ repository, so every other use is unchanged. Every path and step below is under 
 4. Prints `differ N px, max level M`; passes when M <= 3 and N <= 0.1% of the pixels (Tint and
    naga round trigonometry differently). On a failure, or with --keep, writes the screenshot
    and a diff picture beside the reference (`<scenario>-browser.png`, `.diff.png`).
-5. Reports console errors and warnings (an error fails the check) and stops what it started,
+5. Reports console errors and warnings (an error fails the check), each exception in full. After
+   an exception, or a fetch of the page's wasm that is not 200, it fetches `/patchwork.wasm`
+   itself and prints the HTTP status and the first line of the body (`src/serve.zig` names the
+   limit a refused file hit there). It stops what it started,
    its whole process groups, also on SIGTERM, SIGHUP, or Ctrl+C. It never kills a process it did
    not start; a port still taken afterwards is reported with its pid.
 
@@ -58,6 +61,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 
@@ -69,6 +74,8 @@ SERVE_TIMEOUT_S = 300
 LOAD_TIMEOUT_S = 30
 FRAME_TIMEOUT_S = 5
 NO_FRAME_STATUS = 3
+# The route every app's page fetches its wasm from (build.zig, `add_serve`).
+WASM_ROUTE = "/patchwork.wasm"
 # Chromium's new headless mode with WebGPU on the hardware adapter. Without
 # `--disable-gpu-compositing` the page gets no adapter ("A valid external Instance reference no
 # longer exists"), and without `--use-angle=vulkan` it gets SwiftShader, Chromium's CPU one.
@@ -152,7 +159,12 @@ class Cdp:
             self.logs.append((message["params"]["type"], text))
         elif method == "Runtime.exceptionThrown":
             details = message["params"]["exceptionDetails"]
-            self.logs.append(("exception", json.dumps(details)[:300]))
+            self.logs.append(("exception", exception_text(details)))
+        elif method == "Network.responseReceived":
+            response = message["params"]["response"]
+            path = urllib.parse.urlsplit(response["url"]).path
+            if path == WASM_ROUTE and response["status"] != 200:
+                self.logs.append(("fetch", f"{path}: HTTP {response['status']}"))
 
     def call(self, method, params=None):
         self.next_id += 1
@@ -295,6 +307,35 @@ def http_ok(port):
             return response.status == 200
     except OSError:
         return False
+
+
+def exception_text(details):
+    """An exception's whole text: the thrown value's description (its message and stack), else
+    the exception's own text, never cut short."""
+    thrown = details.get("exception", {})
+    description = thrown.get("description") or thrown.get("value")
+    if description is not None:
+        return str(description)
+    return details.get("text", json.dumps(details))
+
+
+def fetch_report(port, route):
+    """Fetches `route` from the server on `port` and prints its HTTP status and the first line of
+    its body in full; a 200 prints its length, since the body is the wasm's bytes."""
+    url = f"http://127.0.0.1:{port}{route}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            status, body = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, body = error.code, error.read()
+    except OSError as error:
+        print(f"fetch {route}: no answer from :{port}: {error}")
+        return
+    if status == 200:
+        print(f"fetch {route}: HTTP 200, {len(body)} bytes")
+        return
+    line = body.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+    print(f"fetch {route}: HTTP {status}: {line}")
 
 
 def stop(process):
@@ -503,6 +544,7 @@ def main(argv):
                 time.sleep(0.25)
         cdp.call("Runtime.enable")
         cdp.call("Page.enable")
+        cdp.call("Network.enable")
         cdp.call(
             "Emulation.setDeviceMetricsOverride",
             {
@@ -524,7 +566,7 @@ def main(argv):
                 else "its window is not being shown (show its workspace, or pass --headless)"
             )
             print(f"browser_check: the page drew no frame in {FRAME_TIMEOUT_S} s: {why}")
-            report_console(cdp.logs)
+            report_console(cdp.logs, port)
             return NO_FRAME_STATUS
         done_line = f"bench done {scenario}"
         ended = cdp.pump_until(
@@ -537,7 +579,7 @@ def main(argv):
                 f"browser_check: the scenario did not finish: "
                 f"no \"{done_line}\" within {DONE_TIMEOUT_S} s"
             )
-            report_console(cdp.logs)
+            report_console(cdp.logs, port)
             return 1
         # One more frame for the compositor to show the last present.
         cdp.pump_until(lambda logs: False, 0.3)
@@ -573,7 +615,7 @@ def main(argv):
             open(browser_path, "wb").write(png_encode(width, height, browser))
             open(diff_path, "wb").write(png_encode(width, height, diff_rows))
             print(f"wrote {browser_path} and {diff_path}")
-        errors = report_console(cdp.logs)
+        errors = report_console(cdp.logs, port)
         if errors:
             passed = False
         print(f"{app} {scenario}: {'pass' if passed else 'FAIL'}")
@@ -586,13 +628,18 @@ def main(argv):
         shutil.rmtree(profile, ignore_errors=True)
 
 
-def report_console(logs):
-    """Prints console errors and warnings; returns how many errors there were."""
-    problems = [(kind, text) for kind, text in logs if kind in ("error", "warning", "exception")]
+def report_console(logs, port):
+    """Prints console errors and warnings, exceptions and a failed fetch of the wasm whole; after
+    either of those two, the wasm's HTTP status and first body line from the server on `port`.
+    Returns how many errors there were."""
+    kinds = ("error", "warning", "exception", "fetch")
+    problems = [(kind, text) for kind, text in logs if kind in kinds]
     for kind, text in problems:
         print(f"console {kind}: {text}")
     if not problems:
         print("console: no errors or warnings")
+    if any(kind in ("exception", "fetch") for kind, _ in problems):
+        fetch_report(port, WASM_ROUTE)
     return sum(1 for kind, _ in problems if kind != "warning")
 
 
