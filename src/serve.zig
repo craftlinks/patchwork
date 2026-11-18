@@ -34,8 +34,8 @@
 //!   does not parse: 400. A method other than GET or HEAD: 405 with `allow: GET, HEAD`. No
 //!   route, a name `name_ok` refuses, a folder's own path (there is no listing), a file that is
 //!   missing, is not a regular file, or whose real path leaves its folder: 404. A file over
-//!   `file_cap`, or cut short or failing while read: 500 with the reason in the body. Otherwise
-//!   200, and HEAD sends the head only. Each body names the limit it hit.
+//!   `file_cap` (16 MiB), or cut short or failing while read: 500 with the reason in the body.
+//!   Otherwise 200, and HEAD sends the head only. Each body names the limit it hit.
 //! - Closing a socket with bytes still unread makes Linux reset the connection, and the
 //!   client may never see the answer. So after a 414, a 431, a 400, or a 405 the server ends its
 //!   sending side, reads and discards up to `drain_cap` bytes or the end of the stream, and
@@ -49,24 +49,26 @@
 //!   browser and keeps the control flow bounded.
 //!
 //! ## 3. TigerStyle Invariants
-//! - Header buffers are `header_cap` bytes and a served file may be at most `file_cap` bytes;
-//!   a larger file is a 500, never truncated.
+//! - Header buffers are `header_cap` bytes and a served file may be at most `file_cap` bytes
+//!   (16 MiB, room for an app's Debug wasm); a larger file is a 500, never truncated.
 //! - A file in a folder is held to it twice. The name is checked as text, and after the file is
 //!   opened its real path (`File.realPath`) must be the folder's real path (`Dir.realPath`)
 //!   followed by `/`, so a link that leaves the folder is refused. Both paths are read into
 //!   two stack buffers of `std.fs.max_path_bytes`. The name is examined, links followed,
 //!   before it is opened, because opening a FIFO blocks (step 37). Zig's `resolve_beneath`
 //!   open option is not used: on Linux the standard library ignores it.
-//! - No heap allocation: the Io runtime is built with a failing allocator, and the request
-//!   and file buffers live on the stack.
+//! - No heap allocation: the Io runtime is built with a failing allocator. The request buffers
+//!   live on the stack. A file is read whole into `body_buffer`, one static buffer of `file_cap`
+//!   bytes that the server owns, since `file_cap` on the stack risks an overflow. The server
+//!   answers one request at a time, so one buffer serves all; `body_busy` asserts that.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
 /// Size of each of the receive and send buffers, which bounds the request head.
 const header_cap: u32 = 4096;
-/// Largest file the server will read into its stack buffer.
-const file_cap: u32 = 4 * 1024 * 1024;
+/// Largest file the server will read into `body_buffer`.
+const file_cap: u32 = 16 * 1024 * 1024;
 /// Loopback TCP port. A fixed port keeps the URL stable between runs.
 const listen_port: u16 = 8080;
 /// The environment variable that overrides `listen_port`.
@@ -78,6 +80,17 @@ pub const routes_max: u32 = 32;
 pub const name_max: u32 = 1024;
 /// Bytes read and discarded after an answer to a head that did not fit or parse.
 const drain_cap: u32 = 4 * 1024 * 1024;
+
+/// The one buffer a served file is read into (section 3): static, not on the stack.
+var body_buffer: [file_cap]u8 = undefined;
+/// True while a request holds `body_buffer`; the server answers one request at a time.
+var body_busy: bool = false;
+
+comptime {
+    assert(file_cap == 16 * 1024 * 1024);
+    assert(@sizeOf(@TypeOf(body_buffer)) == file_cap);
+    assert(header_cap < file_cap);
+}
 
 /// One `ROUTE=PATH` pair from the command line.
 pub const Route = struct {
@@ -386,8 +399,12 @@ fn respond_text(
 fn respond_file(io: std.Io, request: *std.http.Server.Request, found: Match) !void {
     assert(found.route.path.len != 0);
     assert(found.route.route.len != 0);
-    var body: [file_cap]u8 = undefined;
-    const length = load(io, found.route.path, found.name, body[0..]) catch |err| {
+    // One request at a time holds the static buffer (section 3).
+    assert(!body_busy);
+    body_busy = true;
+    defer body_busy = false;
+    const body = body_buffer[0..];
+    const length = load(io, found.route.path, found.name, body) catch |err| {
         const status: std.http.Status = switch (err) {
             error.NotFound => .not_found,
             else => .internal_server_error,
@@ -782,5 +799,62 @@ test "a file that cannot be sent has an answer" {
     var out: std.Io.Writer = .fixed(&out_buffer);
     try std.testing.expect(!try answer_test("GET /big.bin HTTP/1.1\r\n\r\n", &routes, &out));
     try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error", first_line(&out));
-    try std.testing.expect(std.mem.find(u8, out.buffered(), "4194304") != null);
+    try std.testing.expect(std.mem.find(u8, out.buffered(), "16777216") != null);
+}
+
+/// What the test of a whole `file_cap` answer writes into: the head, then the file. Static, as
+/// `body_buffer` is, since 16 MiB on a test's stack risks an overflow.
+var cap_out_buffer: [file_cap + header_cap]u8 = undefined;
+
+/// A file `name` in `dir` of `length` bytes: 'A' first, 'Z' last, and zero between.
+fn cap_file(dir: std.Io.Dir, name: []const u8, length: u32) !void {
+    assert(length >= 2);
+    assert(name.len != 0);
+    const io = std.testing.io;
+    var file = try dir.createFile(io, name, .{});
+    defer file.close(io);
+    try file.setLength(io, length);
+    try file.writePositionalAll(io, "A", 0);
+    try file.writePositionalAll(io, "Z", length - 1);
+}
+
+// Locks the cap (section 2, 3): a file of exactly `file_cap` = 16,777,216 bytes ('A', zeros, 'Z')
+// is 200 with `content-length: 16777216` and every byte of it after the head; a file of 16,777,217
+// bytes is 500 with the body "file over 16777216 bytes\n", the text the cap has always had.
+test "a file of file_cap bytes is served whole, and one byte more is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "index.html", .data = "i" });
+    try cap_file(tmp.dir, "cap.wasm", file_cap);
+    try cap_file(tmp.dir, "over.wasm", file_cap + 1);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = try tmp_path(&tmp, &path_buffer);
+    var texts: [3][std.fs.max_path_bytes + 32]u8 = undefined;
+    const page = try std.fmt.bufPrint(&texts[0], "/index.html={s}/index.html", .{base});
+    const cap = try std.fmt.bufPrint(&texts[1], "/cap.wasm={s}/cap.wasm", .{base});
+    const over = try std.fmt.bufPrint(&texts[2], "/over.wasm={s}/over.wasm", .{base});
+    var routes: Routes = .empty;
+    try routes_parse(&.{ page, cap, over }, &routes);
+    var out: std.Io.Writer = .fixed(&cap_out_buffer);
+    try std.testing.expect(!try answer_test("GET /cap.wasm HTTP/1.1\r\n\r\n", &routes, &out));
+    try std.testing.expect(!body_busy);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK", first_line(&out));
+    const written = out.buffered();
+    const head_end = std.mem.find(u8, written, "\r\n\r\n").? + 4;
+    const head = written[0..head_end];
+    try std.testing.expect(std.mem.find(u8, head, "content-length: 16777216\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, head, "content-type: application/wasm\r\n") != null);
+    const body = written[head_end..];
+    try std.testing.expectEqual(@as(usize, 16777216), body.len);
+    try std.testing.expectEqual(@as(u8, 'A'), body[0]);
+    try std.testing.expectEqual(@as(u8, 'Z'), body[body.len - 1]);
+    try std.testing.expect(std.mem.allEqual(u8, body[1 .. body.len - 1], 0));
+    var small_buffer: [2048]u8 = undefined;
+    out = .fixed(&small_buffer);
+    try std.testing.expect(!try answer_test("GET /over.wasm HTTP/1.1\r\n\r\n", &routes, &out));
+    try std.testing.expect(!body_busy);
+    try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error", first_line(&out));
+    const refused = "\r\n\r\nfile over 16777216 bytes\n";
+    try std.testing.expect(std.mem.endsWith(u8, out.buffered(), refused));
 }
