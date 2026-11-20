@@ -725,7 +725,13 @@ fn add_serve(
     // `ROUTE=PATH` pairs (`src/serve.zig`, section 2): Patchwork's four, then the app's files.
     serve_run.addPrefixedFileArg("/index.html=", patchwork_builder.path("web/index.html"));
     serve_run.addPrefixedFileArg("/shell.js=", patchwork_builder.path("web/shell.js"));
-    serve_run.addPrefixedFileArg("/patchwork.wasm=", wasm.getEmittedBin());
+    // The installed copy, not `wasm.getEmittedBin()`: that path holds the build's hash, so it is
+    // new after every rebuild and a server started earlier would serve the old file forever. The
+    // installed path stays put, and the server reads it on each request (`src/serve.zig`).
+    const installed: std.Build.LazyPath = .{
+        .relative = .{ .base = .install_bin, .sub_path = wasm.out_filename },
+    };
+    serve_run.addPrefixedFileArg("/patchwork.wasm=", installed);
     const module = options.web_module orelse patchwork_builder.path("web/app.js");
     serve_run.addPrefixedFileArg("/app.js=", module);
     for (options.web_files) |file| {

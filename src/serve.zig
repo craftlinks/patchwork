@@ -17,7 +17,10 @@
 //!   then the app's own `web_files` (step 54); an audio worklet is one of those (step 56).
 //!   Relative paths resolve against the working directory. Every file is opened once at
 //!   startup, so a missing one fails there, naming its route, and not on a request; a route
-//!   given twice or without `/index.html` is refused too.
+//!   given twice or without `/index.html` is refused too. That open is only a check: each
+//!   request reads its file by path again, so a file rewritten in place is served as it now is.
+//!   `build.zig` (`add_serve`) therefore passes the installed wasm, whose path is the same
+//!   after every build, and not the cache's, whose path holds the build's hash.
 //! - A route that ends in `/` (and is longer than `/`) is a folder, `/scenes/=scenes` on the
 //!   command line, `web_dirs` in `build.zig` (step 70). It is opened as a folder at startup, and
 //!   a file inside it is read when the request comes, so a file added while the server runs is
