@@ -375,6 +375,15 @@ const IconButton = widgets.ButtonOf(IconSkin);
 /// The icon buttons' skin (section 2b): the default face, then the label's one codepoint in the
 /// label style's face and size, its ink centred in the button (`text.icon`).
 const IconSkin = struct {
+    /// The face and one icon glyph: the label is one codepoint, not text, so no glyph per byte.
+    pub const button_appends: widgets.SkinAppends = .{
+        .fixed = .{ .draws = &.{
+            .{ .type = quads.Box, .count = 1 },
+            .{ .type = quads.Glyph, .count = 1 },
+        } },
+        .per_byte = .{},
+    };
+
     pub fn button(cx: anytype, look: widgets.ButtonLook) ?widgets.Shape {
         assert(look.label.len == 3);
         assert(look.style.size > 0);

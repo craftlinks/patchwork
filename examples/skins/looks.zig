@@ -405,6 +405,11 @@ const centered: text.Options = .{ .align_x = .center, .align_y = .center, .ellip
 /// The skin of the parameter cells, the meters, the section headers, the tooltip, and the
 /// slider (section 3). Every function reads `cx.theme()` and the look, nothing else.
 pub const Skin = struct {
+    /// The cell (filled), its line, and the value line; the name and value text are per byte.
+    pub const knob_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 3 },
+    } } };
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         assert(look.value >= 0 and look.value <= 1);
         assert(look.row.width >= 0);
@@ -431,6 +436,16 @@ pub const Skin = struct {
         }
         return .{ .rect = look.row, .radius = form.radius.control };
     }
+
+    /// The row, the fill past the tick and below it, and the tick; the name and the percent
+    /// ("100%" at most) each drawn twice, over the fill and beside it (`split_label`).
+    pub const meter_appends: widgets.SkinAppends = .{
+        .fixed = .{ .draws = &.{
+            .{ .type = quads.Box, .count = 4 },
+            .{ .type = quads.Glyph, .count = 2 * percent_bytes_max },
+        } },
+        .per_byte = .{ .draws = &.{.{ .type = quads.Glyph, .count = 2 }} },
+    };
 
     pub fn meter(cx: anytype, look: widgets.MeterLook) void {
         assert(look.value >= 0 and look.value <= 1);
@@ -462,6 +477,13 @@ pub const Skin = struct {
         const percent = percent_text(&digits, look.value);
         split_label(cx, scheme.value, percent, inner, look.clip, split, over, end);
     }
+
+    /// The focus face, the chevron (3 points, nothing without `draw.Path`), and the rule; the
+    /// label's two parts are per byte.
+    pub const disclosure_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+        .{ .type = quads.Path, .count = 1 },
+    }, .points = 3 } };
 
     pub fn disclosure(cx: anytype, look: widgets.DisclosureLook) ?widgets.Shape {
         assert(look.turn >= 0 and look.turn <= 1);
@@ -505,6 +527,11 @@ pub const Skin = struct {
         return .{ .rect = look.rect, .radius = form.radius.control };
     }
 
+    /// The card; its caption, title, and note are parts of the label, so per byte.
+    pub const tooltip_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     pub fn tooltip(cx: anytype, look: widgets.TooltipLook) void {
         assert(look.label.len <= text.byte_cap);
         assert(look.clip.x1 > look.clip.x0);
@@ -537,6 +564,11 @@ pub const Skin = struct {
         const below: Rect = .{ .x = inner.x, .y = top.y + top.height, .width = inner.width, .height = inner.y + inner.height - top.y - top.height - 4 };
         if (below.height > 0) kit.label(cx, note, lines.note, below, look.clip, start);
     }
+
+    /// The track, the fill, and the dot.
+    pub const slider_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 3 },
+    } } };
 
     pub fn slider(cx: anytype, look: widgets.SliderLook) ?widgets.Shape {
         assert(look.value >= 0 and look.value <= 1);
@@ -575,6 +607,11 @@ pub const Skin = struct {
 
 /// The skin of the patch's object boxes and of the object and toolbar buttons (section 3a).
 pub const Object = struct {
+    /// The box and the value bar; the line is the name, a space (no ink), and the value text.
+    pub const knob_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+    } } };
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         assert(look.value >= 0 and look.value <= 1);
         assert(look.row.width >= 0);
@@ -601,6 +638,11 @@ pub const Object = struct {
         if (inner.width > 0) kit.label(cx, style, line, inner, look.clip, start);
         return .{ .rect = look.row, .radius = form.radius.control };
     }
+
+    /// The face; the label is per byte.
+    pub const button_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
 
     pub fn button(cx: anytype, look: widgets.ButtonLook) ?widgets.Shape {
         assert(look.paint.radius >= 0);
@@ -673,12 +715,16 @@ fn luma(color: [4]f32) f32 {
     return 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
 }
 
+/// The longest `percent_text`: "100%".
+pub const percent_bytes_max: u32 = 4;
+
 /// `value` in `[0, 1]` as a whole percent, "72%".
 pub fn percent_text(out: *[8]u8, value: f32) []const u8 {
     assert(value >= 0 and value <= 1);
     const percent: u32 = @intFromFloat(@round(value * 100));
     const shown = std.fmt.bufPrint(out, "{d}%", .{percent}) catch unreachable;
     assert(shown.len >= 2);
+    assert(shown.len <= percent_bytes_max);
     return shown;
 }
 

@@ -123,6 +123,12 @@ pub const LensSlider = widgets.SliderOf(LensSkin);
 /// A thin track in the text colour, filled to the value, and a glass disc on the popup level
 /// as the knob; a solid disc where the app has no glass.
 pub const LensSkin = struct {
+    /// The track, the fill, and the glass disc or its solid Box.
+    pub const slider_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 3 },
+        .{ .type = quads.Glass, .count = 1 },
+    } } };
+
     pub fn slider(cx: anytype, look: widgets.SliderLook) ?widgets.Shape {
         assert(look.value >= 0 and look.value <= 1);
         const colors = &cx.theme().colors;

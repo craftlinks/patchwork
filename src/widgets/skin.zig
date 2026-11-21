@@ -53,6 +53,7 @@
 //! MenuBarOf(S)    menu_title(cx, MenuTitleLook)        ?Shape   one title; its menus are
 //!                                                               MenuOf(S)
 //! TooltipOf(S)    tooltip(cx, TooltipLook)             void     on Layer.tooltip
+//! every function  <function>_appends: SkinAppends               what one call appends (2b)
 //! ```
 //! `check` reads the table of each widget's functions (`functions_of`), in this order.
 //! - A look carries values, never the widget, so a skin cannot change state. Animator values
@@ -65,7 +66,25 @@
 //! - `check(S, kind)` returns the first problem as a message naming the skin and the function
 //!   (`"hardware.Skin: missing ``pub fn knob(cx, widgets.KnobLook) ?widgets.Shape``"`, or
 //!   `"... ``knob`` must return ?widgets.Shape"`); each `XOf` turns it into a compile error.
-//!   `zig build test-contract` locks one case.
+//!   After the functions (and `tab_arrange`, `slider_travel`) it checks each function's
+//!   declaration (section 2b), in table order: missing, not a `widgets.SkinAppends`, a type
+//!   named twice, a type that is not a draw type (`draw.check_type`), or areas counted.
+//!   `zig build test-contract` locks a missing function and a missing declaration.
+//!
+//! ## 2b. Counts
+//! Beside each skin function `<name>` is `pub const <name>_appends: widgets.SkinAppends`
+//! (`widgets/appends.zig`): what one call appends at most, so an app can size its pools from
+//! it. `fixed` is what the call appends besides its look's text; `per_byte` is what each byte
+//! of that text adds, one `draw.Glyph` by default, since text places at most one glyph per
+//! codepoint. A skin that draws its text twice, or not as text (an icon), overrides it.
+//! - The declaration is an upper bound over every branch, per draw type separately: where
+//!   branches append different types (a `draw.Path` or its Box fallback, `draw.Glass` or its
+//!   Box), each type takes its own worst branch, and no one frame need reach them all. An
+//!   optional type an app does not register reads as 0.
+//! - A skin counts no areas: the behaviour records them (section 2).
+//! - `slider_travel` and `tab_arrange` are not draws and need no declaration.
+//! The tests draw each library skin function in its worst frames and check the frames hold
+//! exactly the declared counts: none above, each reached by some frame.
 //!
 //! ## 3. Slider Travel
 //! A press maps onto the slider's value through the skin's travel, so a skin whose knob is
@@ -105,6 +124,7 @@
 //! ## 5. TigerStyle Invariants
 //! - Skin functions are stateless: everything they need is in the look and `cx.theme()`.
 //! - `check` runs at compile time only; a skin that does not satisfy it does not compile.
+//! - Every skin function has its `_appends`, tested against frames for the library's skins.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -112,6 +132,7 @@ const quads = @import("../draw.zig");
 const text = @import("../text.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
+const appends = @import("appends.zig");
 const theme = @import("../theme.zig");
 const slider_file = @import("slider.zig");
 const knob_file = @import("knob.zig");
@@ -131,6 +152,7 @@ const window_chrome_file = @import("window_chrome.zig");
 const menu_bar_file = @import("menu_bar.zig");
 
 const Rect = kit.Rect;
+const SkinAppends = appends.SkinAppends;
 const Clip = kit.Clip;
 const Inset = kit.Inset;
 const Paint = kit.Paint;
@@ -510,9 +532,50 @@ pub fn check(comptime S: type, comptime widget: Kind) ?[]const u8 {
             return @typeName(S) ++ ": `tab_arrange` must be a `widgets.TabArrange`";
         }
     }
-    if (widget != .slider) return null;
-    const travel = "pub fn slider_travel(area: widgets.Rect) [2]f32";
-    return problem(S, "slider_travel", &.{Rect}, [2]f32, travel, "[2]f32");
+    if (widget == .slider) {
+        const travel = "pub fn slider_travel(area: widgets.Rect) [2]f32";
+        const found = problem(S, "slider_travel", &.{Rect}, [2]f32, travel, "[2]f32");
+        if (found) |message| return message;
+    }
+    for (functions_of(widget)) |function| {
+        if (undeclared(S, function.name)) |message| return message;
+    }
+    return null;
+}
+
+/// The first way `S.<name>_appends` is not a declaration of what `S.<name>` appends (section
+/// 2b), or null.
+fn undeclared(comptime S: type, comptime name: []const u8) ?[]const u8 {
+    const prefix = @typeName(S) ++ ": ";
+    const declaration = name ++ "_appends";
+    const shown = "`" ++ declaration ++ "`";
+    if (!@hasDecl(S, declaration)) {
+        return prefix ++ "missing `pub const " ++ declaration ++ ": widgets.SkinAppends`";
+    }
+    const value = @field(S, declaration);
+    if (@TypeOf(value) != SkinAppends) {
+        return prefix ++ shown ++ " must be a `widgets.SkinAppends`";
+    }
+    const parts = [_]appends.Appends{ value.fixed, value.per_byte };
+    for (parts) |part| {
+        if (appends.repeated(part.draws)) |T| {
+            return prefix ++ shown ++ " names `" ++ @typeName(T) ++ "` twice";
+        }
+    }
+    for (parts) |part| {
+        for (part.draws) |entry| {
+            if (quads.check_type(entry.type) != null) {
+                const named = @typeName(entry.type);
+                return prefix ++ shown ++ " names `" ++ named ++ "`, which is not a draw type";
+            }
+        }
+    }
+    for (parts) |part| {
+        if (part.areas != 0) {
+            return prefix ++ shown ++ " counts areas; the widget records them, not the skin";
+        }
+    }
+    return null;
 }
 
 /// The first way `S.name` differs from `params` and `Result`. A null parameter is the
@@ -682,6 +745,11 @@ fn outlined(scheme: *const theme.Scheme) bool {
 
 /// The library's look (section 4): `widgets.Knob` is `KnobOf(Default)`, and so on.
 pub const Default = struct {
+    /// The face; the label is per byte.
+    pub const button_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// The face (`Paint.look` of the two animator values), then the label inside `padding`.
     /// Outlined, the face is `outline` in the paint's colour and the label takes that colour
     /// too (the style's face and size kept). The face is the hit shape, rounded by the
@@ -703,6 +771,11 @@ pub const Default = struct {
         kit.label(cx, style, look.label, inner, look.clip, kit.centered);
         return .{ .rect = look.rect, .radius = look.paint.radius };
     }
+
+    /// Track, fill, and knob.
+    pub const slider_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 3 },
+    } } };
 
     /// Track, then fill (omitted at value 0), then the knob on top, every face lightened by
     /// hover. The whole rect is the hit shape, rounded by `knob_radius`.
@@ -733,6 +806,11 @@ pub const Default = struct {
         return travel;
     }
 
+    /// The track and value arcs; the name and value text are per byte.
+    pub const knob_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Arc, .count = 2 },
+    } } };
+
     /// On the scheme's ring, a track arc over the whole sweep, the value arc over `value` of
     /// it in the accent (omitted at 0, lightened by hover), the name, and the value text. The
     /// disc inscribed in the ring is the hit shape. A row shorter than the ring draws nothing.
@@ -761,6 +839,11 @@ pub const Default = struct {
         return .{ .rect = ring, .radius = look.ring * 0.5 };
     }
 
+    /// The pill and the thumb.
+    pub const toggle_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+    } } };
+
     /// The pill (`colors.track`, or outlined in `colors.control`), the thumb disc (lightened
     /// by hover, moving toward the accent with the thumb when there is one), and the name in
     /// the label column. The pill is the hit shape.
@@ -788,6 +871,12 @@ pub const Default = struct {
         kit.label(cx, scheme.name, look.name, side_box, look.clip, kit.centered);
         return .{ .rect = pill, .radius = pill_radius };
     }
+
+    /// The box, then the mixed bar, the mark (3 points), or the mark's square fallback.
+    pub const checkbox_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+        .{ .type = quads.Path, .count = 1 },
+    }, .points = 3 } };
 
     /// The box in `colors.track` moving toward `colors.focus` with the check (all the way when
     /// mixed), lightened by hover, its border `colors.focus` while focused, the fill once
@@ -851,6 +940,11 @@ pub const Default = struct {
         return .{ .rect = hit, .radius = 0 };
     }
 
+    /// The track and the fill.
+    pub const meter_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+    } } };
+
     /// The track, the fill growing up from its bottom (omitted at 0), and the name.
     pub fn meter(cx: anytype, look: MeterLook) void {
         assert(look.value >= 0);
@@ -868,6 +962,12 @@ pub const Default = struct {
         const side_box = knob_file.side_box(look.row);
         kit.label(cx, scheme.name, look.name, side_box, look.clip, kit.centered);
     }
+
+    /// The solid face, or the glass instead.
+    pub const panel_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Glass, .count = 1 },
+    } } };
 
     /// The face in the panel's paint, or glass of its material over the backdrop under it
     /// (`kit.glass`); without one, the solid face, with a `hairline` border in
@@ -888,6 +988,11 @@ pub const Default = struct {
         kit.face(cx, look.rect, look.clip, face);
     }
 
+    /// The face.
+    pub const field_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// The face in `colors.track` with a `hairline` border, `colors.focus` while focused and
     /// `colors.control` otherwise; outlined, the bare border.
     pub fn field(cx: anytype, look: FieldLook) void {
@@ -906,6 +1011,12 @@ pub const Default = struct {
         if (outlined(scheme)) face = outline(scheme, border, radius, 0, 0);
         kit.append(cx, quads.Box, null, quads.Box.of(look.rect, look.clip, face));
     }
+
+    /// The glass and its hairline, or the solid face.
+    pub const menu_face_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Glass, .count = 1 },
+    } } };
 
     /// The popup face in `colors.panel` with a one-pixel `colors.control` border, or glass of
     /// its material over the popup layer's backdrop, which the menu marked, with a hairline in
@@ -942,6 +1053,11 @@ pub const Default = struct {
         });
     }
 
+    /// The highlight band.
+    pub const menu_row_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// The highlight band in `colors.selection` (inset by `menu_band_inset`), then the label
     /// inside `menu_pad_x`, at half alpha when disabled.
     pub fn menu_row(cx: anytype, look: MenuRowLook) void {
@@ -958,6 +1074,12 @@ pub const Default = struct {
         const inner = ui.cx.inset(look.rect, .xy(menu_file.menu_pad_x, 0));
         kit.label(cx, style, look.label, inner, look.clip, menu_file.menu_text_options);
     }
+
+    /// The face and the chevron (3 points).
+    pub const dropdown_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Path, .count = 1 },
+    }, .points = 3 } };
 
     /// A button-like face in `colors.track` with a `colors.control` border (`colors.focus`
     /// while the list is open), lightened by hover, or outlined in that border's colour; the
@@ -1000,6 +1122,11 @@ pub const Default = struct {
         return .{ .rect = look.rect, .radius = radius };
     }
 
+    /// The line and the insertion marker.
+    pub const tab_bar_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+    } } };
+
     /// A one-pixel line along the bar's bottom: `colors.focus` while the bar has focus,
     /// `colors.control` otherwise, and a `tab_marker_px` insertion marker in `colors.focus`
     /// at `insert_x`, as tall as the tabs, in the gap between two. The tabs draw over it.
@@ -1027,6 +1154,12 @@ pub const Default = struct {
             kit.face(cx, marker, look.clip, .{ .fill = colors.focus });
         }
     }
+
+    /// The face, the close band, and the underline; the close button's "×".
+    pub const tab_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 3 },
+        .{ .type = quads.Glyph, .count = 1 },
+    } } };
 
     /// The tab's face (`tab_face`), the selected tab's accent underline under `tab_mark =
     /// .underline`, and the label centered inside `tab_pad_x` (before the close button's gap
@@ -1105,6 +1238,11 @@ pub const Default = struct {
         };
     }
 
+    /// The line.
+    pub const divider_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// A `mark`-wide line down the middle of the divider in `colors.control`, rounded by
     /// `capsule` and lightened by hover. The whole divider is the hit shape.
     pub fn divider(cx: anytype, look: DividerLook) ?Shape {
@@ -1134,6 +1272,11 @@ pub const Default = struct {
         return .{ .rect = look.rect, .radius = 0 };
     }
 
+    /// The band.
+    pub const list_row_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// A band over the row: `colors.selection` when selected, `colors.track` when hovered,
     /// nothing otherwise.
     pub fn list_row(cx: anytype, look: ListRowLook) void {
@@ -1148,6 +1291,12 @@ pub const Default = struct {
         });
     }
 
+    /// The chevron (3 points), or its "+" / "−" fallback.
+    pub const tree_chevron_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Path, .count = 1 },
+        .{ .type = quads.Glyph, .count = 1 },
+    }, .points = 3 } };
+
     /// A chevron centred in the cell in `colors.text` (lightened toward `colors.lighten` while
     /// hovered), turned by `turn` (`kit.chevron`); without `draw.Path`, "+" closed or "−" open
     /// in the name style.
@@ -1156,6 +1305,13 @@ pub const Default = struct {
         assert(look.rect.width > 0);
         chevron_in(cx, look.rect, look.clip, look.turn, look.hovered);
     }
+
+    /// The header, and the chevron (3 points) or its glyph fallback.
+    pub const disclosure_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Path, .count = 1 },
+        .{ .type = quads.Glyph, .count = 1 },
+    }, .points = 3 } };
 
     /// The header in `colors.track` (lightened by hover) with a one-pixel `colors.focus` border
     /// while focused, the chevron in its left cell turned by `turn`, and the label in the
@@ -1193,6 +1349,11 @@ pub const Default = struct {
         return .{ .rect = look.rect, .radius = radius };
     }
 
+    /// The band.
+    pub const menu_title_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// A `colors.track` band `menubar_band_h` high centred in the title while its menu is open
     /// (lightened) or the pointer is on it, then the label centred in the name style. The band
     /// is the hit shape.
@@ -1218,6 +1379,13 @@ pub const Default = struct {
         kit.label(cx, scheme.name, look.label, look.rect, look.clip, kit.centered);
         return .{ .rect = band, .radius = radius };
     }
+
+    /// The band, and restore's two strokes (10 points) or a glyph fallback.
+    pub const window_button_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Path, .count = 2 },
+        .{ .type = quads.Glyph, .count = 1 },
+    }, .points = 10 } };
 
     /// A band inset `window_band_inset` while hovered or pressed (`colors.track`, or `close_red`
     /// for close) at the hover value's alpha, darkened by the press, then the icon
@@ -1245,6 +1413,12 @@ pub const Default = struct {
         window_icon(cx, look.rect, look.clip, look.kind, color);
         return .{ .rect = look.rect, .radius = 0 };
     }
+
+    /// The cell, its line, and the sort arrow.
+    pub const header_cell_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+        .{ .type = quads.Glyph, .count = 1 },
+    } } };
 
     /// The cell in `colors.track` (lightened while hovered), a one-pixel `colors.control` line
     /// at its right, the label at the left inside `header_pad_x`, and on the sorted column "↑"
@@ -1289,6 +1463,11 @@ pub const Default = struct {
         return .{ .rect = look.rect, .radius = 0 };
     }
 
+    /// The face; the value and the unit are per byte.
+    pub const number_face_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// A field-like face (`colors.track`, a `hairline` `colors.control` border, lightened by
     /// hover; or outlined in `colors.control`), then the value in `scheme.value` and the unit
     /// in `scheme.name` at `number_unit_alpha`, right-aligned on one baseline inside
@@ -1325,6 +1504,11 @@ pub const Default = struct {
         }
         return .{ .rect = look.rect, .radius = scheme.form.radius.control };
     }
+
+    /// The face.
+    pub const tooltip_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
 
     /// The face in `fill` or `colors.panel` with a `hairline` border in `colors.text` and
     /// `radius.popup` corners, then the label centred in the name style.
@@ -1380,6 +1564,11 @@ comptime {
 pub const Segmented = struct {
     pub const tab_arrange: tabs_file.TabArrange = .even;
 
+    /// The track.
+    pub const tab_bar_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     /// The track: a capsule in `colors.track`, bordered in `colors.focus` while focused.
     pub fn tab_bar(cx: anytype, look: TabBarLook) void {
         assert(look.rect.width > 0);
@@ -1393,6 +1582,11 @@ pub const Segmented = struct {
             .radius = look.rect.height * scheme.form.capsule,
         });
     }
+
+    /// The selected capsule or the hovered band.
+    pub const tab_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
 
     /// The selected segment a capsule in `colors.panel`, a hovered one the track lightened,
     /// the others bare; the label centred inside `segment_pad_x`, cut with an ellipsis. The
@@ -1426,6 +1620,8 @@ const fixture = @import("fixture.zig");
 
 /// A skin that covers the knob alone.
 const KnobOnly = struct {
+    pub const knob_appends: SkinAppends = .{ .per_byte = .{} };
+
     pub fn knob(cx: anytype, look: KnobLook) ?Shape {
         _ = cx;
         return .{ .rect = look.row, .radius = 0 };
@@ -1450,7 +1646,8 @@ const Mixed = struct {
 };
 
 // Locks the contract check (section 2): `Default` covers all 20 kinds; a skin covering the
-// knob alone passes for the knob and names the missing `button`, `tab_bar`, and `tooltip`; a
+// knob alone (and declaring it) passes for the knob and names the missing `button`, `tab_bar`,
+// and `tooltip`; a
 // wrong return type and a wrong look each give their message; a slider skin needs
 // `slider_travel` too, and a number box skin `field` for its editor.
 test "check names the skin and the first problem" {
@@ -1505,6 +1702,92 @@ test "check names the skin and the first problem" {
     try testing.expectEqualStrings("u32: a skin must be a struct type", not_struct);
 }
 
+/// A knob skin whose `knob_appends` is `declaration`, or that has none when it is null.
+fn KnobDeclared(comptime declaration: anytype) type {
+    if (@TypeOf(declaration) == @TypeOf(null)) return KnobBare;
+    return struct {
+        pub const knob_appends = declaration;
+
+        pub fn knob(cx: anytype, look: KnobLook) ?Shape {
+            _ = cx;
+            return .{ .rect = look.row, .radius = 0 };
+        }
+    };
+}
+
+/// A knob skin with the function and no declaration.
+const KnobBare = struct {
+    pub fn knob(cx: anytype, look: KnobLook) ?Shape {
+        _ = cx;
+        return .{ .rect = look.row, .radius = 0 };
+    }
+};
+
+/// `check(S, .knob)` less the skin's name and ": ".
+fn knob_problem(comptime S: type) []const u8 {
+    const message = check(S, .knob).?;
+    const prefix = @typeName(S) ++ ": ";
+    assert(std.mem.startsWith(u8, message, prefix));
+    assert(message.len > prefix.len);
+    return message[prefix.len..];
+}
+
+// Locks the declaration check (section 2b), one case per problem, each after the functions:
+// none; not a `SkinAppends`; Box twice in `fixed`, Glyph twice in `per_byte`; `u32`, not a draw
+// type; areas counted. A menu bar skin with every function and `menu_face_appends` alone names
+// `menu_row_appends`, the next in the table, first.
+test "check refuses a skin function without its declaration" {
+    try testing.expectEqualStrings(
+        "widgets.skin.KnobBare: missing `pub const knob_appends: widgets.SkinAppends`",
+        comptime check(KnobBare, .knob).?,
+    );
+    try testing.expectEqualStrings(
+        "`knob_appends` must be a `widgets.SkinAppends`",
+        comptime knob_problem(KnobDeclared(@as(u32, 1))),
+    );
+    const box_twice: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+    try testing.expectEqualStrings(
+        "`knob_appends` names `" ++ @typeName(quads.Box) ++ "` twice",
+        comptime knob_problem(KnobDeclared(box_twice)),
+    );
+    const glyph_twice: SkinAppends = .{ .per_byte = .{ .draws = &.{
+        .{ .type = quads.Glyph, .count = 1 },
+        .{ .type = quads.Glyph, .count = 1 },
+    } } };
+    try testing.expectEqualStrings(
+        "`knob_appends` names `" ++ @typeName(quads.Glyph) ++ "` twice",
+        comptime knob_problem(KnobDeclared(glyph_twice)),
+    );
+    const not_draw: SkinAppends = .{ .fixed = .{ .draws = &.{.{ .type = u32, .count = 1 }} } };
+    try testing.expectEqualStrings(
+        "`knob_appends` names `u32`, which is not a draw type",
+        comptime knob_problem(KnobDeclared(not_draw)),
+    );
+    const areas: SkinAppends = .{ .fixed = .{ .areas = 1 } };
+    try testing.expectEqualStrings(
+        "`knob_appends` counts areas; the widget records them, not the skin",
+        comptime knob_problem(KnobDeclared(areas)),
+    );
+    try testing.expect(comptime check(KnobDeclared(SkinAppends{}), .knob) == null);
+    try testing.expect(comptime KnobDeclared(null) == KnobBare);
+    try testing.expectEqualStrings(
+        "widgets.skin.MenuBarFaceOnly: missing `pub const menu_row_appends: widgets.SkinAppends`",
+        comptime check(MenuBarFaceOnly, .menu_bar).?,
+    );
+}
+
+/// A menu bar skin with all three functions and the face's declaration alone.
+const MenuBarFaceOnly = struct {
+    pub const menu_face_appends = Default.menu_face_appends;
+    pub const menu_title_appends = Default.menu_title_appends;
+    pub const menu_face = Default.menu_face;
+    pub const menu_row = Default.menu_row;
+    pub const menu_title = Default.menu_title;
+};
+
 // Locks the travel map (section 3) at the worked pointer of "slider value at the worked
 // pointer": rect x = 16, width = 1248, so the travel is [28, 1252] and x = 640 maps to
 // (640 - 28) / 1224 = 0.5, exactly `value_at`; the stops clamp and an empty span gives 0.
@@ -1523,6 +1806,11 @@ test "default slider travel reproduces value_at" {
 /// A skin whose knob hit shape is a fixed 10 px disc at (50, 20), or nothing.
 const FixedSkin = struct {
     var absent: bool = false;
+
+    pub const knob_appends: SkinAppends = .{
+        .fixed = .{ .draws = &.{.{ .type = quads.Box, .count = 1 }} },
+        .per_byte = .{},
+    };
 
     pub fn knob(cx: anytype, look: KnobLook) ?Shape {
         assert(look.value >= 0);
@@ -1830,4 +2118,418 @@ test "a framed panel has a hairline" {
     const box = cx.draw.items(quads.Box)[0];
     try testing.expectEqual(theme.dark.colors.control, box.border_color);
     try testing.expectEqual(@as(f32, 1), box.border_width);
+}
+
+/// Eight inked bytes, the look's text in the reach tests (section 2b): no spaces, which have
+/// no ink, and no letter narrow enough to hide a cut.
+const reach_text = "WWWWWWWW";
+const reach_bytes: u32 = reach_text.len;
+
+/// A frame of `cx`, and its window clip.
+fn reach_begin(cx: anytype) Clip {
+    cx.begin_frame(1280, 720, 120);
+    const clip = cx.clip().?;
+    assert(clip.x1 == 1280);
+    assert(clip.y1 == 720);
+    return clip;
+}
+
+/// Ends the frame of `cx` and observes it.
+fn reach_end(cx: anytype, tally: anytype) !void {
+    assert(cx.phase == .draw);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    assert(tally.frames >= 1);
+}
+
+/// Marks a frosted backdrop on layer 2 and draws there, as `panel.zig`'s `panel_frame` does.
+fn reach_glass_layer(cx: anytype) void {
+    const layer: quads.Layer = @fromBackingInt(2);
+    assert(kit.backdrop(cx, layer, theme.Material.frosted) != null);
+    _ = cx.drawing().layer(layer);
+    assert(cx.drawing().layer_now == layer);
+}
+
+/// A wide rect at `y`, so no label is cut and every `width > 0` branch is taken.
+fn reach_rect(y: f32, height: f32) Rect {
+    assert(y >= 0);
+    assert(height > 0);
+    return .{ .x = 0, .y = y, .width = 600, .height = height };
+}
+
+// Locks the button, slider, knob, toggle, checkbox, meter, and number face of `Default`
+// against their declarations (section 2b) at 8 bytes of text: button Box 1 Glyph 8; slider at
+// 0.5 Box 3; knob at 0.5 Arc 2 Glyph 8 (name and value 4 bytes each); toggle Box 2 Glyph 8;
+// checkbox mixed (Box 2), checked (Box 1, Path 1, points 3), and checked bare (Box 2), Glyph 8;
+// meter at 0.5 Box 2 Glyph 8; number face "-99999999.999999" and "abcdefgh" Box 1 Glyph 24.
+test "Default's controls reach their declarations" {
+    const cx = fixture.context();
+    const scheme = theme.dark;
+    {
+        var tally: fixture.Tally(Default.button_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.button(cx, .{
+            .rect = reach_rect(0, 40),
+            .clip = clip,
+            .label = reach_text,
+            .style = scheme.name,
+            .padding = .all(8),
+            .paint = kit.paint_of(.{ 0.3, 0.46, 0.7, 1 }, 4),
+            .hover = 1,
+            .down = 1,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.slider_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.slider(cx, .{
+            .rect = reach_rect(0, 24),
+            .clip = clip,
+            .value = 0.5,
+            .hover = 1,
+            .track = kit.paint_of(scheme.colors.track, 2),
+            .fill = kit.paint_of(scheme.colors.meter, 2),
+            .knob = kit.paint_of(scheme.colors.control, 12),
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.knob_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.knob(cx, .{
+            .row = reach_rect(0, knob_file.knob_height),
+            .clip = clip,
+            .ring = knob_file.ring_size,
+            .value = 0.5,
+            .hover = 1,
+            .accent = knob_file.accents[0],
+            .name = reach_text[0..4],
+            .value_text = reach_text[4..],
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.toggle_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.toggle(cx, .{
+            .row = reach_rect(0, toggle_file.toggle_height),
+            .clip = clip,
+            .thumb = 1,
+            .hover = 1,
+            .name = reach_text,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    try reach_checkbox(cx);
+    {
+        var tally: fixture.Tally(Default.meter_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        Default.meter(cx, .{
+            .row = reach_rect(0, meter_file.meter_height),
+            .clip = clip,
+            .value = 0.5,
+            .track_h = meter_file.meter_track_h,
+            .name = reach_text,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        const value_text = "-99999999.999999";
+        const unit = "abcdefgh";
+        var tally: fixture.Tally(Default.number_face_appends.with(value_text.len + unit.len)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.number_face(cx, .{
+            .rect = reach_rect(0, 28),
+            .clip = clip,
+            .value_text = value_text,
+            .unit = unit,
+            .hover = 1,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+        try testing.expectEqual(@as(usize, 24), cx.draw.items(quads.Glyph).len);
+    }
+}
+
+/// The checkbox's three worst frames (section 2b): mixed, checked, and checked without
+/// `draw.Path`.
+fn reach_checkbox(cx: *fixture.Context) !void {
+    const Need = fixture.Tally(Default.checkbox_appends.with(reach_bytes));
+    var tally: Need = .{};
+    for ([_]bool{ true, false }) |mixed| {
+        const clip = reach_begin(cx);
+        _ = Default.checkbox(cx, .{
+            .row = reach_rect(0, checkbox_file.checkbox_height),
+            .clip = clip,
+            .label = reach_text,
+            .check = 1,
+            .mixed = mixed,
+            .hover = 1,
+            .focused = true,
+        });
+        try reach_end(cx, &tally);
+    }
+    const bare = fixture.bare_context();
+    const clip = reach_begin(bare);
+    _ = Default.checkbox(bare, .{
+        .row = reach_rect(0, checkbox_file.checkbox_height),
+        .clip = clip,
+        .label = reach_text,
+        .check = 1,
+        .mixed = false,
+        .hover = 1,
+        .focused = true,
+    });
+    try reach_end(bare, &tally);
+    try testing.expectEqual(@as(usize, 2), bare.draw.items(quads.Box).len);
+    try tally.expect_reached();
+    assert(tally.frames == 3);
+}
+
+// Locks the panel, field, menu face, menu row, dropdown, tooltip, and divider of `Default`
+// (section 2b): panel solid (Box 1) and glass over a backdrop (Glass 1); field Box 1; menu face
+// solid and glass (Glass 1 and Box 1 in one frame); a highlighted menu row Box 1 Glyph 8; a
+// dropdown Box 1, Path 1, points 3, Glyph 8; a tooltip Box 1 Glyph 8; a divider Box 1.
+test "Default's faces and popups reach their declarations" {
+    const cx = fixture.context();
+    {
+        var tally: fixture.Tally(Default.panel_appends.with(0)) = .{};
+        for ([_]bool{ false, true }) |glass| {
+            const clip = reach_begin(cx);
+            if (glass) reach_glass_layer(cx);
+            Default.panel(cx, .{
+                .rect = reach_rect(100, 120),
+                .clip = clip,
+                .paint = kit.paint_of(.{ 0.2, 0.2, 0.2, 1 }, 8),
+                .material = if (glass) theme.Material.frosted else .solid,
+            });
+            try reach_end(cx, &tally);
+        }
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.field_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        Default.field(cx, .{ .rect = reach_rect(0, 28), .clip = clip, .focused = true });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.menu_face_appends.with(0)) = .{};
+        for ([_]bool{ false, true }) |glass| {
+            const clip = reach_begin(cx);
+            if (glass) reach_glass_layer(cx);
+            Default.menu_face(cx, .{
+                .rect = reach_rect(100, 120),
+                .clip = clip,
+                .material = if (glass) theme.Material.frosted else .solid,
+            });
+            try reach_end(cx, &tally);
+        }
+        try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Box).len);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.menu_row_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        Default.menu_row(cx, .{
+            .rect = reach_rect(0, 28),
+            .clip = clip,
+            .label = reach_text,
+            .style = theme.dark.name,
+            .enabled = true,
+            .highlighted = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.dropdown_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.dropdown(cx, .{
+            .rect = reach_rect(0, 28),
+            .clip = clip,
+            .label = reach_text,
+            .hover = 1,
+            .open = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.tooltip_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        Default.tooltip(cx, .{ .rect = reach_rect(0, 32), .clip = clip, .label = reach_text });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.divider_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.divider(cx, .{
+            .rect = .{ .x = 100, .y = 0, .width = 6, .height = 300 },
+            .clip = clip,
+            .axis = .horizontal,
+            .hover = 1,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+}
+
+// Locks the tab bar, tab, list row, menu title, and header cell of `Default` (section 2b): a
+// bar with `insert_x` Box 2; a selected, closable tab with the close hovered Box 3 Glyph 9 (the
+// "×" and 8); a selected list row Box 1; an open menu title Box 1 Glyph 8; a sorted header cell
+// Box 2 Glyph 9 (the arrow and 8).
+test "Default's bars and rows reach their declarations" {
+    const cx = fixture.context();
+    {
+        var tally: fixture.Tally(Default.tab_bar_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        const bar = reach_rect(0, 32);
+        Default.tab_bar(cx, .{ .rect = bar, .clip = clip, .focused = true, .insert_x = 100 });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.tab_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.tab(cx, .{
+            .rect = reach_rect(0, 32),
+            .clip = clip,
+            .label = reach_text,
+            .selected = true,
+            .hovered = true,
+            .close = .{ .x = 570, .y = 8, .width = 16, .height = 16 },
+            .close_hovered = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.list_row_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        const row = reach_rect(0, 24);
+        Default.list_row(cx, .{ .rect = row, .clip = clip, .selected = true, .hovered = true });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.menu_title_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.menu_title(cx, .{
+            .rect = reach_rect(0, 28),
+            .clip = clip,
+            .label = reach_text,
+            .open = true,
+            .hovered = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.header_cell_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Default.header_cell(cx, .{
+            .rect = reach_rect(0, 28),
+            .clip = clip,
+            .label = reach_text,
+            .sorted = true,
+            .hovered = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+}
+
+// Locks the parts with a `draw.Path` and a fallback (section 2b), each on the full context and
+// on `bare_context`: a tree chevron Path 1 and points 3, or Glyph 1; a disclosure Box 1, Path 1,
+// points 3, or Box 1 and Glyph 1, plus 8 Glyph; a hovered restore button Box 1, Path 2, points
+// 10, or Box 1 and Glyph 1.
+test "Default's paths and their fallbacks reach their declarations" {
+    const cx = fixture.context();
+    const bare = fixture.bare_context();
+    {
+        var tally: fixture.Tally(Default.tree_chevron_appends.with(0)) = .{};
+        const look: ChevronLook = .{
+            .rect = reach_rect(0, 24),
+            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .turn = 0,
+            .hovered = true,
+        };
+        _ = reach_begin(cx);
+        Default.tree_chevron(cx, look);
+        try reach_end(cx, &tally);
+        _ = reach_begin(bare);
+        Default.tree_chevron(bare, look);
+        try reach_end(bare, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.disclosure_appends.with(reach_bytes)) = .{};
+        const look: DisclosureLook = .{
+            .rect = reach_rect(0, 28),
+            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .label = reach_text,
+            .turn = 1,
+            .hover = 1,
+            .focused = true,
+        };
+        _ = reach_begin(cx);
+        _ = Default.disclosure(cx, look);
+        try reach_end(cx, &tally);
+        _ = reach_begin(bare);
+        _ = Default.disclosure(bare, look);
+        try reach_end(bare, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Default.window_button_appends.with(0)) = .{};
+        const look: WindowButtonLook = .{
+            .rect = .{ .x = 0, .y = 0, .width = 40, .height = 32 },
+            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .kind = .restore,
+            .hover = 1,
+            .down = 0,
+            .active = true,
+        };
+        _ = reach_begin(cx);
+        _ = Default.window_button(cx, look);
+        try reach_end(cx, &tally);
+        _ = reach_begin(bare);
+        _ = Default.window_button(bare, look);
+        try reach_end(bare, &tally);
+        try tally.expect_reached();
+    }
+}
+
+// Locks `Segmented` (section 2b): its bar Box 1; a selected segment Box 1 Glyph 8.
+test "Segmented's skin functions reach their declarations" {
+    const cx = fixture.context();
+    {
+        var tally: fixture.Tally(Segmented.tab_bar_appends.with(0)) = .{};
+        const clip = reach_begin(cx);
+        Segmented.tab_bar(cx, .{ .rect = reach_rect(0, 32), .clip = clip, .focused = true });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
+    {
+        var tally: fixture.Tally(Segmented.tab_appends.with(reach_bytes)) = .{};
+        const clip = reach_begin(cx);
+        _ = Segmented.tab(cx, .{
+            .rect = reach_rect(0, 32),
+            .clip = clip,
+            .label = reach_text,
+            .selected = true,
+            .hovered = true,
+        });
+        try reach_end(cx, &tally);
+        try tally.expect_reached();
+    }
 }

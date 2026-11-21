@@ -933,13 +933,19 @@ the clip, the text, and the app's fill or null) work the same way. A
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
 is no vtable: two looks on one screen are two types, and `ui.route` routes both.
 
-A knob skin declares one function. It gets a `widgets.KnobLook` of plain values (the row, the
-clip, the ring's side, the value and its text, the raw hover value, the accent, the name),
-appends whatever it draws, and returns the hit shape the knob records, or null to draw and
-record nothing:
+A knob skin declares one function and what it appends. The function gets a
+`widgets.KnobLook` of plain values (the row, the clip, the ring's side, the value and its
+text, the raw hover value, the accent, the name), appends whatever it draws, and returns the
+hit shape the knob records, or null to draw and record nothing:
 
 ```zig
 const Skin = struct {
+    // A dial and an arc; the name and value text add a draw.Glyph per byte (the default).
+    pub const knob_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = hardware.Dial, .count = 1 },
+        .{ .type = draw.Arc, .count = 1 },
+    } } };
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         if (look.row.height < look.ring) return null;
         const ring = widgets.ring_sized(look.row, look.ring);
@@ -967,6 +973,16 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   editor. A skin declares only what it skins. `KnobOf(S)` checks `S.knob` and
   fails the build with a message naming the skin and the function, for example
   "hardware.Skin: missing `pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`".
+- **Counts.** Beside every skin function `<name>` goes `pub const <name>_appends:
+  widgets.SkinAppends`, what one call appends at most, so an app can size `config.draw`,
+  `point_cap`, and `area_cap` from it. `fixed` counts instances by draw type (a
+  `widgets.Appends`: `draws` of `.{ .type, .count }`, and `points` for paths); `per_byte` is
+  what each byte of the look's text adds, one `draw.Glyph` by default. Count each type at its
+  worst branch: a `draw.Path` and the Box an app without it gets instead both go in. A skin
+  counts no areas; the widget records them. `KnobOf(S)` checks it after the function:
+  "hardware.Skin: missing `pub const knob_appends: widgets.SkinAppends`", and a type named
+  twice, a type that is not a draw type, or areas are refused by name. `with(bytes)` gives one
+  call's `widgets.Appends`; `plus`, `times`, `max`, and `of(T)` combine and read them.
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
   A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
