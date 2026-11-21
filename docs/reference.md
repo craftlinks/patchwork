@@ -127,6 +127,7 @@ patchwork/
 │   ├── ui/view.zig             # Scrolling views (ViewState, scrollbar) and the virtual List
 │   ├── ui/canvas.zig           # Pan/zoom canvases: CanvasState, the zoom ladder, wheel and drag
 │   ├── ui/gestures.zig         # Per-target recognizer: tap, drag, long-press, pinch, two-finger
+│   ├── ui/drag.zig             # Drag: a press, drag, and release as the place of the dragged point
 │   ├── ui/edit.zig             # Editing core: bounded UTF-8 field, caret, words, sanitizing
 │   ├── ui/popup.zig            # Popup placement: place (side, flip, clamp, cut), Anchor
 │   ├── widgets.zig             # Widgets namespace: re-exports every widget and constant
@@ -794,7 +795,8 @@ Nesting is the call structure; the stack holds at most 32 open containers.
 - **Routing.** `App.event` calls each widget's `handle`, which is how it learns what changed.
   For widgets whose result it does not need, `ui.route(cx, event, target)` calls every widget
   a target names: a widget, a slice or array of them, or each widget field of a struct (so
-  `ui.route(cx, event, app)` cannot forget one). It returns how many acted.
+  `ui.route(cx, event, app)` cannot forget one). It returns how many acted. A widget whose
+  `handle` takes more than the event (a grip given the point it drags) is called by its holder.
 - **Widget sizes.** `widgets.Knob.init(...).sized(40)` sets one knob's ring (the labels follow
   it), and `Meter.track_h` one meter's track; the defaults are the shared constants.
 - **Widget kit.** The library widgets are built from `widgets.kit`, which an app's own widget
@@ -1670,6 +1672,36 @@ button. A long-press counts `.frame` deltas and keeps the app animating only whi
 so the app sleeps after at most 400 ms. Thresholds are in `ui.gestures.Thresholds`, and `feed` and
 `tick` are pure for tests.
 
+### Drag
+
+`ui.Drag` turns one area's press, drag, and release into the place of the point it moves, so the
+spot under the pointer stays under it. The holder keeps one per gesture it can run at a time and
+names the point dragged: a top-left to move something, a corner to resize it.
+
+```text
+hit            state        result                       state after
+down           any          Action.grabbed               grab = pointer - origin
+drag           held         Action.dragged = pointer - grab (the origin's new place)
+drag           not held     Action.none                  unchanged
+up             held         Action.released              grab = null
+up             not held     Action.none                  unchanged
+anything else  any          Action.none                  unchanged
+```
+
+```zig
+var drag: ui.Drag = .{};
+switch (drag.track(cx.hit(id, event), origin)) {
+    .dragged => |place| origin = place,                  // clamp it here if it has limits
+    .grabbed, .released, .none => {},
+}
+```
+
+There is no cancel: a pointer leave and a touch cancel give the capture an `up`, so they arrive
+as `released`, and the last `dragged` place stays. `track` works in window pixels;
+`track_in(hit, origin, view)` maps the pointer through a canvas's `CanvasState.drawn` and keeps
+the offset in world pixels. `Drag` redraws nothing and ignores hover: the holder has the same
+`Hit` and does both from it. To forget a drag (the thing it moved is gone), write `.{}`.
+
 ## Drags Between Widgets
 
 A widget that holds a press may turn it into a drag that another widget receives: a tab
@@ -1784,8 +1816,10 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
   visible world rect), and `cx.visible` are in world pixels, so culling is the usual cull
   test. Areas are mapped to the screen when recorded (`Area.zoom` keeps a path area's
   polyline in world pixels), so hit testing, capture, and `Press.rect` need no inverse;
-  `CanvasState.to_world` maps the pointer back for moving content. `cx.begin_at(rect,
-  layout)` places a container at a fixed rect outside its parent's flow (free placement).
+  `CanvasState.to_world` maps the pointer back for moving content;
+  `ui.Drag.track_in(hit, origin, view.drawn)` keeps a grab offset in world pixels.
+  `cx.begin_at(rect, layout)` places a container at a fixed rect outside its parent's flow
+  (free placement).
 - **Zoom ladder.** 17 rungs `2^(k/4)` from 0.25 to 4. The wheel moves one rung about the
   pointer; the offset is snapped to device pixels when drawn. Glyphs rasterize at the rung
   nearest the zoom (`text.Cache.zoom`), so the cache holds at most one size per rung, text is

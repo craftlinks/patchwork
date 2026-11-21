@@ -34,9 +34,10 @@
 //! event, wrapped to the period, and asks for the next frame (`draw/path.zig`, section 4b): every
 //! frame redraws the app and rewrites the dashed cables' records, and no point. Dashes stay at
 //! every zoom, so the bench measures the dashed shader's worst case.
-//! A header drag keeps the world point under the pointer under it: on press the grab is the
-//! world offset of the pointer from the module's origin (`CanvasState.to_world`), and each drag
-//! puts the origin at the pointer's world point minus that offset.
+//! A header drag keeps the world point under the pointer under it with a `ui.Drag` (`track_in`
+//! through the canvas's drawn view): on press the grab is the world offset of the pointer from
+//! the module's origin, and each drag puts the origin at the pointer's world point minus that
+//! offset.
 //!
 //! ## 4. TigerStyle Invariants
 //! Capacities hold the zoomed-out grid (comptime block); a frame is O(modules + cables).
@@ -136,12 +137,6 @@ comptime {
     assert(port_y + port_size <= module_height);
 }
 
-/// A header drag in progress (section 3).
-const Drag = struct {
-    index: u32,
-    grab: [2]f32,
-};
-
 /// The canvas screen. See the module guide.
 pub const App = struct {
     view: ui.CanvasState,
@@ -150,7 +145,9 @@ pub const App = struct {
     /// Each module's knob, routed with `ui.route` (section 3).
     knobs: [module_count]widgets.Knob,
     selected: ?u32,
-    drag: ?Drag,
+    /// The module whose header is pressed, and its drag (section 3): held together.
+    held: ?u32,
+    drag: ui.Drag,
     /// What the last frame drew, for the status line.
     visible: u32,
     cables_drawn: u32,
@@ -233,7 +230,8 @@ pub const App = struct {
             knob.* = widgets.Knob.init(knob_id(index), "gain", value_of(index), accent).sized(knob_ring);
         }
         app.selected = null;
-        app.drag = null;
+        app.held = null;
+        app.drag = .{};
         app.visible = 0;
         app.cables_drawn = 0;
         app.dashed = false;
@@ -255,34 +253,33 @@ pub const App = struct {
 
     /// Selection and header drags (section 3). True when a module took the event.
     fn route_modules(app: *App, cx: *Context, event_value: input.Event) bool {
-        if (app.drag) |drag| {
-            switch (cx.hit(header_id(drag.index), event_value)) {
-                .drag => |press| {
-                    const at = app.view.to_world(press.x, press.y);
-                    app.origins[drag.index] = .{ at[0] - drag.grab[0], at[1] - drag.grab[1] };
+        assert((app.held != null) == app.drag.held());
+        if (app.held) |index| {
+            const hit = cx.hit(header_id(index), event_value);
+            switch (app.drag.track_in(hit, app.origins[index], app.view.drawn)) {
+                .dragged => |origin| {
+                    app.origins[index] = origin;
                     cx.redraw();
                     return true;
                 },
-                .up => {
-                    app.drag = null;
+                .released => {
+                    app.held = null;
                     return true;
                 },
-                else => {},
+                .none, .grabbed => {},
             }
         }
         // Only a press resolves to a module; `hit` is O(1) per id.
         if (event_value != .pointer_down) return false;
         for (0..module_count) |index_usize| {
             const index: u32 = @intCast(index_usize);
-            switch (cx.hit(header_id(index), event_value)) {
-                .down => |press| {
-                    const at = app.view.to_world(press.x, press.y);
-                    const origin = app.origins[index];
-                    app.drag = .{ .index = index, .grab = .{ at[0] - origin[0], at[1] - origin[1] } };
-                    app.select(cx, index);
-                    return true;
-                },
-                else => {},
+            const hit = cx.hit(header_id(index), event_value);
+            if (hit == .down) {
+                const action = app.drag.track_in(hit, app.origins[index], app.view.drawn);
+                assert(action == .grabbed);
+                app.held = index;
+                app.select(cx, index);
+                return true;
             }
             switch (cx.hit(module_id(index), event_value)) {
                 .down => {
@@ -575,7 +572,8 @@ test "a header drag moves its module by the world delta" {
     send(app, .{ .pointer_up = input.left_at(.{ .x = x + 30, .y = y }) });
     try std.testing.expectEqual(home_of(0)[0] + 15, app.origins[0][0]);
     try std.testing.expectEqual(home_of(0)[1], app.origins[0][1]);
-    try std.testing.expectEqual(@as(?Drag, null), app.drag);
+    try std.testing.expect(!app.drag.held());
+    try std.testing.expectEqual(@as(?u32, null), app.held);
 }
 
 // Locks a widget inside the canvas (section 3): at zoom 2 module 0's knob area is its 40 px
