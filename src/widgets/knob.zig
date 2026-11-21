@@ -35,8 +35,8 @@
 //! (`widgets/skin.zig`); `Knob` is `KnobOf(skins.Default)`. The default look is a track arc
 //! over the whole of the scheme's ring, the value arc over `value` of it in `accent` (omitted
 //! at 0, lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed
-//! `[8]u8` `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a value
-//! in its units, "-27.7db"), valid for the call.
+//! `[8]u8` `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a
+//! value in its units, "-27.7db"), valid for the call.
 //!
 //! ## 4. Counts
 //! `KnobOf(S).appends` is what one knob appends to a frame at most (`widgets/appends.zig`): the

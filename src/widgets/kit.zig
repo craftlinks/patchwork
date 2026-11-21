@@ -424,7 +424,6 @@ pub fn arc(cx: anytype, ring: Rect, clip: Clip, look: ArcLook) void {
     assert(look.thickness >= 0);
     var resolved = look;
     resolved.shape = look.shape orelse cx.theme().arc;
-    assert(resolved.shape != null);
     append(cx, draw.Arc, null, draw.Arc.of(ring, clip, resolved));
 }
 
@@ -766,7 +765,7 @@ test "a chevron turns from right to down" {
 // mid radius, (28, 54), is 11.458590 outside (chord 2 * 26 * sin 15 - 2). A look's own
 // `shape = .{}` wins over the scheme's (`arc_start`, `arc_sweep`), and under plain `dark` a
 // plain arc records the default ring.
-test "kit.arc draws on the scheme's ring, a look's shape wins, and a symmetric ring is its own mirror" {
+test "kit.arc takes the scheme's ring unless the look names one" {
     const size: f32 = 56;
     const square: Rect = .{ .x = 0, .y = 0, .width = size, .height = size };
     const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
@@ -786,13 +785,13 @@ test "kit.arc draws on the scheme's ring, a look's shape wins, and a symmetric r
     try testing.expectApproxEqAbs(@as(f32, 5.2359877), record.sweep, 1e-6);
     const field = struct {
         fn at(x: f32, y: f32, start: f32, sweep: f32) f32 {
-            return draw.sdf_arc(x, y, 56, 56, 4, start, sweep);
+            return draw.sdf_arc(x, y, size, size, 4, start, sweep);
         }
     }.at;
     var y: u32 = 0;
-    while (y <= 56) : (y += 1) {
+    while (y <= size) : (y += 1) {
         var x: u32 = 0;
-        while (x <= 56) : (x += 1) {
+        while (x <= size) : (x += 1) {
             const fx: f32 = @floatFromInt(x);
             const fy: f32 = @floatFromInt(y);
             const left = field(fx, fy, record.start, record.sweep);

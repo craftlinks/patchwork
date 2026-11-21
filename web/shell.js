@@ -668,7 +668,7 @@ function submit_js(ptr, len) {
  * The trap that follows is caught where the shell called in (`stop_module`).
  *
  * @param {number} ptr Byte offset of the message in Wasm linear memory.
- * @param {number} len Byte length of the message, at most `panic_message_max`.
+ * @param {number} len Byte length of the message.
  */
 function panic_js(ptr, len) {
     const bytes = new Uint8Array(wasm.memory.buffer, ptr, len);

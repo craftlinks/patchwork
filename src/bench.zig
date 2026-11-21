@@ -972,20 +972,33 @@ pub const ParseError = error{
     BadMode,
 };
 
-/// What `error.FramesOverCap` refused, for the host's message (`refusal_text`).
+/// What `error.FramesOverCap` refused, for the host's message (`format`).
 pub const Refusal = struct {
-    /// The option: `--frames`.
-    option: []const u8,
-    /// The value given.
+    /// The `--frames` value given.
     value: u32,
     /// The cap it is over: `sample_cap`, or `render_frames_max` with `--render`.
     cap: u32,
 
-    pub const none: Refusal = .{ .option = "", .value = 0, .cap = 0 };
-};
+    pub const none: Refusal = .{ .value = 0, .cap = 0 };
 
-/// Bytes `refusal_text` may write; the longest refusal fits (comptime and a test).
-pub const refusal_text_cap: u32 = 128;
+    /// The host's line: the value given and the cap it is over, and with `sample_cap` the
+    /// larger cap `--render` takes.
+    pub fn format(refusal: Refusal, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        assert(refusal.value > refusal.cap);
+        if (refusal.cap == sample_cap) {
+            try writer.print(
+                "--frames {d} is over its cap of {d} (bench.sample_cap); --render takes up to {d}",
+                .{ refusal.value, refusal.cap, render_frames_max },
+            );
+        } else {
+            assert(refusal.cap == render_frames_max);
+            try writer.print(
+                "--frames {d} is over its cap of {d} (bench.render_frames_max)",
+                .{ refusal.value, refusal.cap },
+            );
+        }
+    }
+};
 
 /// Parses the arguments after the program name. `--bench` takes an optional scenario name,
 /// `--no-cache`, `--check`, `--regress`, `--bless`, and `--keep` take none, and every other
@@ -996,7 +1009,7 @@ pub const refusal_text_cap: u32 = 128;
 /// ends the host's options and the rest are `app_args` (section 2e).
 pub fn parse_refused(args: []const [:0]const u8, refusal: *Refusal) ParseError!Options {
     assert(args.len <= arg_cap);
-    assert(refusal.option.len == 0);
+    assert(refusal.cap == 0);
     var options: Options = .off;
     var index: u32 = 0;
     while (index < args.len) : (index += 1) {
@@ -1078,27 +1091,29 @@ pub fn parse_refused(args: []const [:0]const u8, refusal: *Refusal) ParseError!O
         }
     }
     assert(index == args.len);
+    try parse_mode(&options, refusal);
+    return options;
+}
+
+/// The checks `parse_refused` makes once every option is read: the modes that go together, and
+/// `--frames` against the cap of the mode it is in.
+fn parse_mode(options: *const Options, refusal: *Refusal) ParseError!void {
+    assert(refusal.cap == 0);
     if (options.both and !options.regress) return error.BadAdapter;
     if (options.render != null) {
         if (options.regress or options.bench or options.check) return error.BadMode;
         if (options.out == null) return error.BadMode;
-        if (options.frames) |frames| {
-            if (frames > render_frames_max) {
-                refusal.* = .{ .option = "--frames", .value = frames, .cap = render_frames_max };
-                return error.FramesOverCap;
-            }
-        }
-        return options;
+    } else {
+        if (options.size != null or options.scale_120 != null) return error.BadMode;
+        if (options.fps != null or options.out != null) return error.BadMode;
     }
-    if (options.size != null or options.scale_120 != null) return error.BadMode;
-    if (options.fps != null or options.out != null) return error.BadMode;
-    if (options.frames) |frames| {
-        if (frames > sample_cap) {
-            refusal.* = .{ .option = "--frames", .value = frames, .cap = sample_cap };
-            return error.FramesOverCap;
-        }
+    const frames_max: u32 = if (options.render != null) render_frames_max else sample_cap;
+    const frames = options.frames orelse return;
+    assert(frames >= 1);
+    if (frames > frames_max) {
+        refusal.* = .{ .value = frames, .cap = frames_max };
+        return error.FramesOverCap;
     }
-    return options;
 }
 
 /// `parse_refused` that drops the refusal: for callers that print only the error's name.
@@ -1106,28 +1121,6 @@ pub fn parse_args(args: []const [:0]const u8) ParseError!Options {
     assert(args.len <= arg_cap);
     var refusal: Refusal = .none;
     return parse_refused(args, &refusal);
-}
-
-/// The host's line for `error.FramesOverCap`: the option, the value given, and the cap it is
-/// over, and with `sample_cap` the larger cap `--render` takes.
-pub fn refusal_text(refusal: Refusal, out: *[refusal_text_cap]u8) []const u8 {
-    assert(refusal.option.len > 0);
-    assert(refusal.value > refusal.cap);
-    assert(refusal.cap == sample_cap or refusal.cap == render_frames_max);
-    const text = if (refusal.cap == sample_cap)
-        std.fmt.bufPrint(
-            out,
-            "{s} {d} is over its cap of {d} (bench.sample_cap); --render takes up to {d}",
-            .{ refusal.option, refusal.value, refusal.cap, render_frames_max },
-        ) catch unreachable
-    else
-        std.fmt.bufPrint(
-            out,
-            "{s} {d} is over its cap of {d} (bench.render_frames_max)",
-            .{ refusal.option, refusal.value, refusal.cap },
-        ) catch unreachable;
-    assert(text.len <= refusal_text_cap);
-    return text;
 }
 
 /// `parse_refused` for an app: `error.UnknownArgument` for arguments an app with no `args`
@@ -1906,9 +1899,6 @@ test "render arguments parse" {
     try testing.expectError(error.BadNumber, parse_args(&(base ++ .{ "--size", "0x720" })));
     const most = (try parse_args(&(base ++ .{ "--frames", "216000" }))).frames;
     try testing.expectEqual(@as(?u32, render_frames_max), most);
-    const over = parse_args(&(base ++ .{ "--frames", "216001" }));
-    try testing.expectError(error.FramesOverCap, over);
-    try testing.expectError(error.FramesOverCap, parse_args(&.{ "--bench", "--frames", "5000" }));
     try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--regress"})));
     try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--bench"})));
     try testing.expectError(error.BadMode, parse_args(&(base ++ .{"--check"})));
@@ -2112,14 +2102,9 @@ fn expect_refused(
     cap: u32,
 ) !void {
     assert(args.len <= arg_cap);
-    assert(expected != error.FramesOverCap or value > cap);
+    if (expected == error.FramesOverCap) assert(value > cap);
     var refusal: Refusal = .none;
     try testing.expectError(expected, parse_refused(args, &refusal));
-    if (expected == error.FramesOverCap) {
-        try testing.expectEqualStrings("--frames", refusal.option);
-    } else {
-        try testing.expectEqualStrings("", refusal.option);
-    }
     try testing.expectEqual(value, refusal.value);
     try testing.expectEqual(cap, refusal.cap);
 }
@@ -2131,14 +2116,13 @@ fn expect_frames(args: []const [:0]const u8, frames: u32) !void {
     var refusal: Refusal = .none;
     const options = try parse_refused(args, &refusal);
     try testing.expectEqual(@as(?u32, frames), options.frames);
-    try testing.expectEqualStrings("", refusal.option);
-    try testing.expectEqual(@as(u32, 0), refusal.cap);
+    try testing.expectEqual(Refusal.none, refusal);
 }
 
-// Locks the frame cap by name: `--bench --frames 5000` is `FramesOverCap` with `--frames`, 5000,
-// and 4096, and its text names all three; 4096 is accepted; `ten`, 0, and 4294967296 stay
-// `BadNumber`; 300000 without `--render` names 4096; with `--render` 216000 is accepted and
-// 216001 names 216000; the cap does not depend on where `--render` comes; the longest text fits.
+// Locks the frame cap by name: `--bench --frames 5000` is `FramesOverCap` with 5000 and 4096, and
+// its text names both; 4096 is accepted; `ten`, 0, and 4294967296 stay `BadNumber`; 300000
+// without `--render` names 4096; with `--render` 216000 is accepted and 216001 names 216000; the
+// cap does not depend on where `--render` comes.
 test "frames over their cap are refused by name" {
     try expect_refused(&.{ "--bench", "--frames", "5000" }, error.FramesOverCap, 5000, 4096);
     try expect_frames(&.{ "--bench", "--frames", "4096" }, 4096);
@@ -2152,38 +2136,28 @@ test "frames over their cap are refused by name" {
     try expect_refused(&render_over, error.FramesOverCap, 216001, 216000);
     try expect_frames(&.{ "--frames", "5000", "--render", "still", "--out", "f" }, 5000);
 
-    var text: [refusal_text_cap]u8 = undefined;
-    const bench_cap: Refusal = .{ .option = "--frames", .value = 5000, .cap = sample_cap };
+    var text: [128]u8 = undefined;
+    const bench_cap: Refusal = .{ .value = 5000, .cap = sample_cap };
     try testing.expectEqualStrings(
         "--frames 5000 is over its cap of 4096 (bench.sample_cap); --render takes up to 216000",
-        refusal_text(bench_cap, &text),
+        try std.fmt.bufPrint(&text, "{f}", .{bench_cap}),
     );
-    const render_cap: Refusal = .{ .option = "--frames", .value = 216001, .cap = render_frames_max };
+    const render_cap: Refusal = .{ .value = 216001, .cap = render_frames_max };
     try testing.expectEqualStrings(
         "--frames 216001 is over its cap of 216000 (bench.render_frames_max)",
-        refusal_text(render_cap, &text),
+        try std.fmt.bufPrint(&text, "{f}", .{render_cap}),
     );
-    const longest: Refusal = .{
-        .option = "--frames",
-        .value = std.math.maxInt(u32),
-        .cap = sample_cap,
-    };
-    const longest_text = refusal_text(longest, &text);
-    try testing.expectEqual(@as(usize, 91), longest_text.len);
-    try testing.expect(longest_text.len <= refusal_text_cap);
 
     const Plain = struct {};
     var refusal: Refusal = .none;
     const hosted = parse_for(Plain, &.{ "--bench", "--frames", "5000" }, &refusal);
     try testing.expectError(error.FramesOverCap, hosted);
-    try testing.expectEqualStrings("--frames", refusal.option);
     try testing.expectEqual(@as(u32, 5000), refusal.value);
     try testing.expectEqual(sample_cap, refusal.cap);
 }
 
 comptime {
     assert(event_cap == 10);
-    assert(refusal_text_cap >= 96);
     assert(ticks_per_frame_max >= 1000 / fps_min);
     assert(producer_frames_max * fps_min > producer_rate_hz);
     assert(render_frames_max > sample_cap);

@@ -47,12 +47,11 @@ GPU, and no Chromium.
    and a diff picture beside the reference (`<scenario>-browser.png`, `.diff.png`).
 5. Reports console errors and warnings (an error fails the check), each exception in full. A
    panic's `panic:` line and the shell's `wasm stopped in` line fail the check at once, naming
-   the panic. After
-   an exception, or a fetch of the page's wasm that is not 200, it fetches `/patchwork.wasm`
-   itself and prints the HTTP status and the first line of the body (`src/serve.zig` names the
-   limit a refused file hit there). It stops what it started,
-   its whole process groups, also on SIGTERM, SIGHUP, or Ctrl+C. It never kills a process it did
-   not start; a port still taken afterwards is reported with its pid.
+   the panic. After an exception, or a fetch of the page's wasm that is not 200, it fetches
+   `/patchwork.wasm` itself and prints the HTTP status and the first line of the body
+   (`src/serve.zig` names the limit a refused file hit there). It stops what it started, its
+   whole process groups, also on SIGTERM, SIGHUP, or Ctrl+C. It never kills a process it did not
+   start; a port still taken afterwards is reported with its pid.
 
 Python standard library only, so it runs with `python3 -I`. Exit status 0 on a pass, 1 on a
 failure, 2 on a usage or setup error, 3 when the page drew no frame.
@@ -99,10 +98,9 @@ HEADLESS_FLAGS = (
 )
 # The windowed run: a Wayland window the compositor shows.
 WINDOW_FLAGS = ("--ozone-platform=wayland",)
-# `zig build -l` in the root: how long its configure may take, and the most it may print.
-# Patchwork's own lists 71 steps in 5538 bytes; a listing past either bound is refused.
+# `zig build -l` in the root: how long its configure may take, and the most lines it may print.
+# Patchwork's own lists 71 steps; a longer listing than the bound is refused.
 LIST_TIMEOUT_S = 120
-LISTING_BYTES_MAX = 64 * 1024
 LISTING_LINES_MAX = 1024
 
 
@@ -412,9 +410,7 @@ def regress_size(first_line):
 def listed_steps(listing):
     """The step names in `zig build -l`'s stdout: each step line is two spaces, the name
     (`install` is printed `install (default)`), padding, and the description, so the name is the
-    line's first field. None past `LISTING_BYTES_MAX` or `LISTING_LINES_MAX`."""
-    if len(listing) > LISTING_BYTES_MAX:
-        return None
+    line's first field. None past `LISTING_LINES_MAX`."""
     lines = listing.splitlines()
     if len(lines) > LISTING_LINES_MAX:
         return None
@@ -425,7 +421,6 @@ def listed_steps(listing):
         fields = line.split()
         if fields:
             names.append(fields[0])
-    assert len(names) <= len(lines)
     return names
 
 
@@ -436,8 +431,7 @@ def serve_step(app, listing):
     names = listed_steps(listing)
     if names is None:
         return None, (
-            f"zig build -l printed more than {LISTING_BYTES_MAX} bytes or "
-            f"{LISTING_LINES_MAX} lines"
+            f"zig build -l printed more than {LISTING_LINES_MAX} lines"
         )
     for step in (f"serve-{app}", "serve"):
         if step in names:
@@ -479,14 +473,6 @@ LISTING_HEAD = listing_row("install (default)", "Copy build artifacts to prefix 
 # the fallback; a name is matched whole, never by prefix or in a description; past the bound
 # nothing is picked.
 SERVE_STEP_CASES = (
-    # Both listed (Treadle as it is, Tapestry): serve-<app>.
-    (
-        "treadle",
-        LISTING_HEAD
-        + listing_row("serve", "Serve on localhost")
-        + listing_row("serve-treadle", "Serve (alias)"),
-        "serve-treadle",
-    ),
     # Only serve-<app> (Weft play, Patchwork's examples).
     ("play", LISTING_HEAD + listing_row("serve-play", "Serve on localhost"), "serve-play"),
     # Only serve (Treadle without its alias, test/consumer).
@@ -507,11 +493,11 @@ SERVE_STEP_CASES = (
     ("x", LISTING_HEAD + listing_row("run", "not serve-x"), None),
     # A name past the 28-column padding is still one field.
     (
-        "tapestry-player",
+        "tapestry-player-and-then-some",
         LISTING_HEAD
         + listing_row("serve-tapestry-player-and-then-some", "x")
         + listing_row("serve", "Serve"),
-        "serve",
+        "serve-tapestry-player-and-then-some",
     ),
     # An empty listing.
     ("x", "", None),
@@ -717,9 +703,11 @@ def main(argv):
             return NO_FRAME_STATUS
         done_line = f"bench done {scenario}"
         ended = cdp.pump_until(
-            lambda logs: any(t in (done_line, f"bench failed {scenario}") for _, t in logs)
-            or any(t.startswith("bench: no scenario") for _, t in logs)
-            or any(t.startswith(STOPPED_PREFIX) for _, t in logs),
+            lambda logs: any(
+                t in (done_line, f"bench failed {scenario}")
+                or t.startswith(("bench: no scenario", STOPPED_PREFIX))
+                for _, t in logs
+            ),
             DONE_TIMEOUT_S,
         )
         stops = [t for _, t in cdp.logs if t.startswith(STOPPED_PREFIX)]

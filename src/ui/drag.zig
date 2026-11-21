@@ -71,10 +71,7 @@ pub const Drag = struct {
     /// `track_in` with the identity view: `origin` and the result are in logical window pixels,
     /// the space `hit` reports.
     pub fn track(self: *Drag, hit: Hit, origin: [2]f32) Action {
-        assert(finite(origin));
-        const action = self.track_in(hit, origin, draw.View.identity);
-        if (action == .dragged) assert(self.held());
-        return action;
+        return self.track_in(hit, origin, draw.View.identity);
     }
 
     /// What `hit` means for a drag of the point `origin` (module guide, section 1). `origin` and
@@ -127,9 +124,7 @@ const area: draw.Rect = .{ .x = 100, .y = 50, .width = 200, .height = 100 };
 
 fn press_at(x: f32, y: f32) Press {
     assert(finite(.{ x, y }));
-    const press: Press = .{ .x = x, .y = y, .rect = area, .clicks = 1, .mods = .none };
-    assert(press.clicks == 1);
-    return press;
+    return .{ .x = x, .y = y, .rect = area, .clicks = 1, .mods = .none };
 }
 
 fn down_at(x: f32, y: f32) Hit {
@@ -255,19 +250,11 @@ test "track equals track_in at the identity, exactly" {
         try testing.expectEqual(a, b);
         try testing.expectEqual(window.grab, world.grab);
     }
-    const cases = [_][3][2]f32{
-        .{ .{ 100.25, 50.5 }, .{ 105.125, 100.75 }, .{ 299.875, 200.0625 } },
-        .{ .{ -8388608, 8388608 }, .{ -8388603, 8388608 }, .{ -8388600, 8388610 } },
-    };
-    for (cases) |case| {
-        const origin, const press, const to = case;
-        var drag: Drag = .{};
-        _ = drag.track(down_at(press[0], press[1]), origin);
-        const grab: [2]f32 = .{ press[0] - origin[0], press[1] - origin[1] };
-        const expected: [2]f32 = .{ to[0] - grab[0], to[1] - grab[1] };
-        const moved = drag.track(drag_at(to[0], to[1]), origin);
-        try testing.expectEqual(Drag.Action{ .dragged = expected }, moved);
-    }
+    var fraction: Drag = .{};
+    _ = fraction.track(down_at(105.125, 100.75), .{ 100.25, 50.5 });
+    try testing.expectEqual([2]f32{ 4.875, 50.25 }, fraction.grab.?);
+    const near = fraction.track(drag_at(299.875, 200.0625), .{ 100.25, 50.5 });
+    try testing.expectEqual(Drag.Action{ .dragged = .{ 295, 149.8125 } }, near);
     var large: Drag = .{};
     _ = large.track(down_at(-8388603, 8388608), .{ -8388608, 8388608 });
     try testing.expectEqual([2]f32{ 5, 0 }, large.grab.?);

@@ -133,7 +133,7 @@
 //! from here, so every panic, a safety check's or an `@panic`, hands its message to
 //! `panic_js(ptr, len)` and then traps. The message is read in place, as `submit_js`'s stream
 //! is (section 3): it lives in linear memory (std's formatting buffer or static data), and the
-//! call is synchronous. At most `panic_message_max` bytes are handed over. Only the first panic
+//! call is synchronous; std bounds its length. Only the first panic
 //! is reported: a panic inside the handler, or a call into the module after the shell stopped
 //! it, traps with no second message. The return address is not reported: `wasm32-freestanding`
 //! has none. Safety checks exist only in Debug and ReleaseSafe builds; in ReleaseFast and
@@ -166,9 +166,6 @@ const drop = @import("../drop.zig");
 /// Bytes `shell.js` may write into the input buffer: a key name or a paste.
 pub const input_cap: u32 = ui.cx.clipboard_cap;
 
-/// Most bytes of a panic's message `panic_js` is handed; a longer one is cut (section 4e).
-pub const panic_message_max: u32 = 4096;
-
 /// The wasm root's panic namespace (`host/web_main.zig`): every panic, a safety check's or an
 /// `@panic`, hands its message to `web/shell.js` through `panic_js` and traps (section 4e).
 pub const panic = std.debug.FullPanic(panic_call);
@@ -176,11 +173,6 @@ pub const panic = std.debug.FullPanic(panic_call);
 /// Set by the first panic; a second (a panic inside the first, or a call into the module after
 /// the shell stopped it) traps without a second message.
 var panicked: bool = false;
-
-/// The message's length as `panic_js` takes it: at most `panic_message_max`.
-fn panic_len(len: usize) u32 {
-    return @intCast(@min(len, panic_message_max));
-}
 
 fn panic_call(message: []const u8, return_address: ?usize) noreturn {
     @branchHint(.cold);
@@ -193,7 +185,7 @@ fn panic_call(message: []const u8, return_address: ?usize) noreturn {
             const js = struct {
                 extern "env" fn panic_js(ptr: u32, len: u32) void;
             };
-            js.panic_js(@intCast(@intFromPtr(message.ptr)), panic_len(message.len));
+            js.panic_js(@intCast(@intFromPtr(message.ptr)), @intCast(message.len));
         }
     }
     @trap();
@@ -1008,15 +1000,3 @@ test "the op table export is commands.table_json" {
     try std.testing.expectEqualStrings(commands.table_json, exported);
 }
 
-// Locks the cut: 10 stays 10, panic_message_max stays, 4111 (std's longest) is cut to
-// panic_message_max.
-test "a panic's message is cut at panic_message_max" {
-    try std.testing.expectEqual(@as(u32, 10), panic_len(10));
-    try std.testing.expectEqual(panic_message_max, panic_len(panic_message_max));
-    try std.testing.expectEqual(panic_message_max, panic_len(0x1000 + 15));
-}
-
-comptime {
-    assert(panic_message_max >= 1024);
-    assert(panic_message_max <= 1 << 16);
-}

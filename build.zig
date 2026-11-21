@@ -955,8 +955,8 @@ fn add_seams_step(
     test_step.step.dependOn(&b.addRunArtifact(tests).step);
 }
 
-/// `test/panic`, an app whose wasm panics on its first frame, for `tools/browser_check.py`
-/// (step 77). It is in no example list, so no `check`, `regress`, or example `test` runs it;
+/// `test/panic`, an app whose wasm panics on its first frame, for `tools/browser_check.py`.
+/// It is in no example list, so no `check`, `regress`, or example `test` runs it;
 /// `zig build` installs it, `add_example_steps` gives it `-panic` steps, and `test` runs its own.
 fn add_panic_steps(
     b: *std.Build,

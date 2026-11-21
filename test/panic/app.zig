@@ -60,7 +60,12 @@ pub const App = struct {
     };
 
     pub const scenarios: []const patchwork.bench.Scenario = &.{
-        .{ .name = "still", .setup = &.{.{ .wait = 3 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 10 },
+        .{
+            .name = "still",
+            .setup = &.{.{ .wait = 3 }},
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 10,
+        },
     };
 
     pub fn init(app: *App, textures: *quads.Textures) void {

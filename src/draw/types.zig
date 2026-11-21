@@ -204,9 +204,12 @@ pub const Arc = extern struct {
         assert(shape.problem() == null);
         assert(ring.width == ring.height);
         assert(look.thickness >= 0);
-        assert(look.sweep >= 0 and look.sweep <= 1);
-        assert(look.start >= 0 and look.start + look.sweep <= 1);
-        assert(look.hover >= 0 and look.hover <= 1);
+        assert(look.sweep >= 0);
+        assert(look.sweep <= 1);
+        assert(look.start >= 0);
+        assert(look.start + look.sweep <= 1);
+        assert(look.hover >= 0);
+        assert(look.hover <= 1);
         return .{
             .rect = ring.array(),
             .clip = clip.array(),
@@ -755,8 +758,10 @@ pub fn sdf_arc(
     assert(width > 0);
     assert(height > 0);
     assert(thickness >= 0);
-    assert(start >= -std.math.pi and start <= std.math.pi);
-    assert(sweep >= 0 and sweep <= std.math.tau);
+    assert(start >= -std.math.pi);
+    assert(start <= std.math.pi);
+    assert(sweep >= 0);
+    assert(sweep <= std.math.tau);
     const center_x: f32 = width * 0.5;
     const center_y: f32 = height * 0.5;
     const local_x = px - center_x;

@@ -857,10 +857,8 @@ test "a scheme's arc rides in its record" {
     var mirrored = dark;
     mirrored.arc = ArcShape.symmetric(std.math.pi / 3.0);
     const moved = mirrored.record();
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0943952), moved.arc[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.2359877), moved.arc[1], 1e-6);
-    try std.testing.expectEqual(@as(f32, 0), moved.arc[2]);
-    try std.testing.expectEqual(@as(f32, 0), moved.arc[3]);
+    const expected: [4]f32 = .{ mirrored.arc.start, mirrored.arc.sweep, 0, 0 };
+    try std.testing.expectEqual(expected, moved.arc);
     const info = @typeInfo(Theme).@"struct";
     inline for (info.field_names) |field_name| {
         if (comptime !std.mem.eql(u8, field_name, "arc")) {
