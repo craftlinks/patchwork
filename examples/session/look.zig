@@ -155,6 +155,9 @@ pub const ring_thickness: f32 = 2;
 
 /// The ring knob (section 1).
 pub const Ring = struct {
+    /// The track and value arcs and the value dot; the name and value text are per byte.
+    pub const knob_appends: widgets.SkinAppends = ring_appends;
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         return ring(cx, look, true);
     }
@@ -162,10 +165,19 @@ pub const Ring = struct {
 
 /// The ring knob whose value arc runs from the top (section 1).
 pub const Bipolar = struct {
+    /// The track and value arcs and the value dot; the name and value text are per byte.
+    pub const knob_appends: widgets.SkinAppends = ring_appends;
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         return ring(cx, look, false);
     }
 };
+
+/// What `ring` appends besides its text: two arcs and the dot.
+const ring_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+    .{ .type = quads.Arc, .count = 2 },
+    .{ .type = quads.Box, .count = 1 },
+} } };
 
 fn ring(cx: anytype, look: widgets.KnobLook, from_start: bool) ?widgets.Shape {
     assert(look.value >= 0 and look.value <= 1);
@@ -202,6 +214,11 @@ pub const pill_row_h: f32 = pill_h + 16;
 
 /// The upright toggle (section 1): the pill at the top of its row, the name under it.
 pub const Pill = struct {
+    /// The pill and the thumb; the name is per byte.
+    pub const toggle_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 2 },
+    } } };
+
     pub fn toggle(cx: anytype, look: widgets.ToggleLook) ?widgets.Shape {
         assert(look.thumb >= 0 and look.thumb <= 1);
         if (look.row.height < pill_h) return null;

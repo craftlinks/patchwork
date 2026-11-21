@@ -201,6 +201,7 @@ pub fn TooltipOf(comptime Skin: type) type {
 const testing = std.testing;
 const draw = @import("../draw.zig");
 const fixture = @import("fixture.zig");
+const appends = @import("appends.zig");
 
 fn hover_frame(cx: *fixture.Context, tooltip: anytype) void {
     cx.begin_frame(1280, 720, 120);
@@ -262,6 +263,11 @@ test "a tooltip shows after its dwell and hides on a press" {
 /// A skin whose tooltip is one red Box over the look's rect, and which keeps the look.
 const Fixed = struct {
     var last: ?skin.TooltipLook = null;
+
+    pub const tooltip_appends: appends.SkinAppends = .{
+        .fixed = .{ .draws = &.{.{ .type = draw.Box, .count = 1 }} },
+        .per_byte = .{},
+    };
 
     pub fn tooltip(cx: anytype, look: skin.TooltipLook) void {
         assert(look.label.len <= tooltip_text_cap);

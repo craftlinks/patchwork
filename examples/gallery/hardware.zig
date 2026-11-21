@@ -154,6 +154,12 @@ pub fn dial_body(ring: Rect) Rect {
 
 /// The skin: a dial, a bevel button, and a bevel housing with an LED (module guide).
 pub const Skin = struct {
+    /// The dial and the value arc; the name and value text are per byte.
+    pub const knob_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = Dial, .count = 1 },
+        .{ .type = draw.Arc, .count = 1 },
+    } } };
+
     pub fn knob(cx: anytype, look: widgets.KnobLook) ?widgets.Shape {
         assert(look.value >= 0 and look.value <= 1);
         if (look.row.height < look.ring) return null;
@@ -186,6 +192,11 @@ pub const Skin = struct {
         return .{ .rect = body, .radius = body.width * 0.5 };
     }
 
+    /// The bevel; the label is per byte.
+    pub const button_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = Bevel, .count = 1 },
+    } } };
+
     pub fn button(cx: anytype, look: widgets.ButtonLook) ?widgets.Shape {
         assert(look.hover >= 0 and look.down >= 0);
         const scheme = cx.theme();
@@ -206,6 +217,12 @@ pub const Skin = struct {
         kit.label(cx, look.style, look.label, inner, look.clip, kit.centered);
         return .{ .rect = look.rect, .radius = paint.radius };
     }
+
+    /// The housing and the LED; the name is per byte.
+    pub const toggle_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = Bevel, .count = 1 },
+        .{ .type = Led, .count = 1 },
+    } } };
 
     pub fn toggle(cx: anytype, look: widgets.ToggleLook) ?widgets.Shape {
         assert(look.thumb >= 0 and look.thumb <= 1);

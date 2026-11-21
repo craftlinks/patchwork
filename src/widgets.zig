@@ -125,6 +125,7 @@ const ui = @import("ui.zig");
 pub const kit = @import("widgets/kit.zig");
 /// Skins: the look of each widget, apart from its behaviour (`widgets/skin.zig`).
 pub const skins = @import("widgets/skin.zig");
+const appends = @import("widgets/appends.zig");
 const label = @import("widgets/label.zig");
 const paragraph = @import("widgets/paragraph.zig");
 const panel = @import("widgets/panel.zig");
@@ -166,6 +167,11 @@ pub const value_style = kit.value_style;
 pub const centered = kit.centered;
 pub const paint_of = kit.paint_of;
 pub const settled = kit.settled;
+
+/// What a widget or a skin function appends to one frame at most (`widgets/appends.zig`).
+pub const Appends = appends.Appends;
+pub const SkinAppends = appends.SkinAppends;
+pub const AppendsCount = appends.Count;
 
 pub const Shape = skins.Shape;
 pub const ButtonLook = skins.ButtonLook;
@@ -380,6 +386,7 @@ pub const parse_number = number_box.parse;
 
 test {
     _ = kit;
+    _ = appends;
     _ = skins;
     _ = label;
     _ = paragraph;

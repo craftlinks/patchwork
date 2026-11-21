@@ -1201,6 +1201,11 @@ fn add_test_steps(
                 "`pub fn knob(cx, widgets.KnobLook) ?widgets.Shape`",
         },
         .{
+            .path = "test/contract_skin_appends_missing.zig",
+            .expected = "contract_skin_appends_missing.Bare: missing " ++
+                "`pub const knob_appends: widgets.SkinAppends`",
+        },
+        .{
             .path = "test/contract_overlays_none.zig",
             .expected = "ui.overlays: contract_overlays_none.Bare has no overlay field",
         },

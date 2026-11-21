@@ -1284,6 +1284,11 @@ fn draw_preset(cx: *Context, row: widgets.ListRow) void {
 /// The preset list's look: a band under the selected row in `selected_fill` and under the
 /// hovered one in the scheme's track, as the rack drew them before `widgets.ListBox`.
 const PresetSkin = struct {
+    /// The band.
+    pub const list_row_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
     pub fn list_row(cx: anytype, look: widgets.ListRowLook) void {
         assert(look.rect.width > 0);
         if (!look.selected and !look.hovered) return;
