@@ -253,7 +253,7 @@
 //! record into `draw.theme`, and calls `redraw`; the same scheme again is no change and owes
 //! nothing. The renderer sees the new record as a uniform change; a scheme that differs only
 //! in its material or form leaves the record as it was and is a redraw. Both calls assert the
-//! scheme's material and form are in range, since a scheme built at run time escapes
+//! scheme's material, form, and arc are in range, since a scheme built at run time escapes
 //! `theme.problem`.
 //!
 //! ## 10. TigerStyle Invariants
@@ -844,6 +844,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             // A scheme built at run time is not checked at compile time (`theme.problem`).
             assert(scheme.material.problem() == null);
             assert(scheme.form.problem() == null);
+            assert(scheme.arc.problem() == null);
             self.scheme = scheme;
             self.draw.theme = scheme.record();
         }
@@ -863,6 +864,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             // A scheme built at run time is not checked at compile time (`theme.problem`).
             assert(scheme.material.problem() == null);
             assert(scheme.form.problem() == null);
+            assert(scheme.arc.problem() == null);
             if (std.meta.eql(scheme, self.scheme)) return;
             self.scheme = scheme;
             self.draw.theme = scheme.record();

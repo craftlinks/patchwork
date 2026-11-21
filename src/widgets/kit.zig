@@ -417,11 +417,15 @@ fn mix_toward(color: [4]f32, light: [4]f32, dark: [4]f32, toward_light: f32, tow
     return out;
 }
 
-/// A `draw.Arc` inscribed in the square `ring` under `clip`.
+/// A `draw.Arc` inscribed in the square `ring` under `clip`, on the look's shape, or the
+/// scheme's (`Scheme.arc`).
 pub fn arc(cx: anytype, ring: Rect, clip: Clip, look: ArcLook) void {
     assert(ring.width == ring.height);
     assert(look.thickness >= 0);
-    append(cx, draw.Arc, null, draw.Arc.of(ring, clip, look));
+    var resolved = look;
+    resolved.shape = look.shape orelse cx.theme().arc;
+    assert(resolved.shape != null);
+    append(cx, draw.Arc, null, draw.Arc.of(ring, clip, resolved));
 }
 
 /// `bytes` in `style`, placed in `rect` by `options` under `clip`. `bytes` points at app-owned
@@ -752,4 +756,64 @@ test "a chevron turns from right to down" {
     try std.testing.expectApproxEqAbs(@as(f32, 12), down[1][1], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 14), down[0][0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 8), down[0][1], 0.0001);
+}
+
+// Locks `arc` on a scheme's ring (the step 74 mirror test): under a dark copy on
+// `symmetric(pi / 3)` (start pi / 2 + pi / 6, sweep 2 pi - pi / 3) a plain arc over the 56
+// square, thickness 4, records start 2.0943952 and sweep 5.2359877; its field is its own
+// mirror about x = 28 at every integer point of the square (within 1e-3); both cap centres,
+// (15, 50.516660) and (41, 50.516660), are -2 (half the stroke inside); the gap's middle on the
+// mid radius, (28, 54), is 11.458590 outside (chord 2 * 26 * sin 15 - 2). A look's own
+// `shape = .{}` wins over the scheme's (`arc_start`, `arc_sweep`), and under plain `dark` a
+// plain arc records the default ring.
+test "kit.arc draws on the scheme's ring, a look's shape wins, and a symmetric ring is its own mirror" {
+    const size: f32 = 56;
+    const square: Rect = .{ .x = 0, .y = 0, .width = size, .height = size };
+    const clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+    const color: [4]f32 = .{ 1, 1, 1, 1 };
+    var mirrored = theme.dark;
+    mirrored.arc = theme.ArcShape.symmetric(std.math.pi / 3.0);
+    var cx = fixture.context();
+    cx.theme_setup(mirrored);
+    cx.begin_frame(1280, 720, 120);
+    arc(cx, square, clip, .{ .color = color, .thickness = 4 });
+    arc(cx, square, clip, .{ .color = color, .thickness = 4, .shape = .{} });
+    _ = cx.end_frame();
+    const arcs = cx.draw.items(draw.Arc);
+    try testing.expectEqual(@as(usize, 2), arcs.len);
+    const record = arcs[0];
+    try testing.expectApproxEqAbs(@as(f32, 2.0943952), record.start, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 5.2359877), record.sweep, 1e-6);
+    const field = struct {
+        fn at(x: f32, y: f32, start: f32, sweep: f32) f32 {
+            return draw.sdf_arc(x, y, 56, 56, 4, start, sweep);
+        }
+    }.at;
+    var y: u32 = 0;
+    while (y <= 56) : (y += 1) {
+        var x: u32 = 0;
+        while (x <= 56) : (x += 1) {
+            const fx: f32 = @floatFromInt(x);
+            const fy: f32 = @floatFromInt(y);
+            const left = field(fx, fy, record.start, record.sweep);
+            const right = field(size - fx, fy, record.start, record.sweep);
+            try testing.expectApproxEqAbs(left, right, 1e-3);
+        }
+    }
+    const start = record.start;
+    const sweep = record.sweep;
+    try testing.expectApproxEqAbs(@as(f32, -2), field(15, 50.516660, start, sweep), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -2), field(41, 50.516660, start, sweep), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 11.458590), field(28, 54, start, sweep), 1e-3);
+    try testing.expectEqual(theme.arc_start, arcs[1].start);
+    try testing.expectEqual(theme.arc_sweep, arcs[1].sweep);
+    cx = fixture.context();
+    cx.theme_setup(theme.dark);
+    cx.begin_frame(1280, 720, 120);
+    arc(cx, square, clip, .{ .color = color, .thickness = 4 });
+    _ = cx.end_frame();
+    const plain = cx.draw.items(draw.Arc);
+    try testing.expectEqual(@as(usize, 1), plain.len);
+    try testing.expectEqual(theme.arc_start, plain[0].start);
+    try testing.expectEqual(theme.arc_sweep, plain[0].sweep);
 }

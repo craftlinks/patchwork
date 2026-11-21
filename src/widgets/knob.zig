@@ -33,9 +33,9 @@
 //! ## 3. Drawing
 //! `KnobOf(Skin)` hands the skin a `KnobLook` and records the hit shape it returns
 //! (`widgets/skin.zig`); `Knob` is `KnobOf(skins.Default)`. The default look is a track arc
-//! over the whole sweep, the value arc over `value` of it in `accent` (omitted at 0,
-//! lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed `[8]u8`
-//! `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a value
+//! over the whole of the scheme's ring, the value arc over `value` of it in `accent` (omitted
+//! at 0, lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed
+//! `[8]u8` `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a value
 //! in its units, "-27.7db"), valid for the call.
 
 const std = @import("std");
@@ -394,6 +394,24 @@ test "a knob under the light theme draws in its colors" {
     for (cx.draw.items(quads.Glyph)) |glyph| {
         try testing.expectEqual(theme.light.colors.text, glyph.color);
     }
+}
+
+// Locks that a knob draws on its scheme's ring: at value 0.5 under a dark copy on
+// `symmetric(pi / 3)` it appends a track of sweep 5.2359877 and a value arc of exactly half of
+// it, both from 2.0943952.
+test "a knob draws on its scheme's ring" {
+    const cx = test_context();
+    var knob = Knob.init(ui.id("knob", 0), "k", 0.5, accents[1]);
+    var mirrored = theme.dark;
+    mirrored.arc = theme.ArcShape.symmetric(std.math.pi / 3.0);
+    cx.theme_setup(mirrored);
+    draw_one(cx, &knob, at(0, 0, 200, knob_height));
+    const arcs = cx.draw.items(quads.Arc);
+    try testing.expectEqual(@as(usize, 2), arcs.len);
+    try testing.expectApproxEqAbs(@as(f32, 5.2359877), arcs[0].sweep, 1e-6);
+    try testing.expectEqual(@as(f32, 0.5) * mirrored.arc.sweep, arcs[1].sweep);
+    try testing.expectApproxEqAbs(@as(f32, 2.0943952), arcs[0].start, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.0943952), arcs[1].start, 1e-6);
 }
 
 // Locks `draw_text`: the default skin draws the name and the text it is handed, so "gain" at

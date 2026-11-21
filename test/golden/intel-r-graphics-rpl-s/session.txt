@@ -11,7 +11,7 @@ bind-undo     382f9a8d6f748edf
 edit          d29f208d284ea63f
 keys          e453cff8f9793691
 knobs         c1b54f031c32bf59
-mix           2f84f748b0b5dba5
+mix           232d06be21feeb2d
 play          ce6a36091efdca8b
 rename        d70ac2039167067b
 reorder       10056e5266c030d8

@@ -149,14 +149,6 @@ pub fn vline(cx: anytype, x: f32, y0: f32, y1: f32, clip: Clip, color: [4]f32) v
     fill(cx, .{ .x = x, .y = @min(y0, y1), .width = 1, .height = @abs(y1 - y0) }, clip, color);
 }
 
-/// The point at `value` along the open ring of `ring`, `inset` inside its edge.
-pub fn arc_point(circle: Rect, value: f32, inset: f32) Point {
-    assert(value >= 0 and value <= 1);
-    const angle = theme.arc_start + value * theme.arc_sweep;
-    const radius = circle.width * 0.5 - inset;
-    return .{ circle.x + circle.width * 0.5 + radius * @cos(angle), circle.y + circle.height * 0.5 + radius * @sin(angle) };
-}
-
 // ---------------------------------------------------------------------------- skins
 
 pub const ring_thickness: f32 = 2;
@@ -194,7 +186,7 @@ fn ring(cx: anytype, look: widgets.KnobLook, from_start: bool) ?widgets.Shape {
         const value_arc: quads.ArcLook = .{ .color = with_alpha(accent, 0.85), .thickness = ring_thickness, .start = @min(origin, look.value), .sweep = sweep, .hover = hover };
         kit.arc(cx, ring_rect, look.clip, value_arc);
     }
-    dot(cx, arc_point(ring_rect, look.value, ring_thickness * 0.5), 3, look.clip, accent);
+    dot(cx, quads.arc_point(ring_rect, cx.theme().arc, look.value, ring_thickness * 0.5), 3, look.clip, accent);
     const name: Rect = .{ .x = ring_rect.x, .y = ring_rect.y + side * 0.16, .width = side, .height = side * 0.22 };
     kit.label(cx, style(.serif_italic, @max(9, side * 0.17), dim), look.name, name, look.clip, centered);
     const value: Rect = .{ .x = ring_rect.x, .y = ring_rect.y + side * 0.36, .width = side, .height = side * 0.34 };
@@ -226,15 +218,3 @@ pub const Pill = struct {
         return .{ .rect = pill, .radius = pill_w * 0.5 };
     }
 };
-
-// Locks the arc geometry the dots follow: value 0 sits at arc_start (lower left, 120 degrees
-// clockwise from +x) and value 1 a three-quarter turn later (lower right, 30 degrees).
-test "arc points follow the open ring" {
-    const ring_rect: Rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 };
-    const lo = arc_point(ring_rect, 0, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 50 - 25), lo[0], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 50 + 43.30127), lo[1], 1e-3);
-    const hi = arc_point(ring_rect, 1, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 50 + 43.30127), hi[0], 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 50 + 25), hi[1], 1e-3);
-}

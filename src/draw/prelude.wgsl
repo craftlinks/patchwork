@@ -47,7 +47,7 @@
 //
 // ## 5. Distance Fields
 // `sdf_box` and `sdf_arc` are twins of `draw.sdf_box` and `draw.sdf_arc`, whose CPU tests lock
-// the math; arc angles come from `frame.theme.arc` (see `theme.zig`).
+// the math; arc angles come from the instance (`draw.Arc`, filled by `Arc.of`).
 //
 // ## 6. Time
 // `frame.time.x` is the animation time in seconds, wrapped at one hour (`animator.Time`). Only
@@ -152,24 +152,22 @@ fn wrap_tau(angle: f32) -> f32 {
     return value;
 }
 
-// Open ring inscribed in `size`, swept clockwise by `sweep_fraction * frame.theme.arc.y` from
-// `start_fraction` of that sweep past `frame.theme.arc.x`, with round caps at both ends.
+// Open ring inscribed in `size`, swept clockwise by `sweep` radians from `start` radians (in
+// [-pi, pi], so `wrap_tau` needs one turn at most), with round caps at both ends.
 fn sdf_arc(
     p_local: vec2<f32>,
     size: vec2<f32>,
     thickness: f32,
-    start_fraction: f32,
-    sweep_fraction: f32,
+    start: f32,
+    sweep: f32,
 ) -> f32 {
     let center = size * 0.5;
     let p = p_local - center;
     let mid = min(center.x, center.y) - thickness * 0.5;
-    let sweep = sweep_fraction * frame.theme.arc.y;
-    let origin = frame.theme.arc.x + start_fraction * frame.theme.arc.y;
-    let rel = wrap_tau(atan2(p.y, p.x) - origin);
+    let rel = wrap_tau(atan2(p.y, p.x) - start);
     // The nearer end: the gap's half next to the start measures against the start cap.
     let gap_middle = sweep + 0.5 * (6.283185307179586 - sweep);
     let ang = select(min(rel, sweep), 0.0, rel > gap_middle);
-    let dir = vec2<f32>(cos(origin + ang), sin(origin + ang));
+    let dir = vec2<f32>(cos(start + ang), sin(start + ang));
     return length(p - dir * mid) - thickness * 0.5;
 }

@@ -239,9 +239,9 @@ test "demo layout at 1280 by 720" {
     try expect_rect(area_rect(app.knobs[0].id), 960, 40, 56, 56);
     const arcs = cx.draw.items(quads.Arc);
     try expect_rect(rect_of(arcs[0].rect), 960, 40, 56, 56);
-    try std.testing.expectEqual(@as(f32, 1), arcs[0].sweep);
+    try std.testing.expectEqual(theme.arc_sweep, arcs[0].sweep);
     try expect_rect(rect_of(arcs[1].rect), 960, 40, 56, 56);
-    try std.testing.expectEqual(@as(f32, 0.25), arcs[1].sweep);
+    try std.testing.expectEqual(@as(f32, 0.25) * theme.arc_sweep, arcs[1].sweep);
     try std.testing.expect(!cx.dirty);
 }
 
