@@ -3,21 +3,28 @@
 
 Usage: python3 -I tools/browser_check.py <app> <scenario> [--keep] [--port N] [--cdp N] [--reuse]
        [--root DIR] [--headless]
+       python3 -I tools/browser_check.py --self-test
 
 `--root DIR` names the tree that holds the app: its `zig-out/bin/<app>`, its golden files, and its
-`serve-<app>` step, for an app in a package of its own (Weft's Play, or `examples/sound` for the
+serve step (item 2), for an app in a package of its own (Weft's Play, or `examples/sound` for the
 audio and rack examples). The default is this
 repository, so every other use is unchanged. Every path and step below is under that root.
+`--self-test` runs the serve step's selection on the worked listings in `SERVE_STEP_CASES` and
+exits 0 when each picks what it should, 1 naming the first that does not; it needs no build, no
+GPU, and no Chromium.
 
 1. Renders the scenario headless on the high adapter with `zig-out/bin/<app> --regress --only
    <scenario> --adapter high --keep`, which leaves the reference frame in
    `zig-out/regress/<app>/<scenario>-high-on.png` (build the examples first with
    `zig build -Doptimize=ReleaseFast`).
-2. Starts its own `zig build serve-<app>`, which builds the wasm from
-   this tree, on a free port (or `--port`) through `PATCHWORK_SERVE_PORT` (src/serve.zig), and
+2. Picks the app's serve step from `zig build -l` in the root: `serve-<app>` when the build lists
+   it, else `serve`, else it stops naming both (exit status 2). An app in a package of its own
+   may name its serve step either way. Starts its own `zig build <step>`, which builds the wasm
+   from this tree, on a free port (or `--port`) through `PATCHWORK_SERVE_PORT` (src/serve.zig), and
    waits for it. It never uses a server it did not start, since one already on a port may serve
    another tree's or an older build (another session in this repository runs its own), unless
-   `--reuse` says to use the one on `--port` (default 8080) as it is.
+   `--reuse` says to use the one on `--port` (default 8080) as it is. With `--reuse` nothing is
+   listed (it starts no server).
 3. Starts system Chromium with WebGPU and remote debugging on a free port (or `--cdp`), sets
    the viewport to the app's regress size at scale 1 (the `WxH` of the headless run's first
    line, `regress <app>  WxH@1.00`; 1280 x 720 unless the app declares `regress_size`), loads
@@ -92,6 +99,11 @@ HEADLESS_FLAGS = (
 )
 # The windowed run: a Wayland window the compositor shows.
 WINDOW_FLAGS = ("--ozone-platform=wayland",)
+# `zig build -l` in the root: how long its configure may take, and the most it may print.
+# Patchwork's own lists 71 steps in 5538 bytes; a listing past either bound is refused.
+LIST_TIMEOUT_S = 120
+LISTING_BYTES_MAX = 64 * 1024
+LISTING_LINES_MAX = 1024
 
 
 class Cdp:
@@ -397,6 +409,130 @@ def regress_size(first_line):
     return int(match.group(1)), int(match.group(2))
 
 
+def listed_steps(listing):
+    """The step names in `zig build -l`'s stdout: each step line is two spaces, the name
+    (`install` is printed `install (default)`), padding, and the description, so the name is the
+    line's first field. None past `LISTING_BYTES_MAX` or `LISTING_LINES_MAX`."""
+    if len(listing) > LISTING_BYTES_MAX:
+        return None
+    lines = listing.splitlines()
+    if len(lines) > LISTING_LINES_MAX:
+        return None
+    names = []
+    for line in lines:
+        if not line.startswith("  "):
+            continue
+        fields = line.split()
+        if fields:
+            names.append(fields[0])
+    assert len(names) <= len(lines)
+    return names
+
+
+def serve_step(app, listing):
+    """The serve step `zig build -l`'s stdout offers for `app`: `serve-<app>`, else `serve`.
+    Returns `(step, None)`, or `(None, why)` naming both when neither is listed."""
+    assert app
+    names = listed_steps(listing)
+    if names is None:
+        return None, (
+            f"zig build -l printed more than {LISTING_BYTES_MAX} bytes or "
+            f"{LISTING_LINES_MAX} lines"
+        )
+    for step in (f"serve-{app}", "serve"):
+        if step in names:
+            return step, None
+    return None, f"neither serve-{app} nor serve is a step (zig build -l lists {len(names)})"
+
+
+def serve_step_in(root, app):
+    """Runs `zig build -l` in `root` and picks `app`'s serve step from it (`serve_step`)."""
+    try:
+        listed = subprocess.run(
+            [os.environ.get("ZIG", "zig"), "build", "-l"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=LIST_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"zig build -l took over {LIST_TIMEOUT_S} s"
+    if listed.returncode != 0:
+        # A compile error ends in its source line and caret, so the `error:` line is the one
+        # that says what failed; any other failure is named by its last line.
+        lines = listed.stderr.strip().splitlines()
+        errors = [line for line in lines if "error:" in line]
+        named = errors[0] if errors else (lines[-1] if lines else "no output")
+        return None, f"zig build -l failed: {named.strip()}"
+    return serve_step(app, listed.stdout)
+
+
+def listing_row(name, description):
+    """One line of `zig build -l`, as Zig 0.17 prints it (`Maker/ScannedConfig.zig`)."""
+    return f"  {name:<28} {description}\n"
+
+
+LISTING_HEAD = listing_row("install (default)", "Copy build artifacts to prefix path") + (
+    listing_row("uninstall", "Remove build artifacts from prefix path")
+)
+# (app, listing, the step it must pick or None). Locks: serve-<app> wins over serve; serve is
+# the fallback; a name is matched whole, never by prefix or in a description; past the bound
+# nothing is picked.
+SERVE_STEP_CASES = (
+    # Both listed (Treadle as it is, Tapestry): serve-<app>.
+    (
+        "treadle",
+        LISTING_HEAD
+        + listing_row("serve", "Serve on localhost")
+        + listing_row("serve-treadle", "Serve (alias)"),
+        "serve-treadle",
+    ),
+    # Only serve-<app> (Weft play, Patchwork's examples).
+    ("play", LISTING_HEAD + listing_row("serve-play", "Serve on localhost"), "serve-play"),
+    # Only serve (Treadle without its alias, test/consumer).
+    ("treadle", LISTING_HEAD + listing_row("serve", "Serve on localhost"), "serve"),
+    # Neither.
+    ("treadle", LISTING_HEAD + listing_row("run", "Run natively"), None),
+    # A longer name with the app's as a prefix is not the app's.
+    ("rack", LISTING_HEAD + listing_row("serve-rackety", "Serve another"), None),
+    # serve-<app> listed after serve still wins (examples/sound's order is serve, serve-rack).
+    (
+        "rack",
+        LISTING_HEAD
+        + listing_row("serve", "Serve the rack")
+        + listing_row("serve-rack", "The same as serve"),
+        "serve-rack",
+    ),
+    # The app's step name only in a description is not a step.
+    ("x", LISTING_HEAD + listing_row("run", "not serve-x"), None),
+    # A name past the 28-column padding is still one field.
+    (
+        "tapestry-player",
+        LISTING_HEAD
+        + listing_row("serve-tapestry-player-and-then-some", "x")
+        + listing_row("serve", "Serve"),
+        "serve",
+    ),
+    # An empty listing.
+    ("x", "", None),
+    # Past LISTING_LINES_MAX: refused, even though serve is listed.
+    ("x", "  serve\n" * (LISTING_LINES_MAX + 1), None),
+)
+
+
+def self_test():
+    """`--self-test`: every case in `SERVE_STEP_CASES` picks its step. 0 on a pass, 1 naming
+    the first case that does not."""
+    for index, (app, listing, want) in enumerate(SERVE_STEP_CASES):
+        got, why = serve_step(app, listing)
+        assert (got is None) == (why is not None)
+        if got != want:
+            print(f"browser_check: serve step case {index} ({app}): picked {got}, want {want}")
+            return 1
+    print(f"browser_check: serve step: {len(SERVE_STEP_CASES)} cases pass")
+    return 0
+
+
 def first_frame(cdp, seconds):
     """Whether the page runs one animation frame within `seconds`. The limit is kept here, not
     by a page timer, since a page that gets no frame may get its timers late too."""
@@ -427,6 +563,8 @@ def exit_on_signal(signum, _frame):
 
 
 def main(argv):
+    if "--self-test" in argv:
+        return self_test()
     args = [a for a in argv if not a.startswith("--")]
     keep = "--keep" in argv
     reuse = "--reuse" in argv
@@ -498,7 +636,10 @@ def main(argv):
             if port_open(port):
                 print(f"browser_check: :{port} is taken; pass another --port, or --reuse")
                 return 2
-            step = f"serve-{app}"
+            step, why = serve_step_in(root, app)
+            if step is None:
+                print(f"browser_check: {root}: {why}")
+                return 2
             print(f"server: zig build {step} on :{port}")
             server = subprocess.Popen(
                 [os.environ.get("ZIG", "zig"), "build", step],

@@ -20,7 +20,11 @@
 //!         },
 //!     };
 //!     pub fn init(app: *App, textures: *patchwork.draw.Textures) void
-//!     pub fn event(app: *App, cx: *patchwork.app.Context(App), event: patchwork.input.Event) void
+//!     pub fn event(
+//!         app: *App,
+//!         cx: *patchwork.app.Context(App),
+//!         event_value: patchwork.input.Event,
+//!     ) void
 //!     pub fn timer(app: *App, cx: *patchwork.app.Context(App), now_ms: u64) void
 //!     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 //! };
@@ -69,6 +73,23 @@
 //! the type; see `draw/registry.zig`), a zero cap, a `batch_cap` whose worst frame would not
 //! fit one command buffer, an `area_cap` outside `1 .. area_cap_max`, and a
 //! `point_cap` outside `1 .. point_cap_max`.
+//!
+//! ## 2b. Names Beside the Library's
+//! The contract's `draw`, and every widget's, share a name with the `patchwork.draw` module.
+//! Zig gives a name one meaning per scope, so a file with a `draw` method imports the module
+//! under another name, as the examples do:
+//!
+//! ```text
+//! const quads = patchwork.draw; // not `draw`: this file's App has a `draw` method
+//! ```
+//!
+//! Named `draw`, any `draw.Rect` inside a struct that declares `fn draw` fails with
+//! `error: ambiguous reference`, reached or not (it is an AstGen error), and a file that is
+//! itself the struct fails with `duplicate struct member name 'draw'`. A struct field named
+//! `draw` is fine. The same holds for `input` and `text`: `ui.Edit` has a `text` method, and a
+//! parameter or local named like an import fails with `function parameter shadows declaration
+//! of 'text'` or `local constant shadows declaration of 'input'`. The contract's `event` takes
+//! the event as `event_value` for the same reason: a parameter named `event` shadows the method.
 //!
 //! ## 3. Host Order Per Wake
 //! Drain queued events through `ui.dispatch`. When a frame callback completes, call
