@@ -44,7 +44,12 @@
 //! returns under `id.derive(divider_salt)`; `Splitter` is `SplitterOf(skins.Default)`, a thin
 //! `colors.control` line down the divider's middle, lightened by hover.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `SplitterOf(S).appends` is what one splitter appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `divider_appends` and the divider's area. The panes'
+//! content is the app's.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation; every function is O(1). `ratio` stays in `[0, 1]`.
 
 const std = @import("std");
@@ -55,6 +60,7 @@ const ui = @import("../ui.zig");
 const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -179,6 +185,14 @@ pub fn SplitterOf(comptime Skin: type) type {
             moved: f32,
             /// A double click restored `default`.
             reset: f32,
+        };
+
+        /// What one splitter appends to a frame at most (section 5).
+        pub const appends: Appends = blk: {
+            const out = Skin.divider_appends.with(0).plus(.{ .areas = 1 });
+            assert(out.areas == 1);
+            assert(out.points == Skin.divider_appends.fixed.points);
+            break :blk out;
         };
 
         /// A splitter at `ratio` (also its default) with minimum pane lengths.
@@ -479,4 +493,22 @@ test "splitters nest in a pane and route" {
     cx.event_end();
     try testing.expectEqual(@as(f32, 0.5), pair.inner.ratio);
     try testing.expectEqual(@as(f32, 0.5), pair.outer.ratio);
+}
+
+// Locks `Splitter.appends` (section 5) with the default skin: begin, next, and end over a
+// 600 by 300 rect with empty panes draw Box 1 (the divider's line) and one area, the
+// divider's, with no overflow.
+test "Splitter appends at most appends and reaches it" {
+    const cx = fixture.context();
+    var splitter = Splitter.init(ui.id("split", 0), .horizontal, 0.5, 50, 50);
+    splitter.hover.value = 1;
+    var tally: fixture.Tally(Splitter.appends) = .{};
+    cx.begin_frame(1280, 720, 120);
+    _ = splitter.begin(cx, fixture.at(0, 0, 600, 300));
+    _ = splitter.next(cx);
+    splitter.end(cx);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    try tally.expect_reached();
+    try testing.expect(cx.find(splitter.divider_id()) != null);
 }

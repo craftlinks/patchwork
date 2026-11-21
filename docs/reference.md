@@ -36,7 +36,7 @@ pub const App = struct {
 
 | Declaration | Signature | Description |
 |---|---|---|
-| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `batch_order` (see Draw order), `area_cap`, `point_cap`, `theme` (see Theme). |
+| `config` | `Config` | `title`, `timer_period_ms`, `timer_armed`, `draw` (types and capacities), `batch_cap`, `batch_order` (see Draw order), `area_cap`, `point_cap`, `theme` (see Theme). The capacities can come from what the widgets say they append (`widgets.Appends`; see Make a Skin, "A widget's counts"). |
 | `init` | `fn (*App, *draw.Textures) void` | Called once before any other call; may create textures. |
 | `event` | `fn (*App, *Context(App), Event) void` | Routes pointer, wheel, key, paste, window focus, file drop, and `frame` events to the app's widgets. |
 | `timer` | `fn (*App, *Context(App), u64) void` | Called on host timer expiration while the timer runs. |
@@ -983,6 +983,24 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   "hardware.Skin: missing `pub const knob_appends: widgets.SkinAppends`", and a type named
   twice, a type that is not a draw type, or areas are refused by name. `with(bytes)` gives one
   call's `widgets.Appends`; `plus`, `times`, `max`, and `of(T)` combine and read them.
+- **A widget's counts.** `KnobOf(S).appends`, and the same on `ToggleOf`, `CheckboxOf`,
+  `SliderOf`, `PanelOf`, `SplitterOf`, `DisclosureOf`, `TooltipOf`, and `NumberBoxOf`, is
+  what one instance appends to a frame at most with skin `S`: the skin's declarations with the
+  text at the library's maximum (`name_max`, `checkbox_label_max`, ...), plus the areas the
+  widget records. Where the app holds the text, the widget takes its length:
+  `ButtonOf(S).appends_for(label_bytes)`, `MeterOf(S).appends_for(name_bytes)`,
+  `TextFieldOf(S).appends_for(.{ .limit, .hint, .icon })` (a `widgets.FieldText`), and
+  `KnobOf(S).appends_for(value_bytes)` for `draw_text`. An app sums its widgets and its own
+  instances and reads the caps:
+
+  ```zig
+  const need = widgets.Knob.appends.times(8).plus(widgets.Toggle.appends.times(2));
+  // .draw = &.{ .{ .type = draw.Arc, .cap = need.of(draw.Arc) }, ... },
+  // .area_cap = need.areas,
+  ```
+
+  Menus, lists, tabs, and the other containers grow with their items and publish no counts
+  yet.
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
   A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
@@ -1307,6 +1325,9 @@ demonstrates:
   `ui.view.thumb_min_px`, and hidden when nothing can scroll. Thumb drag maps absolute
   pointer travel onto the scroll range. A wheel elsewhere in the viewport scrolls; a wheel on
   a knob ring turns the knob.
+
+- **Derived capacities.** Its `config.draw` caps and `area_cap` are the sum of the widgets'
+  `appends` (eight knobs, the meter, two toggles, the panel) and the view's thumb and areas.
 
 The docked panel's coordinates at specific window sizes are locked by the layout tests in
 `examples/column/app.zig`.

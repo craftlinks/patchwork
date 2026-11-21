@@ -76,6 +76,17 @@
 //! Every append goes through `kit.append`, which skips an instance whose pool or batch list is
 //! full; the context counts the drop in `overflow_count`, and app tests assert it is zero.
 //!
+//! An app sizes its pools from what its widgets say they append (`widgets/appends.zig`).
+//! `Knob`, `Toggle`, `Checkbox`, `Slider`, `Panel`, `Splitter`, `Disclosure`, `Tooltip`, and
+//! `NumberBox` (each `...Of(Skin)`) publish `appends`: one instance at most, for its skin, with
+//! its text at the library's stated maximum. Where the app holds the text and the library
+//! states no maximum, the widget publishes `appends_for` instead: `Button.appends_for(label
+//! bytes)`, `Meter.appends_for(name bytes)`, `TextField.appends_for(FieldText)`, and
+//! `Knob.appends_for(value bytes)` for `draw_text`. An app sums them (`plus`, `times`) with
+//! its own instances and reads `.of(T)` into each `config.draw` cap, `.areas` into `area_cap`,
+//! and `.points` into `point_cap`. The menus, lists, tabs, and other containers grow with
+//! their items and publish nothing yet.
+//!
 //! ## 5. Theme and Text Styles
 //! Widgets read their colors, text styles, and hover and press weights from the app's scheme
 //! at draw time (`cx.theme()`, `theme.zig`): control names in `scheme.name` and knob values in
@@ -263,6 +274,7 @@ pub const checkbox_label_max = checkbox.checkbox_label_max;
 
 pub const TextField = text_field.TextField;
 pub const TextFieldOf = text_field.TextFieldOf;
+pub const FieldText = text_field.FieldText;
 pub const field_flags = text_field.field_flags;
 pub const field_padding_x = text_field.field_padding_x;
 pub const field_radius = text_field.field_radius;

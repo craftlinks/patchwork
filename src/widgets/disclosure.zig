@@ -23,6 +23,12 @@
 //! The header is focusable, so a press focuses it and Tab visits it. A flip returns `toggled`
 //! with the new `open` and aims `turn`, which eases the chevron from pointing right (0, closed)
 //! to down (1, open) on `.frame`; the section itself appears or goes at once.
+//!
+//! ## 3. Counts
+//! `DisclosureOf(S).appends` is what one header appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `disclosure_appends` with a `disclosure_label_max`
+//! label, plus its area. The section is the app's. The bound holds while `label` stays within
+//! the maximum, which `init` and `begin` assert.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,6 +37,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -73,6 +80,14 @@ pub fn DisclosureOf(comptime Skin: type) type {
             toggled: bool,
         };
 
+        /// What one header appends to a frame at most (section 3).
+        pub const appends: Appends = blk: {
+            const out = Skin.disclosure_appends.with(disclosure_label_max).plus(.{ .areas = 1 });
+            assert(out.areas == 1);
+            assert(out.points == Skin.disclosure_appends.fixed.points);
+            break :blk out;
+        };
+
         /// A disclosure at rest, open or closed.
         pub fn init(id: Id, label: []const u8, open: bool) Self {
             assert(id != .none);
@@ -93,6 +108,8 @@ pub fn DisclosureOf(comptime Skin: type) type {
         pub fn begin(self: *const Self, cx: anytype, walk: Walk, layout: ui.Layout) bool {
             assert(self.turn.value >= 0 and self.turn.value <= 1);
             assert(layout.flow == .down);
+            // `label` is public; `appends` is a bound only while it fits.
+            assert(self.label.len <= disclosure_label_max);
             _ = cx.begin(walk, layout);
             const header = cx.walk(ui.sized(.fill, .{ .fixed = disclosure_h }));
             const clip = cx.visible(header) orelse return self.open;
@@ -206,4 +223,46 @@ test "a disclosure flips on a click, Space, and Enter" {
     const again = fixture.send(cx, &disclosure, key(.enter, ""));
     try testing.expectEqual(Disclosure.Action{ .toggled = true }, again);
     try testing.expectEqual(Disclosure.Action.none, fixture.send(cx, &disclosure, key(.a, "a")));
+}
+
+const draw = @import("../draw.zig");
+
+comptime {
+    // The default skin's header (section 3): its face, the chevron's path of 3 points or its
+    // glyph, a 64-byte label, an area.
+    assert(Disclosure.appends.of(draw.Box) == 1);
+    assert(Disclosure.appends.of(draw.Path) == 1);
+    assert(Disclosure.appends.points == 3);
+    assert(Disclosure.appends.of(draw.Glyph) == 65);
+    assert(Disclosure.appends.areas == 1);
+}
+
+/// 64 inked bytes, `disclosure_label_max`.
+const label_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+
+/// One frame of `disclosure`'s header, 1200 px wide, on `cx`.
+fn header_frame(cx: anytype, disclosure: *const Disclosure) void {
+    cx.begin_frame(1280, 720, 120);
+    _ = disclosure.begin(cx, ui.sized(.{ .fixed = 1200 }, .fit), .{ .flow = .down });
+    disclosure.end(cx);
+    _ = cx.end_frame();
+}
+
+// Locks `Disclosure.appends` (section 3) with the default skin: a 64-byte label in a 1200 px
+// header draws Box 1, Path 1 (3 points), and Glyph 64 with `draw.Path`, and Box 1 and Glyph 65
+// (the chevron's glyph) without it, one area each time and no overflow.
+test "Disclosure appends at most appends and reaches it" {
+    comptime assert(label_64.len == disclosure_label_max);
+    var disclosure = Disclosure.init(ui.id("group", 0), label_64, true);
+    disclosure.hover.value = 1;
+    var tally: fixture.Tally(Disclosure.appends) = .{};
+    const cx = fixture.context();
+    header_frame(cx, &disclosure);
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 64), cx.draw.items(draw.Glyph).len);
+    const bare = fixture.bare_context();
+    header_frame(bare, &disclosure);
+    try tally.observe(bare);
+    try testing.expectEqual(@as(usize, 65), bare.draw.items(draw.Glyph).len);
+    try tally.expect_reached();
 }

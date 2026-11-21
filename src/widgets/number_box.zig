@@ -38,7 +38,13 @@
 //! draws in its place instead. `NumberBox` is `NumberBoxOf(skins.Default)`: a field-like face,
 //! the value right-aligned in the mono value style, and the unit dimmer.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `NumberBoxOf(S).appends` is what one number box appends to a frame at most
+//! (`widgets/appends.zig`): the larger of its face (the skin's `number_face_appends` with
+//! `number_text_cap` bytes of value and unit, and its area) and its editor (a
+//! `TextFieldOf(S)` of limit `number_text_cap`), since a frame draws one or the other.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation; `format` and `parse` loop at most `number_text_cap` times.
 
 const std = @import("std");
@@ -51,6 +57,7 @@ const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const text_field = @import("text_field.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Walk = kit.Walk;
 const Id = kit.Id;
@@ -242,6 +249,16 @@ pub fn NumberBoxOf(comptime Skin: type) type {
             changed: f64,
             /// A typed value was entered.
             committed: f64,
+        };
+
+        /// What one number box appends to a frame at most (section 5).
+        pub const appends: Appends = blk: {
+            const face = Skin.number_face_appends.with(number_text_cap).plus(.{ .areas = 1 });
+            const editor = Field.appends_for(.{ .limit = number_text_cap });
+            const out = face.max(editor);
+            assert(out.areas == 1);
+            assert(out.points == @max(face.points, editor.points));
+            break :blk out;
         };
 
         /// A box at `value` (also its default) in `[min, max]`.
@@ -588,4 +605,35 @@ test "a number box edits on a double click and commits on Enter" {
     _ = fixture.send(cx, gain, typed(.d9, "9"));
     const clamped: NumberBox.Action = .{ .committed = 12 };
     try testing.expectEqual(clamped, fixture.send(cx, gain, typed(.enter, "")));
+}
+
+comptime {
+    // The default skin's number box (section 5): the editor's face, band, and caret; 24 bytes
+    // of value and unit; an area.
+    assert(NumberBox.appends.of(draw.Box) == 3);
+    assert(NumberBox.appends.of(draw.Glyph) == 24);
+    assert(NumberBox.appends.areas == 1);
+    assert(NumberBox.appends.points == 0);
+}
+
+// Locks `NumberBox.appends` (section 5) with the default skin: the widest value,
+// -99999999 at 6 decimals, with the 8-byte unit "abcdefgh" in a 600 px box draws its face,
+// Box 1 and Glyph 24, and one area; editing, with "-99999999.000000" all selected, Box 3
+// (face, band, caret), Glyph 16, and the field's area; no overflow.
+test "NumberBox appends at most appends and reaches it" {
+    const cx = fixture.context();
+    const shown: Format = .{ .decimals = decimals_max, .unit = "abcdefgh" };
+    var number = NumberBox.init(ui.id("wide", 0), -number_abs_max, -number_abs_max, 0, 0, shown);
+    var tally: fixture.Tally(NumberBox.appends) = .{};
+    const walk = fixture.at(0, 0, 600, 32);
+    fixture.draw_one(cx, &number, walk);
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 24), cx.draw.items(draw.Glyph).len);
+    double_click(cx, &number, 0);
+    try testing.expect(number.editing);
+    try testing.expectEqualStrings("-99999999.000000", number.field.bytes());
+    fixture.draw_one(cx, &number, walk);
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 3), cx.draw.items(draw.Box).len);
+    try tally.expect_reached();
 }
