@@ -34,6 +34,15 @@
 //! walks each title as wide as its label in the name style plus `menubar_pad_x` on both sides
 //! and as high as the row, hands the skin a `MenuTitleLook`, and records the shape. The open
 //! menu draws in `draw_overlay` (`ui.overlays` calls it).
+//!
+//! ## 4. Counts
+//! `MenuBarOf(S).face_appends_for(MenuBarText)` is what the titles append to a frame at most
+//! (`widgets/appends.zig`): one `menu_title` call per title with a label of up to `title_max`
+//! bytes, and an area each. `appends_for` adds the open menu, at most one, counted as the
+//! largest: the most items and the longest label of any menu (`MenuBarText.of` takes both from
+//! the arrays `init` takes). The open menu is a popup and a frame draws one, so an app with
+//! several popup owners sums their faces and takes the `max` of their popups (`widgets.zig`,
+//! section 4).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -43,6 +52,8 @@ const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const menu_file = @import("menu.zig");
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -64,6 +75,38 @@ pub const menubar_title_flags: ui.Flags = .{
     .tab = false,
     .cursor = .default,
     .primary_only = true,
+};
+
+/// What a menu bar holds at most, for `appends_for` (section 4): its titles, the longest
+/// title's bytes, and its largest menu (the most items, the longest label of any menu).
+pub const MenuBarText = struct {
+    titles: u32,
+    title_max: u32,
+    menu: menu_file.MenuText,
+
+    /// The shape of `titles` and their menus `items`, as `init` takes them.
+    pub fn of(
+        comptime titles: []const []const u8,
+        comptime items: []const []const []const u8,
+    ) MenuBarText {
+        comptime {
+            assert(titles.len >= 1);
+            assert(titles.len <= menubar_menus_max);
+            assert(titles.len == items.len);
+            var largest: menu_file.MenuText = .{ .items = 0, .label_max = 0 };
+            for (items) |listed| {
+                largest.items = @max(largest.items, @as(u32, @intCast(listed.len)));
+                largest.label_max = @max(largest.label_max, appends.label_max_of(listed));
+            }
+            const out: MenuBarText = .{
+                .titles = titles.len,
+                .title_max = appends.label_max_of(titles),
+                .menu = largest,
+            };
+            assert(out.menu.items >= 1);
+            return out;
+        }
+    }
 };
 
 /// The default bar: `MenuBarOf(skins.Default)`.
@@ -100,6 +143,31 @@ pub fn MenuBarOf(comptime Skin: type) type {
             /// The open menu closed without a choice.
             closed,
         };
+
+        /// The titles alone (section 4): a `menu_title` per title and its area.
+        pub fn face_appends_for(comptime bar_text: MenuBarText) Appends {
+            comptime {
+                assert(bar_text.titles >= 1);
+                assert(bar_text.titles <= menubar_menus_max);
+                assert(bar_text.title_max <= text.byte_cap);
+                const titles = Skin.menu_title_appends.with(bar_text.title_max)
+                    .times(bar_text.titles);
+                const out = titles.plus(.{ .areas = bar_text.titles });
+                assert(out.areas == bar_text.titles);
+                return out;
+            }
+        }
+
+        /// The titles and the open menu, one popup (section 4).
+        pub fn appends_for(comptime bar_text: MenuBarText) Appends {
+            comptime {
+                const open = Menu.appends_for(bar_text.menu);
+                const out = face_appends_for(bar_text).plus(open);
+                assert(out.areas == bar_text.titles + open.areas);
+                assert(out.points >= open.points);
+                return out;
+            }
+        }
 
         /// A bar of `titles`, title `i` opening a menu of `items[i]`, all closed.
         pub fn init(id: Id, titles: []const []const u8, items: []const []const []const u8) Self {
@@ -302,9 +370,23 @@ pub fn MenuBarOf(comptime Skin: type) type {
     };
 }
 
+const quads = @import("../draw.zig");
+
 comptime {
     assert(menubar_menus_max <= 32);
     assert(menubar_menu_salt > menubar_menus_max);
+    // The default skin's bar of 3 titles of up to 4 bytes and menus of up to 3 items of 5
+    // (section 4): titles 3 x (Box 1, Glyph 4), areas 3; the menu Box 4, Glass 1, Glyph 15,
+    // areas 4.
+    const bar = MenuBar.appends_for(.{
+        .titles = 3,
+        .title_max = 4,
+        .menu = .{ .items = 3, .label_max = 5 },
+    });
+    assert(bar.of(quads.Box) == 7);
+    assert(bar.of(quads.Glass) == 1);
+    assert(bar.of(quads.Glyph) == 27);
+    assert(bar.areas == 7);
 }
 
 const testing = std.testing;
@@ -404,4 +486,77 @@ test "a menu bar chooses, closes on its title, and dismisses" {
     const away: input.Point = .{ .x = 600, .y = 400 };
     const dismissed = fixture.send(cx, &bar, .{ .pointer_down = input.left_at(away) });
     try testing.expectEqual(MenuBar.Action.closed, dismissed);
+}
+
+const wide_titles = [_][]const u8{ "WWWW", "WWWW", "WWWW" };
+const wide_menu = [_][]const u8{ "WWWWW", "WWWWW", "WWWWW" };
+const wide_items = [_][]const []const u8{ &wide_menu, &wide_menu, &wide_menu };
+
+/// Draws `bar` fit x 40 at (0, 0) and its open menu, and observes the frame.
+fn wide_frame(cx: anytype, bar: anytype, tally: anytype) !void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    bar.draw(cx, .{ .width = .fit, .height = .{ .fixed = 40 } });
+    bar.draw_overlay(cx);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+}
+
+/// Draws a frame, opens menu 0 by a press on its title, and draws and observes the next.
+fn wide_open(cx: anytype, bar: anytype, tally: anytype) !void {
+    try wide_frame(cx, bar, tally);
+    const rect = cx.find(bar.title_id(0)).?.rect;
+    const at: input.Point = .{ .x = rect[0] + rect[2] * 0.5, .y = rect[1] + rect[3] * 0.5 };
+    _ = fixture.send(cx, bar, .{ .pointer_down = input.left_at(at) });
+    _ = fixture.send(cx, bar, .{ .pointer_up = input.left_at(at) });
+    try wide_frame(cx, bar, tally);
+    assert(bar.open.? == 0);
+}
+
+// Locks `MenuBarText.of` (section 4): the test arrays are 3 titles of up to 4 bytes and menus
+// of up to 3 items of 5; File, Edit, View over their menus are 3, 4, and {3, 5} ("Light").
+test "MenuBarText.of takes the titles and the largest menu" {
+    const wide = comptime MenuBarText.of(&wide_titles, &wide_items);
+    try testing.expectEqual(MenuBarText{
+        .titles = 3,
+        .title_max = 4,
+        .menu = .{ .items = 3, .label_max = 5 },
+    }, wide);
+    const sample = comptime MenuBarText.of(&test_titles, &test_items);
+    try testing.expectEqual(MenuBarText{
+        .titles = 3,
+        .title_max = 4,
+        .menu = .{ .items = 3, .label_max = 5 },
+    }, sample);
+}
+
+// Locks the composition of `MenuBarOf(S).appends_for` (section 4) with `fixture.Counted`
+// (title Box 4, menu face 2, row 3): 3 x "WWWW" titles, menu 0 of 3 x "WWWWW" open, draw Box 12
+// + 2 + 9 = 23, Glyph 12 + 15 = 27, and areas 7 (3 titles, the backdrop, 3 rows), reached.
+test "MenuBar appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Counted = MenuBarOf(fixture.Counted);
+    var bar = Counted.init(ui.id("bar", 0), &wide_titles, &wide_items);
+    var tally: fixture.Tally(Counted.appends_for(MenuBarText.of(&wide_titles, &wide_items))) = .{};
+    try wide_open(cx, &bar, &tally);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 23), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 27), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
+}
+
+// Locks `MenuBar.appends_for` (section 4) with the default skin, menu 0 open with item 0
+// highlighted and title 1 hovered: at most Box 7, Glass 1, Glyph 27, areas 7, and it draws Box
+// 4 (two title bands, the menu's face, the highlight), Glyph 27, and areas 7.
+test "MenuBar appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var bar = MenuBar.init(ui.id("bar", 0), &wide_titles, &wide_items);
+    var tally: fixture.Tally(MenuBar.appends_for(MenuBarText.of(&wide_titles, &wide_items))) = .{};
+    try wide_open(cx, &bar, &tally);
+    bar.hovered = 1;
+    bar.menus[0].highlight = 0;
+    try wide_frame(cx, &bar, &tally);
+    try testing.expectEqual(@as(usize, 4), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 27), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
 }

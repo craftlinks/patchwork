@@ -15,11 +15,19 @@
 //! the turtle's rule stands and a fit parent sees the real extent. Any other height is walked
 //! as given, with the lines from the top, clipped. The width may not be `fit`: there is nothing
 //! to wrap to.
+//!
+//! ## 3. Counts
+//! `Paragraph.appends_for(bytes)` is what one paragraph of up to `bytes` bytes appends to a
+//! frame at most (`widgets/appends.zig`): a glyph a byte, and no area. Wrapping places each
+//! codepoint at most once and adds no glyph of its own (no ellipsis, no hyphen), and a line
+//! outside the clip places none.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const text = @import("../text.zig");
 const kit = @import("kit.zig");
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -29,6 +37,17 @@ pub const Paragraph = struct {
     text: []const u8,
     style: text.Style,
     align_x: text.Align = .start,
+
+    /// What one paragraph of up to `bytes` bytes appends to a frame at most (section 3): a
+    /// glyph a byte.
+    pub fn appends_for(comptime bytes: u32) Appends {
+        comptime {
+            assert(bytes <= text.byte_cap);
+            const out = appends.text_byte.times(bytes);
+            assert(out.areas == 0);
+            return out;
+        }
+    }
 
     /// Walks `walk` (a `fit` height is the height for the width, section 2) and places the
     /// lines. Returns the box, so an app can anchor to it.
@@ -91,4 +110,37 @@ test "a fixed-height paragraph clips its lines" {
     try testing.expectEqual(@as(f32, 28), rect.height);
     try testing.expectEqual(@as(usize, 8), cx.draw.items(draw.Glyph).len);
     _ = cx.end_frame();
+}
+
+const theme = @import("../theme.zig");
+
+comptime {
+    // A paragraph of twelve bytes (section 3): twelve glyphs, no area.
+    assert(Paragraph.appends_for(12).of(draw.Glyph) == 12);
+    assert(Paragraph.appends_for(12).areas == 0);
+}
+
+// Locks `Paragraph.appends_for` (section 3): "WWWWWWWWWWWW" in a 300 px fit box draws Glyph 12,
+// reached; "WWWW WWWW WWWW" wrapped to 60 px is at most `appends_for(14)` and draws Glyph 12
+// (the spaces have no ink).
+test "Paragraph appends at most appends_for and reaches it" {
+    const cx = fixture.context();
+    {
+        const paragraph: Paragraph = .{ .text = "WWWWWWWWWWWW", .style = theme.dark.name };
+        var tally: fixture.Tally(Paragraph.appends_for("WWWWWWWWWWWW".len)) = .{};
+        cx.begin_frame(1280, 720, 120);
+        _ = paragraph.draw(cx, ui.sized(.{ .fixed = 300 }, .fit));
+        _ = cx.end_frame();
+        try tally.observe(cx);
+        try tally.expect_reached();
+    }
+    {
+        const paragraph: Paragraph = .{ .text = "WWWW WWWW WWWW", .style = theme.dark.name };
+        var tally: fixture.Tally(Paragraph.appends_for("WWWW WWWW WWWW".len)) = .{};
+        cx.begin_frame(1280, 720, 120);
+        _ = paragraph.draw(cx, ui.sized(.{ .fixed = 60 }, .fit));
+        _ = cx.end_frame();
+        try tally.observe(cx);
+        try testing.expectEqual(@as(usize, 12), cx.draw.items(draw.Glyph).len);
+    }
 }

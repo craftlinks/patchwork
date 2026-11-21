@@ -30,6 +30,13 @@
 //! ```
 //! Hover and press ease per button. The look (`WindowButtonLook`) names the button, so a skin
 //! draws its own icons; `active` is the window's `activated` state, which a skin may dim.
+//!
+//! ## 3. Counts
+//! What each part appends to a frame at most (`widgets/appends.zig`) is a constant, because
+//! none has text of the app's: `window_drag_appends` is its one area, `window_edges_appends` an
+//! area per edge part, and `WindowButtonsOf(S).appends` three calls of the skin's
+//! `window_button` and their areas. A skin's declaration holds for any of its calls, so the
+//! three calls count three of its worst button, whichever buttons are shown.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -38,6 +45,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Id = kit.Id;
@@ -98,6 +106,12 @@ const edge_parts = [_]ui.WindowPart{
     .bottom_left,
     .bottom_right,
 };
+
+/// What `window_drag` appends (section 3): one area.
+pub const window_drag_appends: Appends = .{ .areas = 1 };
+
+/// What `window_edges` appends at most (section 3): an area per edge part.
+pub const window_edges_appends: Appends = .{ .areas = edge_parts.len };
 
 /// Records the resize areas over the window (section 1), ids `id.derive(part)`. The last call
 /// of `App.draw`, with only the root open.
@@ -186,6 +200,18 @@ pub fn WindowButtonsOf(comptime Skin: type) type {
             none,
             /// The button was clicked; its request is made.
             pressed: WindowButton,
+        };
+
+        /// What the buttons append to a frame at most (section 3): three `window_button` calls
+        /// and their areas. The look has no text.
+        pub const appends: Appends = appends: {
+            const buttons = std.enums.values(WindowButton).len;
+            const out = Skin.window_button_appends.with(0).times(buttons).plus(.{
+                .areas = buttons,
+            });
+            assert(buttons == 3);
+            assert(out.areas == 3);
+            break :appends out;
         };
 
         /// The buttons at rest.
@@ -282,17 +308,28 @@ pub fn WindowButtonsOf(comptime Skin: type) type {
     };
 }
 
+const quads = @import("../draw.zig");
+
 comptime {
     assert(window_corner_px > window_edge_px);
     assert(window_button_w > 0);
     assert(edge_parts.len == 8);
+    // The default skin's buttons (section 3): 3 x (Box 1, Path 2, Glyph 1, points 10), areas 3.
+    assert(WindowButtons.appends.of(quads.Box) == 3);
+    assert(WindowButtons.appends.of(quads.Path) == 6);
+    assert(WindowButtons.appends.of(quads.Glyph) == 3);
+    assert(WindowButtons.appends.points == 30);
+    assert(WindowButtons.appends.areas == 3);
+    assert(window_edges_appends.areas == 8);
+    assert(window_drag_appends.areas == 1);
 }
 
 const testing = std.testing;
 const fixture = @import("fixture.zig");
 
 /// Draws the buttons in a 200 x 40 row at (100, 0), then the edges, in a 1280 x 720 frame.
-fn draw_chrome(cx: *fixture.Context, buttons: *const WindowButtons) void {
+fn draw_chrome(cx: anytype, buttons: anytype) void {
+    assert(cx.phase != .draw);
     cx.begin_frame(1280, 720, 120);
     _ = cx.begin(fixture.at(100, 0, 200, 40), .{ .flow = .right });
     buttons.draw(cx);
@@ -301,7 +338,8 @@ fn draw_chrome(cx: *fixture.Context, buttons: *const WindowButtons) void {
     _ = cx.end_frame();
 }
 
-fn set_state(cx: *fixture.Context, state: input.WindowState) void {
+fn set_state(cx: anytype, state: input.WindowState) void {
+    assert(cx.phase != .draw);
     cx.event_begin(.{ .window_state = state });
     cx.event_end();
 }
@@ -374,4 +412,68 @@ test "a window button click makes its request" {
     const released = fixture.send(cx, &buttons, .{ .pointer_up = input.left_at(outside) });
     try testing.expectEqual(WindowButtons.Action.none, released);
     try testing.expectEqual(@as(?ui.WindowRequest, null), cx.take_window_request());
+}
+
+/// The buttons alone in a 200 x 40 row at (100, 0), in a 1280 x 720 frame.
+fn draw_buttons(cx: anytype, buttons: anytype) void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    _ = cx.begin(fixture.at(100, 0, 200, 40), .{ .flow = .right });
+    buttons.draw(cx);
+    _ = cx.end();
+    _ = cx.end_frame();
+    assert(cx.area_count <= 3);
+}
+
+// Locks the composition of `WindowButtonsOf(S).appends` (section 3) with `fixture.Counted`
+// (Box 2 a call): three buttons draw Box 6 and 3 areas, reached exactly.
+test "WindowButtons appends exactly appends with a counted skin" {
+    const cx = fixture.wide_context();
+    const Buttons = WindowButtonsOf(fixture.Counted);
+    const buttons = Buttons.init(ui.id("chrome", 0));
+    var tally: fixture.Tally(Buttons.appends) = .{};
+    draw_buttons(cx, &buttons);
+    try tally.observe(cx);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 6), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(u32, 3), cx.area_count);
+}
+
+// Locks `WindowButtons.appends` (section 3) with the default skin, all three hovered and the
+// window maximized (restore): Box 3, Path 5 (minimize 1, restore 2, close 2), points 16, areas
+// 3; on `bare_context` Box 3, Glyph 3, areas 3. Then `window_edges` alone draws its 8 areas and
+// `window_drag` its 1, each reached.
+test "WindowButtons appends at most appends" {
+    const cx = fixture.wide_context();
+    var buttons = WindowButtons.init(ui.id("chrome", 0));
+    for (&buttons.hover) |*hover| hover.value = 1;
+    var tally: fixture.Tally(WindowButtons.appends) = .{};
+    set_state(cx, .{ .maximized = true });
+    draw_buttons(cx, &buttons);
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 3), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 5), cx.draw.items(quads.Path).len);
+    try testing.expectEqual(@as(usize, 0), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 16), cx.draw.point_count);
+    try testing.expectEqual(@as(u32, 3), cx.area_count);
+    const bare = fixture.bare_context();
+    set_state(bare, .{ .maximized = true });
+    draw_buttons(bare, &buttons);
+    try tally.observe(bare);
+    try testing.expectEqual(@as(usize, 3), bare.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 3), bare.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 3), bare.area_count);
+    const small = fixture.context();
+    var edges: fixture.Tally(window_edges_appends) = .{};
+    small.begin_frame(1280, 720, 120);
+    window_edges(small, ui.id("edges", 0));
+    _ = small.end_frame();
+    try edges.observe(small);
+    try edges.expect_reached();
+    var drag: fixture.Tally(window_drag_appends) = .{};
+    small.begin_frame(1280, 720, 120);
+    window_drag(small, ui.id("drag", 0), .{ .x = 0, .y = 0, .width = 400, .height = 40 });
+    _ = small.end_frame();
+    try drag.observe(small);
+    try drag.expect_reached();
 }

@@ -17,7 +17,15 @@
 //! the label at the left, and a chevron of two `draw.Path` segments at the right, so an app with
 //! a default dropdown registers `draw.Path`.
 //!
-//! ## 3. TigerStyle Invariants
+//! ## 3. Counts
+//! `DropdownOf(S).face_appends_for(label_bytes)` is what the face appends to a frame at most
+//! (`widgets/appends.zig`): one `dropdown` call with the selected label, at most the longest
+//! item's bytes, and its area. `appends_for(MenuText)` adds the open list,
+//! `MenuOf(S).appends_for` (`widgets/menu.zig`, section 5). The list is a popup and a frame
+//! draws one, so an app with several popup owners sums their faces and takes the `max` of
+//! their popups (`widgets.zig`, section 4).
+//!
+//! ## 4. TigerStyle Invariants
 //! - No allocation: the items are app-owned labels, at most `menu.menu_items_max`.
 
 const std = @import("std");
@@ -28,6 +36,8 @@ const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const menu_file = @import("menu.zig");
+const text = @import("../text.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -86,6 +96,28 @@ pub fn DropdownOf(comptime Skin: type) type {
             /// The selected item changed to this index.
             changed: u32,
         };
+
+        /// The face alone (section 3): the skin's `dropdown` with the selected label, and its
+        /// area.
+        pub fn face_appends_for(comptime label_bytes: u32) Appends {
+            comptime {
+                assert(label_bytes <= text.byte_cap);
+                const out = Skin.dropdown_appends.with(label_bytes).plus(.{ .areas = 1 });
+                assert(out.areas == 1);
+                return out;
+            }
+        }
+
+        /// The face and its open list, one popup (section 3).
+        pub fn appends_for(comptime menu_text: menu_file.MenuText) Appends {
+            comptime {
+                const list = List.appends_for(menu_text);
+                const out = face_appends_for(menu_text.label_max).plus(list);
+                assert(out.areas == list.areas + 1);
+                assert(out.points >= list.points);
+                return out;
+            }
+        }
 
         /// A closed dropdown of `items` with `selected` selected.
         pub fn init(id: Id, items: []const []const u8, selected: u32) Self {
@@ -168,6 +200,26 @@ pub fn DropdownOf(comptime Skin: type) type {
     };
 }
 
+const quads = @import("../draw.zig");
+
+comptime {
+    // The default skin's dropdown of 6 items of up to 8 bytes (section 3): the face Box 1,
+    // Path 1, points 3, Glyph 8, area 1, and the list's Box 7, Glass 1, Glyph 48, areas 7.
+    const face = Dropdown.face_appends_for(8);
+    assert(face.of(quads.Box) == 1);
+    assert(face.of(quads.Path) == 1);
+    assert(face.of(quads.Glyph) == 8);
+    assert(face.points == 3);
+    assert(face.areas == 1);
+    const six = Dropdown.appends_for(.{ .items = 6, .label_max = 8 });
+    assert(six.of(quads.Box) == 8);
+    assert(six.of(quads.Path) == 1);
+    assert(six.of(quads.Glass) == 1);
+    assert(six.of(quads.Glyph) == 56);
+    assert(six.points == 3);
+    assert(six.areas == 8);
+}
+
 const testing = std.testing;
 const fixture = @import("fixture.zig");
 
@@ -225,4 +277,72 @@ test "the chevron sits inside the face's right edge" {
     try testing.expectEqual([2]f32{ 246, 113.5 }, points[0]);
     try testing.expectEqual([2]f32{ 251, 118.5 }, points[1]);
     try testing.expectEqual([2]f32{ 256, 113.5 }, points[2]);
+}
+
+/// Six labels of eight inked bytes.
+const wide_items = [_][]const u8{
+    "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW",
+};
+
+/// The items' shape for `appends_for`.
+const wide_text: menu_file.MenuText = .{ .items = wide_items.len, .label_max = "WWWWWWWW".len };
+
+/// One frame: `dropdown`'s face 300 px wide at (100, 100), then its overlay, observed.
+fn wide_frame(cx: anytype, dropdown: anytype, tally: anytype) !void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    dropdown.draw(cx, fixture.at(100, 100, 300, 32));
+    ui.overlays(cx, dropdown);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+}
+
+/// Draws a frame, opens `dropdown`'s list, and draws and observes the next.
+fn wide_open(cx: anytype, dropdown: anytype, tally: anytype) !void {
+    try wide_frame(cx, dropdown, tally);
+    cx.event_begin(.{ .frame = 0 });
+    dropdown.open(cx);
+    cx.event_end();
+    try wide_frame(cx, dropdown, tally);
+    assert(dropdown.menu.open);
+}
+
+// Locks the composition of `DropdownOf(S).appends_for` (section 3) with `fixture.Counted`
+// (dropdown Box 5, menu face 2, row 3): 6 x "WWWWWWWW", a 300 px face, opened, draw Box 5 + 2 +
+// 18 = 25, Glyph 8 + 48 = 56, and areas 8 (the face, the backdrop, the rows), reached exactly.
+test "Dropdown appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Counted = DropdownOf(fixture.Counted);
+    var dropdown = Counted.init(ui.id("wave", 0), &wide_items, 0);
+    var tally: fixture.Tally(Counted.appends_for(wide_text)) = .{};
+    try wide_open(cx, &dropdown, &tally);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 25), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 56), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 8), cx.area_count);
+}
+
+// Locks `Dropdown.appends_for` (section 3) with the default skin, opened with item 0
+// highlighted: a solid frame draws Box 3 (the face, the list's face, the band), Path 1, points
+// 3, Glyph 56, areas 8; a frosted one Glass 1 and Box 3 (the face, the hairline, the band), the
+// rest the same. Both are at most Box 8, Path 1, Glass 1, Glyph 56, points 3, areas 8.
+test "Dropdown appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var dropdown = Dropdown.init(ui.id("wave", 0), &wide_items, 0);
+    var tally: fixture.Tally(Dropdown.appends_for(wide_text)) = .{};
+    try wide_open(cx, &dropdown, &tally);
+    try testing.expectEqual(@as(?u32, 0), dropdown.menu.highlight);
+    for ([_]bool{ false, true }) |frosted| {
+        if (frosted) {
+            dropdown.menu.material = .frosted;
+            try wide_frame(cx, &dropdown, &tally);
+        }
+        const glass: usize = if (frosted) 1 else 0;
+        try testing.expectEqual(@as(usize, 3), cx.draw.items(quads.Box).len);
+        try testing.expectEqual(glass, cx.draw.items(quads.Glass).len);
+        try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Path).len);
+        try testing.expectEqual(@as(u32, 3), cx.draw.point_count);
+        try testing.expectEqual(@as(usize, 56), cx.draw.items(quads.Glyph).len);
+        try testing.expectEqual(@as(u32, 8), cx.area_count);
+    }
 }

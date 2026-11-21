@@ -77,15 +77,29 @@
 //! full; the context counts the drop in `overflow_count`, and app tests assert it is zero.
 //!
 //! An app sizes its pools from what its widgets say they append (`widgets/appends.zig`).
-//! `Knob`, `Toggle`, `Checkbox`, `Slider`, `Panel`, `Splitter`, `Disclosure`, `Tooltip`, and
-//! `NumberBox` (each `...Of(Skin)`) publish `appends`: one instance at most, for its skin, with
-//! its text at the library's stated maximum. Where the app holds the text and the library
-//! states no maximum, the widget publishes `appends_for` instead: `Button.appends_for(label
-//! bytes)`, `Meter.appends_for(name bytes)`, `TextField.appends_for(FieldText)`, and
-//! `Knob.appends_for(value bytes)` for `draw_text`. An app sums them (`plus`, `times`) with
-//! its own instances and reads `.of(T)` into each `config.draw` cap, `.areas` into `area_cap`,
-//! and `.points` into `point_cap`. The menus, lists, tabs, and other containers grow with
-//! their items and publish nothing yet.
+//! Every widget publishes `appends` or `appends_for`: what one instance appends to a frame at
+//! most, for its skin. `Knob`, `Toggle`, `Checkbox`, `Slider`, `Panel`, `Splitter`,
+//! `Disclosure`, `Tooltip`, `NumberBox`, and `WindowButtons` (each `...Of(Skin)`) publish
+//! `appends`, with their text at the library's stated maximum. Where the app holds the text or
+//! the items, the widget publishes `appends_for` over what the app bounds:
+//! - text: `Button.appends_for(label bytes)`, `Meter.appends_for(name bytes)`,
+//!   `TextField.appends_for(FieldText)`, `Knob.appends_for(value bytes)` for `draw_text`,
+//!   `Label.appends_for(bytes)`, and `Paragraph.appends_for(bytes)`;
+//! - items and the longest label (`label_max_of(labels)`): `Menu.appends_for(MenuText)`,
+//!   `Dropdown.appends_for(MenuText)`, `MenuBar.appends_for(MenuBarText)`,
+//!   `Tabs.appends_for(TabText)` (and `Segmented`'s), `ColumnHeader.appends_for(ColumnText)`,
+//!   and `Dock.appends_for(DockText)`;
+//! - visible rows: `ListBox.appends_for(rows)` and `TreeView(n).appends_for(rows)`, with
+//!   `rows` from `list_rows_for(view_h, row_h)`; set the list's `visible_max` to the same
+//!   bound, which its `begin` asserts.
+//! A container's count is its calls times the skin function's declared bound, plus its own
+//! instances and areas, so it holds for any skin; `skins.Default` draws less (one highlighted
+//! row, one underlined tab). A frame draws one popup (`ui/popup.zig`, `popup_depth_max`), so an
+//! app sums the popup owners' faces (`Dropdown.face_appends_for`, `MenuBar.face_appends_for`)
+//! and takes the `max` of their popups (`Menu.appends_for`, ...). The window chrome's areas are
+//! constants: `window_drag_appends` and `window_edges_appends`. An app sums its widgets
+//! (`plus`, `times`) with its own instances and reads `.of(T)` into each `config.draw` cap,
+//! `.areas` into `area_cap`, and `.points` into `point_cap`.
 //!
 //! ## 5. Theme and Text Styles
 //! Widgets read their colors, text styles, and hover and press weights from the app's scheme
@@ -183,6 +197,7 @@ pub const settled = kit.settled;
 pub const Appends = appends.Appends;
 pub const SkinAppends = appends.SkinAppends;
 pub const AppendsCount = appends.Count;
+pub const label_max_of = appends.label_max_of;
 
 pub const Shape = skins.Shape;
 pub const ButtonLook = skins.ButtonLook;
@@ -288,6 +303,7 @@ pub const field_inner = text_field.field_inner;
 pub const Menu = menu.Menu;
 pub const MenuOf = menu.MenuOf;
 pub const MenuAction = menu.MenuAction;
+pub const MenuText = menu.MenuText;
 pub const ContextMenu = menu.ContextMenu;
 pub const ContextMenuOf = menu.ContextMenuOf;
 pub const menu_items_max = menu.menu_items_max;
@@ -317,6 +333,7 @@ pub const TabsOf = tabs.TabsOf;
 /// A segmented control: tabs arranged `even` in a track, drawn with `bar` (no page).
 pub const Segmented = TabsOf(skins.Segmented);
 pub const TabArrange = tabs.TabArrange;
+pub const TabText = tabs.TabText;
 pub const even_widths = tabs.even_widths;
 pub const segment_inset = tabs.segment_inset;
 pub const tabs_max = tabs.tabs_max;
@@ -337,6 +354,7 @@ pub const Dock = dock.Dock;
 pub const DockOf = dock.DockOf;
 pub const DockZone = dock.Zone;
 pub const DockPanel = dock.Panel;
+pub const DockText = dock.DockText;
 pub const dock_nodes_max = dock.dock_nodes_max;
 pub const dock_panels_max = dock.dock_panels_max;
 pub const dock_save_max = dock.dock_save_max;
@@ -350,6 +368,7 @@ pub const ListBox = list_box.ListBox;
 pub const ListBoxOf = list_box.ListBoxOf;
 pub const ListRow = list_box.Row;
 pub const list_rows_max = list_box.list_rows_max;
+pub const list_rows_for = list_box.rows_for;
 pub const list_row_salt = list_box.row_salt;
 
 pub const TreeView = tree_view.TreeView;
@@ -368,6 +387,7 @@ pub const disclosure_h = disclosure.disclosure_h;
 pub const ColumnHeader = column_header.ColumnHeader;
 pub const ColumnHeaderOf = column_header.ColumnHeaderOf;
 pub const Column = column_header.Column;
+pub const ColumnText = column_header.ColumnText;
 pub const ColumnSort = column_header.Sort;
 pub const columns_max = column_header.columns_max;
 pub const header_h = column_header.header_h;
@@ -382,10 +402,13 @@ pub const window_drag_flags = window_chrome.window_drag_flags;
 pub const window_edges = window_chrome.window_edges;
 pub const window_edge_px = window_chrome.window_edge_px;
 pub const window_corner_px = window_chrome.window_corner_px;
+pub const window_drag_appends = window_chrome.window_drag_appends;
+pub const window_edges_appends = window_chrome.window_edges_appends;
 
 pub const MenuBar = menu_bar.MenuBar;
 pub const MenuBarOf = menu_bar.MenuBarOf;
 pub const MenuChoice = menu_bar.MenuChoice;
+pub const MenuBarText = menu_bar.MenuBarText;
 pub const menubar_menus_max = menu_bar.menubar_menus_max;
 
 pub const NumberBox = number_box.NumberBox;

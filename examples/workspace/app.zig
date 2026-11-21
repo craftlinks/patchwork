@@ -88,6 +88,9 @@ const file_names = [_][]const u8{
 };
 
 const help = "drag a tab onto a panel to join it or onto a side to split it";
+const button_labels = [_][]const u8{ "Save", "Load", "Reset" };
+/// The most file rows one draw walks: the dock's height bounds the files page's.
+const files_rows: u32 = widgets.list_rows_for(dock_h, row_px);
 
 pub const dock_id = ui.id("dock", 0);
 const files_id = ui.id("files", 0);
@@ -156,13 +159,14 @@ pub const App = struct {
         app.dock.init(dock_id, &panel_labels);
         build_default(&app.dock);
         app.files = widgets.ListBox.init(files_id, file_names.len, row_px);
+        app.files.visible_max = files_rows;
         app.code.init(code_id, CEditor.default_style);
         const loaded = app.code.load(@embedFile("sample.c"));
         assert(loaded);
         app.light = widgets.Toggle.init(light_id, "light", false);
-        app.save = button(save_id, "Save");
-        app.load = button(load_id, "Load");
-        app.reset = button(reset_id, "Reset");
+        app.save = button(save_id, button_labels[0]);
+        app.load = button(load_id, button_labels[1]);
+        app.reset = button(reset_id, button_labels[2]);
         app.saved_len = 0;
         app.log_count = 0;
         app.status_len = 0;
@@ -407,15 +411,27 @@ const save_steps = [_]bench.Step{
 const edge_target_id = dock_id.derive(widgets.dock_edge_salt + @as(u64, @backingInt(widgets.DockZone.right)));
 
 comptime {
-    // Boxes: per set (at most four) its bar line, four tab faces, an underline, a close band,
-    // and the insertion marker; three dividers, the overlay, the ghost; the editor's faces, a
-    // band per line, its caret and thumb; the list's band and thumb; the toggle; three buttons.
+    // The widgets' counts (widgets.zig, section 4): the dock, the files list at its most rows,
+    // the toggle, the three buttons, the help, and the bar's panel face.
+    const need = widgets.Dock.appends_for(.{
+        .panels = panel_labels.len,
+        .label_max = widgets.label_max_of(&panel_labels), // 10, "appearance"
+    }).plus(widgets.ListBox.appends_for(files_rows))
+        .plus(widgets.Toggle.appends)
+        .plus(widgets.Button.appends_for(widgets.label_max_of(&button_labels)).times(3))
+        .plus(widgets.Paragraph.appends_for(help.len))
+        .plus(widgets.Panel.appends);
+    // The editor's faces, a band per line, its caret and thumb; its three areas: the editor's
+    // own.
     const lines = editor.lines_bound(dock_h, 15);
-    assert(4 * (1 + 4 + 1 + 1 + 1) + 3 + 1 + 1 + (2 + lines + 2) + 2 + 3 + 3 <= box_cap);
-    // Areas: per set its bar, page, four tabs, and four close buttons; three dividers, four
-    // edges; the editor's three; the list's view, thumb, and rows; the toggle; three buttons.
-    const rows: u32 = @intFromFloat(@ceil(dock_h / row_px) + 1);
-    assert(4 * (2 + 4 + 4) + 3 + 4 + 3 + 2 + rows + 1 + 3 <= area_cap);
+    assert(need.of(quads.Box) + (2 + lines + 2) <= box_cap);
+    assert(need.areas + 3 <= area_cap);
+    assert(files_rows == 27);
+    assert(need.of(quads.Box) == 27 + 28 + 2 + 3 + 1);
+    assert(need.areas == 23 + 29 + 1 + 3);
+    // The caps keep the values they had before they were derived.
+    assert(box_cap == 512);
+    assert(area_cap == 128);
     patchwork.app.check(App);
     assert(dock_w == 1248 and dock_h == 624);
     assert(panel_labels.len <= widgets.dock_panels_max);

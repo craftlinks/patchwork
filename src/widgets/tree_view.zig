@@ -46,7 +46,14 @@
 //! ```
 //! Right on a leaf and Left on a collapsed root do nothing. A move scrolls into view.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `TreeViewOf(S, capacity).appends_for(rows)` is what one tree appends to a frame at most with
+//! up to `rows` rows walked (`widgets/appends.zig`): its list's (`ListBoxOf(S).appends_for`,
+//! `widgets/list_box.zig`, section 5), and a `tree_chevron` call and its area per row. Depth
+//! moves only the chevron's cell, and a cell outside the clip draws nothing, so neither adds.
+//! The names are the app's. The app bounds the walk with `tree.list.visible_max`.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation: `capacity` rows and depths live in the widget; flattening is O(nodes) with
 //!   a `tree_depth_max` stack.
 //! - Every visible row is a node below `nodes.len`; `selected` is a node below it.
@@ -58,6 +65,7 @@ const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const list_box = @import("list_box.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -171,6 +179,19 @@ pub fn TreeViewOf(comptime Skin: type, comptime capacity: u32) type {
         };
 
         pub const Toggled = struct { node: u32, expanded: bool };
+
+        /// What one tree appends to a frame at most with up to `rows` rows walked (section
+        /// 5): its list's, and a chevron and its area per row. The names are the app's.
+        pub fn appends_for(comptime rows: u32) Appends {
+            comptime {
+                assert(rows >= 1);
+                assert(rows <= capacity);
+                const chevrons = Skin.tree_chevron_appends.with(0).times(rows);
+                const out = List.appends_for(rows).plus(chevrons).plus(.{ .areas = rows });
+                assert(out.areas == List.appends_for(rows).areas + rows);
+                return out;
+            }
+        }
 
         /// A tree over `nodes` (pre-order, at most `capacity`) in rows of `row_h`, nothing
         /// selected.
@@ -384,6 +405,17 @@ const testing = std.testing;
 const draw = @import("../draw.zig");
 const fixture = @import("fixture.zig");
 
+comptime {
+    // The default skin's tree of 11 walked rows (section 5): the list's Box 12 and areas 13,
+    // and 11 x (Path 1, Glyph 1, points 3) and 11 areas.
+    const eleven = TreeView(16).appends_for(11);
+    assert(eleven.of(draw.Box) == 12);
+    assert(eleven.of(draw.Path) == 11);
+    assert(eleven.of(draw.Glyph) == 11);
+    assert(eleven.points == 33);
+    assert(eleven.areas == 24);
+}
+
 /// a (b (c), d), e (f): a and e expanded, b collapsed.
 fn sample() [6]TreeNode {
     return .{
@@ -534,4 +566,82 @@ test "a chevron press toggles its node and a row click selects" {
     _ = fixture.send(cx, &tree, .{ .pointer_down = input.left_at(row) });
     const picked = fixture.send(cx, &tree, .{ .pointer_up = input.left_at(row) });
     try testing.expectEqual(Tree.Action{ .selected = 3 }, picked);
+}
+
+/// Sixteen root nodes, each with children and collapsed: every row draws a chevron.
+fn parents() [16]TreeNode {
+    return @splat(.{ .has_children = true });
+}
+
+/// Draws `tree` in a 300 x `height` box at (0, 0) with no content and observes the frame;
+/// returns the rows walked.
+fn tree_frame(cx: anytype, tree: anytype, height: f32, tally: anytype) !u32 {
+    assert(cx.phase != .draw);
+    assert(height > 0);
+    cx.begin_frame(1280, 720, 120);
+    _ = tree.begin(cx, fixture.at(0, 0, 300, height));
+    var walked: u32 = 0;
+    while (tree.next(cx)) |_| walked += 1;
+    tree.end(cx);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    return walked;
+}
+
+// Locks the composition of `TreeViewOf(S, 16).appends_for` (section 5) with `fixture.Counted`
+// (Box 2 a row, 1 a chevron): 16 collapsed parents of 24 px in a 240 px view, scrolled by 12,
+// walk 11 rows: Box 22 + 1 (the thumb) + 11 = 34, areas 13 + 11 = 24, reached exactly.
+test "TreeView appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Counted = TreeViewOf(fixture.Counted, 16);
+    var nodes = parents();
+    var tree = Counted.init(ui.id("tree", 0), &nodes, 24);
+    tree.list.visible_max = comptime list_box.rows_for(240, 24);
+    var tally: fixture.Tally(Counted.appends_for(list_box.rows_for(240, 24))) = .{};
+    _ = try tree_frame(cx, &tree, 240, &tally);
+    tree.list.view.scroll_y = 12;
+    try testing.expectEqual(@as(u32, 11), try tree_frame(cx, &tree, 240, &tally));
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 34), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(u32, 24), cx.area_count);
+}
+
+/// Draws `tree` at the top, moves the pointer over row 3's content, scrolls by 12, and draws
+/// it again; returns the rows the second frame walked.
+fn tree_worst(cx: anytype, tree: anytype, height: f32, tally: anytype) !u32 {
+    _ = try tree_frame(cx, tree, height, tally);
+    const three = cx.find(tree.list.row_id(3)).?;
+    const over: input.Point = .{ .x = three.rect[0] + 200, .y = three.rect[1] + 10 };
+    _ = fixture.send(cx, tree, .{ .pointer_move = over });
+    tree.list.view.scroll_y = 12;
+    return tree_frame(cx, tree, height, tally);
+}
+
+// Locks `TreeView(16).appends_for` (section 5) with the default skin, node 0 selected and the
+// pointer over row 3: in a 240 px view (11 rows) at most Box 12, Path 11, Glyph 11, points 33,
+// areas 24, and it draws Box 3 (two bands and the thumb), Path 11, Glyph 0, points 33, areas
+// 24; in a 120 px view on `bare_context` (6 rows) at most `appends_for(6)`, and it draws Box 3,
+// Glyph 6 (the "+" fallback), areas 14.
+test "TreeView appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var nodes = parents();
+    var tree = TreeView(16).init(ui.id("tree", 0), &nodes, 24);
+    tree.selected = 0;
+    tree.list.visible_max = comptime list_box.rows_for(240, 24);
+    var tally: fixture.Tally(TreeView(16).appends_for(list_box.rows_for(240, 24))) = .{};
+    try testing.expectEqual(@as(u32, 11), try tree_worst(cx, &tree, 240, &tally));
+    try testing.expectEqual(@as(usize, 3), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 11), cx.draw.items(draw.Path).len);
+    try testing.expectEqual(@as(usize, 0), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 33), cx.draw.point_count);
+    try testing.expectEqual(@as(u32, 24), cx.area_count);
+    const bare = fixture.bare_context();
+    var small = TreeView(16).init(ui.id("tree", 0), &nodes, 24);
+    small.selected = 0;
+    small.list.visible_max = comptime list_box.rows_for(120, 24);
+    var bare_tally: fixture.Tally(TreeView(16).appends_for(list_box.rows_for(120, 24))) = .{};
+    try testing.expectEqual(@as(u32, 6), try tree_worst(bare, &small, 120, &bare_tally));
+    try testing.expectEqual(@as(usize, 3), bare.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 6), bare.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 14), bare.area_count);
 }

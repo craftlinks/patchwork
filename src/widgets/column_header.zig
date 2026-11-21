@@ -31,6 +31,13 @@
 //!
 //! ## 3. Ids
 //! Cell `i` is `id.derive(i)` and divider `i` is `id.derive(divider_salt + i)`.
+//!
+//! ## 4. Counts
+//! `ColumnHeaderOf(S).appends_for(ColumnText)` is what one header appends to a frame at most
+//! (`widgets/appends.zig`): one `header_cell` call per column with a label of up to
+//! `label_max` bytes (the longest), an area per cell, and a divider's area between each two.
+//! The skin's declaration bounds every call, so it holds for any skin; the default skin draws
+//! its sort arrow on one cell only, and so draws less.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -39,6 +46,7 @@ const text = @import("../text.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -83,6 +91,10 @@ pub const Sort = struct {
     descending: bool,
 };
 
+/// What a header holds at most, for `appends_for` (section 4): how many columns and the
+/// longest label's bytes.
+pub const ColumnText = struct { columns: u32, label_max: u32 };
+
 /// The default header: `ColumnHeaderOf(skins.Default)`.
 pub const ColumnHeader = ColumnHeaderOf(skin.Default);
 
@@ -112,6 +124,21 @@ pub fn ColumnHeaderOf(comptime Skin: type) type {
         };
 
         pub const Resized = struct { column: u32, width: f32 };
+
+        /// What one header appends to a frame at most (section 4): a cell per column, its
+        /// area, and a divider's area between each two.
+        pub fn appends_for(comptime column_text: ColumnText) Appends {
+            comptime {
+                assert(column_text.columns >= 1);
+                assert(column_text.columns <= columns_max);
+                assert(column_text.label_max <= text.byte_cap);
+                const cells = Skin.header_cell_appends.with(column_text.label_max)
+                    .times(column_text.columns);
+                const out = cells.plus(.{ .areas = 2 * column_text.columns - 1 });
+                assert(out.areas == 2 * column_text.columns - 1);
+                return out;
+            }
+        }
 
         /// A header over `columns` (1 to `columns_max`), unsorted.
         pub fn init(id: Id, columns: []const Column) Self {
@@ -283,9 +310,17 @@ pub fn ColumnHeaderOf(comptime Skin: type) type {
     };
 }
 
+const quads = @import("../draw.zig");
+
 comptime {
     assert(divider_salt > columns_max);
     assert(header_divider_w > 0 and header_pad_x > 0);
+    // The default skin's header of 4 columns of up to 6 bytes (section 4): 4 x (Box 2, Glyph 1
+    // + 6), areas 4 + 3.
+    const four = ColumnHeader.appends_for(.{ .columns = 4, .label_max = 6 });
+    assert(four.of(quads.Box) == 8);
+    assert(four.of(quads.Glyph) == 28);
+    assert(four.areas == 7);
 }
 
 const testing = std.testing;
@@ -382,4 +417,54 @@ test "a divider drag resizes within the minimum and the room" {
     press.time_ms = 5100;
     const reset = fixture.send(cx, &header, .{ .pointer_down = press });
     try expect_resized(200, reset);
+}
+
+/// Four columns 300 wide labelled "WWWWWW", so a 1200 px header cuts no label.
+const wide = [_]Column{
+    .{ .label = "WWWWWW", .width = 300, .min = 60 },
+    .{ .label = "WWWWWW", .width = 300, .min = 60 },
+    .{ .label = "WWWWWW", .width = 300, .min = 60 },
+    .{ .label = "WWWWWW", .width = 300, .min = 60 },
+};
+
+/// The columns' shape for `appends_for`.
+const wide_text: ColumnText = .{ .columns = wide.len, .label_max = "WWWWWW".len };
+
+/// Draws `header` 1200 px wide and observes the frame.
+fn header_frame(cx: anytype, header: anytype, tally: anytype) !void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    header.draw(cx, fixture.at(0, 0, 1200, header_h));
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    assert(tally.frames >= 1);
+}
+
+// Locks the composition of `ColumnHeaderOf(S).appends_for` (section 4) with `fixture.Counted`
+// (Box 3 a cell): 4 columns of "WWWWWW" in a 1200 px header draw Box 12, Glyph 24, and areas 7
+// (4 cells, 3 dividers), reached exactly.
+test "ColumnHeader appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Header = ColumnHeaderOf(fixture.Counted);
+    var header = Header.init(ui.id("header", 0), &wide);
+    var tally: fixture.Tally(Header.appends_for(wide_text)) = .{};
+    try header_frame(cx, &header, &tally);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 12), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 24), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
+}
+
+// Locks `ColumnHeader.appends_for` (section 4) with the default skin, column 1 sorted
+// ascending: at most Box 8, Glyph 28, areas 7, and it draws Box 8 (both of every cell), Glyph
+// 25 (4 x 6 and one arrow), and areas 7.
+test "ColumnHeader appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var header = ColumnHeader.init(ui.id("header", 0), &wide);
+    header.sort = .{ .column = 1, .descending = false };
+    var tally: fixture.Tally(ColumnHeader.appends_for(wide_text)) = .{};
+    try header_frame(cx, &header, &tally);
+    try testing.expectEqual(@as(usize, 8), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 25), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
 }

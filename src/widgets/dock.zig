@@ -84,7 +84,25 @@
 //! (0 when empty); panel ids below `labels.len`, each once; and only the root may be empty.
 //! A refused load changes nothing; the app keeps its layout or builds its default.
 //!
-//! ## 7. TigerStyle Invariants
+//! ## 7. Counts
+//! `DockOf(S).appends_for(DockText)` is what one dock appends to a frame at most
+//! (`widgets/appends.zig`): a closable tab set per panel (`TabsOf(S).appends_for` of one tab),
+//! a splitter between each two sets, one dragged tab's ghost, a page's area per set, and while a
+//! drag is in flight the four edges' areas and the drop overlay's Box, which the dock draws
+//! itself (`kit.face`), not the skin. The panels' content is the app's. One set per panel is the
+//! worst layout:
+//! - each set costs a bar (its `tab_bar` call and area) and a page area, and every set but the
+//!   root one split's divider and area;
+//! - each tab costs the same in any set;
+//! - so the cost grows with the number of sets, and there are at most as many sets as panels,
+//!   because only the root may be empty (`collapse`, `verify`); an empty root alone costs at
+//!   most what one panel's set does.
+//! A future dock that keeps empty sets breaks `sets <= panels`, and this count with it. The sets'
+//! tabs are closable and movable, but only the bar whose tab is in flight draws a ghost, and one
+//! drag exists at a time, so the ghost is counted once, not once per set (`widgets/tabs.zig`,
+//! section 5).
+//!
+//! ## 8. TigerStyle Invariants
 //! - No allocation: `dock_nodes_max` nodes inline, each set `tabs_max` panels; the draw stack
 //!   is `dock_nodes_max` deep. Every loop is bounded by the node or panel caps.
 //! - Parents and children agree, every used node is reachable once from the root, and each
@@ -98,6 +116,9 @@ const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const tabs_file = @import("tabs.zig");
 const splitter_file = @import("splitter.zig");
+const text = @import("../text.zig");
+const draw = @import("../draw.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -125,6 +146,10 @@ pub const dock_save_max: u32 = 8 + dock_nodes_max * (3 + tabs_max);
 /// The `derive` salts of a set's page and of the edge strips.
 pub const page_salt: u64 = 0x70616765;
 pub const edge_salt: u64 = 0x65646765 << 8;
+
+/// What a dock holds at most, for `appends_for` (section 7): its panels (`labels.len`) and the
+/// longest label's bytes.
+pub const DockText = struct { panels: u32, label_max: u32 };
 
 /// Where a drop lands on a set's page (section 4).
 pub const Zone = enum(u8) { centre, left, right, top, bottom };
@@ -251,6 +276,33 @@ pub fn DockOf(comptime Skin: type) type {
             /// A divider moved.
             resized,
         };
+
+        /// What one dock appends to a frame at most (section 7): a closable tab set per panel,
+        /// the splitters between them, one dragged tab's ghost, the pages' areas, and while a
+        /// drag is in flight the edges' areas and the drop overlay. The panels' content is the
+        /// app's.
+        pub fn appends_for(comptime dock_text: DockText) Appends {
+            comptime {
+                assert(dock_text.panels >= 1);
+                assert(dock_text.panels <= dock_panels_max);
+                assert(dock_text.label_max <= text.byte_cap);
+                const sets = dock_text.panels;
+                const set = Tabs.appends_for(.{
+                    .tabs = 1,
+                    .label_max = dock_text.label_max,
+                    .closable = true,
+                });
+                const ghost = Skin.tab_appends.with(dock_text.label_max);
+                const own: Appends = .{
+                    .draws = &.{.{ .type = draw.Box, .count = 1 }},
+                    .areas = sets + edges.len,
+                };
+                const out = set.times(sets).plus(ghost).plus(Splitter.appends.times(sets - 1))
+                    .plus(own);
+                assert(out.areas == 5 * sets + 3);
+                return out;
+            }
+        }
 
         const Frame = struct { node: u8, stage: u8 };
 
@@ -1027,6 +1079,15 @@ fn shape_valid(decoded: *const Decoded, panel_count: u32) bool {
 pub const Dock = DockOf(skin.Default);
 
 comptime {
+    // One set per panel and the splits between them (section 7) fit the nodes.
+    assert(2 * dock_panels_max - 1 <= dock_nodes_max);
+    // The default skin's dock of 4 panels of up to 10 bytes (section 7): 4 sets x (Box 5, Glyph
+    // 11, areas 3), the ghost Box 3 and Glyph 11, 3 splitters (Box 1, area 1 each), the
+    // overlay, and 4 page and 4 edge areas.
+    const docked = Dock.appends_for(.{ .panels = 4, .label_max = 10 });
+    assert(docked.of(draw.Box) == 27);
+    assert(docked.of(draw.Glyph) == 55);
+    assert(docked.areas == 23);
     assert(dock_nodes_max <= 64);
     assert(dock_panels_max <= 64);
     assert(dock_save_max <= 4096);
@@ -1034,7 +1095,7 @@ comptime {
 }
 
 const testing = std.testing;
-const draw = @import("../draw.zig");
+const fixture = @import("fixture.zig");
 
 const test_types = [_]draw.DrawType{
     .{ .type = draw.Box, .cap = 256 },
@@ -1047,6 +1108,7 @@ const test_static = struct {
     var context: TestContext = undefined;
     var dock: Dock = undefined;
     var copy: Dock = undefined;
+    var counted: DockOf(fixture.Counted) = undefined;
 };
 
 const files: u32 = 0;
@@ -1060,13 +1122,19 @@ const four = [_][]const u8{ "files", "editor", "log", "appearance" };
 /// log 3, split 4, appearance 5, split 6.
 fn default_dock() *Dock {
     const dock = &test_static.dock;
-    dock.init(ui.id("dock", 0), &four);
+    build_default(dock, &four);
+    return dock;
+}
+
+/// Builds the default layout (`default_dock`) in `dock` over `labels`, four of them.
+fn build_default(dock: anytype, labels: []const []const u8) void {
+    assert(labels.len == 4);
+    dock.init(ui.id("dock", 0), labels);
     dock.add(dock.root, editor);
     _ = dock.split(0, .left, files, 0.2).?;
     _ = dock.split(0, .bottom, log, 0.3).?;
     _ = dock.split(0, .right, appearance, 0.25).?;
     dock.verify();
-    return dock;
 }
 
 fn fresh_context() *TestContext {
@@ -1075,7 +1143,7 @@ fn fresh_context() *TestContext {
 }
 
 /// Draws `dock` in a 1000 x 600 box at (0, 0) and writes the panels it gave, in order.
-fn draw_dock(cx: *TestContext, dock: *Dock, out: []Panel) []Panel {
+fn draw_dock(cx: *TestContext, dock: anytype, out: []Panel) []Panel {
     cx.begin_frame(1280, 720, 120);
     dock.begin(cx, .{ .width = .{ .fixed = 1000 }, .height = .{ .fixed = 600 } });
     var count: usize = 0;
@@ -1088,14 +1156,14 @@ fn draw_dock(cx: *TestContext, dock: *Dock, out: []Panel) []Panel {
     return out[0..count];
 }
 
-fn send(cx: *TestContext, dock: *Dock, event: input.Event) Dock.Action {
+fn send(cx: *TestContext, dock: anytype, event: input.Event) @TypeOf(dock.*).Action {
     cx.event_begin(event);
     const action = dock.handle(cx, event);
     cx.event_end();
     return action;
 }
 
-fn centre_of(cx: *TestContext, id: Id) input.Point {
+fn centre_of(cx: anytype, id: Id) input.Point {
     const rect = cx.find(id).?.rect;
     return .{ .x = rect[0] + rect[2] * 0.5, .y = rect[1] + rect[3] * 0.5 };
 }
@@ -1368,4 +1436,56 @@ test "a copied dock draws like the original" {
     try testing.expectEqualSlices(Panel, original, copied);
     const copy = &test_static.copy;
     try testing.expect(copy.nodes[0].tabs.labels.ptr == &copy.nodes[0].labels);
+}
+
+/// Four panels of ten inked bytes, in the default layout's order.
+const wide_four = [_][]const u8{ "WWWWWWWWWW", "WWWWWWWWWW", "WWWWWWWWWW", "WWWWWWWWWW" };
+
+/// The frame of "dragging a tab onto a page's side splits it", observed: log's tab dragged off
+/// its bar and over the right zone of the editor's page, every set, splitter, edge, the ghost,
+/// and the overlay drawn.
+fn drag_frame(cx: *TestContext, dock: anytype, tally: anytype) !void {
+    var storage: [8]Panel = undefined;
+    _ = draw_dock(cx, dock, &storage);
+    try tally.observe(cx);
+    const tab = centre_of(cx, dock.tab_id(log).?);
+    _ = send(cx, dock, .{ .pointer_down = input.left_at(tab) });
+    _ = send(cx, dock, .{ .pointer_move = .{ .x = tab.x, .y = 300 } });
+    try testing.expect(cx.dragging() != null);
+    _ = send(cx, dock, .{ .pointer_move = .{ .x = 780, .y = 200 } });
+    try testing.expect(cx.drag_hovering(dock.page_id(0)));
+    _ = draw_dock(cx, dock, &storage);
+    try tally.observe(cx);
+}
+
+// Locks the composition of `DockOf(S).appends_for` (section 7) with `fixture.Counted` (tab bar
+// Box 2, tab 3, divider 1): the default layout of 4 panels of "WWWWWWWWWW" on the drag frame
+// draws Box 4 x 5 + 3 (the ghost) + 3 (the splitters) + 1 (the overlay) = 27, Glyph 5 x 10 = 50,
+// and areas 23 (4 bars, 4 tabs, 4 close buttons, 3 dividers, 4 pages, 4 edges), reached exactly.
+test "Dock appends exactly appends_for with a counted skin" {
+    const cx = fresh_context();
+    const Counted = DockOf(fixture.Counted);
+    const dock = &test_static.counted;
+    build_default(dock, &wide_four);
+    const need = comptime Counted.appends_for(.{ .panels = 4, .label_max = "WWWWWWWWWW".len });
+    var tally: fixture.Tally(need) = .{};
+    try drag_frame(cx, dock, &tally);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 27), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 50), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 23), cx.area_count);
+}
+
+// Locks `Dock.appends_for` (section 7) with the default skin on the same frame over `four`: at
+// most Box 27, Glyph 55, areas 23, and it draws Box 17 (4 bar lines, 4 faces, 4 underlines, the
+// ghost's face, 3 dividers, the overlay), Glyph 31 (5 + 6 + 3 + 10, a "x" each, "log" as the
+// ghost), and every area of the bound, 23.
+test "Dock appends at most appends_for" {
+    const cx = fresh_context();
+    const dock = default_dock();
+    var tally: fixture.Tally(Dock.appends_for(.{ .panels = 4, .label_max = 10 })) = .{};
+    try drag_frame(cx, dock, &tally);
+    try testing.expectEqual(@as(usize, 17), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 31), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 23), cx.area_count);
 }

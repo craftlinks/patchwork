@@ -29,6 +29,12 @@
 //! codepoint, and a codepoint is at least one byte. `with(bytes)` is one call with `bytes` of
 //! text in its look.
 //!
+//! ## 3a. Item Text
+//! A container's text is many labels of one kind: menu items, tab labels, column titles,
+//! panel names. Its bound takes the longest of them, `label_max`, for every item, not their
+//! total: each call of a skin function shows one label, and a skin may draw any of them in any
+//! call. `label_max_of(labels)` is that length for labels an app holds as literals.
+//!
 //! ## 4. TigerStyle Invariants
 //! - Every value is comptime-only: it holds `type`.
 //! - Each type appears at most once in `draws`; the operations keep it so, and
@@ -37,6 +43,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const draw = @import("../draw.zig");
+const text = @import("../text.zig");
 
 /// One draw type's instances.
 pub const Count = struct { type: type, count: u32 };
@@ -131,6 +138,21 @@ pub const SkinAppends = struct {
 
 /// One `draw.Glyph`: what a byte of text appends at most (module guide, section 3).
 pub const text_byte: Appends = .{ .draws = &.{.{ .type = draw.Glyph, .count = 1 }} };
+
+/// The longest of `labels` in bytes: the `label_max` of a widget's text (module guide, 3a).
+/// No labels give 0.
+pub fn label_max_of(comptime labels: []const []const u8) u32 {
+    comptime {
+        var longest: u32 = 0;
+        for (labels) |label| {
+            assert(label.len <= text.byte_cap);
+            longest = @max(longest, @as(u32, @intCast(label.len)));
+        }
+        assert(longest <= text.byte_cap);
+        if (labels.len == 0) assert(longest == 0);
+        return longest;
+    }
+}
 
 /// The first type `draws` names twice, or null.
 pub fn repeated(comptime draws: []const Count) ?type {
@@ -294,4 +316,11 @@ test "repeated finds a type named twice" {
     };
     try testing.expect(comptime repeated(&twice).? == draw.Box);
     try testing.expect(comptime repeated(face.draws) == null);
+}
+
+// Locks `label_max_of` (section 3a): {"New", "Open", "Save as"} is 7, the last and longest;
+// no labels are 0.
+test "label_max_of takes the longest label" {
+    try testing.expectEqual(@as(u32, 7), comptime label_max_of(&.{ "New", "Open", "Save as" }));
+    try testing.expectEqual(@as(u32, 0), comptime label_max_of(&.{}));
 }
