@@ -29,7 +29,8 @@
 //!
 //! ## 5. TigerStyle Invariants
 //! - Fixed widget arrays and no allocation; every loop is bounded by them.
-//! - The comptime block asserts that every row fits the configured pool and area capacities.
+//! - The pool and area capacities are the sum of what the widgets say they append
+//!   (`widgets.Appends`); the comptime block states the sum.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -66,14 +67,20 @@ const toggle_specs = [_]struct { name: []const u8, on: bool }{
 /// The view's id; its thumb is `view_id.derive(ui.view.thumb_salt)`.
 const view_id = ui.id("view", 0);
 
-/// Pool and area capacities: one panel and one thumb box plus two faces per row, two arcs
-/// per knob, up to 12 glyphs per row, and one area per knob and toggle plus the view and
-/// its thumb. The comptime block checks them.
-const box_cap: u32 = 64;
-const arc_cap: u32 = 32;
-const glyph_cap: u32 = 256;
-const area_cap: u32 = 16;
+/// What a frame appends at most: the widgets' own counts (`widgets.Appends`) for the knobs,
+/// the meter, the toggles, and the panel, plus the view's thumb box and the view's and the
+/// thumb's areas. The pool and area capacities are read from it.
+const need: widgets.Appends = widgets.Knob.appends.times(knob_specs.len)
+    .plus(widgets.Meter.appends_for(meter_name.len))
+    .plus(widgets.Toggle.appends.times(toggle_specs.len))
+    .plus(widgets.Panel.appends)
+    .plus(.{ .draws = &.{.{ .type = quads.Box, .count = 1 }}, .areas = 2 });
+const box_cap: u32 = need.of(quads.Box);
+const arc_cap: u32 = need.of(quads.Arc);
+const glyph_cap: u32 = need.of(quads.Glyph);
+const area_cap: u32 = need.areas;
 const row_count: u32 = knob_specs.len + 1 + toggle_specs.len;
+const meter_name = "meter";
 
 const Context = patchwork.app.Context(App);
 
@@ -108,7 +115,7 @@ pub const App = struct {
             const id = ui.id("knob", @intCast(index));
             knob.* = widgets.Knob.init(id, spec.name, spec.value, accent);
         }
-        app.meter = .{ .name = "meter", .value = 0.5 };
+        app.meter = .{ .name = meter_name, .value = 0.5 };
         for (&app.toggles, toggle_specs, 0..) |*toggle, spec, index| {
             toggle.* = widgets.Toggle.init(ui.id("toggle", @intCast(index)), spec.name, spec.on);
         }
@@ -161,10 +168,14 @@ fn row(height: f32) ui.Walk {
 
 comptime {
     assert(row_count == 11);
-    assert(1 + 1 + row_count * 2 <= box_cap);
-    assert(knob_specs.len * 2 <= arc_cap);
-    assert(row_count * 12 <= glyph_cap);
-    assert(knob_specs.len + toggle_specs.len + 2 <= area_cap);
+    // The sum `need` gives, so a change in a widget's counts is reviewed here: a panel, a
+    // thumb, a meter's two and a toggle's two boxes; two arcs a knob; 16-byte names and 4-byte
+    // values, "meter"; an area a knob and toggle, the view and its thumb.
+    assert(box_cap == 8);
+    assert(arc_cap == 16);
+    assert(glyph_cap == 197);
+    assert(area_cap == 12);
+    assert(need.points == 0);
 }
 
 /// The test context: static, like the hosts', so its pools stay off the stack.

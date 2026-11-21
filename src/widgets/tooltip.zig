@@ -23,7 +23,12 @@
 //! (`theme.Form`), then the text in the scheme's `name` style, centered in the box. The
 //! tooltip records no area, so it never takes the hover from what it describes.
 //!
-//! ## 3. TigerStyle Invariants
+//! ## 3. Counts
+//! `TooltipOf(S).appends` is what a shown tooltip appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `tooltip_appends` with `tooltip_text_cap` bytes of
+//! text, the most it keeps, and no area.
+//!
+//! ## 4. TigerStyle Invariants
 //! - No allocation: the text is an inline copy; `draw_overlay` reads the state.
 
 const std = @import("std");
@@ -34,6 +39,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -85,6 +91,14 @@ pub fn TooltipOf(comptime Skin: type) type {
         fill: ?[4]f32,
         /// The rect the box stays inside; null is the window.
         bounds: ?Rect,
+
+        /// What a shown tooltip appends to a frame at most (section 3).
+        pub const appends: Appends = blk: {
+            const out = Skin.tooltip_appends.with(tooltip_text_cap);
+            assert(out.areas == 0);
+            assert(out.points == Skin.tooltip_appends.fixed.points);
+            break :blk out;
+        };
 
         /// Nothing hovered, placed to the right of its anchor.
         pub fn init() Self {
@@ -306,4 +320,33 @@ test "a skinned tooltip draws what its skin draws" {
     tooltip.fill = .{ 0.2, 0.3, 0.4, 1 };
     hover_frame(cx, &tooltip);
     try testing.expectEqual([4]f32{ 0.2, 0.3, 0.4, 1 }, Fixed.last.?.fill.?);
+}
+
+comptime {
+    // The default skin's tooltip (section 3): its face and 64 bytes of text, no area.
+    assert(Tooltip.appends.of(draw.Box) == 1);
+    assert(Tooltip.appends.of(draw.Glyph) == 64);
+    assert(Tooltip.appends.areas == 0);
+}
+
+/// 64 inked bytes, `tooltip_text_cap`.
+const tip_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+
+// Locks `Tooltip.appends` (section 3) with the default skin: shown after its dwell beside the
+// anchor at (100, 100), a 64-byte tip draws Box 1 and Glyph 64 and no area of its own (the one
+// area is the test's anchor), with no overflow.
+test "Tooltip appends at most appends and reaches it" {
+    comptime assert(tip_64.len == tooltip_text_cap);
+    const cx = fixture.context();
+    var tooltip = Tooltip.init();
+    const tip: Tip = .{ .anchor = ui.id("knob", 0), .text = tip_64 };
+    hover_frame(cx, &tooltip);
+    step(cx, &tooltip, .{ .pointer_move = .{ .x = 120, .y = 120 } }, tip);
+    step(cx, &tooltip, .{ .frame = tooltip_delay_ms }, tip);
+    try testing.expect(tooltip.visible());
+    var tally: fixture.Tally(Tooltip.appends.plus(.{ .areas = 1 })) = .{};
+    hover_frame(cx, &tooltip);
+    try tally.observe(cx);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 64), cx.draw.items(draw.Glyph).len);
 }

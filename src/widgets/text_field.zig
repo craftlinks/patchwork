@@ -50,6 +50,14 @@
 //! with `unmask_index`. Copy and cut do nothing (the browser's `copy` event then finds nothing
 //! to take). Word moves and word erasure go to the ends, and a double press selects all, so
 //! the text's word structure never shows. The number of codepoints does: platform behaviour.
+//!
+//! ## 7. Counts
+//! `TextFieldOf(S).appends_for(field_text)` is what one field appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `field_appends`, the selection band and the caret (two
+//! `draw.Box`), one `draw.Glyph` per byte of the larger of `limit` and `hint` (the hint shows
+//! only while the field is empty; a secret field's bullets are one a codepoint), one for the
+//! icon, and the area. The app says the field's text (`FieldText`), since `limit` is per
+//! instance and the hint is the app's.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -61,6 +69,7 @@ const ui = @import("../ui.zig");
 const edit = @import("../ui/edit.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -102,6 +111,14 @@ pub const FieldIcon = struct {
     codepoint: u21,
 };
 
+/// What a field's text is at most, for `appends_for` (section 7): its `limit`, its hint's
+/// bytes, and whether it has an icon.
+pub const FieldText = struct {
+    limit: u32,
+    hint: u32 = 0,
+    icon: bool = false,
+};
+
 /// Field text starts at the left and is centered vertically, never cut.
 pub const field_text_options: text.Options = .{
     .align_x = .start,
@@ -140,6 +157,24 @@ pub fn TextFieldOf(comptime Skin: type) type {
             /// Escape.
             cancelled,
         };
+
+        /// What one field with `field_text` appends to a frame at most (section 7).
+        pub fn appends_for(comptime field_text: FieldText) Appends {
+            comptime {
+                assert(field_text.limit <= edit.field_cap);
+                assert(field_text.hint <= text.byte_cap);
+                const icon: u32 = @intFromBool(field_text.icon);
+                const glyphs = @max(field_text.limit, field_text.hint) + icon;
+                const own: Appends = .{ .draws = &.{
+                    .{ .type = quads.Box, .count = 2 },
+                    .{ .type = quads.Glyph, .count = glyphs },
+                }, .areas = 1 };
+                const out = Skin.field_appends.with(0).plus(own);
+                assert(out.areas == 1);
+                assert(out.of(quads.Glyph) >= glyphs);
+                return out;
+            }
+        }
 
         /// An empty field holding at most `limit` bytes.
         pub fn init(id: Id, limit: u32, style: text.Style) Self {
@@ -770,4 +805,44 @@ test "a tracked field's caret and press agree with its glyphs" {
     const band = cx.draw.items(quads.Box)[1];
     try testing.expectEqual(@as(f32, field_padding_x), band.rect[0]);
     try testing.expectEqual(@as(f32, 23), band.rect[0] + band.rect[2]);
+}
+
+comptime {
+    // The default skin's field (section 7) at limit 64, a 16-byte hint, and an icon: the face,
+    // the band, and the caret; 64 glyphs and the icon's; an area.
+    const most = TextField.appends_for(.{ .limit = 64, .hint = 16, .icon = true });
+    assert(most.of(quads.Box) == 3);
+    assert(most.of(quads.Glyph) == 65);
+    assert(most.areas == 1);
+    assert(TextField.appends_for(.{ .limit = 3 }).of(quads.Box) == 3);
+}
+
+/// 64 inked bytes, and a 16-byte hint.
+const text_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+const hint_16 = "sixteen-letters!";
+
+// Locks `TextField.appends_for` (section 7) with the default skin at limit 64, a 16-byte hint,
+// and an icon, in a 1200 px field: empty and unfocused it draws Box 1 and Glyph 17 (the hint
+// and the icon); full, focused, and all selected Box 3 (face, band, caret) and Glyph 65; one
+// area each time and no overflow.
+test "TextField appends at most appends_for and reaches it" {
+    comptime assert(text_64.len == 64);
+    comptime assert(hint_16.len == 16);
+    const cx = test_context();
+    var field = TextField.init(ui.id("field", 0), 64, field_style);
+    field.hint = hint_16;
+    field.icon = .{ .face = .sans, .codepoint = 'A' };
+    const Need = fixture.Tally(TextField.appends_for(.{ .limit = 64, .hint = 16, .icon = true }));
+    var tally: Need = .{};
+    draw_one(cx, &field, at(0, 0, 1200, 24));
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 17), cx.draw.items(quads.Glyph).len);
+    field.load(text_64);
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_focus(field.id);
+    cx.event_end();
+    draw_one(cx, &field, at(0, 0, 1200, 24));
+    try tally.observe(cx);
+    try testing.expect(field.edit.has_selection());
+    try tally.expect_reached();
 }

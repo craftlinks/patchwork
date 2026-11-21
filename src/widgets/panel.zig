@@ -8,12 +8,18 @@
 //! alone, as a leaf. The skin draws the face (`widgets/skin.zig`); `Panel` is
 //! `PanelOf(skins.Default)`. Its `material` (or the scheme's) decides between a solid face and
 //! glass over the backdrop under its layer (`theme.zig`, section 7).
+//!
+//! ## 2. Counts
+//! `PanelOf(S).appends` is what one panel appends to a frame at most, for `begin` and for
+//! `draw` alike (`widgets/appends.zig`): the skin's `panel_appends`, with no text and no area.
+//! The children are the app's.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -31,6 +37,14 @@ pub fn PanelOf(comptime Skin: type) type {
         paint: kit.Paint,
         /// The panel's material; null takes the scheme's (`theme.zig`, section 7).
         material: ?kit.Material = null,
+
+        /// What one panel appends to a frame at most (section 2).
+        pub const appends: Appends = blk: {
+            const out = Skin.panel_appends.with(0);
+            assert(out.areas == 0);
+            assert(out.points == Skin.panel_appends.fixed.points);
+            break :blk out;
+        };
 
         /// Draws the face over the box `walk` gets, under the enclosing clip, then opens a
         /// container laid out by `layout` over it. The caller closes it with `cx.end()`. The
@@ -99,4 +113,34 @@ test "a panel is glass over a backdrop and solid without one" {
     try testing.expectEqual(cx.theme().colors.panel[0], glass[0].tint[0]);
     try testing.expectEqual(@as(f32, 12), glass[0].look[0]);
     try testing.expect(cx.draw.textures.is_backdrop(cx.draw.backdrop_list()[0].id));
+}
+
+comptime {
+    // The default skin's panel (section 2): a Box when solid, a Glass over a backdrop.
+    assert(Panel.appends.of(draw.Box) == 1);
+    assert(Panel.appends.of(draw.Glass) == 1);
+    assert(Panel.appends.of(draw.Glyph) == 0);
+    assert(Panel.appends.areas == 0);
+}
+
+// Locks `Panel.appends` (section 2) with the default skin: solid it draws Box 1, frosted over
+// a marked backdrop Glass 1, no text, no area, and no overflow; `begin` draws the same face.
+test "Panel appends at most appends and reaches it" {
+    const cx = fixture.context();
+    var tally: fixture.Tally(Panel.appends) = .{};
+    var panel: Panel = .{ .paint = kit.paint_of(.{ 0.2, 0.2, 0.2, 1 }, 12), .material = .solid };
+    panel_frame(cx, &panel, false);
+    try tally.observe(cx);
+    panel.material = .frosted;
+    panel_frame(cx, &panel, true);
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 1), cx.draw.items(draw.Glass).len);
+    try tally.expect_reached();
+    var opened: fixture.Tally(Panel.appends) = .{};
+    cx.begin_frame(1280, 720, 120);
+    _ = panel.begin(cx, fixture.at(100, 100, 200, 120), .{ .flow = .down });
+    _ = cx.end();
+    _ = cx.end_frame();
+    try opened.observe(cx);
+    try testing.expectEqual(@as(usize, 1), cx.draw.items(draw.Box).len);
 }

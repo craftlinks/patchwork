@@ -37,6 +37,12 @@
 //! at 0, lightened by hover), the name, and the value text as hundredths `d.dd` in the fixed
 //! `[8]u8` `value_text`, tail zeroed. `draw_text` hands the skin the app's own text instead (a value
 //! in its units, "-27.7db"), valid for the call.
+//!
+//! ## 4. Counts
+//! `KnobOf(S).appends` is what one knob appends to a frame at most (`widgets/appends.zig`): the
+//! skin's `knob_appends` with a `name_max` name and the default 4-byte value text, plus its
+//! area. `appends_for(value_bytes)` is the same for `draw_text` with up to `value_bytes` bytes.
+//! The bound holds while `name` stays within `name_max`, which `init` and `draw_text` assert.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -47,6 +53,7 @@ const theme = @import("../theme.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -75,6 +82,8 @@ pub const label_line_px: f32 = 36;
 pub const accent_count: u32 = 4;
 /// Bytes of a knob's or a toggle's name at most.
 pub const name_max: u32 = 16;
+/// Bytes of the default value text `draw` hands the skin: hundredths, `d.dd`.
+pub const value_text_bytes: u32 = 4;
 
 /// A knob's ring area: it takes the wheel and shows the grab cursor.
 pub const knob_flags: ui.Flags = .{
@@ -132,6 +141,21 @@ pub fn KnobOf(comptime Skin: type) type {
             /// A right press set the value back to `default`.
             reset: f32,
         };
+
+        /// What one knob appends to a frame at most with `draw` (section 4).
+        pub const appends: Appends = appends_for(value_text_bytes);
+
+        /// What one knob appends at most with `draw_text` and up to `value_bytes` bytes of
+        /// value text (section 4): the skin's knob with a `name_max` name, and its area.
+        pub fn appends_for(comptime value_bytes: u32) Appends {
+            comptime {
+                assert(value_bytes <= text.byte_cap);
+                const out = Skin.knob_appends.with(name_max + value_bytes).plus(.{ .areas = 1 });
+                assert(out.areas == 1);
+                assert(out.points == Skin.knob_appends.fixed.points);
+                return out;
+            }
+        }
 
         /// A knob at `value` (also its default) with its text written.
         pub fn init(id: Id, name: []const u8, value: f32, accent: kit.Paint) Self {
@@ -201,7 +225,7 @@ pub fn KnobOf(comptime Skin: type) type {
         /// area. The default skin draws the ring, the value arc, the name, and the value text,
         /// and nothing in a box shorter than the ring.
         pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
-            self.draw_text(cx, walk, self.value_text[0..4]);
+            self.draw_text(cx, walk, self.value_text[0..value_text_bytes]);
         }
 
         /// `draw` with `value_text` as the value's text: the app's formatting in its units,
@@ -210,6 +234,9 @@ pub fn KnobOf(comptime Skin: type) type {
             assert(self.value >= 0);
             assert(self.value <= 1);
             assert(value_text.len <= text.byte_cap);
+            // The fields are public, so an app can lengthen the name after `init`; `appends`
+            // is a bound only while it fits.
+            assert(self.name.len <= name_max);
             const row = cx.walk(walk);
             const clip = cx.visible(row) orelse return;
             const shape = Skin.knob(cx, .{
@@ -329,6 +356,19 @@ comptime {
     assert(ring_inset + ring_size == 64);
     // The default knob's labels start where they always did: ring.x + 64.
     assert(ring_size + label_gap == 64);
+    // `write_hundredths` writes `d.dd` into the first `value_text_bytes`.
+    assert(value_text_bytes == 4);
+}
+
+comptime {
+    // The default skin's knob (section 4): two arcs, a 16-byte name and 4 bytes of value, the
+    // ring's area; with "-6.0db" two more glyphs.
+    assert(Knob.appends.of(quads.Arc) == 2);
+    assert(Knob.appends.of(quads.Glyph) == 20);
+    assert(Knob.appends.of(quads.Box) == 0);
+    assert(Knob.appends.areas == 1);
+    assert(Knob.appends.points == 0);
+    assert(Knob.appends_for(6).of(quads.Glyph) == 22);
 }
 
 const testing = std.testing;
@@ -427,4 +467,25 @@ test "a knob draws the app's value text" {
     try testing.expectEqual(@as(usize, 10), cx.draw.items(quads.Glyph).len);
     const long = Knob.init(ui.id("knob", 1), "sixteen-letters!", 0, accents[0]);
     try testing.expectEqual(@as(usize, name_max), long.name.len);
+}
+
+// Locks `Knob.appends` (section 4) with the default skin: "sixteen-letters!" (16 inked bytes)
+// at value 1 ("1.00") and hover 1 in a 600 px row draws Arc 2, Glyph 20, and one area, nothing
+// else and no overflow; `draw_text` with "-6.0db" reaches `appends_for(6)`, Glyph 22.
+test "Knob appends at most appends and reaches it" {
+    const cx = test_context();
+    var knob = Knob.init(ui.id("knob", 0), "sixteen-letters!", 1, accents[0]);
+    knob.hover.value = 1;
+    var tally: fixture.Tally(Knob.appends) = .{};
+    draw_one(cx, &knob, at(0, 0, 600, knob_height));
+    try tally.observe(cx);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 20), cx.draw.items(quads.Glyph).len);
+    var wide: fixture.Tally(Knob.appends_for(6)) = .{};
+    cx.begin_frame(1280, 720, 120);
+    knob.draw_text(cx, at(0, 0, 600, knob_height), "-6.0db");
+    _ = cx.end_frame();
+    try wide.observe(cx);
+    try wide.expect_reached();
+    try testing.expectEqual(@as(usize, 22), cx.draw.items(quads.Glyph).len);
 }

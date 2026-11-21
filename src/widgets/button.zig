@@ -12,6 +12,11 @@
 //! (`widgets/skin.zig`); `Button` is `ButtonOf(skins.Default)`. The default look is the face
 //! (`Paint.look` of the two animator values), then the label inside `padding`; the face is the
 //! hit area, rounded by the paint's radius.
+//!
+//! ## 3. Counts
+//! `ButtonOf(S).appends_for(label_bytes)` is what one button appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `button_appends` with a label of up to `label_bytes`
+//! bytes, plus its area. The library states no maximum label, so the app says its length.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,6 +26,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Walk = kit.Walk;
 const Id = kit.Id;
@@ -48,6 +54,17 @@ pub fn ButtonOf(comptime Skin: type) type {
             none,
             clicked,
         };
+
+        /// What one button with a label of up to `label_bytes` bytes appends to a frame at
+        /// most (section 3).
+        pub fn appends_for(comptime label_bytes: u32) Appends {
+            comptime {
+                assert(label_bytes <= text.byte_cap);
+                const out = Skin.button_appends.with(label_bytes).plus(.{ .areas = 1 });
+                assert(out.areas == 1);
+                return out;
+            }
+        }
 
         pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
             assert(self.id != .none);
@@ -129,4 +146,25 @@ test "button up inside clicks and up outside does not" {
     );
     try testing.expectEqual(@as(f32, 0), button.hover.target);
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+}
+
+const quads = @import("../draw.zig");
+
+comptime {
+    // The default skin's button (section 3): the face, "go", an area.
+    assert(Button.appends_for(2).of(quads.Box) == 1);
+    assert(Button.appends_for(2).of(quads.Glyph) == 2);
+    assert(Button.appends_for(2).areas == 1);
+}
+
+// Locks `Button.appends_for` (section 3) with the default skin: "go" draws Box 1 and Glyph 2
+// and one area, nothing else and no overflow.
+test "Button appends at most appends_for and reaches it" {
+    const cx = test_context();
+    var button = sample_button();
+    button.label = "go";
+    var tally: fixture.Tally(Button.appends_for("go".len)) = .{};
+    draw_one(cx, &button, at(0, 0, 80, 48));
+    try tally.observe(cx);
+    try tally.expect_reached();
 }

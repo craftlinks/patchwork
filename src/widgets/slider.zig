@@ -20,6 +20,10 @@
 //! carries, so the slider stores no rect and a skin maps presses onto what it drew. The hover
 //! animator is the highlight for the whole gesture (the kit's table without a press channel);
 //! a release reports `released`.
+//!
+//! ## 3. Counts
+//! `SliderOf(S).appends` is what one slider appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `slider_appends`, with no text, plus its area.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,6 +32,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -65,6 +70,14 @@ pub fn SliderOf(comptime Skin: type) type {
             none,
             changed: f32,
             released,
+        };
+
+        /// What one slider appends to a frame at most (section 3).
+        pub const appends: Appends = blk: {
+            const out = Skin.slider_appends.with(0).plus(.{ .areas = 1 });
+            assert(out.areas == 1);
+            assert(out.points == Skin.slider_appends.fixed.points);
+            break :blk out;
         };
 
         pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
@@ -163,6 +176,13 @@ comptime {
     assert(track_radius * 2 == track_height);
 }
 
+comptime {
+    // The default skin's slider (section 3): track, fill, and knob, no text, an area.
+    assert(Slider.appends.of(quads.Box) == 3);
+    assert(Slider.appends.of(quads.Glyph) == 0);
+    assert(Slider.appends.areas == 1);
+}
+
 const testing = std.testing;
 const quads = @import("../draw.zig");
 const fixture = @import("fixture.zig");
@@ -224,4 +244,22 @@ test "slider drag sets an absolute value" {
     try testing.expectEqual(@as(usize, 2), cx.draw.items(quads.Box).len);
     const released = send(cx, &slider, .{ .pointer_up = input.left_at(.{ .x = 28, .y = 628 }) });
     try testing.expectEqual(Slider.Action.released, released);
+}
+
+// Locks `Slider.appends` (section 3) with the default skin: at value 0.5 it draws Box 3
+// (track, fill, knob) and one area, nothing else and no overflow.
+test "Slider appends at most appends and reaches it" {
+    const cx = test_context();
+    var slider: Slider = .{
+        .id = ui.id("slider", 0),
+        .hover = animator.Animator.init(hover_rate_per_ms),
+        .value = 0.5,
+        .track = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 1, .radius = track_radius },
+        .fill = .{ .r = 0.30, .g = 0.46, .b = 0.70, .a = 1, .radius = track_radius },
+        .knob = .{ .r = 0.86, .g = 0.88, .b = 0.92, .a = 1, .radius = knob_radius },
+    };
+    var tally: fixture.Tally(Slider.appends) = .{};
+    draw_one(cx, &slider, at(16, 616, 1248, 24));
+    try tally.observe(cx);
+    try tally.expect_reached();
 }

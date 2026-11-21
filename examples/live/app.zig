@@ -213,7 +213,10 @@ const inline_knob_cap: u32 = bindings.shape_cap * bindings.shape_args;
 /// one lane face per row, the held knob's bar, the column thumb, and the playhead; the header
 /// and the bpm field's face, selection, and caret.
 const box_cap: u32 = (2 + editor.lines_max + 2 * editor.decoration_cap + 1 + 1) +
-    bindings.shape_cap + (1 + binding_cap + 1 + 1 + 1) + (1 + 3);
+    bindings.shape_cap + (1 + binding_cap + 1 + 1 + 1) + (1 + bpm_field_boxes);
+/// The bpm field's face, selection, and caret, as the field says (`widgets.Appends`).
+const bpm_field_boxes: u32 =
+    widgets.TextField.appends_for(.{ .limit = bpm_digits_max }).of(quads.Box);
 /// A track and a value arc per knob.
 const arc_cap: u32 = 2 * (binding_cap + inline_knob_cap);
 /// The editor, the header, a value and a label per knob, and the held knob's original.

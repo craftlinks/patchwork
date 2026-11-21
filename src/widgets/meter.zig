@@ -14,6 +14,12 @@
 //! None: drawing only reads `value` and hands it to the skin (`widgets/skin.zig`; `Meter` is
 //! `MeterOf(skins.Default)`), and it records no area. `set_value` reports a change so
 //! the caller owes a draw only then.
+//!
+//! ## 3. Counts
+//! `MeterOf(S).appends_for(name_bytes)` is what one meter appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `meter_appends` with a name of up to `name_bytes`
+//! bytes, and no area. The library states no maximum name, so the app, which holds the
+//! name, says its length.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,6 +27,7 @@ const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const knob_file = @import("knob.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -45,6 +52,17 @@ pub fn MeterOf(comptime Skin: type) type {
         value: f32,
         /// The track's height in logical pixels (section 1).
         track_h: f32 = meter_track_h,
+
+        /// What one meter with a name of up to `name_bytes` bytes appends to a frame at most
+        /// (section 3).
+        pub fn appends_for(comptime name_bytes: u32) Appends {
+            comptime {
+                const out = Skin.meter_appends.with(name_bytes);
+                assert(out.areas == 0);
+                assert(out.points == Skin.meter_appends.fixed.points);
+                return out;
+            }
+        }
 
         /// Writes `value` when it differs. Returns true when it changed.
         pub fn set_value(self: *Self, value: f32) bool {
@@ -97,6 +115,13 @@ comptime {
     // A capsule: the corner radius is half the width.
     assert(meter_radius * 2 == meter_track_w);
     assert(meter_track_h < meter_height);
+}
+
+comptime {
+    // The default skin's meter (section 3): track and fill, "meter", no area.
+    assert(Meter.appends_for(5).of(quads.Box) == 2);
+    assert(Meter.appends_for(5).of(quads.Glyph) == 5);
+    assert(Meter.appends_for(5).areas == 0);
 }
 
 const testing = std.testing;
@@ -152,4 +177,15 @@ test "meter fill grows upward from the track bottom" {
     draw_one(cx, &meter, walk);
     try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Box).len);
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+}
+
+// Locks `Meter.appends_for` (section 3) with the default skin: "meter" at 0.5 draws Box 2
+// (track, fill) and Glyph 5, no area and no overflow.
+test "Meter appends at most appends_for and reaches it" {
+    const cx = test_context();
+    const meter: Meter = .{ .name = "meter", .value = 0.5 };
+    var tally: fixture.Tally(Meter.appends_for("meter".len)) = .{};
+    draw_one(cx, &meter, at(0, 0, 600, meter_height));
+    try tally.observe(cx);
+    try tally.expect_reached();
 }

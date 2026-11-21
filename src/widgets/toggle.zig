@@ -14,6 +14,11 @@
 //! channel; a release inside flips `on` and aims the `thumb` animator, which eases on `.frame`
 //! beside the hover. Only the thumb disc lightens. `accent`, when set, is the thumb's colour
 //! when on: the default skin mixes `colors.control` toward it by the thumb's position.
+//!
+//! ## 3. Counts
+//! `ToggleOf(S).appends` is what one toggle appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `toggle_appends` with a `name_max` name, plus its area.
+//! The bound holds while `name` stays within `name_max`, which `init` and `draw` assert.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -24,6 +29,7 @@ const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const knob_file = @import("knob.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -59,6 +65,14 @@ pub fn ToggleOf(comptime Skin: type) type {
         pub const Action = union(enum) {
             none,
             toggled: bool,
+        };
+
+        /// What one toggle appends to a frame at most (section 3).
+        pub const appends: Appends = blk: {
+            const out = Skin.toggle_appends.with(knob_file.name_max).plus(.{ .areas = 1 });
+            assert(out.areas == 1);
+            assert(out.points == Skin.toggle_appends.fixed.points);
+            break :blk out;
         };
 
         /// A toggle at rest, thumb on the side `on` selects.
@@ -97,6 +111,8 @@ pub fn ToggleOf(comptime Skin: type) type {
         pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
             assert(self.thumb.value >= 0);
             assert(self.thumb.value <= 1);
+            // `name` is public; `appends` is a bound only while it fits `name_max`.
+            assert(self.name.len <= knob_file.name_max);
             const row = cx.walk(walk);
             const clip = cx.visible(row) orelse return;
             const shape = Skin.toggle(cx, .{
@@ -144,6 +160,14 @@ comptime {
     assert(pill_w - thumb_side - 2 * thumb_inset == 20);
     // A capsule: the corner radius is half the height.
     assert(pill_radius * 2 == pill_h);
+}
+
+comptime {
+    // The default skin's toggle (section 3): the pill and the thumb, a 16-byte name, an area.
+    assert(Toggle.appends.of(quads.Box) == 2);
+    assert(Toggle.appends.of(quads.Glyph) == 16);
+    assert(Toggle.appends.areas == 1);
+    assert(Toggle.appends.points == 0);
 }
 
 const testing = std.testing;
@@ -202,4 +226,17 @@ test "a toggle's accent colours its thumb when on" {
     const boxes = cx.draw.items(quads.Box);
     try testing.expectEqual(cx.theme().colors.track, boxes[0].fill);
     for (accent, boxes[1].fill) |want, got| try testing.expectApproxEqAbs(want, got, 1e-6);
+}
+
+// Locks `Toggle.appends` (section 3) with the default skin: a 16-byte name, on and hovered,
+// in a 600 px row draws Box 2 (pill, thumb), Glyph 16, and one area, with no overflow.
+test "Toggle appends at most appends and reaches it" {
+    const cx = test_context();
+    var toggle = Toggle.init(ui.id("toggle", 0), "sixteen-letters!", true);
+    toggle.hover.value = 1;
+    var tally: fixture.Tally(Toggle.appends) = .{};
+    draw_one(cx, &toggle, at(0, 0, 600, toggle_height));
+    try tally.observe(cx);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 16), cx.draw.items(quads.Glyph).len);
 }

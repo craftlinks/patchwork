@@ -90,7 +90,9 @@ pub const App = struct {
 ```
 
 The smallest complete example to copy from is
-[examples/column/app.zig](examples/column/app.zig).
+[examples/column/app.zig](examples/column/app.zig). Its capacities are summed from what its
+widgets say they append (`widgets.Knob.appends`, `widgets.Toggle.appends`, ...), so adding a
+widget adds its share of the pools.
 
 To use Patchwork from your own project, add it to `build.zig.zon` and call
 `patchwork.addApp(b, dep.builder, .{ .name, .root_source_file, .target, .optimize })` in your

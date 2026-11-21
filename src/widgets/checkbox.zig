@@ -21,6 +21,12 @@
 //! ```
 //! The area is focusable, so a press focuses it (`ui/cx.zig`, section 7) and Tab visits it in
 //! draw order. Every flip returns `toggled` with the new `on`.
+//!
+//! ## 4. Counts
+//! `CheckboxOf(S).appends` is what one checkbox appends to a frame at most
+//! (`widgets/appends.zig`): the skin's `checkbox_appends` with a `checkbox_label_max` label,
+//! plus its area. The bound holds while `label` stays within that, which `init` and `draw`
+//! assert.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -30,6 +36,7 @@ const text = @import("../text.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -74,6 +81,14 @@ pub fn CheckboxOf(comptime Skin: type) type {
             toggled: bool,
         };
 
+        /// What one checkbox appends to a frame at most (section 4).
+        pub const appends: Appends = blk: {
+            const out = Skin.checkbox_appends.with(checkbox_label_max).plus(.{ .areas = 1 });
+            assert(out.areas == 1);
+            assert(out.points == Skin.checkbox_appends.fixed.points);
+            break :blk out;
+        };
+
         /// A checkbox at rest, its check settled on the side `on` selects.
         pub fn init(id: Id, label: []const u8, on: bool) Self {
             assert(id != .none);
@@ -114,6 +129,8 @@ pub fn CheckboxOf(comptime Skin: type) type {
         pub fn draw(self: *const Self, cx: anytype, walk: Walk) void {
             assert(self.check.value >= 0);
             assert(self.check.value <= 1);
+            // `label` is public; `appends` is a bound only while it fits.
+            assert(self.label.len <= checkbox_label_max);
             const row = cx.walk(walk);
             const clip = cx.visible(row) orelse return;
             const shape = Skin.checkbox(cx, .{
@@ -206,6 +223,16 @@ pub const mixed_h: f32 = 2;
 comptime {
     assert(checkbox_height >= box_side);
     assert(mark_square < box_side and mixed_w < box_side);
+}
+
+comptime {
+    // The default skin's checkbox (section 4): two boxes (the box and the bar or the mark's
+    // square), the mark's path of 3 points, a 32-byte label, an area.
+    assert(Checkbox.appends.of(draw.Box) == 2);
+    assert(Checkbox.appends.of(draw.Path) == 1);
+    assert(Checkbox.appends.points == 3);
+    assert(Checkbox.appends.of(draw.Glyph) == 32);
+    assert(Checkbox.appends.areas == 1);
 }
 
 const testing = std.testing;
@@ -301,4 +328,34 @@ test "the default checkbox draws its box, mark or bar, and label" {
     try testing.expectEqual(@as(usize, 2), cx.draw.items(draw.Box).len);
     try testing.expectEqual(@as(usize, 0), cx.draw.items(draw.Path).len);
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
+}
+
+/// 32 inked bytes, `checkbox_label_max`.
+const label_32 = "abcdefghijklmnopqrstuvwxyzABCDEF";
+
+// Locks `Checkbox.appends` (section 4) with the default skin and a 32-byte label in a 1200 px
+// row: mixed (Box 2), checked (Box 1, Path 1, points 3), and checked without `draw.Path`
+// (Box 2) reach Box 2, Path 1, points 3, Glyph 32, and one area, with no overflow.
+test "Checkbox appends at most appends and reaches it" {
+    comptime assert(label_32.len == checkbox_label_max);
+    const cx = fixture.context();
+    var tally: fixture.Tally(Checkbox.appends) = .{};
+    var checkbox = Checkbox.init(ui.id("check", 0), label_32, true);
+    checkbox.hover.value = 1;
+    checkbox.mixed = true;
+    draw_one(cx, &checkbox, at(0, 0, 1200, checkbox_height));
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 2), cx.draw.items(draw.Box).len);
+    checkbox.mixed = false;
+    draw_one(cx, &checkbox, at(0, 0, 1200, checkbox_height));
+    try tally.observe(cx);
+    try testing.expectEqual(@as(usize, 1), cx.draw.items(draw.Path).len);
+    try testing.expectEqual(@as(usize, 32), cx.draw.items(draw.Glyph).len);
+    const bare = fixture.bare_context();
+    bare.begin_frame(1280, 720, 120);
+    checkbox.draw(bare, at(0, 0, 1200, checkbox_height));
+    _ = bare.end_frame();
+    try tally.observe(bare);
+    try testing.expectEqual(@as(usize, 2), bare.draw.items(draw.Box).len);
+    try tally.expect_reached();
 }
