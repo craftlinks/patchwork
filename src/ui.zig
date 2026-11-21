@@ -27,6 +27,7 @@
 //! ui/view.zig     ViewState, scrollbar geometry, List
 //! ui/canvas.zig   CanvasState, the zoom ladder, wheel and drag
 //! ui/gestures.zig tap, drag, long-press, pinch, and two-finger recognizers per target
+//! ui/drag.zig     Drag: one area's press, drag, and release as the place of the point it moves
 //! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words,
 //!                 and paste sanitizing for one line and the code editor's multi-line text
 //! ```
@@ -47,9 +48,11 @@
 //! target names: a widget, a slice or array of widgets, or the fields of a struct (one level,
 //! in field order) that are widgets or arrays of widgets. A widget is a type with a
 //! three-parameter `handle(self, cx, event)`; `ViewState.handle` takes an id too, so a bare view
-//! is routed by hand, while `widgets.ListBox` wraps one and routes it itself. Routing every
-//! field of the app (`route(cx, event, app)`) means a widget added to the app is never
-//! silently dead. Test "route reaches every widget field" locks it.
+//! is routed by hand, while `widgets.ListBox` wraps one and routes it itself. `route` routes
+//! only those widgets: a widget whose `handle` needs something from its holder (the point it
+//! drags, as one built on `Drag` does, or its bounds) is called by its holder, which passes it.
+//! Routing every field of the app (`route(cx, event, app)`) means a widget added to the app is
+//! never silently dead. Test "route reaches every widget field" locks it.
 //!
 //! ## 3b. Overlays
 //! Popups and tooltips are drawn last, at the root, on their own layers (`ui/popup.zig`,
@@ -80,6 +83,7 @@ pub const areas = @import("ui/areas.zig");
 pub const view = @import("ui/view.zig");
 pub const canvas = @import("ui/canvas.zig");
 pub const gestures = @import("ui/gestures.zig");
+pub const drag = @import("ui/drag.zig");
 pub const cx = @import("ui/cx.zig");
 pub const edit = @import("ui/edit.zig");
 pub const popup = @import("ui/popup.zig");
@@ -103,6 +107,7 @@ pub const WindowState = input.WindowState;
 pub const title_max = cx.title_max;
 pub const Decorations = input.Decorations;
 pub const Hit = cx.Hit;
+pub const Drag = drag.Drag;
 pub const Dragging = cx.Dragging;
 pub const DragOver = cx.DragOver;
 pub const DragEnd = cx.DragEnd;
@@ -137,8 +142,9 @@ pub fn flow_of(flow: Flow) Layout {
 /// something other than `.none` (module guide, section 3a). `target` is a pointer to a widget,
 /// a slice or a pointer to an array of widgets, or a pointer to a struct, whose fields that are
 /// widgets or arrays of widgets are routed in field order. A widget is a type with a
-/// three-parameter `handle(self, cx, event)` whose result has a `none` tag; other fields are
-/// skipped at compile time, and a target that names no widget at all is a compile error.
+/// three-parameter `handle(self, cx, event)` whose result has a `none` tag; a `handle` with
+/// more parameters is the holder's to call; other fields are skipped at compile time, and a
+/// target that names no widget at all is a compile error.
 pub fn route(context: anytype, event: input.Event, target: anytype) u32 {
     const Target = @TypeOf(target);
     const info = @typeInfo(Target);
@@ -347,6 +353,7 @@ test {
     _ = view;
     _ = canvas;
     _ = gestures;
+    _ = drag;
     _ = cx;
     _ = edit;
     _ = popup;
