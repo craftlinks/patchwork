@@ -1,4 +1,4 @@
-//! The app's theme: the scheme widgets read, its GPU record, and the open-ring arc angles.
+//! The app's theme: the scheme widgets read, its GPU record, and the shape of the open ring.
 //!
 //! # Deep Architectural Guide for Reviewers:
 //!
@@ -9,7 +9,7 @@
 //! Widgets read it on the CPU at draw time through `cx.theme()` (`ui/cx.zig`, section 9b) to
 //! fill per-instance colors. `Theme` is the part the
 //! GPU needs, `Scheme.record()`: the colors the shaders mix toward (`lighten`, `darken`), the
-//! background the passes clear to, the chrome slots, and the arc angles. Sizes are not themed;
+//! background the passes clear to, the chrome slots, and the scheme's arc. Sizes are not themed;
 //! they stay per instance (`Knob.sized`, `Meter.track_h`). Corners and strokes are, in the
 //! scheme's `form` (section 8).
 //! ```text
@@ -26,21 +26,25 @@
 //! `Frame { ortho: mat4x4<f32>, time: vec4<f32>, theme: Theme }` (`draw/prelude.wgsl`). Placing
 //! `Theme` in the frame uniform lets all pipelines share one bind group layout and one bind
 //! group, keeps color and arc-angle literals out of WGSL, and makes a theme switch one uniform
-//! write: the fragment shaders read `lighten`, `darken`, and `arc`, and the renderer's clear
-//! pipeline reads `background` (`draw/renderer.zig`, section 4a).
+//! write: the fragment shaders read `lighten` and `darken`, an app's own shader may read `arc`,
+//! and the renderer's clear pipeline reads `background` (`draw/renderer.zig`, section 4a).
 //!
 //! The frame record is `draw.matrix_bytes + draw.time_bytes + draw.device_to_ndc_bytes + bytes`
 //! long and must equal `draw.uniform_bytes`; see the `comptime` block in `draw.zig` and the
 //! alignment rationale on `draw.uniform_bytes`.
 //!
-//! ## 3. Angle Convention
+//! ## 3. Angle Convention and the Ring
 //! Angles come from `atan2(y, x)` in Y-down pixel space: 0 points along +X, and increasing
-//! angles turn clockwise as seen on screen. The open ring starts at `arc_start`, sweeps
-//! clockwise by `arc_sweep`, and leaves a gap of `tau - arc_sweep` that closes back at
-//! `arc_start`. Test "open ring gap is a quarter turn that closes at the start angle" locks
-//! this, and test "sdf arc locks the open ring" in `draw/types.zig` locks the distance field.
-//! The arc is not themeable: the CPU twins in `draw/types.zig` use the constants for hit tests,
-//! so `record` always writes them.
+//! angles turn clockwise as seen on screen. An `ArcShape` is an open ring: it starts at
+//! `start`, sweeps clockwise by `sweep`, and leaves a gap of `tau - sweep` that closes back at
+//! `start`. The default ring starts at `arc_start` and sweeps `arc_sweep`, a quarter-turn gap
+//! whose ends are not mirror images; `ArcShape.symmetric(gap)` centres a gap of any width on
+//! straight down. `Scheme.arc` is the ring knobs and other arcs are drawn on when their look
+//! names none (`draw.ArcLook.shape`); `record` writes it into the `arc` slot. Each `draw.Arc`
+//! instance carries its own start and sweep in radians, filled by `Arc.of` from the look's
+//! fractions of the ring, so the library's shaders and the CPU twins read the instance, never
+//! the record. Test "open ring gap is a quarter turn that closes at the start angle" locks the
+//! default, and test "sdf arc locks the open ring" in `draw/types.zig` the distance field.
 //!
 //! ## 4. Layout Contract
 //! `Theme` is an `extern struct` of `vec4<f32>` slots. `draw/registry.zig` generates the WGSL
@@ -55,11 +59,12 @@
 //! Start from a preset and change what differs: `var s = theme.dark; s.colors.panel = ...;`.
 //! Colors are straight (non-premultiplied) RGBA with every component in `[0, 1]`, the three text
 //! styles' sizes are within `text.size_max`, and their tracking is in `[0, text.tracking_max]`;
-//! the material's and the form's fields are in their ranges (a corner in `[0, radius_max]`,
-//! `capsule` in `[0, 0.5]`, `hairline` in `[0, stroke_max]`, `mark` in `(0, stroke_max]`, and
-//! a hairline above 0 when controls are outlined). `app.check` refuses a `config.theme` that
-//! breaks any of these and names the field (`conformance`); `cx.set_theme` asserts the
-//! material and the form of a scheme built at run time. `heading` has no default: a scheme
+//! the material's, the form's, and the arc's fields are in their ranges (a corner in
+//! `[0, radius_max]`, `capsule` in `[0, 0.5]`, `hairline` in `[0, stroke_max]`, `mark` in
+//! `(0, stroke_max]`, a hairline above 0 when controls are outlined, the arc's `start` in
+//! `[-tau, tau]` and `sweep` in `(0, tau]`). `app.check` refuses a `config.theme` that breaks
+//! any of these and names the field (`conformance`); `cx.set_theme` asserts the material, the
+//! form, and the arc of a scheme built at run time. `heading` has no default: a scheme
 //! literal states its section-title style, colour included, so a light scheme never inherits
 //! dark's text colour. Keep each `background` component off an 8-bit rounding tie (`c * 255` a
 //! half, such as 0.90): the background reaches the screen both as a pass's clear value and as
@@ -125,16 +130,61 @@ pub const bytes: u32 = 176;
 /// Number of accents a scheme carries; `widgets.accent_count` equals it.
 pub const accent_count: u32 = 4;
 
-/// Start angle of the open ring, in the angle convention of the module guide.
+/// Start angle of the default open ring, in the angle convention of the module guide.
 pub const arc_start: f32 = 2.0 * std.math.pi / 3.0;
 
-/// Clockwise sweep of the full open ring. The remainder of the turn is the gap.
+/// Clockwise sweep of the default open ring. The remainder of the turn is the gap.
 pub const arc_sweep: f32 = 3.0 * std.math.pi / 2.0;
+
+/// The open ring an arc is drawn on: where it starts and how far it sweeps clockwise, in
+/// radians, in the angle convention of the module guide (section 3). The rest of the turn is
+/// the gap. The default is the default open ring, `arc_start` and `arc_sweep`.
+pub const ArcShape = struct {
+    /// In `[-tau, tau]`.
+    start: f32 = arc_start,
+    /// In `(0, tau]`; `tau` is a closed circle.
+    sweep: f32 = arc_sweep,
+
+    /// The ring whose gap of `gap` radians, in `[0, tau)`, is centred on straight down, so its
+    /// ends mirror each other about the vertical: start `pi / 2 + gap / 2`, sweep `tau - gap`.
+    pub fn symmetric(gap: f32) ArcShape {
+        assert(gap >= 0);
+        assert(gap < std.math.tau);
+        const shape: ArcShape = .{
+            .start = std.math.pi * 0.5 + gap * 0.5,
+            .sweep = std.math.tau - gap,
+        };
+        assert(shape.problem() == null);
+        return shape;
+    }
+
+    /// The angle `fraction` (in `[0, 1]`) of the way along the ring: `start + fraction * sweep`.
+    pub fn angle(self: ArcShape, fraction: f32) f32 {
+        assert(fraction >= 0);
+        assert(fraction <= 1);
+        assert(self.problem() == null);
+        return self.start + fraction * self.sweep;
+    }
+
+    /// Null when `start` and `sweep` are in range, otherwise the first that is not. A NaN is
+    /// out of every range.
+    pub fn problem(self: ArcShape) ?[]const u8 {
+        if (!(self.start >= -std.math.tau and self.start <= std.math.tau)) {
+            return "start: must be in [-tau, tau]";
+        }
+        if (!(self.sweep > 0 and self.sweep <= std.math.tau)) {
+            return "sweep: must be in (0, tau]";
+        }
+        return null;
+    }
+};
 
 /// The GPU record of a scheme. Field order is the GPU layout, so it must match the WGSL
 /// `Theme`.
 ///
-/// `arc.x` is `arc_start` and `arc.y` is `arc_sweep`; `arc.z`, `arc.w`, and `pad` stay zero.
+/// `arc` is the scheme's `arc` (start, sweep); `arc.z`, `arc.w`, and `pad` stay zero. The
+/// library's shaders do not read it (arcs carry their angles in the instance); an app's
+/// shader may.
 pub const Theme = extern struct {
     panel: [4]f32,
     text: [4]f32,
@@ -352,8 +402,11 @@ pub const Scheme = struct {
     material: Material = .solid,
     /// What shape the default skins give faces (section 8). CPU state only, like `material`.
     form: Form = .{},
+    /// The ring knobs and other arcs are drawn on when their look names none (section 3).
+    /// CPU state like `form`, recorded for app shaders.
+    arc: ArcShape = .{},
 
-    /// The GPU record: the colors the shaders and the passes read, and the constant arc.
+    /// The GPU record: the colors the shaders and the passes read, and the scheme's arc.
     pub fn record(self: *const Scheme) Theme {
         assert(self.hover_lighten >= 0);
         assert(self.down_darken >= 0);
@@ -367,11 +420,11 @@ pub const Scheme = struct {
             .meter = c.meter,
             .lighten = c.lighten,
             .darken = c.darken,
-            .arc = .{ arc_start, arc_sweep, 0, 0 },
+            .arc = .{ self.arc.start, self.arc.sweep, 0, 0 },
             .background = c.background,
             .pad1 = .{ 0, 0, 0, 0 },
         };
-        assert(out.arc[0] == arc_start);
+        assert(out.arc[0] == self.arc.start);
         assert(out.pad1[3] == 0);
         return out;
     }
@@ -492,6 +545,7 @@ pub fn problem(comptime scheme: Scheme) ?[]const u8 {
         }
         if (scheme.material.problem()) |message| return "material." ++ message;
         if (scheme.form.problem()) |message| return "form." ++ message;
+        if (scheme.arc.problem()) |message| return "arc." ++ message;
         return null;
     }
 }
@@ -758,4 +812,59 @@ test "form problem names the first field out of range" {
     };
     const message = comptime problem(scheme).?;
     try std.testing.expectEqualStrings("form.capsule: must be in [0, 0.5]", message);
+}
+
+// Locks `ArcShape`: the default is `{arc_start, arc_sweep}` exactly; `symmetric(pi / 3)` is start
+// 2.0943952 (bit for bit `pi * 0.5 + (pi / 3) * 0.5`) and sweep 5.2359877, its end wrapped
+// (1.0471976, pi / 3) mirrors its start (`pi - start`), and halfway is 3 pi / 2 (4.712389,
+// straight up). `problem` refuses a sweep of 0 or 7 and a start of 7, and `theme.problem`
+// prefixes "arc.".
+test "ArcShape defaults to the open ring and symmetric mirrors itself" {
+    const shape: ArcShape = .{};
+    try std.testing.expectEqual(arc_start, shape.start);
+    try std.testing.expectEqual(arc_sweep, shape.sweep);
+    try std.testing.expect(shape.problem() == null);
+    const third: f32 = std.math.pi / 3.0;
+    const mirror = ArcShape.symmetric(third);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0943952), mirror.start, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.2359877), mirror.sweep, 1e-6);
+    const expected_start: f32 = std.math.pi * 0.5 + third * 0.5;
+    try std.testing.expectEqual(expected_start, mirror.start);
+    const end: f32 = mirror.start + mirror.sweep - std.math.tau;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0471976), end, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, std.math.pi) - mirror.start, end, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.712389), mirror.angle(0.5), 1e-6);
+    const sweep_rule = "sweep: must be in (0, tau]";
+    try std.testing.expectEqualStrings(sweep_rule, (ArcShape{ .sweep = 0 }).problem().?);
+    try std.testing.expectEqualStrings(sweep_rule, (ArcShape{ .sweep = 7 }).problem().?);
+    const start_rule = "start: must be in [-tau, tau]";
+    try std.testing.expectEqualStrings(start_rule, (ArcShape{ .start = 7 }).problem().?);
+    const scheme = comptime blk: {
+        var out = dark;
+        out.arc.sweep = 0;
+        break :blk out;
+    };
+    const message = comptime problem(scheme).?;
+    try std.testing.expectEqualStrings("arc.sweep: must be in (0, tau]", message);
+}
+
+// Locks the record's arc slot: `dark.record().arc` is `{arc_start, arc_sweep, 0, 0}`, and a dark
+// copy on `symmetric(pi / 3)` records `{2.0943952, 5.2359877, 0, 0}` with every other slot equal
+// to `dark.record()`'s.
+test "a scheme's arc rides in its record" {
+    const record = dark.record();
+    try std.testing.expectEqual([4]f32{ arc_start, arc_sweep, 0, 0 }, record.arc);
+    var mirrored = dark;
+    mirrored.arc = ArcShape.symmetric(std.math.pi / 3.0);
+    const moved = mirrored.record();
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0943952), moved.arc[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.2359877), moved.arc[1], 1e-6);
+    try std.testing.expectEqual(@as(f32, 0), moved.arc[2]);
+    try std.testing.expectEqual(@as(f32, 0), moved.arc[3]);
+    const info = @typeInfo(Theme).@"struct";
+    inline for (info.field_names) |field_name| {
+        if (comptime !std.mem.eql(u8, field_name, "arc")) {
+            try std.testing.expectEqual(@field(record, field_name), @field(moved, field_name));
+        }
+    }
 }

@@ -148,6 +148,7 @@ const namespaces = [_]Namespace{
     .{ .path = "text.Glyphs", .T = text.Glyphs, .cx = .none },
     .{ .path = "text.ttf", .T = text.ttf, .cx = .none },
     .{ .path = "theme", .T = patchwork.theme, .cx = .none },
+    .{ .path = "theme.ArcShape", .T = patchwork.theme.ArcShape, .cx = .none },
     .{ .path = "ui", .T = ui, .cx = .ui },
     .{ .path = "ui.Context()", .T = UiContext, .cx = .ui },
     .{ .path = "widgets.kit", .T = widgets.kit, .cx = .ui },
@@ -2436,9 +2437,9 @@ fn test_setup() void {
 }
 
 // Locks that the list of namespaces is checked at comptime (a missing one is a compile error,
-// `check_namespace`) and holds the 30 namespaces, with `draw.path` expecting the draw context.
+// `check_namespace`) and holds the 31 namespaces, with `draw.path` expecting the draw context.
 test "every namespace in the list exists" {
-    comptime assert(namespaces.len == 30);
+    comptime assert(namespaces.len == 31);
     comptime check_namespace(namespaces[0]);
     try testing.expectEqual(Cx.draw, namespaces[7].cx);
     try testing.expectEqualStrings("draw.path", namespaces[7].path);

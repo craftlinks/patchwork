@@ -733,9 +733,9 @@ pub const Default = struct {
         return travel;
     }
 
-    /// A track arc over the whole sweep, the value arc over `value` of it in the accent
-    /// (omitted at 0, lightened by hover), the name, and the value text. The disc inscribed
-    /// in the ring is the hit shape. A row shorter than the ring draws nothing.
+    /// On the scheme's ring, a track arc over the whole sweep, the value arc over `value` of
+    /// it in the accent (omitted at 0, lightened by hover), the name, and the value text. The
+    /// disc inscribed in the ring is the hit shape. A row shorter than the ring draws nothing.
     pub fn knob(cx: anytype, look: KnobLook) ?Shape {
         assert(look.value >= 0);
         assert(look.value <= 1);

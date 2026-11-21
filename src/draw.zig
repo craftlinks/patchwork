@@ -234,6 +234,7 @@ pub const mix_premultiplied = types.mix_premultiplied;
 pub const shadow_alpha = types.shadow_alpha;
 pub const sdf_segment = types.sdf_segment;
 pub const sdf_arc = types.sdf_arc;
+pub const arc_point = types.arc_point;
 pub const contains_box = types.contains_box;
 /// Null when a type satisfies the draw type convention, else a message naming it.
 pub const check_type = registry.check;

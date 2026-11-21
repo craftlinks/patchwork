@@ -11,7 +11,7 @@ bind-undo     7f69e1c5b837d71b
 edit          6052006b74fa4c82
 keys          117c4ec8072b39c5
 knobs         f4f46b4a6fc1adac
-mix           cd4acc7d68597b3f
+mix           b308a0f162e1ce5c
 play          10e6abd8b5e7f22d
 rename        2ee216ec89e9c0b5
 reorder       2502115d8ad52893

@@ -186,7 +186,7 @@ patchwork/
 │   ├── animator.zig            # Scalar animator transitions and animation time (Animator, Clock, Time)
 │   ├── frame.zig               # Presentation and damage policy (Frame)
 │   ├── input.zig               # Events, EventQueue, clicks, key names, text filter, repeat
-│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, arc angles, Material, Form
+│   ├── theme.zig               # Scheme (dark, light), its GPU record behind the projection, the default arc shape (ArcShape), Material, Form
 │   ├── gpu.zig                 # Cross-platform GPU seam: create and submit
 │   ├── gpu/commands.zig        # GPU command stream: op encoding, decoder, generated op table
 │   ├── gpu/table.golden.json   # Committed copy of the op table; a test pins it byte for byte
@@ -805,9 +805,11 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   inside, a repaint on hover), and `kit.Interaction` (or `kit.respond` on a widget's own
   animators) is the hover and press table every library widget follows. The records come from
   `draw.Box.of(rect, clip, BoxLook)` and `draw.Arc.of(ring, clip, ArcLook)`, whose looks
-  default to no border, hover, or press and the full sweep from the theme's start
-  (`ArcLook.start`, a fraction of the sweep, moves the arc along the ring: a pan is an arc
-  from 0.5); `ui` and `draw` use the constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
+  default to no border, hover, or press and the whole ring of the look's shape
+  (`ArcLook.shape`), or with none the scheme's (`Scheme.arc`, through `kit.arc`) or the default
+  ring (`Arc.of`); `ArcLook.start`, a fraction of the sweep, moves the arc along the ring (a
+  pan is an arc from 0.5), and `draw.arc_point(ring, shape, fraction, inset)` is the point a
+  value dot sits on; `ui` and `draw` use the constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
   re-exports every name. Each widget is generic over a skin that draws it (`KnobOf(Skin)`;
   see Make a Skin below).
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
@@ -955,7 +957,8 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
   A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
-  `skins.Default` does.
+  `skins.Default` does. A skin picks a ring with `ArcLook.shape` (a `theme.ArcShape`, such as
+  `ArcShape.symmetric(gap)`), and a theme picks one for every arc with `Scheme.arc`.
 - **Draw order.** A batch draws where its type first appeared in its layer. A skin with its
   own face type should append faces on one layer and what goes on top (arcs, labels) on a
   higher one, then restore the layer, as the gallery's hardware skin does.
@@ -2317,7 +2320,7 @@ children use the panel border box clip.
 The uniform buffer (`draw.uniform_bytes`) stores the 4x4 projection matrix first and the
 `Theme` record (`src/theme.zig`) after it, shared by every pipeline through one bind group.
 Colors live in instances and in the theme's lighten, darken, background, and arc slots, never
-in WGSL literals.
+in WGSL literals; the library's arcs carry their angles in the instance.
 
 Memory: each pool holds `cap` records plus a renderer shadow of the same size, and one scratch
 buffer of the largest pool backs the counting sort. The context also holds the glyph cache
