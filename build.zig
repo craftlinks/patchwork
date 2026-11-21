@@ -99,6 +99,10 @@
 //!   strokes through `addTool` and counts the pixels two chunks of one stroke cover twice or not
 //!   at all (`tools/seams.zig`). It needs a GPU, so it is in no part of `test`, `check`, or
 //!   `regress`; `test` runs its pure parts.
+//! - `test/panic` is an app whose wasm panics on its first frame, for the browser check
+//!   (`python3 -I tools/browser_check.py panic still --headless` fails naming the panic). It
+//!   gets the `-panic` steps and `zig build` installs it; `test` runs its tests, and it is in no
+//!   `check` or `regress` list.
 //!
 //! ## 6. Fonts
 //! `add_font_module(patchwork_builder, ranges, fonts)` builds `tools/subset.zig` for the host,
@@ -908,6 +912,7 @@ pub fn build(b: *std.Build) void {
     add_regress_step(b, &examples);
     add_compare_step(b, library);
     add_seams_step(b, vector, library, target, optimize);
+    add_panic_steps(b, target, optimize, wgpu_lib_dir);
     add_consumer_step(b, optimize);
     add_sound_step(b, optimize);
 }
@@ -948,6 +953,28 @@ fn add_seams_step(
     const tests = b.addTest(.{ .root_module = root });
     const test_step = b.top_level_steps.get("test").?;
     test_step.step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// `test/panic`, an app whose wasm panics on its first frame, for `tools/browser_check.py`
+/// (step 77). It is in no example list, so no `check`, `regress`, or example `test` runs it;
+/// `zig build` installs it, `add_example_steps` gives it `-panic` steps, and `test` runs its own.
+fn add_panic_steps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    wgpu_lib_dir: ?[]const u8,
+) void {
+    const panic = addApp(b, b, .{
+        .name = "panic",
+        .root_source_file = b.path("test/panic/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    b.getInstallStep().dependOn(panic.install);
+    add_example_steps(b, "-panic", "the panic test", panic);
+    const test_step = b.top_level_steps.get("test").?;
+    test_step.step.dependOn(panic.tests);
 }
 
 /// `test-consumer`: `test/consumer`, a package outside this build graph, through its own `zig

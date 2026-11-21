@@ -26,8 +26,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         storage[count] = arg;
         count += 1;
     }
-    var options = bench.parse_for(app.App, storage[0..count]) catch |err| {
-        std.debug.print("{s}: {s}\n{s}", .{ app.App.config.title, @errorName(err), bench.usage });
+    var refusal: bench.Refusal = .none;
+    var options = bench.parse_for(app.App, storage[0..count], &refusal) catch |err| {
+        const title = app.App.config.title;
+        if (err == error.FramesOverCap) {
+            // The line says what to change, so no usage text follows it.
+            var text: [bench.refusal_text_cap]u8 = undefined;
+            std.debug.print("{s}: {s}\n", .{ title, bench.refusal_text(refusal, &text) });
+        } else {
+            std.debug.print("{s}: {s}\n{s}", .{ title, @errorName(err), bench.usage });
+        }
         return err;
     };
     options.program = program;

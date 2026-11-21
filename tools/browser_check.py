@@ -38,7 +38,9 @@ repository, so every other use is unchanged. Every path and step below is under 
 4. Prints `differ N px, max level M`; passes when M <= 3 and N <= 0.1% of the pixels (Tint and
    naga round trigonometry differently). On a failure, or with --keep, writes the screenshot
    and a diff picture beside the reference (`<scenario>-browser.png`, `.diff.png`).
-5. Reports console errors and warnings (an error fails the check), each exception in full. After
+5. Reports console errors and warnings (an error fails the check), each exception in full. A
+   panic's `panic:` line and the shell's `wasm stopped in` line fail the check at once, naming
+   the panic. After
    an exception, or a fetch of the page's wasm that is not 200, it fetches `/patchwork.wasm`
    itself and prints the HTTP status and the first line of the body (`src/serve.zig` names the
    limit a refused file hit there). It stops what it started,
@@ -76,6 +78,10 @@ FRAME_TIMEOUT_S = 5
 NO_FRAME_STATUS = 3
 # The route every app's page fetches its wasm from (build.zig, `add_serve`).
 WASM_ROUTE = "/patchwork.wasm"
+# The start of the line `web/shell.js` logs when a call into the wasm threw (its section 4a).
+STOPPED_PREFIX = "wasm stopped in "
+# The start of the line `web/shell.js` logs with a panic's message (`panic_js`).
+PANIC_PREFIX = "panic: "
 # Chromium's new headless mode with WebGPU on the hardware adapter. Without
 # `--disable-gpu-compositing` the page gets no adapter ("A valid external Instance reference no
 # longer exists"), and without `--use-angle=vulkan` it gets SwiftShader, Chromium's CPU one.
@@ -571,9 +577,17 @@ def main(argv):
         done_line = f"bench done {scenario}"
         ended = cdp.pump_until(
             lambda logs: any(t in (done_line, f"bench failed {scenario}") for _, t in logs)
-            or any(t.startswith("bench: no scenario") for _, t in logs),
+            or any(t.startswith("bench: no scenario") for _, t in logs)
+            or any(t.startswith(STOPPED_PREFIX) for _, t in logs),
             DONE_TIMEOUT_S,
         )
+        stops = [t for _, t in cdp.logs if t.startswith(STOPPED_PREFIX)]
+        if stops:
+            panics = [t for _, t in cdp.logs if t.startswith(PANIC_PREFIX)]
+            cause = panics[0] if panics else stops[0].splitlines()[0]
+            print(f"browser_check: the page's wasm stopped: {cause}")
+            report_console(cdp.logs, port)
+            return 1
         if not ended or not any(t == done_line for _, t in cdp.logs):
             print(
                 f"browser_check: the scenario did not finish: "
