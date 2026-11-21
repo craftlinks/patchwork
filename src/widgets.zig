@@ -85,10 +85,10 @@
 //! - text: `Button.appends_for(label bytes)`, `Meter.appends_for(name bytes)`,
 //!   `TextField.appends_for(FieldText)`, `Knob.appends_for(value bytes)` for `draw_text`,
 //!   `Label.appends_for(bytes)`, and `Paragraph.appends_for(bytes)`;
-//! - items and the longest label (`label_max_of(labels)`): `Menu.appends_for(MenuText)`,
-//!   `Dropdown.appends_for(MenuText)`, `MenuBar.appends_for(MenuBarText)`,
-//!   `Tabs.appends_for(TabText)` (and `Segmented`'s), `ColumnHeader.appends_for(ColumnText)`,
-//!   and `Dock.appends_for(DockText)`;
+//! - items and the longest label (`Items`, `Items.of(labels)`): `Menu.appends_for(Items)`,
+//!   `Dropdown.appends_for(Items)`, `MenuBar.appends_for(MenuBarText)` (titles and the largest
+//!   menu), `Tabs.appends_for(TabText)` (labels, `closable`, `movable`; and `Segmented`'s),
+//!   `ColumnHeader.appends_for(Items)`, and `Dock.appends_for(Items)`;
 //! - visible rows: `ListBox.appends_for(rows)` and `TreeView(n).appends_for(rows)`, with
 //!   `rows` from `list_rows_for(view_h, row_h)`; set the list's `visible_max` to the same
 //!   bound, which its `begin` asserts.
@@ -197,7 +197,7 @@ pub const settled = kit.settled;
 pub const Appends = appends.Appends;
 pub const SkinAppends = appends.SkinAppends;
 pub const AppendsCount = appends.Count;
-pub const label_max_of = appends.label_max_of;
+pub const Items = appends.Items;
 
 pub const Shape = skins.Shape;
 pub const ButtonLook = skins.ButtonLook;
@@ -303,7 +303,6 @@ pub const field_inner = text_field.field_inner;
 pub const Menu = menu.Menu;
 pub const MenuOf = menu.MenuOf;
 pub const MenuAction = menu.MenuAction;
-pub const MenuText = menu.MenuText;
 pub const ContextMenu = menu.ContextMenu;
 pub const ContextMenuOf = menu.ContextMenuOf;
 pub const menu_items_max = menu.menu_items_max;
@@ -354,7 +353,6 @@ pub const Dock = dock.Dock;
 pub const DockOf = dock.DockOf;
 pub const DockZone = dock.Zone;
 pub const DockPanel = dock.Panel;
-pub const DockText = dock.DockText;
 pub const dock_nodes_max = dock.dock_nodes_max;
 pub const dock_panels_max = dock.dock_panels_max;
 pub const dock_save_max = dock.dock_save_max;
@@ -387,7 +385,6 @@ pub const disclosure_h = disclosure.disclosure_h;
 pub const ColumnHeader = column_header.ColumnHeader;
 pub const ColumnHeaderOf = column_header.ColumnHeaderOf;
 pub const Column = column_header.Column;
-pub const ColumnText = column_header.ColumnText;
 pub const ColumnSort = column_header.Sort;
 pub const columns_max = column_header.columns_max;
 pub const header_h = column_header.header_h;

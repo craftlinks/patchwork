@@ -999,11 +999,11 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   // .area_cap = need.areas,
   ```
 
-  The containers take what the app bounds: their items and the longest label
-  (`widgets.label_max_of(labels)`), as `MenuOf(S).appends_for(.{ .items, .label_max })` (a
-  `widgets.MenuText`), `DropdownOf`, `MenuBarOf` (a `widgets.MenuBarText`, `.of(titles,
-  items)`), `TabsOf` (a `widgets.TabText`, with `closable` and `movable`), `ColumnHeaderOf` (a
-  `widgets.ColumnText`), and `DockOf` (a `widgets.DockText`); their visible rows, as
+  The containers take what the app bounds: their items and the longest label, a
+  `widgets.Items` (`.{ .count, .label_max }`, or `widgets.Items.of(labels)`), as
+  `MenuOf(S).appends_for(items)`, `DropdownOf`, `ColumnHeaderOf`, and `DockOf`; `MenuBarOf`
+  takes a `widgets.MenuBarText` (its titles and largest menu, `.of(titles, items)`) and
+  `TabsOf` a `widgets.TabText` (its labels, `closable`, and `movable`); their visible rows, as
   `ListBoxOf(S).appends_for(rows)` and `TreeViewOf(S, n).appends_for(rows)`, with `rows` from
   `widgets.list_rows_for(view_h, row_h)` and the list's `visible_max` set to the same bound,
   which `begin` asserts. `WindowButtonsOf(S).appends`, `widgets.window_drag_appends`, and

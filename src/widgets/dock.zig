@@ -85,7 +85,7 @@
 //! A refused load changes nothing; the app keeps its layout or builds its default.
 //!
 //! ## 7. Counts
-//! `DockOf(S).appends_for(DockText)` is what one dock appends to a frame at most
+//! `DockOf(S).appends_for(Items)` is what one dock appends to a frame at most
 //! (`widgets/appends.zig`): a closable tab set per panel (`TabsOf(S).appends_for` of one tab),
 //! a splitter between each two sets, one dragged tab's ghost, a page's area per set, and while a
 //! drag is in flight the four edges' areas and the drop overlay's Box, which the dock draws
@@ -118,7 +118,8 @@ const tabs_file = @import("tabs.zig");
 const splitter_file = @import("splitter.zig");
 const text = @import("../text.zig");
 const draw = @import("../draw.zig");
-const Appends = @import("appends.zig").Appends;
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -146,10 +147,6 @@ pub const dock_save_max: u32 = 8 + dock_nodes_max * (3 + tabs_max);
 /// The `derive` salts of a set's page and of the edge strips.
 pub const page_salt: u64 = 0x70616765;
 pub const edge_salt: u64 = 0x65646765 << 8;
-
-/// What a dock holds at most, for `appends_for` (section 7): its panels (`labels.len`) and the
-/// longest label's bytes.
-pub const DockText = struct { panels: u32, label_max: u32 };
 
 /// Where a drop lands on a set's page (section 4).
 pub const Zone = enum(u8) { centre, left, right, top, bottom };
@@ -277,30 +274,24 @@ pub fn DockOf(comptime Skin: type) type {
             resized,
         };
 
-        /// What one dock appends to a frame at most (section 7): a closable tab set per panel,
-        /// the splitters between them, one dragged tab's ghost, the pages' areas, and while a
-        /// drag is in flight the edges' areas and the drop overlay. The panels' content is the
-        /// app's.
-        pub fn appends_for(comptime dock_text: DockText) Appends {
+        /// What one dock of `panels` appends to a frame at most (section 7).
+        pub fn appends_for(comptime panels: appends.Items) Appends {
             comptime {
-                assert(dock_text.panels >= 1);
-                assert(dock_text.panels <= dock_panels_max);
-                assert(dock_text.label_max <= text.byte_cap);
-                const sets = dock_text.panels;
+                panels.assert_within(dock_panels_max);
+                // Each set holds one tab at worst; the ghost is counted once (section 7).
+                const sets = panels.count;
                 const set = Tabs.appends_for(.{
-                    .tabs = 1,
-                    .label_max = dock_text.label_max,
+                    .labels = .{ .count = 1, .label_max = panels.label_max },
                     .closable = true,
+                    .movable = false,
                 });
-                const ghost = Skin.tab_appends.with(dock_text.label_max);
+                const ghost = Skin.tab_appends.with(panels.label_max);
                 const own: Appends = .{
                     .draws = &.{.{ .type = draw.Box, .count = 1 }},
                     .areas = sets + edges.len,
                 };
-                const out = set.times(sets).plus(ghost).plus(Splitter.appends.times(sets - 1))
+                return set.times(sets).plus(ghost).plus(Splitter.appends.times(sets - 1))
                     .plus(own);
-                assert(out.areas == 5 * sets + 3);
-                return out;
             }
         }
 
@@ -1084,7 +1075,7 @@ comptime {
     // The default skin's dock of 4 panels of up to 10 bytes (section 7): 4 sets x (Box 5, Glyph
     // 11, areas 3), the ghost Box 3 and Glyph 11, 3 splitters (Box 1, area 1 each), the
     // overlay, and 4 page and 4 edge areas.
-    const docked = Dock.appends_for(.{ .panels = 4, .label_max = 10 });
+    const docked = Dock.appends_for(.{ .count = 4, .label_max = 10 });
     assert(docked.of(draw.Box) == 27);
     assert(docked.of(draw.Glyph) == 55);
     assert(docked.areas == 23);
@@ -1439,7 +1430,7 @@ test "a copied dock draws like the original" {
 }
 
 /// Four panels of ten inked bytes, in the default layout's order.
-const wide_four = [_][]const u8{ "WWWWWWWWWW", "WWWWWWWWWW", "WWWWWWWWWW", "WWWWWWWWWW" };
+const wide_four: [4][]const u8 = @splat(fixture.inked(10));
 
 /// The frame of "dragging a tab onto a page's side splits it", observed: log's tab dragged off
 /// its bar and over the right zone of the editor's page, every set, splitter, edge, the ghost,
@@ -1467,7 +1458,7 @@ test "Dock appends exactly appends_for with a counted skin" {
     const Counted = DockOf(fixture.Counted);
     const dock = &test_static.counted;
     build_default(dock, &wide_four);
-    const need = comptime Counted.appends_for(.{ .panels = 4, .label_max = "WWWWWWWWWW".len });
+    const need = comptime Counted.appends_for(.of(&wide_four));
     var tally: fixture.Tally(need) = .{};
     try drag_frame(cx, dock, &tally);
     try tally.expect_reached();
@@ -1483,7 +1474,7 @@ test "Dock appends exactly appends_for with a counted skin" {
 test "Dock appends at most appends_for" {
     const cx = fresh_context();
     const dock = default_dock();
-    var tally: fixture.Tally(Dock.appends_for(.{ .panels = 4, .label_max = 10 })) = .{};
+    var tally: fixture.Tally(Dock.appends_for(.{ .count = 4, .label_max = 10 })) = .{};
     try drag_frame(cx, dock, &tally);
     try testing.expectEqual(@as(usize, 17), cx.draw.items(draw.Box).len);
     try testing.expectEqual(@as(usize, 31), cx.draw.items(draw.Glyph).len);

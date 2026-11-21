@@ -73,12 +73,7 @@ pub fn SliderOf(comptime Skin: type) type {
         };
 
         /// What one slider appends to a frame at most (section 3).
-        pub const appends: Appends = blk: {
-            const out = Skin.slider_appends.with(0).plus(.{ .areas = 1 });
-            assert(out.areas == 1);
-            assert(out.points == Skin.slider_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.slider_appends.with(0).plus(.{ .areas = 1 });
 
         pub fn handle(self: *Self, cx: anytype, event: input.Event) Action {
             assert(self.value >= 0);

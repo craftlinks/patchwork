@@ -169,10 +169,7 @@ pub fn TextFieldOf(comptime Skin: type) type {
                     .{ .type = quads.Box, .count = 2 },
                     .{ .type = quads.Glyph, .count = glyphs },
                 }, .areas = 1 };
-                const out = Skin.field_appends.with(0).plus(own);
-                assert(out.areas == 1);
-                assert(out.of(quads.Glyph) >= glyphs);
-                return out;
+                return Skin.field_appends.with(0).plus(own);
             }
         }
 
@@ -818,16 +815,14 @@ comptime {
 }
 
 /// 64 inked bytes, and a 16-byte hint.
-const text_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
-const hint_16 = "sixteen-letters!";
+const text_64 = fixture.inked(64);
+const hint_16 = fixture.inked(16);
 
 // Locks `TextField.appends_for` (section 7) with the default skin at limit 64, a 16-byte hint,
 // and an icon, in a 1200 px field: empty and unfocused it draws Box 1 and Glyph 17 (the hint
 // and the icon); full, focused, and all selected Box 3 (face, band, caret) and Glyph 65; one
 // area each time and no overflow.
 test "TextField appends at most appends_for and reaches it" {
-    comptime assert(text_64.len == 64);
-    comptime assert(hint_16.len == 16);
     const cx = test_context();
     var field = TextField.init(ui.id("field", 0), 64, field_style);
     field.hint = hint_16;

@@ -59,10 +59,7 @@ pub fn ButtonOf(comptime Skin: type) type {
         /// most (section 3).
         pub fn appends_for(comptime label_bytes: u32) Appends {
             comptime {
-                assert(label_bytes <= text.byte_cap);
-                const out = Skin.button_appends.with(label_bytes).plus(.{ .areas = 1 });
-                assert(out.areas == 1);
-                return out;
+                return Skin.button_appends.with(label_bytes).plus(.{ .areas = 1 });
             }
         }
 

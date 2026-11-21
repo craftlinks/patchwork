@@ -81,12 +81,8 @@ pub fn DisclosureOf(comptime Skin: type) type {
         };
 
         /// What one header appends to a frame at most (section 3).
-        pub const appends: Appends = blk: {
-            const out = Skin.disclosure_appends.with(disclosure_label_max).plus(.{ .areas = 1 });
-            assert(out.areas == 1);
-            assert(out.points == Skin.disclosure_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.disclosure_appends.with(disclosure_label_max)
+            .plus(.{ .areas = 1 });
 
         /// A disclosure at rest, open or closed.
         pub fn init(id: Id, label: []const u8, open: bool) Self {
@@ -237,8 +233,8 @@ comptime {
     assert(Disclosure.appends.areas == 1);
 }
 
-/// 64 inked bytes, `disclosure_label_max`.
-const label_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+/// `disclosure_label_max` inked bytes.
+const label_64 = fixture.inked(disclosure_label_max);
 
 /// One frame of `disclosure`'s header, 1200 px wide, on `cx`.
 fn header_frame(cx: anytype, disclosure: *const Disclosure) void {
@@ -252,7 +248,6 @@ fn header_frame(cx: anytype, disclosure: *const Disclosure) void {
 // header draws Box 1, Path 1 (3 points), and Glyph 64 with `draw.Path`, and Box 1 and Glyph 65
 // (the chevron's glyph) without it, one area each time and no overflow.
 test "Disclosure appends at most appends and reaches it" {
-    comptime assert(label_64.len == disclosure_label_max);
     var disclosure = Disclosure.init(ui.id("group", 0), label_64, true);
     disclosure.hover.value = 1;
     var tally: fixture.Tally(Disclosure.appends) = .{};

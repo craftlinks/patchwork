@@ -68,12 +68,8 @@ pub fn ToggleOf(comptime Skin: type) type {
         };
 
         /// What one toggle appends to a frame at most (section 3).
-        pub const appends: Appends = blk: {
-            const out = Skin.toggle_appends.with(knob_file.name_max).plus(.{ .areas = 1 });
-            assert(out.areas == 1);
-            assert(out.points == Skin.toggle_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.toggle_appends.with(knob_file.name_max)
+            .plus(.{ .areas = 1 });
 
         /// A toggle at rest, thumb on the side `on` selects.
         pub fn init(id: Id, name: []const u8, on: bool) Self {

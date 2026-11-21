@@ -121,19 +121,19 @@ const ui = @import("../ui.zig");
 const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
-const Appends = @import("appends.zig").Appends;
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
 const Id = kit.Id;
 
-/// What a bar holds at most, for `appends_for` (section 5): how many tabs, the longest label's
-/// bytes, and whether they close and move (as `closable` and `movable` will be set).
+/// What a bar holds at most, for `appends_for` (section 5): its labels, and whether its tabs
+/// close and move (as `closable` and `movable` will be set).
 pub const TabText = struct {
-    tabs: u32,
-    label_max: u32,
-    closable: bool = false,
-    movable: bool = false,
+    labels: appends.Items,
+    closable: bool,
+    movable: bool,
 };
 
 /// Tabs one bar holds at most.
@@ -379,18 +379,13 @@ pub fn TabsOf(comptime Skin: type) type {
         /// each close button's.
         pub fn appends_for(comptime tab_text: TabText) Appends {
             comptime {
-                assert(tab_text.tabs <= tabs_max);
-                assert(tab_text.label_max <= text.byte_cap);
-                const ghost = tab_text.movable and tab_text.tabs >= 1;
-                const calls = tab_text.tabs + @intFromBool(ghost);
-                const tabs = Skin.tab_appends.with(tab_text.label_max).times(calls);
+                const labels = tab_text.labels;
+                labels.assert_within(tabs_max);
+                const calls = labels.count + @intFromBool(tab_text.movable);
+                const tabs = Skin.tab_appends.with(labels.label_max).times(calls);
                 const per_tab: u32 = if (tab_text.closable) 2 else 1;
-                const out = Skin.tab_bar_appends.with(0).plus(tabs).plus(.{
-                    .areas = 1 + tab_text.tabs * per_tab,
-                });
-                assert(out.areas >= 1 + tab_text.tabs);
-                assert(out.areas <= 1 + 2 * tab_text.tabs);
-                return out;
+                const areas: Appends = .{ .areas = 1 + labels.count * per_tab };
+                return Skin.tab_bar_appends.with(0).plus(tabs).plus(areas);
             }
         }
 
@@ -863,20 +858,20 @@ comptime {
     // bar's Box 2 and 5 calls (4 tabs, the ghost) x (Box 3, Glyph 1 + 8), areas 1 + 4 x 2; 4
     // plain tabs Box 14, Glyph 36, areas 5; a segmented bar of 3 of up to 6, Box 4, Glyph 18,
     // areas 4.
-    const moving = Tabs.appends_for(.{
-        .tabs = 4,
-        .label_max = 8,
-        .closable = true,
-        .movable = true,
-    });
+    const four: appends.Items = .{ .count = 4, .label_max = 8 };
+    const moving = Tabs.appends_for(.{ .labels = four, .closable = true, .movable = true });
     assert(moving.of(draw.Box) == 17);
     assert(moving.of(draw.Glyph) == 45);
     assert(moving.areas == 9);
-    const plain = Tabs.appends_for(.{ .tabs = 4, .label_max = 8 });
+    const plain = Tabs.appends_for(.{ .labels = four, .closable = false, .movable = false });
     assert(plain.of(draw.Box) == 14);
     assert(plain.of(draw.Glyph) == 36);
     assert(plain.areas == 5);
-    const segments = TabsOf(skin.Segmented).appends_for(.{ .tabs = 3, .label_max = 6 });
+    const segments = TabsOf(skin.Segmented).appends_for(.{
+        .labels = .{ .count = 3, .label_max = 6 },
+        .closable = false,
+        .movable = false,
+    });
     assert(segments.of(draw.Box) == 4);
     assert(segments.of(draw.Glyph) == 18);
     assert(segments.areas == 4);
@@ -1324,16 +1319,11 @@ test "move_item, remove_item, and insert_item update an app's arrays" {
     try testing.expectEqualSlices(u8, "zacdy", &items);
 }
 
-const wide_labels = [_][]const u8{ "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW" };
+const wide_labels: [4][]const u8 = @splat(fixture.inked(8));
 const wide_keys = [_]u64{ 10, 11, 12, 13 };
 
 /// The labels' shape for `appends_for`, closable and movable.
-const wide_text: TabText = .{
-    .tabs = wide_labels.len,
-    .label_max = "WWWWWWWW".len,
-    .closable = true,
-    .movable = true,
-};
+const wide_text: TabText = .{ .labels = .of(&wide_labels), .closable = true, .movable = true };
 
 /// Draws `tabs` over a 1200 x 100 box at (0, 0), its page empty.
 fn wide_frame(cx: anytype, tabs: anytype) void {
@@ -1412,10 +1402,15 @@ test "Tabs appends at most appends_for" {
 // the selected capsule, the hovered band), Glyph 18, and areas 4.
 test "Segmented appends at most appends_for" {
     const Segmented = TabsOf(skin.Segmented);
-    const labels = [_][]const u8{ "WWWWWW", "WWWWWW", "WWWWWW" };
+    const labels: [3][]const u8 = comptime @splat(fixture.inked(6));
     const cx = fixture.wide_context();
     var segmented = Segmented.init(ui.id("segments", 0), &labels, 0);
-    var tally: fixture.Tally(Segmented.appends_for(.{ .tabs = 3, .label_max = 6 })) = .{};
+    const shape: TabText = .{
+        .labels = comptime .of(&labels),
+        .closable = false,
+        .movable = false,
+    };
+    var tally: fixture.Tally(Segmented.appends_for(shape)) = .{};
     cx.event_begin(.{ .frame = 0 });
     cx.set_focus(segmented.id);
     cx.event_end();

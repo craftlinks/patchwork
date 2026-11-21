@@ -8,7 +8,8 @@
 //! frame. An undercount shows only as `overflow()` above zero and missing pieces. `Appends`
 //! says what one part appends at most, keyed by draw type the way `draw.DrawType` is
 //! (`{ type, count }` beside `{ type, cap }`), plus path points and hit areas, so an app sums
-//! them instead of reading skins.
+//! them instead of reading skins. Batches (`config.batch_cap`) are not counted: they depend on
+//! the order the whole frame draws in, not on one part.
 //!
 //! ## 2. Operations
 //! ```text
@@ -31,9 +32,10 @@
 //!
 //! ## 3a. Item Text
 //! A container's text is many labels of one kind: menu items, tab labels, column titles,
-//! panel names. Its bound takes the longest of them, `label_max`, for every item, not their
-//! total: each call of a skin function shows one label, and a skin may draw any of them in any
-//! call. `label_max_of(labels)` is that length for labels an app holds as literals.
+//! panel names. `Items` is how many and the longest of them, `label_max`, which its bound takes
+//! for every item, not their total: each call of a skin function shows one label, and a skin
+//! may draw any of them in any call. `Items.of(labels)` is both for labels an app holds as
+//! literals.
 //!
 //! ## 4. TigerStyle Invariants
 //! - Every value is comptime-only: it holds `type`.
@@ -60,10 +62,8 @@ pub const Appends = struct {
     pub fn of(comptime self: Appends, comptime T: type) u32 {
         comptime {
             assert(repeated(self.draws) == null);
-            for (self.draws) |entry| {
-                if (entry.type == T) return entry.count;
-            }
-            return 0;
+            const index = index_of(self.draws, T) orelse return 0;
+            return self.draws[index].count;
         }
     }
 
@@ -85,19 +85,17 @@ pub const Appends = struct {
     /// `n` of these in one frame.
     pub fn times(comptime self: Appends, comptime n: u32) Appends {
         comptime {
+            assert(repeated(self.draws) == null);
             var draws: [self.draws.len]Count = undefined;
             for (self.draws, &draws) |entry, *scaled| {
                 scaled.* = .{ .type = entry.type, .count = entry.count * n };
             }
             const fixed = draws;
-            const out: Appends = .{
+            return .{
                 .draws = &fixed,
                 .points = self.points * n,
                 .areas = self.areas * n,
             };
-            assert(out.draws.len == self.draws.len);
-            assert(out.areas == self.areas * n);
-            return out;
         }
     }
 
@@ -111,8 +109,8 @@ pub const Appends = struct {
                 .points = @max(self.points, other.points),
                 .areas = @max(self.areas, other.areas),
             };
-            assert(out.points >= self.points);
-            assert(out.areas >= other.areas);
+            assert(out.draws.len >= self.draws.len);
+            assert(out.draws.len >= other.draws.len);
             return out;
         }
     }
@@ -126,12 +124,12 @@ pub const SkinAppends = struct {
     per_byte: Appends = text_byte,
 
     /// One call with `bytes` bytes of text in its look: `fixed` plus `per_byte` times `bytes`.
+    /// The text a widget hands its skin is bounded by `text.byte_cap`, so a count above it is a
+    /// widget's mistake, caught here once for every widget.
     pub fn with(comptime self: SkinAppends, comptime bytes: u32) Appends {
         comptime {
-            const out = self.fixed.plus(self.per_byte.times(bytes));
-            assert(out.areas == self.fixed.areas + self.per_byte.areas * bytes);
-            assert(out.points == self.fixed.points + self.per_byte.points * bytes);
-            return out;
+            assert(bytes <= text.byte_cap);
+            return self.fixed.plus(self.per_byte.times(bytes));
         }
     }
 };
@@ -139,18 +137,42 @@ pub const SkinAppends = struct {
 /// One `draw.Glyph`: what a byte of text appends at most (module guide, section 3).
 pub const text_byte: Appends = .{ .draws = &.{.{ .type = draw.Glyph, .count = 1 }} };
 
-/// The longest of `labels` in bytes: the `label_max` of a widget's text (module guide, 3a).
-/// No labels give 0.
-pub fn label_max_of(comptime labels: []const []const u8) u32 {
-    comptime {
-        var longest: u32 = 0;
-        for (labels) |label| {
-            assert(label.len <= text.byte_cap);
-            longest = @max(longest, @as(u32, @intCast(label.len)));
+/// A container's items at most (module guide, section 3a): how many, and the longest label's
+/// bytes.
+pub const Items = struct {
+    count: u32,
+    label_max: u32,
+
+    /// The count of `labels` and the longest of them in bytes. No labels give 0 and 0.
+    pub fn of(comptime labels: []const []const u8) Items {
+        comptime {
+            var longest: u32 = 0;
+            for (labels) |label| {
+                assert(label.len <= text.byte_cap);
+                longest = @max(longest, @as(u32, @intCast(label.len)));
+            }
+            return .{ .count = labels.len, .label_max = longest };
         }
-        assert(longest <= text.byte_cap);
-        if (labels.len == 0) assert(longest == 0);
-        return longest;
+    }
+
+    /// Asserts what every container's `appends_for` takes: one to `count_max` items, each label
+    /// within `text.byte_cap`.
+    pub fn assert_within(comptime items: Items, comptime count_max: u32) void {
+        comptime {
+            assert(items.count >= 1);
+            assert(items.count <= count_max);
+            assert(items.label_max <= text.byte_cap);
+        }
+    }
+};
+
+/// The index of `T`'s entry in `draws`, or null when `draws` does not name it.
+pub fn index_of(comptime draws: []const Count, comptime T: type) ?usize {
+    comptime {
+        for (draws, 0..) |entry, index| {
+            if (entry.type == T) return index;
+        }
+        return null;
     }
 }
 
@@ -158,9 +180,7 @@ pub fn label_max_of(comptime labels: []const []const u8) u32 {
 pub fn repeated(comptime draws: []const Count) ?type {
     comptime {
         for (draws, 0..) |entry, index| {
-            for (draws[index + 1 ..]) |later| {
-                if (later.type == entry.type) return entry.type;
-            }
+            if (index_of(draws[index + 1 ..], entry.type) != null) return entry.type;
         }
         return null;
     }
@@ -182,7 +202,7 @@ fn merged(
         var out: [first.len + second.len]Count = undefined;
         var count: usize = 0;
         for (first) |entry| {
-            const other = count_of(second, entry.type);
+            const other = if (index_of(second, entry.type)) |index| second[index].count else 0;
             const combined = switch (how) {
                 .sum => entry.count + other,
                 .max => @max(entry.count, other),
@@ -191,7 +211,7 @@ fn merged(
             count += 1;
         }
         for (second) |entry| {
-            if (names(first, entry.type)) continue;
+            if (index_of(first, entry.type) != null) continue;
             out[count] = entry;
             count += 1;
         }
@@ -199,26 +219,6 @@ fn merged(
         const result = out[0..count].*;
         assert(repeated(&result) == null);
         return &result;
-    }
-}
-
-/// True when `draws` names `T`.
-fn names(comptime draws: []const Count, comptime T: type) bool {
-    comptime {
-        for (draws) |entry| {
-            if (entry.type == T) return true;
-        }
-        return false;
-    }
-}
-
-/// `T`'s count in `draws`, 0 when it is not named.
-fn count_of(comptime draws: []const Count, comptime T: type) u32 {
-    comptime {
-        for (draws) |entry| {
-            if (entry.type == T) return entry.count;
-        }
-        return 0;
     }
 }
 
@@ -307,6 +307,13 @@ test "with adds the text's bytes" {
     try testing.expectEqual(@as(u32, 24), comptime icon.with(3).of(draw.Glyph));
 }
 
+// Locks `index_of`: the editor names Box at 0 and Glyph at 1, and not Arc.
+test "index_of finds a type's entry" {
+    try testing.expectEqual(@as(?usize, 0), comptime index_of(editor.draws, draw.Box));
+    try testing.expectEqual(@as(?usize, 1), comptime index_of(editor.draws, draw.Glyph));
+    try testing.expectEqual(@as(?usize, null), comptime index_of(editor.draws, draw.Arc));
+}
+
 // Locks `repeated`: Box named twice is found; distinct types give null.
 test "repeated finds a type named twice" {
     const twice = [_]Count{
@@ -318,9 +325,11 @@ test "repeated finds a type named twice" {
     try testing.expect(comptime repeated(face.draws) == null);
 }
 
-// Locks `label_max_of` (section 3a): {"New", "Open", "Save as"} is 7, the last and longest;
-// no labels are 0.
-test "label_max_of takes the longest label" {
-    try testing.expectEqual(@as(u32, 7), comptime label_max_of(&.{ "New", "Open", "Save as" }));
-    try testing.expectEqual(@as(u32, 0), comptime label_max_of(&.{}));
+// Locks `Items.of` (section 3a): {"New", "Open", "Save as"} is 3 items of up to 7 bytes, the
+// last and longest; no labels are 0 and 0.
+test "Items.of counts the labels and takes the longest" {
+    const menu: Items = comptime .of(&.{ "New", "Open", "Save as" });
+    try testing.expectEqual(Items{ .count = 3, .label_max = 7 }, menu);
+    const none: Items = comptime .of(&.{});
+    try testing.expectEqual(Items{ .count = 0, .label_max = 0 }, none);
 }

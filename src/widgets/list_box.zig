@@ -163,13 +163,10 @@ pub fn ListBoxOf(comptime Skin: type) type {
             comptime {
                 assert(rows >= 1);
                 assert(rows <= list_rows_max);
-                const bands = Skin.list_row_appends.with(0).times(rows);
-                const out = bands.plus(.{
+                return Skin.list_row_appends.with(0).times(rows).plus(.{
                     .draws = &.{.{ .type = draw.Box, .count = 1 }},
                     .areas = rows + 2,
                 });
-                assert(out.areas == rows + 2);
-                return out;
             }
         }
 

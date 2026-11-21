@@ -33,7 +33,7 @@
 //! Cell `i` is `id.derive(i)` and divider `i` is `id.derive(divider_salt + i)`.
 //!
 //! ## 4. Counts
-//! `ColumnHeaderOf(S).appends_for(ColumnText)` is what one header appends to a frame at most
+//! `ColumnHeaderOf(S).appends_for(Items)` is what one header appends to a frame at most
 //! (`widgets/appends.zig`): one `header_cell` call per column with a label of up to
 //! `label_max` bytes (the longest), an area per cell, and a divider's area between each two.
 //! The skin's declaration bounds every call, so it holds for any skin; the default skin draws
@@ -46,7 +46,8 @@ const text = @import("../text.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
-const Appends = @import("appends.zig").Appends;
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -91,10 +92,6 @@ pub const Sort = struct {
     descending: bool,
 };
 
-/// What a header holds at most, for `appends_for` (section 4): how many columns and the
-/// longest label's bytes.
-pub const ColumnText = struct { columns: u32, label_max: u32 };
-
 /// The default header: `ColumnHeaderOf(skins.Default)`.
 pub const ColumnHeader = ColumnHeaderOf(skin.Default);
 
@@ -127,16 +124,11 @@ pub fn ColumnHeaderOf(comptime Skin: type) type {
 
         /// What one header appends to a frame at most (section 4): a cell per column, its
         /// area, and a divider's area between each two.
-        pub fn appends_for(comptime column_text: ColumnText) Appends {
+        pub fn appends_for(comptime columns: appends.Items) Appends {
             comptime {
-                assert(column_text.columns >= 1);
-                assert(column_text.columns <= columns_max);
-                assert(column_text.label_max <= text.byte_cap);
-                const cells = Skin.header_cell_appends.with(column_text.label_max)
-                    .times(column_text.columns);
-                const out = cells.plus(.{ .areas = 2 * column_text.columns - 1 });
-                assert(out.areas == 2 * column_text.columns - 1);
-                return out;
+                columns.assert_within(columns_max);
+                return Skin.header_cell_appends.with(columns.label_max).times(columns.count)
+                    .plus(.{ .areas = 2 * columns.count - 1 });
             }
         }
 
@@ -317,7 +309,7 @@ comptime {
     assert(header_divider_w > 0 and header_pad_x > 0);
     // The default skin's header of 4 columns of up to 6 bytes (section 4): 4 x (Box 2, Glyph 1
     // + 6), areas 4 + 3.
-    const four = ColumnHeader.appends_for(.{ .columns = 4, .label_max = 6 });
+    const four = ColumnHeader.appends_for(.{ .count = 4, .label_max = 6 });
     assert(four.of(quads.Box) == 8);
     assert(four.of(quads.Glyph) == 28);
     assert(four.areas == 7);
@@ -421,14 +413,14 @@ test "a divider drag resizes within the minimum and the room" {
 
 /// Four columns 300 wide labelled "WWWWWW", so a 1200 px header cuts no label.
 const wide = [_]Column{
-    .{ .label = "WWWWWW", .width = 300, .min = 60 },
-    .{ .label = "WWWWWW", .width = 300, .min = 60 },
-    .{ .label = "WWWWWW", .width = 300, .min = 60 },
-    .{ .label = "WWWWWW", .width = 300, .min = 60 },
+    .{ .label = fixture.inked(6), .width = 300, .min = 60 },
+    .{ .label = fixture.inked(6), .width = 300, .min = 60 },
+    .{ .label = fixture.inked(6), .width = 300, .min = 60 },
+    .{ .label = fixture.inked(6), .width = 300, .min = 60 },
 };
 
 /// The columns' shape for `appends_for`.
-const wide_text: ColumnText = .{ .columns = wide.len, .label_max = "WWWWWW".len };
+const wide_text: appends.Items = .{ .count = wide.len, .label_max = 6 };
 
 /// Draws `header` 1200 px wide and observes the frame.
 fn header_frame(cx: anytype, header: anytype, tally: anytype) !void {

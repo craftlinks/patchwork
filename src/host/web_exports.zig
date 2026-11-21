@@ -999,4 +999,3 @@ test "the op table export is commands.table_json" {
     const exported = commands_json_ptr()[0..commands_json_len()];
     try std.testing.expectEqualStrings(commands.table_json, exported);
 }
-

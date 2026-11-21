@@ -57,10 +57,7 @@ pub fn MeterOf(comptime Skin: type) type {
         /// (section 3).
         pub fn appends_for(comptime name_bytes: u32) Appends {
             comptime {
-                const out = Skin.meter_appends.with(name_bytes);
-                assert(out.areas == 0);
-                assert(out.points == Skin.meter_appends.fixed.points);
-                return out;
+                return Skin.meter_appends.with(name_bytes);
             }
         }
 

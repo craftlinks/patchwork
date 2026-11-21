@@ -22,14 +22,15 @@
 //!
 //! ## 3. Counted
 //! `Counted` is a skin for a container's composition tests. Each of its functions appends
-//! exactly what it declares on every call, whatever its look's state: `k` `draw.Box` faces over
-//! the look's rect, and then the look's label, if it has one, every byte of it (no ellipsis),
-//! so a byte of inked text is a glyph. A container's `appends_for` is `calls x per-call bound +
-//! its own instances and areas` (`widgets.zig`, section 4); with `Counted` every call reaches
-//! its bound, so a `Tally` of the formula is reached exactly, and a wrong number of calls,
-//! bytes, or areas fails. The `k` differ between functions, so a multiplier taken from the
-//! wrong function fails too. A kind that gains a function stops `Counted` compiling at its
-//! comptime block, which is the signal to give it the function and a `k`.
+//! exactly what it declares on every call, whatever its look's state: `faces_per_call`
+//! `draw.Box` faces over the look's rect, and then the look's label, if it has one, every byte
+//! of it (no ellipsis), so a byte of inked text is a glyph. A container's `appends_for` is
+//! `calls x per-call bound + its own instances and areas` (`widgets.zig`, section 4); with
+//! `Counted` every call reaches its bound, so a `Tally` of the formula is reached exactly, and
+//! a wrong number of calls, bytes, or areas fails. `faces_per_call` differs between functions,
+//! so a multiplier taken from the wrong function fails too. A kind that gains a function stops
+//! `Counted` compiling at its comptime block, which is the signal to give it the function and
+//! its `faces_per_call`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -140,7 +141,7 @@ pub fn Tally(comptime need: appends.Appends) type {
                     std.debug.print("{s}: {d} over {d}\n", .{ @typeName(T), count, bound });
                     return error.TallyExceeded;
                 }
-                if (comptime slot(T)) |entry_index| {
+                if (comptime appends.index_of(need.draws, T)) |entry_index| {
                     self.seen[entry_index] = true;
                     self.most[entry_index] = @max(self.most[entry_index], count);
                 }
@@ -182,15 +183,18 @@ pub fn Tally(comptime need: appends.Appends) type {
                 return error.TallyNotReached;
             }
         }
-
-        /// The index of `T` in `need.draws`, or null.
-        fn slot(comptime T: type) ?usize {
-            for (need.draws, 0..) |entry, entry_index| {
-                if (entry.type == T) return entry_index;
-            }
-            return null;
-        }
     };
+}
+
+/// `n` bytes of "W": inked text of a stated length for the tests that reach a text bound. No
+/// spaces, which have no ink, and no letter narrow enough to hide a cut.
+pub fn inked(comptime n: u32) *const [n]u8 {
+    // A container's constant has a static address, so the pointer outlives the call.
+    const static = struct {
+        const bytes: [n]u8 = @splat('W');
+    };
+    comptime assert(n <= text.byte_cap);
+    return &static.bytes;
 }
 
 /// The walk that puts a `width` by `height` box at `(x, y)` under the root turtle.
@@ -327,23 +331,23 @@ pub const Counted = struct {
         return .{ .rect = look.rect, .radius = 0 };
     }
 
-    /// `k` Box faces a call, and the default `per_byte`: a glyph a byte of the label.
-    fn counted(comptime k: u32) appends.SkinAppends {
+    /// `faces_per_call` Box faces a call, and the default `per_byte`: a glyph a byte of the label.
+    fn counted(comptime faces_per_call: u32) appends.SkinAppends {
         comptime {
-            assert(k >= 1);
+            assert(faces_per_call >= 1);
             const out: appends.SkinAppends = .{ .fixed = .{
-                .draws = &.{.{ .type = draw.Box, .count = k }},
+                .draws = &.{.{ .type = draw.Box, .count = faces_per_call }},
             } };
             assert(out.per_byte.of(draw.Glyph) == 1);
             return out;
         }
     }
 
-    /// `k` faces over `rect` under `clip`.
-    fn faces(cx: anytype, rect: kit.Rect, clip: kit.Clip, comptime k: u32) void {
+    /// `faces_per_call` faces over `rect` under `clip`.
+    fn faces(cx: anytype, rect: kit.Rect, clip: kit.Clip, comptime faces_per_call: u32) void {
         assert(rect.width > 0);
         assert(rect.height > 0);
-        for (0..k) |_| kit.face(cx, rect, clip, .{ .fill = .{ 1, 1, 1, 1 } });
+        for (0..faces_per_call) |_| kit.face(cx, rect, clip, .{ .fill = .{ 1, 1, 1, 1 } });
     }
 
     /// `label` from `rect`'s left, centred vertically, never cut, so every inked byte draws.
@@ -381,8 +385,8 @@ comptime {
 const testing = std.testing;
 const theme = @import("../theme.zig");
 
-/// Eight inked bytes: no spaces, which have no ink.
-const counted_label = "WWWWWWWW";
+/// Eight inked bytes.
+const counted_label = inked(8);
 
 /// A wide rect at `y`, so no label is cut.
 fn counted_rect(y: f32) kit.Rect {
@@ -409,80 +413,90 @@ fn counted_reach(
     assert(tally.frames == 1);
 }
 
-// Locks `Counted` (module guide, section 3): one call of each function appends its `k` Box
-// faces (menu_face 2, menu_row 3, dropdown 5, tab_bar 2, tab 3, divider 1, list_row 2,
-// tree_chevron 1, menu_title 4, window_button 2, header_cell 3) and Glyph 8 for an 8-byte label,
-// reached exactly.
-test "Counted appends its declarations" {
+/// The clip of a 1280 by 720 frame, under which `counted_reach` draws.
+const counted_clip: kit.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
+
+// Locks `Counted`'s functions without a label (module guide, section 3): one call of each
+// appends its Box faces (menu_face 2, tab_bar 2, divider 1, list_row 2, tree_chevron 1,
+// window_button 2), reached exactly.
+test "Counted's faces append their declarations" {
     const cx = wide_context();
-    const clip: kit.Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
     const rect = counted_rect(0);
-    const style = theme.dark.name;
-    const C = Counted;
+    const clip = counted_clip;
     const face: skin.MenuFaceLook = .{ .rect = rect, .clip = clip };
-    try counted_reach(cx, C.menu_face, face, C.menu_face_appends, 0);
-    try counted_reach(cx, C.menu_row, skin.MenuRowLook{
-        .rect = rect,
-        .clip = clip,
-        .label = counted_label,
-        .style = style,
-        .enabled = true,
-        .highlighted = false,
-    }, C.menu_row_appends, counted_label.len);
-    try counted_reach(cx, C.dropdown, skin.DropdownLook{
-        .rect = rect,
-        .clip = clip,
-        .label = counted_label,
-        .hover = 0,
-        .open = false,
-    }, C.dropdown_appends, counted_label.len);
+    try counted_reach(cx, Counted.menu_face, face, Counted.menu_face_appends, 0);
     const bar: skin.TabBarLook = .{ .rect = rect, .clip = clip, .focused = false };
-    try counted_reach(cx, C.tab_bar, bar, C.tab_bar_appends, 0);
-    try counted_reach(cx, C.tab, skin.TabLook{
-        .rect = rect,
-        .clip = clip,
-        .label = counted_label,
-        .selected = false,
-        .hovered = false,
-    }, C.tab_appends, counted_label.len);
-    try counted_reach(cx, C.divider, skin.DividerLook{
+    try counted_reach(cx, Counted.tab_bar, bar, Counted.tab_bar_appends, 0);
+    try counted_reach(cx, Counted.divider, skin.DividerLook{
         .rect = rect,
         .clip = clip,
         .axis = .horizontal,
         .hover = 0,
-    }, C.divider_appends, 0);
-    try counted_reach(cx, C.list_row, skin.ListRowLook{
+    }, Counted.divider_appends, 0);
+    try counted_reach(cx, Counted.list_row, skin.ListRowLook{
         .rect = rect,
         .clip = clip,
         .selected = false,
         .hovered = false,
-    }, C.list_row_appends, 0);
-    try counted_reach(cx, C.tree_chevron, skin.ChevronLook{
+    }, Counted.list_row_appends, 0);
+    try counted_reach(cx, Counted.tree_chevron, skin.ChevronLook{
         .rect = rect,
         .clip = clip,
         .turn = 0,
         .hovered = false,
-    }, C.tree_chevron_appends, 0);
-    try counted_reach(cx, C.menu_title, skin.MenuTitleLook{
-        .rect = rect,
-        .clip = clip,
-        .label = counted_label,
-        .open = false,
-        .hovered = false,
-    }, C.menu_title_appends, counted_label.len);
-    try counted_reach(cx, C.window_button, skin.WindowButtonLook{
+    }, Counted.tree_chevron_appends, 0);
+    try counted_reach(cx, Counted.window_button, skin.WindowButtonLook{
         .rect = rect,
         .clip = clip,
         .kind = .close,
         .hover = 0,
         .down = 0,
         .active = true,
-    }, C.window_button_appends, 0);
-    try counted_reach(cx, C.header_cell, skin.HeaderCellLook{
+    }, Counted.window_button_appends, 0);
+}
+
+// Locks `Counted`'s functions with a label (module guide, section 3): one call of each appends
+// its Box faces (menu_row 3, dropdown 5, tab 3, menu_title 4, header_cell 3) and Glyph 8 for
+// an 8-byte label, reached exactly.
+test "Counted's labelled functions append their declarations" {
+    const cx = wide_context();
+    const rect = counted_rect(0);
+    const clip = counted_clip;
+    const bytes = counted_label.len;
+    try counted_reach(cx, Counted.menu_row, skin.MenuRowLook{
+        .rect = rect,
+        .clip = clip,
+        .label = counted_label,
+        .style = theme.dark.name,
+        .enabled = true,
+        .highlighted = false,
+    }, Counted.menu_row_appends, bytes);
+    try counted_reach(cx, Counted.dropdown, skin.DropdownLook{
+        .rect = rect,
+        .clip = clip,
+        .label = counted_label,
+        .hover = 0,
+        .open = false,
+    }, Counted.dropdown_appends, bytes);
+    try counted_reach(cx, Counted.tab, skin.TabLook{
+        .rect = rect,
+        .clip = clip,
+        .label = counted_label,
+        .selected = false,
+        .hovered = false,
+    }, Counted.tab_appends, bytes);
+    try counted_reach(cx, Counted.menu_title, skin.MenuTitleLook{
+        .rect = rect,
+        .clip = clip,
+        .label = counted_label,
+        .open = false,
+        .hovered = false,
+    }, Counted.menu_title_appends, bytes);
+    try counted_reach(cx, Counted.header_cell, skin.HeaderCellLook{
         .rect = rect,
         .clip = clip,
         .label = counted_label,
         .sorted = null,
         .hovered = false,
-    }, C.header_cell_appends, counted_label.len);
+    }, Counted.header_cell_appends, bytes);
 }

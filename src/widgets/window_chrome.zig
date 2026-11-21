@@ -84,6 +84,9 @@ pub const WindowButton = enum(u2) {
     close,
 };
 
+/// How many buttons `WindowButtonsOf` draws: one of each `WindowButton`.
+const buttons_count: u32 = std.enums.values(WindowButton).len;
+
 /// The default buttons: `WindowButtonsOf(skins.Default)`.
 pub const WindowButtons = WindowButtonsOf(skin.Default);
 
@@ -204,15 +207,8 @@ pub fn WindowButtonsOf(comptime Skin: type) type {
 
         /// What the buttons append to a frame at most (section 3): three `window_button` calls
         /// and their areas. The look has no text.
-        pub const appends: Appends = appends: {
-            const buttons = std.enums.values(WindowButton).len;
-            const out = Skin.window_button_appends.with(0).times(buttons).plus(.{
-                .areas = buttons,
-            });
-            assert(buttons == 3);
-            assert(out.areas == 3);
-            break :appends out;
-        };
+        pub const appends: Appends = Skin.window_button_appends.with(0).times(buttons_count)
+            .plus(.{ .areas = buttons_count });
 
         /// The buttons at rest.
         pub fn init(id: Id) Self {

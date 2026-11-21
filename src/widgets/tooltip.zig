@@ -93,12 +93,7 @@ pub fn TooltipOf(comptime Skin: type) type {
         bounds: ?Rect,
 
         /// What a shown tooltip appends to a frame at most (section 3).
-        pub const appends: Appends = blk: {
-            const out = Skin.tooltip_appends.with(tooltip_text_cap);
-            assert(out.areas == 0);
-            assert(out.points == Skin.tooltip_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.tooltip_appends.with(tooltip_text_cap);
 
         /// Nothing hovered, placed to the right of its anchor.
         pub fn init() Self {
@@ -329,14 +324,13 @@ comptime {
     assert(Tooltip.appends.areas == 0);
 }
 
-/// 64 inked bytes, `tooltip_text_cap`.
-const tip_64 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab";
+/// `tooltip_text_cap` inked bytes.
+const tip_64 = fixture.inked(tooltip_text_cap);
 
 // Locks `Tooltip.appends` (section 3) with the default skin: shown after its dwell beside the
 // anchor at (100, 100), a 64-byte tip draws Box 1 and Glyph 64 and no area of its own (the one
 // area is the test's anchor), with no overflow.
 test "Tooltip appends at most appends and reaches it" {
-    comptime assert(tip_64.len == tooltip_text_cap);
     const cx = fixture.context();
     var tooltip = Tooltip.init();
     const tip: Tip = .{ .anchor = ui.id("knob", 0), .text = tip_64 };

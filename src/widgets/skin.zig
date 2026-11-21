@@ -1647,9 +1647,8 @@ const Mixed = struct {
 
 // Locks the contract check (section 2): `Default` covers all 20 kinds; a skin covering the
 // knob alone (and declaring it) passes for the knob and names the missing `button`, `tab_bar`,
-// and `tooltip`; a
-// wrong return type and a wrong look each give their message; a slider skin needs
-// `slider_travel` too, and a number box skin `field` for its editor.
+// and `tooltip`; a wrong return type and a wrong look each give their message; a slider skin
+// needs `slider_travel` too, and a number box skin `field` for its editor.
 test "check names the skin and the first problem" {
     inline for (@typeInfo(Kind).@"enum".field_names) |name| {
         const kind = @field(Kind, name);
@@ -1702,9 +1701,8 @@ test "check names the skin and the first problem" {
     try testing.expectEqualStrings("u32: a skin must be a struct type", not_struct);
 }
 
-/// A knob skin whose `knob_appends` is `declaration`, or that has none when it is null.
+/// A knob skin whose `knob_appends` is `declaration`.
 fn KnobDeclared(comptime declaration: anytype) type {
-    if (@TypeOf(declaration) == @TypeOf(null)) return KnobBare;
     return struct {
         pub const knob_appends = declaration;
 
@@ -1772,7 +1770,6 @@ test "check refuses a skin function without its declaration" {
         comptime knob_problem(KnobDeclared(areas)),
     );
     try testing.expect(comptime check(KnobDeclared(SkinAppends{}), .knob) == null);
-    try testing.expect(comptime KnobDeclared(null) == KnobBare);
     try testing.expectEqualStrings(
         "widgets.skin.MenuBarFaceOnly: missing `pub const menu_row_appends: widgets.SkinAppends`",
         comptime check(MenuBarFaceOnly, .menu_bar).?,
@@ -2120,18 +2117,36 @@ test "a framed panel has a hairline" {
     try testing.expectEqual(@as(f32, 1), box.border_width);
 }
 
-/// Eight inked bytes, the look's text in the reach tests (section 2b): no spaces, which have
-/// no ink, and no letter narrow enough to hide a cut.
-const reach_text = "WWWWWWWW";
+/// Eight inked bytes, the look's text in the reach tests (section 2b).
+const reach_text = fixture.inked(8);
 const reach_bytes: u32 = reach_text.len;
+
+/// The window clip of a 1280 by 720 frame, which `reach_begin` returns.
+const reach_clip: Clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 };
 
 /// A frame of `cx`, and its window clip.
 fn reach_begin(cx: anytype) Clip {
     cx.begin_frame(1280, 720, 120);
     const clip = cx.clip().?;
-    assert(clip.x1 == 1280);
-    assert(clip.y1 == 720);
+    assert(clip.x1 == reach_clip.x1);
+    assert(clip.y1 == reach_clip.y1);
     return clip;
+}
+
+/// One frame of `cx` with one call of `function` with `look` (its clip `reach_clip`), observed
+/// by a tally of `need`, reached.
+fn reach(
+    cx: anytype,
+    comptime need: appends.Appends,
+    comptime function: anytype,
+    look: anytype,
+) !void {
+    assert(std.meta.eql(look.clip, reach_clip));
+    var tally: fixture.Tally(need) = .{};
+    _ = reach_begin(cx);
+    _ = function(cx, look);
+    try reach_end(cx, &tally);
+    try tally.expect_reached();
 }
 
 /// Ends the frame of `cx` and observes it.
@@ -2165,96 +2180,61 @@ fn reach_rect(y: f32, height: f32) Rect {
 test "Default's controls reach their declarations" {
     const cx = fixture.context();
     const scheme = theme.dark;
-    {
-        var tally: fixture.Tally(Default.button_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.button(cx, .{
-            .rect = reach_rect(0, 40),
-            .clip = clip,
-            .label = reach_text,
-            .style = scheme.name,
-            .padding = .all(8),
-            .paint = kit.paint_of(.{ 0.3, 0.46, 0.7, 1 }, 4),
-            .hover = 1,
-            .down = 1,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.slider_appends.with(0)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.slider(cx, .{
-            .rect = reach_rect(0, 24),
-            .clip = clip,
-            .value = 0.5,
-            .hover = 1,
-            .track = kit.paint_of(scheme.colors.track, 2),
-            .fill = kit.paint_of(scheme.colors.meter, 2),
-            .knob = kit.paint_of(scheme.colors.control, 12),
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.knob_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.knob(cx, .{
-            .row = reach_rect(0, knob_file.knob_height),
-            .clip = clip,
-            .ring = knob_file.ring_size,
-            .value = 0.5,
-            .hover = 1,
-            .accent = knob_file.accents[0],
-            .name = reach_text[0..4],
-            .value_text = reach_text[4..],
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.toggle_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.toggle(cx, .{
-            .row = reach_rect(0, toggle_file.toggle_height),
-            .clip = clip,
-            .thumb = 1,
-            .hover = 1,
-            .name = reach_text,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
+    try reach(cx, Default.button_appends.with(reach_bytes), Default.button, ButtonLook{
+        .rect = reach_rect(0, 40),
+        .clip = reach_clip,
+        .label = reach_text,
+        .style = scheme.name,
+        .padding = .all(8),
+        .paint = kit.paint_of(.{ 0.3, 0.46, 0.7, 1 }, 4),
+        .hover = 1,
+        .down = 1,
+    });
+    try reach(cx, Default.slider_appends.with(0), Default.slider, SliderLook{
+        .rect = reach_rect(0, 24),
+        .clip = reach_clip,
+        .value = 0.5,
+        .hover = 1,
+        .track = kit.paint_of(scheme.colors.track, 2),
+        .fill = kit.paint_of(scheme.colors.meter, 2),
+        .knob = kit.paint_of(scheme.colors.control, 12),
+    });
+    try reach(cx, Default.knob_appends.with(reach_bytes), Default.knob, KnobLook{
+        .row = reach_rect(0, knob_file.knob_height),
+        .clip = reach_clip,
+        .ring = knob_file.ring_size,
+        .value = 0.5,
+        .hover = 1,
+        .accent = knob_file.accents[0],
+        .name = reach_text[0..4],
+        .value_text = reach_text[4..],
+    });
+    try reach(cx, Default.toggle_appends.with(reach_bytes), Default.toggle, ToggleLook{
+        .row = reach_rect(0, toggle_file.toggle_height),
+        .clip = reach_clip,
+        .thumb = 1,
+        .hover = 1,
+        .name = reach_text,
+    });
     try reach_checkbox(cx);
-    {
-        var tally: fixture.Tally(Default.meter_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        Default.meter(cx, .{
-            .row = reach_rect(0, meter_file.meter_height),
-            .clip = clip,
-            .value = 0.5,
-            .track_h = meter_file.meter_track_h,
-            .name = reach_text,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        const value_text = "-99999999.999999";
-        const unit = "abcdefgh";
-        var tally: fixture.Tally(Default.number_face_appends.with(value_text.len + unit.len)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.number_face(cx, .{
-            .rect = reach_rect(0, 28),
-            .clip = clip,
-            .value_text = value_text,
-            .unit = unit,
-            .hover = 1,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-        try testing.expectEqual(@as(usize, 24), cx.draw.items(quads.Glyph).len);
-    }
+    try reach(cx, Default.meter_appends.with(reach_bytes), Default.meter, MeterLook{
+        .row = reach_rect(0, meter_file.meter_height),
+        .clip = reach_clip,
+        .value = 0.5,
+        .track_h = meter_file.meter_track_h,
+        .name = reach_text,
+    });
+    const value_text = "-99999999.999999";
+    const unit = "abcdefgh";
+    const number = comptime Default.number_face_appends.with(value_text.len + unit.len);
+    try reach(cx, number, Default.number_face, NumberLook{
+        .rect = reach_rect(0, 28),
+        .clip = reach_clip,
+        .value_text = value_text,
+        .unit = unit,
+        .hover = 1,
+    });
+    try testing.expectEqual(@as(usize, 24), cx.draw.items(quads.Glyph).len);
 }
 
 /// The checkbox's three worst frames (section 2b): mixed, checked, and checked without
@@ -2313,13 +2293,8 @@ test "Default's faces and popups reach their declarations" {
         }
         try tally.expect_reached();
     }
-    {
-        var tally: fixture.Tally(Default.field_appends.with(0)) = .{};
-        const clip = reach_begin(cx);
-        Default.field(cx, .{ .rect = reach_rect(0, 28), .clip = clip, .focused = true });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
+    const field: FieldLook = .{ .rect = reach_rect(0, 28), .clip = reach_clip, .focused = true };
+    try reach(cx, Default.field_appends.with(0), Default.field, field);
     {
         var tally: fixture.Tally(Default.menu_face_appends.with(0)) = .{};
         for ([_]bool{ false, true }) |glass| {
@@ -2335,52 +2310,32 @@ test "Default's faces and popups reach their declarations" {
         try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Box).len);
         try tally.expect_reached();
     }
-    {
-        var tally: fixture.Tally(Default.menu_row_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        Default.menu_row(cx, .{
-            .rect = reach_rect(0, 28),
-            .clip = clip,
-            .label = reach_text,
-            .style = theme.dark.name,
-            .enabled = true,
-            .highlighted = true,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.dropdown_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.dropdown(cx, .{
-            .rect = reach_rect(0, 28),
-            .clip = clip,
-            .label = reach_text,
-            .hover = 1,
-            .open = true,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.tooltip_appends.with(reach_bytes)) = .{};
-        const clip = reach_begin(cx);
-        Default.tooltip(cx, .{ .rect = reach_rect(0, 32), .clip = clip, .label = reach_text });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
-    {
-        var tally: fixture.Tally(Default.divider_appends.with(0)) = .{};
-        const clip = reach_begin(cx);
-        _ = Default.divider(cx, .{
-            .rect = .{ .x = 100, .y = 0, .width = 6, .height = 300 },
-            .clip = clip,
-            .axis = .horizontal,
-            .hover = 1,
-        });
-        try reach_end(cx, &tally);
-        try tally.expect_reached();
-    }
+    try reach(cx, Default.menu_row_appends.with(reach_bytes), Default.menu_row, MenuRowLook{
+        .rect = reach_rect(0, 28),
+        .clip = reach_clip,
+        .label = reach_text,
+        .style = theme.dark.name,
+        .enabled = true,
+        .highlighted = true,
+    });
+    try reach(cx, Default.dropdown_appends.with(reach_bytes), Default.dropdown, DropdownLook{
+        .rect = reach_rect(0, 28),
+        .clip = reach_clip,
+        .label = reach_text,
+        .hover = 1,
+        .open = true,
+    });
+    try reach(cx, Default.tooltip_appends.with(reach_bytes), Default.tooltip, TooltipLook{
+        .rect = reach_rect(0, 32),
+        .clip = reach_clip,
+        .label = reach_text,
+    });
+    try reach(cx, Default.divider_appends.with(0), Default.divider, DividerLook{
+        .rect = .{ .x = 100, .y = 0, .width = 6, .height = 300 },
+        .clip = reach_clip,
+        .axis = .horizontal,
+        .hover = 1,
+    });
 }
 
 // Locks the tab bar, tab, list row, menu title, and header cell of `Default` (section 2b): a
@@ -2459,7 +2414,7 @@ test "Default's paths and their fallbacks reach their declarations" {
         var tally: fixture.Tally(Default.tree_chevron_appends.with(0)) = .{};
         const look: ChevronLook = .{
             .rect = reach_rect(0, 24),
-            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .clip = reach_clip,
             .turn = 0,
             .hovered = true,
         };
@@ -2475,7 +2430,7 @@ test "Default's paths and their fallbacks reach their declarations" {
         var tally: fixture.Tally(Default.disclosure_appends.with(reach_bytes)) = .{};
         const look: DisclosureLook = .{
             .rect = reach_rect(0, 28),
-            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .clip = reach_clip,
             .label = reach_text,
             .turn = 1,
             .hover = 1,
@@ -2493,7 +2448,7 @@ test "Default's paths and their fallbacks reach their declarations" {
         var tally: fixture.Tally(Default.window_button_appends.with(0)) = .{};
         const look: WindowButtonLook = .{
             .rect = .{ .x = 0, .y = 0, .width = 40, .height = 32 },
-            .clip = .{ .x0 = 0, .y0 = 0, .x1 = 1280, .y1 = 720 },
+            .clip = reach_clip,
             .kind = .restore,
             .hover = 1,
             .down = 0,

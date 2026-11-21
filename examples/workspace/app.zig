@@ -413,12 +413,11 @@ const edge_target_id = dock_id.derive(widgets.dock_edge_salt + @as(u64, @backing
 comptime {
     // The widgets' counts (widgets.zig, section 4): the dock, the files list at its most rows,
     // the toggle, the three buttons, the help, and the bar's panel face.
-    const need = widgets.Dock.appends_for(.{
-        .panels = panel_labels.len,
-        .label_max = widgets.label_max_of(&panel_labels), // 10, "appearance"
-    }).plus(widgets.ListBox.appends_for(files_rows))
+    // The panels are 4 of up to 10 bytes ("appearance").
+    const need = widgets.Dock.appends_for(.of(&panel_labels))
+        .plus(widgets.ListBox.appends_for(files_rows))
         .plus(widgets.Toggle.appends)
-        .plus(widgets.Button.appends_for(widgets.label_max_of(&button_labels)).times(3))
+        .plus(widgets.Button.appends_for(widgets.Items.of(&button_labels).label_max).times(3))
         .plus(widgets.Paragraph.appends_for(help.len))
         .plus(widgets.Panel.appends);
     // The editor's faces, a band per line, its caret and thumb; its three areas: the editor's

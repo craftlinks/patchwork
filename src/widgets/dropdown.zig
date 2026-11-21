@@ -20,7 +20,7 @@
 //! ## 3. Counts
 //! `DropdownOf(S).face_appends_for(label_bytes)` is what the face appends to a frame at most
 //! (`widgets/appends.zig`): one `dropdown` call with the selected label, at most the longest
-//! item's bytes, and its area. `appends_for(MenuText)` adds the open list,
+//! item's bytes, and its area. `appends_for(Items)` adds the open list,
 //! `MenuOf(S).appends_for` (`widgets/menu.zig`, section 5). The list is a popup and a frame
 //! draws one, so an app with several popup owners sums their faces and takes the `max` of
 //! their popups (`widgets.zig`, section 4).
@@ -37,7 +37,8 @@ const kit = @import("kit.zig");
 const skin = @import("skin.zig");
 const menu_file = @import("menu.zig");
 const text = @import("../text.zig");
-const Appends = @import("appends.zig").Appends;
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -101,21 +102,14 @@ pub fn DropdownOf(comptime Skin: type) type {
         /// area.
         pub fn face_appends_for(comptime label_bytes: u32) Appends {
             comptime {
-                assert(label_bytes <= text.byte_cap);
-                const out = Skin.dropdown_appends.with(label_bytes).plus(.{ .areas = 1 });
-                assert(out.areas == 1);
-                return out;
+                return Skin.dropdown_appends.with(label_bytes).plus(.{ .areas = 1 });
             }
         }
 
         /// The face and its open list, one popup (section 3).
-        pub fn appends_for(comptime menu_text: menu_file.MenuText) Appends {
+        pub fn appends_for(comptime items: appends.Items) Appends {
             comptime {
-                const list = List.appends_for(menu_text);
-                const out = face_appends_for(menu_text.label_max).plus(list);
-                assert(out.areas == list.areas + 1);
-                assert(out.points >= list.points);
-                return out;
+                return face_appends_for(items.label_max).plus(List.appends_for(items));
             }
         }
 
@@ -211,7 +205,7 @@ comptime {
     assert(face.of(quads.Glyph) == 8);
     assert(face.points == 3);
     assert(face.areas == 1);
-    const six = Dropdown.appends_for(.{ .items = 6, .label_max = 8 });
+    const six = Dropdown.appends_for(.{ .count = 6, .label_max = 8 });
     assert(six.of(quads.Box) == 8);
     assert(six.of(quads.Path) == 1);
     assert(six.of(quads.Glass) == 1);
@@ -280,12 +274,10 @@ test "the chevron sits inside the face's right edge" {
 }
 
 /// Six labels of eight inked bytes.
-const wide_items = [_][]const u8{
-    "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW",
-};
+const wide_items: [6][]const u8 = @splat(fixture.inked(8));
 
 /// The items' shape for `appends_for`.
-const wide_text: menu_file.MenuText = .{ .items = wide_items.len, .label_max = "WWWWWWWW".len };
+const wide_text: appends.Items = .of(&wide_items);
 
 /// One frame: `dropdown`'s face 300 px wide at (100, 100), then its overlay, observed.
 fn wide_frame(cx: anytype, dropdown: anytype, tally: anytype) !void {

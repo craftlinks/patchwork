@@ -188,12 +188,7 @@ pub fn SplitterOf(comptime Skin: type) type {
         };
 
         /// What one splitter appends to a frame at most (section 5).
-        pub const appends: Appends = blk: {
-            const out = Skin.divider_appends.with(0).plus(.{ .areas = 1 });
-            assert(out.areas == 1);
-            assert(out.points == Skin.divider_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.divider_appends.with(0).plus(.{ .areas = 1 });
 
         /// A splitter at `ratio` (also its default) with minimum pane lengths.
         pub fn init(id: Id, axis: Axis, ratio: f32, min_a: f32, min_b: f32) Self {

@@ -26,8 +26,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const text = @import("../text.zig");
 const kit = @import("kit.zig");
-const appends = @import("appends.zig");
-const Appends = appends.Appends;
+const Label = @import("label.zig").Label;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
@@ -39,15 +38,8 @@ pub const Paragraph = struct {
     align_x: text.Align = .start,
 
     /// What one paragraph of up to `bytes` bytes appends to a frame at most (section 3): a
-    /// glyph a byte.
-    pub fn appends_for(comptime bytes: u32) Appends {
-        comptime {
-            assert(bytes <= text.byte_cap);
-            const out = appends.text_byte.times(bytes);
-            assert(out.areas == 0);
-            return out;
-        }
-    }
+    /// label's, a glyph a byte.
+    pub const appends_for = Label.appends_for;
 
     /// Walks `walk` (a `fit` height is the height for the width, section 2) and places the
     /// lines. Returns the box, so an app can anchor to it.
@@ -126,8 +118,9 @@ comptime {
 test "Paragraph appends at most appends_for and reaches it" {
     const cx = fixture.context();
     {
-        const paragraph: Paragraph = .{ .text = "WWWWWWWWWWWW", .style = theme.dark.name };
-        var tally: fixture.Tally(Paragraph.appends_for("WWWWWWWWWWWW".len)) = .{};
+        const words = fixture.inked(12);
+        const paragraph: Paragraph = .{ .text = words, .style = theme.dark.name };
+        var tally: fixture.Tally(Paragraph.appends_for(words.len)) = .{};
         cx.begin_frame(1280, 720, 120);
         _ = paragraph.draw(cx, ui.sized(.{ .fixed = 300 }, .fit));
         _ = cx.end_frame();

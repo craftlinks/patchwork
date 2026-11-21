@@ -187,9 +187,7 @@ pub fn TreeViewOf(comptime Skin: type, comptime capacity: u32) type {
                 assert(rows >= 1);
                 assert(rows <= capacity);
                 const chevrons = Skin.tree_chevron_appends.with(0).times(rows);
-                const out = List.appends_for(rows).plus(chevrons).plus(.{ .areas = rows });
-                assert(out.areas == List.appends_for(rows).areas + rows);
-                return out;
+                return List.appends_for(rows).plus(chevrons).plus(.{ .areas = rows });
             }
         }
 

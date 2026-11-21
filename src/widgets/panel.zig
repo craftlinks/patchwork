@@ -39,12 +39,7 @@ pub fn PanelOf(comptime Skin: type) type {
         material: ?kit.Material = null,
 
         /// What one panel appends to a frame at most (section 2).
-        pub const appends: Appends = blk: {
-            const out = Skin.panel_appends.with(0);
-            assert(out.areas == 0);
-            assert(out.points == Skin.panel_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.panel_appends.with(0);
 
         /// Draws the face over the box `walk` gets, under the enclosing clip, then opens a
         /// container laid out by `layout` over it. The caller closes it with `cx.end()`. The

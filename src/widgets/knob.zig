@@ -149,11 +149,7 @@ pub fn KnobOf(comptime Skin: type) type {
         /// value text (section 4): the skin's knob with a `name_max` name, and its area.
         pub fn appends_for(comptime value_bytes: u32) Appends {
             comptime {
-                assert(value_bytes <= text.byte_cap);
-                const out = Skin.knob_appends.with(name_max + value_bytes).plus(.{ .areas = 1 });
-                assert(out.areas == 1);
-                assert(out.points == Skin.knob_appends.fixed.points);
-                return out;
+                return Skin.knob_appends.with(name_max + value_bytes).plus(.{ .areas = 1 });
             }
         }
 

@@ -82,12 +82,8 @@ pub fn CheckboxOf(comptime Skin: type) type {
         };
 
         /// What one checkbox appends to a frame at most (section 4).
-        pub const appends: Appends = blk: {
-            const out = Skin.checkbox_appends.with(checkbox_label_max).plus(.{ .areas = 1 });
-            assert(out.areas == 1);
-            assert(out.points == Skin.checkbox_appends.fixed.points);
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.checkbox_appends.with(checkbox_label_max)
+            .plus(.{ .areas = 1 });
 
         /// A checkbox at rest, its check settled on the side `on` selects.
         pub fn init(id: Id, label: []const u8, on: bool) Self {
@@ -330,14 +326,13 @@ test "the default checkbox draws its box, mark or bar, and label" {
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
 }
 
-/// 32 inked bytes, `checkbox_label_max`.
-const label_32 = "abcdefghijklmnopqrstuvwxyzABCDEF";
+/// `checkbox_label_max` inked bytes.
+const label_32 = fixture.inked(checkbox_label_max);
 
 // Locks `Checkbox.appends` (section 4) with the default skin and a 32-byte label in a 1200 px
 // row: mixed (Box 2), checked (Box 1, Path 1, points 3), and checked without `draw.Path`
 // (Box 2) reach Box 2, Path 1, points 3, Glyph 32, and one area, with no overflow.
 test "Checkbox appends at most appends and reaches it" {
-    comptime assert(label_32.len == checkbox_label_max);
     const cx = fixture.context();
     var tally: fixture.Tally(Checkbox.appends) = .{};
     var checkbox = Checkbox.init(ui.id("check", 0), label_32, true);

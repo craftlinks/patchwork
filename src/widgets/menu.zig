@@ -44,7 +44,7 @@
 //! `handle(cx, event, target)`. Its actions are the menu's.
 //!
 //! ## 5. Counts
-//! `MenuOf(S).appends_for(MenuText)` is what the open menu appends to a frame at most
+//! `MenuOf(S).appends_for(Items)` is what the open menu appends to a frame at most
 //! (`widgets/appends.zig`): one `menu_face` call, one `menu_row` call per item with a label of
 //! up to `label_max` bytes (the longest), the backdrop's area, and an area per row. The popup
 //! asks for no dim, so the backdrop appends no Box, and marking the backdrop for glass is not a
@@ -64,7 +64,9 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
-const Appends = @import("appends.zig").Appends;
+const appends = @import("appends.zig");
+const Appends = appends.Appends;
+const Items = appends.Items;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -94,10 +96,6 @@ pub const menu_text_options: text.Options = .{
 
 /// Every item enabled.
 pub const all_enabled: u32 = std.math.maxInt(u32);
-
-/// What a menu's items are at most, for `appends_for` (section 5): how many, and the longest
-/// label's bytes.
-pub const MenuText = struct { items: u32, label_max: u32 };
 
 /// The default menu: `MenuOf(skins.Default)`.
 pub const Menu = MenuOf(skin.Default);
@@ -140,17 +138,12 @@ pub fn MenuOf(comptime Skin: type) type {
 
         /// What the open menu appends to a frame at most (section 5): the face, a row per
         /// item, the backdrop's area and the rows'. A frame draws one popup.
-        pub fn appends_for(comptime menu_text: MenuText) Appends {
+        pub fn appends_for(comptime items: Items) Appends {
             comptime {
-                assert(menu_text.items >= 1);
-                assert(menu_text.items <= menu_items_max);
-                assert(menu_text.label_max <= text.byte_cap);
-                const rows = Skin.menu_row_appends.with(menu_text.label_max).times(menu_text.items);
-                const out = Skin.menu_face_appends.with(0).plus(rows).plus(.{
-                    .areas = 1 + menu_text.items,
-                });
-                assert(out.areas == 1 + menu_text.items);
-                return out;
+                items.assert_within(menu_items_max);
+                const rows = Skin.menu_row_appends.with(items.label_max).times(items.count);
+                const areas: Appends = .{ .areas = 1 + items.count };
+                return Skin.menu_face_appends.with(0).plus(rows).plus(areas);
             }
         }
 
@@ -368,14 +361,7 @@ pub fn ContextMenuOf(comptime Skin: type) type {
         pub const Action = MenuAction;
 
         /// What the open context menu appends to a frame at most: its menu's (section 5).
-        pub fn appends_for(comptime menu_text: MenuText) Appends {
-            comptime {
-                const out = MenuOf(Skin).appends_for(menu_text);
-                assert(out.areas == 1 + menu_text.items);
-                assert(out.draws.len >= 1);
-                return out;
-            }
-        }
+        pub const appends_for = MenuOf(Skin).appends_for;
 
         /// A closed context menu of `items`, all enabled.
         pub fn init(id: Id, items: []const []const u8) Self {
@@ -407,32 +393,17 @@ pub fn ContextMenuOf(comptime Skin: type) type {
 
 const quads = @import("../draw.zig");
 
-/// True when `a` and `b` name the same types in the same order with the same counts, points,
-/// and areas.
-fn same_appends(comptime a: Appends, comptime b: Appends) bool {
-    comptime {
-        assert(a.draws.len <= 16);
-        assert(b.draws.len <= 16);
-        if (a.draws.len != b.draws.len) return false;
-        for (a.draws, b.draws) |left, right| {
-            if (left.type != right.type or left.count != right.count) return false;
-        }
-        return a.points == b.points and a.areas == b.areas;
-    }
-}
-
 comptime {
     // The popup rule of section 5 (sum the faces, take the max of the popups) holds only while
     // a frame draws one popup; `widgets.zig`, section 4, states it for apps.
     assert(popup.popup_depth_max == 1);
     // The default skin's menu of 5 items of up to 7 bytes (section 5): the face Box 1 and Glass
     // 1, rows 5 x (Box 1, Glyph 7), areas 1 + 5.
-    const five = Menu.appends_for(.{ .items = 5, .label_max = 7 });
+    const five = Menu.appends_for(.{ .count = 5, .label_max = 7 });
     assert(five.of(quads.Box) == 6);
     assert(five.of(quads.Glass) == 1);
     assert(five.of(quads.Glyph) == 35);
     assert(five.areas == 6);
-    assert(same_appends(ContextMenu.appends_for(.{ .items = 5, .label_max = 7 }), five));
 }
 
 const testing = std.testing;
@@ -607,10 +578,10 @@ test "a context menu opens at a right press on its target" {
 }
 
 /// Five labels of seven inked bytes.
-const wide_items = [_][]const u8{ "WWWWWWW", "WWWWWWW", "WWWWWWW", "WWWWWWW", "WWWWWWW" };
+const wide_items: [5][]const u8 = @splat(fixture.inked(7));
 
 /// The items' shape for `appends_for`.
-const wide_text: MenuText = .{ .items = wide_items.len, .label_max = "WWWWWWW".len };
+const wide_text: Items = .of(&wide_items);
 
 /// One frame: the anchor area "file" at (20, 20, 80, 32), then `menu`'s overlay, observed.
 fn counted_frame(cx: anytype, menu: anytype, tally: anytype) !void {

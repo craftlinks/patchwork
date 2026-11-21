@@ -30,9 +30,7 @@ pub const Label = struct {
     pub fn appends_for(comptime bytes: u32) Appends {
         comptime {
             assert(bytes <= text.byte_cap);
-            const out = appends.text_byte.times(bytes);
-            assert(out.areas == 0);
-            return out;
+            return appends.text_byte.times(bytes);
         }
     }
 
@@ -60,8 +58,9 @@ comptime {
 // else and no overflow, reached.
 test "Label appends at most appends_for and reaches it" {
     const cx = fixture.context();
-    const label: Label = .{ .text = "WWWW", .style = theme.dark.name };
-    var tally: fixture.Tally(Label.appends_for("WWWW".len)) = .{};
+    const word = fixture.inked(4);
+    const label: Label = .{ .text = word, .style = theme.dark.name };
+    var tally: fixture.Tally(Label.appends_for(word.len)) = .{};
     fixture.draw_one(cx, &label, fixture.at(0, 0, 200, 40));
     try tally.observe(cx);
     try tally.expect_reached();

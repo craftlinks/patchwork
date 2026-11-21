@@ -252,14 +252,9 @@ pub fn NumberBoxOf(comptime Skin: type) type {
         };
 
         /// What one number box appends to a frame at most (section 5).
-        pub const appends: Appends = blk: {
-            const face = Skin.number_face_appends.with(number_text_cap).plus(.{ .areas = 1 });
-            const editor = Field.appends_for(.{ .limit = number_text_cap });
-            const out = face.max(editor);
-            assert(out.areas == 1);
-            assert(out.points == @max(face.points, editor.points));
-            break :blk out;
-        };
+        pub const appends: Appends = Skin.number_face_appends.with(number_text_cap)
+            .plus(.{ .areas = 1 })
+            .max(Field.appends_for(.{ .limit = number_text_cap }));
 
         /// A box at `value` (also its default) in `[min, max]`.
         pub fn init(id: Id, value: f64, min: f64, max: f64, step: f64, shown: Format) Self {
