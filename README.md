@@ -83,7 +83,7 @@ pub const App = struct {
         },
     };
     pub fn init(app: *App, textures: *patchwork.draw.Textures) void
-    pub fn event(app: *App, cx: *patchwork.app.Context(App), event: patchwork.input.Event) void
+    pub fn event(app: *App, cx: *patchwork.app.Context(App), event_value: patchwork.input.Event) void
     pub fn timer(app: *App, cx: *patchwork.app.Context(App), now_ms: u64) void
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 };

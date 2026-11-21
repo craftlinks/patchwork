@@ -26,7 +26,7 @@ pub const App = struct {
         },
     };
     pub fn init(app: *App, textures: *patchwork.draw.Textures) void
-    pub fn event(app: *App, cx: *patchwork.app.Context(App), event: patchwork.input.Event) void
+    pub fn event(app: *App, cx: *patchwork.app.Context(App), event_value: patchwork.input.Event) void
     pub fn timer(app: *App, cx: *patchwork.app.Context(App), now_ms: u64) void
     pub fn draw(app: *App, cx: *patchwork.app.Context(App)) void
 };
@@ -528,6 +528,10 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
+An app's serve step is `serve-<app>` or `serve`; the example declares `serve`.
+`tools/browser_check.py --root` lists the package's steps (`zig build -l`) and runs
+`serve-<app>` when there is one, else `serve`.
+
 `AppOptions.font_ranges` sets the codepoints the embedded faces keep, on both targets (see
 Text). It defaults to `patchwork.default_font_ranges`; pass wider ranges for other scripts,
 or `null` for the full faces. `AppOptions.fonts` adds up to five faces of the app's own (see
@@ -622,6 +626,11 @@ comptime {
     patchwork.app.check(App);
 }
 ```
+
+The file imports `patchwork.draw` as `quads`, not `draw`: inside `App`, which has a `draw`
+method, `draw.Box` would be `error: ambiguous reference` (the contract's guide, `src/app.zig`
+section 2b). Name `patchwork.input` and `patchwork.text` imports, parameters, and locals apart in
+the same way.
 
 ### 4. Other Packages
 
@@ -1980,7 +1989,8 @@ zig build regress -Doptimize=ReleaseFast [-- options]
   frame, serves the app, drives system Chromium over CDP, and compares the screenshot: it
   passes at a maximum difference of 3 levels on at most 0.1% of the pixels, and reports
   console errors. `--root DIR` checks an app in another tree, a package of its own: the
-  executable, the reference frame, and the `serve-<app>` step are all taken from `DIR`.
+  executable, the reference frame, and the serve step (`serve-<app>` when `DIR`'s build lists
+  one, else `serve`) are all taken from `DIR`.
   The viewport is the app's regress size, read from the headless run's first line
   (`regress <app>  WxH@1.00`). Before it waits for the replay, the check asks the page for one
   animation frame: a Chromium window the compositor does not show (on a workspace that is not
