@@ -31,9 +31,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "thrum", .module = thrum_wasm.module("thrum") },
         .{ .name = "testtone", .module = thrum_wasm.module("testtone") },
     };
-    // Each page plays the tone in Thrum's worklet from its own wasm (`tone.zig`, section 4).
+    // Each page plays the tone in Thrum's worklet from its own wasm (`tone.zig`, section 4), which
+    // Thrum's `player` starts (`tone.js`).
     const web_files = [_]patchwork.WebFile{
         .{ .route = "/thrum-worklet.js", .path = thrum.path("web/worklet.js") },
+        .{ .route = "/thrum-node.js", .path = thrum.path("web/node.js") },
     };
     const examples = [_]struct { name: []const u8, root: []const u8, suffix: []const u8 }{
         .{ .name = "rack", .root = "rack.zig", .suffix = "" },
