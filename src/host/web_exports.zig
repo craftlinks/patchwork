@@ -7,7 +7,7 @@
 //! WebGPU. All communication with `web/shell.js` crosses three channels:
 //! - **Exports:** `export_app` publishes every symbol through `@export`; `rdynamic` in
 //!   `build.zig` keeps them in the module and `shell.js` looks each one up by name.
-//! - **Imports:** `submit_js` is the only host import (see `gpu.submit`).
+//! - **Imports:** `submit_js` and `panic_js` (see `gpu.submit` and section 4e).
 //! - **Linear memory:** Pointers are `u32` byte offsets into `wasm.memory.buffer`. JavaScript
 //!   builds typed views over them, so no data is serialized or copied on the Zig side.
 //!
@@ -127,6 +127,19 @@
 //! stale ticket and is ignored. After every dispatch `note_event` starts a transfer the app
 //! accepted and dispatches the `cancelled` chunks of its cancels.
 //!
+//! ## 4e. Panics
+//! A `wasm32-freestanding` panic would otherwise be a bare `unreachable` trap with its message
+//! thrown away (`std.debug.defaultPanic`). The wasm root (`host/web_main.zig`) declares `panic`
+//! from here, so every panic, a safety check's or an `@panic`, hands its message to
+//! `panic_js(ptr, len)` and then traps. The message is read in place, as `submit_js`'s stream
+//! is (section 3): it lives in linear memory (std's formatting buffer or static data), and the
+//! call is synchronous. At most `panic_message_max` bytes are handed over. Only the first panic
+//! is reported: a panic inside the handler, or a call into the module after the shell stopped
+//! it, traps with no second message. The return address is not reported: `wasm32-freestanding`
+//! has none. Safety checks exist only in Debug and ReleaseSafe builds; in ReleaseFast and
+//! ReleaseSmall only an `@panic` reaches the handler. `web/shell.js` logs the message with
+//! `console.error`, catches the trap where it called in, and stops calling (its section 4a).
+//!
 //! ## 5. TigerStyle Invariants
 //! - `state`, the draw context, the renderer, and the app are static globals declared
 //!   `undefined`, so they occupy BSS rather than data: the module does not carry their bytes,
@@ -137,6 +150,7 @@
 //! - Every export runs in bounded time with no recursion.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const animator = @import("../animator.zig");
 const app_contract = @import("../app.zig");
@@ -151,6 +165,39 @@ const drop = @import("../drop.zig");
 
 /// Bytes `shell.js` may write into the input buffer: a key name or a paste.
 pub const input_cap: u32 = ui.cx.clipboard_cap;
+
+/// Most bytes of a panic's message `panic_js` is handed; a longer one is cut (section 4e).
+pub const panic_message_max: u32 = 4096;
+
+/// The wasm root's panic namespace (`host/web_main.zig`): every panic, a safety check's or an
+/// `@panic`, hands its message to `web/shell.js` through `panic_js` and traps (section 4e).
+pub const panic = std.debug.FullPanic(panic_call);
+
+/// Set by the first panic; a second (a panic inside the first, or a call into the module after
+/// the shell stopped it) traps without a second message.
+var panicked: bool = false;
+
+/// The message's length as `panic_js` takes it: at most `panic_message_max`.
+fn panic_len(len: usize) u32 {
+    return @intCast(@min(len, panic_message_max));
+}
+
+fn panic_call(message: []const u8, return_address: ?usize) noreturn {
+    @branchHint(.cold);
+    // Always 0 on wasm32-freestanding: the target has no return addresses.
+    _ = return_address;
+    // No asserts here: a failed one would panic inside the panic.
+    if (!panicked) {
+        panicked = true;
+        if (builtin.target.cpu.arch == .wasm32) {
+            const js = struct {
+                extern "env" fn panic_js(ptr: u32, len: u32) void;
+            };
+            js.panic_js(@intCast(@intFromPtr(message.ptr)), panic_len(message.len));
+        }
+    }
+    @trap();
+}
 
 /// The CSS cursor names indexed by `ui.Cursor` value, as a JSON array.
 pub const cursor_names_json: []const u8 = blk: {
@@ -959,4 +1006,17 @@ test "the cursor names are the CSS names by value" {
 test "the op table export is commands.table_json" {
     const exported = commands_json_ptr()[0..commands_json_len()];
     try std.testing.expectEqualStrings(commands.table_json, exported);
+}
+
+// Locks the cut: 10 stays 10, panic_message_max stays, 4111 (std's longest) is cut to
+// panic_message_max.
+test "a panic's message is cut at panic_message_max" {
+    try std.testing.expectEqual(@as(u32, 10), panic_len(10));
+    try std.testing.expectEqual(panic_message_max, panic_len(panic_message_max));
+    try std.testing.expectEqual(panic_message_max, panic_len(0x1000 + 15));
+}
+
+comptime {
+    assert(panic_message_max >= 1024);
+    assert(panic_message_max <= 1 << 16);
 }

@@ -290,7 +290,8 @@ patchwork/
 │       └── fonts/              # Noto Sans Medium, Sans Mono Bold and Light, pre-subset (OFL)
 ├── tools/
 │   ├── compare.zig             # `zig build compare`: how two frames differ; diff and crop PNGs
-│   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame
+│   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame;
+│   │                           # a panic in the page fails it at once, naming the panic
 │   ├── seams.zig               # `zig build seams`: counts a translucent stroke's seam faults on the GPU
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
 ├── web/                        # Browser harness
@@ -309,6 +310,7 @@ patchwork/
     ├── contract_overlays_none.zig # Test verifying that `ui.overlays` of a target without
     │                              # any `draw_overlay` fails, naming it
     ├── contract_args_mistyped.zig # Test verifying that an `args` of the wrong type fails
+    ├── panic/app.zig           # A page that panics on its first frame, for the browser check
     └── consumer/               # A package outside this build (`zig build test-consumer`)
         ├── build.zig, build.zig.zon # `addApp` and `addTool` through a `.path` dependency
         ├── app.zig             # Imports both peers, declares `args` and a still scenario
@@ -1876,6 +1878,9 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
   pass, and the report ends with each target's device size and memory.
 - **Render.** `--render` writes a scenario's frames instead of timing them (see Rendering
   Frames).
+- **Caps.** `--frames` is at most `sample_cap` (4096), or `render_frames_max` (216,000) with
+  `--render`; over it the host prints the option, the value, and the cap
+  (`error.FramesOverCap`, with no usage text after it).
 - **A producer.** No producer thread runs in bench mode: each frame calls `produce` with
   `bench.producer_frames_at` and then `drain`, so dumps are deterministic.
 - **Browser.** `?bench=1` requests `timestamp-query` and logs pass-time percentiles every 120
@@ -2886,3 +2891,10 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
   Mode).
 - A producer: the app's web module delivers its data and calls `shell.wake()`; `tick` calls
   `drain` before it animates and presents. Patchwork serves no audio worklet of its own.
+- Panics: the wasm root declares a panic handler, so a panic (a safety check's in Debug or
+  ReleaseSafe, or an `@panic`) hands its message to the `panic_js` import, which logs `panic:
+  <message>` with `console.error`, and then traps. `shell.js` guards every call into Wasm after
+  the bootstrap (the tick, the timer, every input listener, the file reads): the first throw
+  logs one `wasm stopped in <where>: <stack>` line and nothing calls the module again, so the
+  console shows the cause, not a cascade. `tools/browser_check.py` stops at that line and
+  fails, naming the panic (`test/panic` is a page that panics on its first frame).

@@ -36,6 +36,20 @@
 // "compiled shader" line per shader module with its error and warning counts (the browser has
 // no `--check` mode; `getCompilationInfo` reports WGSL problems at creation).
 //
+// ## 4a. Panics and Traps
+// The wasm's panic handler hands its message to `panic_js(ptr, len)`, which logs it as
+// `panic: <message>` with `console.error`, and then traps (`src/host/web_exports.zig`, section
+// 4e). Every call into Wasm after the bootstrap, the rAF tick, the timer interval, every input
+// listener that calls an export, and the file reads, runs inside `guarded`: a throw there, a trap
+// or any other error, leaves the module's state unknown, so `stop_module` cancels the pending
+// frame and the interval, logs one `wasm stopped in <where>: <stack>` line, and from then on
+// every guarded call returns at once and `schedule` arms nothing. The console shows the panic's
+// cause once instead of a cascade. A guarded handler that runs is the handler as it was: the
+// same event, the same `preventDefault`. `main`'s own calls (`start`, the replay start, the
+// first `fit_canvas`) are not guarded: a throw there rejects `main`, before any listener exists.
+// `tools/browser_check.py` stops waiting at the `wasm stopped in ` line and fails, naming the
+// panic.
+//
 // ## 5. Frame Scheduling
 // There is no unconditional `requestAnimationFrame` loop; an idle UI should not burn power.
 // - Every Wasm entry point that can dirty the frame returns a flag, and `schedule()` runs
@@ -124,9 +138,9 @@
 // ## 9a. The App's Web Module
 // Before the wasm is instantiated the shell imports `./app.js`, the app's own ES module
 // (`AppOptions.web_module`, or Patchwork's empty `web/app.js`). If it exports `imports(shell)`,
-// the object it returns joins `env` beside `submit_js`, so the app's wasm may import functions
-// of its own; a name Patchwork already provides is an error, shown and thrown. After
-// `wasm.start()` the shell calls its `started(shell)`, if exported. `shell` is
+// the object it returns joins `env` beside `submit_js` and `panic_js`, so the app's wasm may
+// import functions of its own; a name Patchwork already provides is an error, shown and
+// thrown. After `wasm.start()` the shell calls its `started(shell)`, if exported. `shell` is
 // `{ wasm, memory, wake, canvas }`: `wasm` and `memory` are null until the instance exists, so
 // an import reads them when it is called, not when it is made; `wake()` schedules one frame,
 // whose `tick` calls the app's `drain` (`src/host/web_exports.zig`, section 4b). A module that
@@ -166,6 +180,8 @@ let cursorShown = -1;
 let titleApplied = 0;
 // The app timer's interval id, or 0 while the app's timer is stopped (guide, section 5).
 let timerInterval = 0;
+// True once a call into Wasm threw: its state is unknown, so nothing calls it again (4a).
+let stopped = false;
 // What the app's web module is handed (section 9a).
 const shell = { wasm: null, memory: null, wake: () => schedule(), canvas };
 const textEncoder = new TextEncoder();
@@ -648,6 +664,56 @@ function submit_js(ptr, len) {
 }
 
 /**
+ * The wasm's panic handler hands its message here just before it traps (guide, section 4a).
+ * The trap that follows is caught where the shell called in (`stop_module`).
+ *
+ * @param {number} ptr Byte offset of the message in Wasm linear memory.
+ * @param {number} len Byte length of the message, at most `panic_message_max`.
+ */
+function panic_js(ptr, len) {
+    const bytes = new Uint8Array(wasm.memory.buffer, ptr, len);
+    console.error(`panic: ${textDecoder.decode(bytes)}`);
+}
+
+/**
+ * Stops calling into Wasm after `where` threw, and logs it once (guide, section 4a).
+ * @param {string} where The call that threw: `tick`, `timer`, `read`, or a DOM event name.
+ * @param {*} error What it threw.
+ */
+function stop_module(where, error) {
+    if (stopped) return;
+    stopped = true;
+    if (raf !== 0) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+    }
+    if (timerInterval !== 0) {
+        clearInterval(timerInterval);
+        timerInterval = 0;
+    }
+    const text = error instanceof Error && error.stack ? error.stack : String(error);
+    console.error(`wasm stopped in ${where}: ${text}`);
+}
+
+/**
+ * `handler`, skipped once the module stopped, with a throw stopping it (guide, section 4a).
+ * Every argument reaches `handler` unchanged, so an event handler's `preventDefault` runs as
+ * before.
+ * @param {string} where The name `stop_module` logs.
+ * @param {Function} handler
+ */
+function guarded(where, handler) {
+    return (...args) => {
+        if (stopped) return;
+        try {
+            handler(...args);
+        } catch (error) {
+            stop_module(where, error);
+        }
+    };
+}
+
+/**
  * Reads the op table export and sizes the resource tables from its caps (guide, section 2).
  * Every op in the table must have a handler, and every handler an op.
  */
@@ -697,10 +763,10 @@ function log_overflow() {
  * Schedules an animation frame if one is not already queued.
  */
 function schedule() {
-    if (raf !== 0) {
+    if (stopped || raf !== 0) {
         return;
     }
-    raf = requestAnimationFrame((now) => {
+    raf = requestAnimationFrame(guarded("tick", (now) => {
         raf = 0;
         // `tick` returns 1 while an animator is live or a frame is owed (guide, section 5); a
         // replay returns 2 after its last frame and 3 when it failed (section 8a).
@@ -717,7 +783,7 @@ function schedule() {
         if (live === 1) {
             schedule();
         }
-    });
+    }));
 }
 
 /**
@@ -727,7 +793,7 @@ function schedule() {
 function sync_timer() {
     const on = wasm.timer_on() === 1;
     if (on && timerInterval === 0) {
-        timerInterval = setInterval(on_timer, wasm.timer_period_ms());
+        timerInterval = setInterval(guarded("timer", on_timer), wasm.timer_period_ms());
     } else if (!on && timerInterval !== 0) {
         clearInterval(timerInterval);
         timerInterval = 0;
@@ -794,10 +860,10 @@ function start_replay() {
  */
 function watch_ratio() {
     const query = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
-    query.addEventListener("change", () => {
+    query.addEventListener("change", guarded("change", () => {
         fit_canvas();
         watch_ratio();
-    }, { once: true });
+    }), { once: true });
 }
 
 /**
@@ -1081,26 +1147,39 @@ async function pump_files() {
     }
     pumping = true;
     for (;;) {
-        const ticket = wasm.read_next();
-        after_input(1);
-        if (ticket === 0) {
+        if (stopped) {
             break;
         }
-        const file = droppedFiles[wasm.read_file()];
-        const offset = wasm.read_offset_hi() * 4294967296 + wasm.read_offset_lo();
-        const length = wasm.read_len();
-        let bytes = null;
+        // Async, so a throw here is caught here: `on_drop`'s guard has returned (section 4a).
         try {
-            bytes = new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+            const ticket = wasm.read_next();
+            after_input(1);
+            if (ticket === 0) {
+                break;
+            }
+            const file = droppedFiles[wasm.read_file()];
+            const offset = wasm.read_offset_hi() * 4294967296 + wasm.read_offset_lo();
+            const length = wasm.read_len();
+            let bytes = null;
+            try {
+                bytes = new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+            } catch (error) {
+                console.warn("file read failed:", file.name, error);
+            }
+            // The module may have stopped while the read was pending.
+            if (stopped) {
+                break;
+            }
+            if (bytes === null || bytes.length !== length) {
+                after_input(wasm.read_done(ticket, 0, 1));
+                continue;
+            }
+            new Uint8Array(wasm.memory.buffer, wasm.chunk_ptr(), length).set(bytes);
+            after_input(wasm.read_done(ticket, length, 0));
         } catch (error) {
-            console.warn("file read failed:", file.name, error);
+            stop_module("read", error);
+            break;
         }
-        if (bytes === null || bytes.length !== length) {
-            after_input(wasm.read_done(ticket, 0, 1));
-            continue;
-        }
-        new Uint8Array(wasm.memory.buffer, wasm.chunk_ptr(), length).set(bytes);
-        after_input(wasm.read_done(ticket, length, 0));
     }
     pumping = false;
 }
@@ -1143,7 +1222,7 @@ async function main() {
     });
 
     const app = await import("./app.js");
-    const env = { submit_js };
+    const env = { submit_js, panic_js };
     if (typeof app.imports === "function") {
         for (const [name, value] of Object.entries(app.imports(shell))) {
             if (name in env) {
@@ -1181,29 +1260,31 @@ async function main() {
         start_replay();
     } else {
         fit_canvas();
-        window.addEventListener("resize", fit_canvas);
+        window.addEventListener("resize", guarded("resize", fit_canvas));
         watch_ratio();
     }
     sync_timer();
 
-    canvas.addEventListener("pointermove", on_pointer_move);
-    canvas.addEventListener("pointerdown", on_pointer_down);
-    canvas.addEventListener("pointerup", on_pointer_up);
-    canvas.addEventListener("pointerleave", on_pointer_leave);
-    canvas.addEventListener("pointercancel", on_pointer_cancel);
-    canvas.addEventListener("wheel", on_wheel, { passive: false });
+    // Every listener that calls an export is guarded (guide, section 4a); the context menu's and
+    // the window's two below call none.
+    canvas.addEventListener("pointermove", guarded("pointermove", on_pointer_move));
+    canvas.addEventListener("pointerdown", guarded("pointerdown", on_pointer_down));
+    canvas.addEventListener("pointerup", guarded("pointerup", on_pointer_up));
+    canvas.addEventListener("pointerleave", guarded("pointerleave", on_pointer_leave));
+    canvas.addEventListener("pointercancel", guarded("pointercancel", on_pointer_cancel));
+    canvas.addEventListener("wheel", guarded("wheel", on_wheel), { passive: false });
     canvas.addEventListener("contextmenu", (event) => event.preventDefault());
-    canvas.addEventListener("keydown", on_key_down);
-    canvas.addEventListener("keyup", on_key_up);
-    canvas.addEventListener("focus", () => after_input(wasm.window_focus(1)));
-    canvas.addEventListener("blur", () => after_input(wasm.window_focus(0)));
-    document.addEventListener("copy", on_copy);
-    document.addEventListener("cut", on_copy);
-    document.addEventListener("paste", on_paste);
-    canvas.addEventListener("dragenter", on_drag_over);
-    canvas.addEventListener("dragover", on_drag_over);
-    canvas.addEventListener("dragleave", on_drag_leave);
-    canvas.addEventListener("drop", on_drop);
+    canvas.addEventListener("keydown", guarded("keydown", on_key_down));
+    canvas.addEventListener("keyup", guarded("keyup", on_key_up));
+    canvas.addEventListener("focus", guarded("focus", () => after_input(wasm.window_focus(1))));
+    canvas.addEventListener("blur", guarded("blur", () => after_input(wasm.window_focus(0))));
+    document.addEventListener("copy", guarded("copy", on_copy));
+    document.addEventListener("cut", guarded("cut", on_copy));
+    document.addEventListener("paste", guarded("paste", on_paste));
+    canvas.addEventListener("dragenter", guarded("dragenter", on_drag_over));
+    canvas.addEventListener("dragover", guarded("dragover", on_drag_over));
+    canvas.addEventListener("dragleave", guarded("dragleave", on_drag_leave));
+    canvas.addEventListener("drop", guarded("drop", on_drop));
     // A file dropped beside the canvas must not open in the tab (guide, section 7a).
     window.addEventListener("dragover", (event) => {
         event.preventDefault();
