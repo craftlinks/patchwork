@@ -98,7 +98,18 @@
 //! that ignores them still compiles: Default draws a 2 px focus marker, a "×", and the ghost
 //! at 95 % opacity.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `TabsOf(S).appends_for(TabText)` is what one bar appends to a frame at most
+//! (`widgets/appends.zig`): one `tab_bar` call, one `tab` call per tab with a label of up to
+//! `label_max` bytes (the longest), and for a movable bar one more for the ghost of its dragged
+//! tab; the bar's area, each tab's, and each close button's. The skin's declarations bound
+//! every call, so the count holds for any skin; the default skin draws its underline, close
+//! band, and marker once each, and so draws less. Only the bar whose own tab is in flight draws
+//! a ghost, and one drag exists at a time, so an app with several movable bars counts `bars -
+//! 1` tabs too many; `Dock` counts its one ghost once. `widgets.Segmented` is a `TabsOf` and
+//! counts the same way.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation: labels and keys are app-owned, at most `tabs_max`; widths, rects, and
 //!   the insertion scan live on the stack, so a drag event is O(tabs_max) plus `cx.find`.
 
@@ -110,10 +121,20 @@ const ui = @import("../ui.zig");
 const theme = @import("../theme.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Walk = kit.Walk;
 const Id = kit.Id;
+
+/// What a bar holds at most, for `appends_for` (section 5): how many tabs, the longest label's
+/// bytes, and whether they close and move (as `closable` and `movable` will be set).
+pub const TabText = struct {
+    tabs: u32,
+    label_max: u32,
+    closable: bool = false,
+    movable: bool = false,
+};
 
 /// Tabs one bar holds at most.
 pub const tabs_max: u32 = 16;
@@ -352,6 +373,26 @@ pub fn TabsOf(comptime Skin: type) type {
             /// A drag carrying `payload` was dropped at `index`; the app inserts the tab.
             received: Received,
         };
+
+        /// What one bar appends to a frame at most (section 5): the bar, a tab per label and,
+        /// for a movable bar, the ghost of its dragged tab; the bar's area, each tab's, and
+        /// each close button's.
+        pub fn appends_for(comptime tab_text: TabText) Appends {
+            comptime {
+                assert(tab_text.tabs <= tabs_max);
+                assert(tab_text.label_max <= text.byte_cap);
+                const ghost = tab_text.movable and tab_text.tabs >= 1;
+                const calls = tab_text.tabs + @intFromBool(ghost);
+                const tabs = Skin.tab_appends.with(tab_text.label_max).times(calls);
+                const per_tab: u32 = if (tab_text.closable) 2 else 1;
+                const out = Skin.tab_bar_appends.with(0).plus(tabs).plus(.{
+                    .areas = 1 + tab_text.tabs * per_tab,
+                });
+                assert(out.areas >= 1 + tab_text.tabs);
+                assert(out.areas <= 1 + 2 * tab_text.tabs);
+                return out;
+            }
+        }
 
         /// Tabs over `labels` (0 to `tabs_max`) with `selected` selected, keyed by index: no
         /// close buttons and no moving.
@@ -817,6 +858,30 @@ const draw = @import("../draw.zig");
 const fixture = @import("fixture.zig");
 const Dragging = ui.Dragging;
 
+comptime {
+    // The default skin's bars (section 5): 4 closable, movable tabs of up to 8 bytes are the
+    // bar's Box 2 and 5 calls (4 tabs, the ghost) x (Box 3, Glyph 1 + 8), areas 1 + 4 x 2; 4
+    // plain tabs Box 14, Glyph 36, areas 5; a segmented bar of 3 of up to 6, Box 4, Glyph 18,
+    // areas 4.
+    const moving = Tabs.appends_for(.{
+        .tabs = 4,
+        .label_max = 8,
+        .closable = true,
+        .movable = true,
+    });
+    assert(moving.of(draw.Box) == 17);
+    assert(moving.of(draw.Glyph) == 45);
+    assert(moving.areas == 9);
+    const plain = Tabs.appends_for(.{ .tabs = 4, .label_max = 8 });
+    assert(plain.of(draw.Box) == 14);
+    assert(plain.of(draw.Glyph) == 36);
+    assert(plain.areas == 5);
+    const segments = TabsOf(skin.Segmented).appends_for(.{ .tabs = 3, .label_max = 6 });
+    assert(segments.of(draw.Box) == 4);
+    assert(segments.of(draw.Glyph) == 18);
+    assert(segments.areas == 4);
+}
+
 // Locks section 2: natural widths 80, 120, and 60 with two 2 px gaps fit a 300 px bar as they
 // are; in 202 px (198 of tabs) round one takes 20.67 from each but the third stops at its
 // 48 px floor (cut 12), round two takes the remaining 8.67 from the other two: 55, 95, 48. In
@@ -849,7 +914,7 @@ fn draw_tabs(cx: *fixture.Context, tabs: *const Tabs) Rect {
     return page;
 }
 
-fn tab_center(cx: *fixture.Context, tabs: anytype, index: u32) input.Point {
+fn tab_center(cx: anytype, tabs: anytype, index: u32) input.Point {
     const area = cx.find(tabs.tab_id(index)).?;
     return .{ .x = area.rect[0] + area.rect[2] * 0.5, .y = area.rect[1] + area.rect[3] * 0.5 };
 }
@@ -1257,4 +1322,110 @@ test "move_item, remove_item, and insert_item update an app's arrays" {
     try testing.expectEqualSlices(u8, "zacd", items[0..4]);
     insert_item(u8, &items, 4, 4, 'y');
     try testing.expectEqualSlices(u8, "zacdy", &items);
+}
+
+const wide_labels = [_][]const u8{ "WWWWWWWW", "WWWWWWWW", "WWWWWWWW", "WWWWWWWW" };
+const wide_keys = [_]u64{ 10, 11, 12, 13 };
+
+/// The labels' shape for `appends_for`, closable and movable.
+const wide_text: TabText = .{
+    .tabs = wide_labels.len,
+    .label_max = "WWWWWWWW".len,
+    .closable = true,
+    .movable = true,
+};
+
+/// Draws `tabs` over a 1200 x 100 box at (0, 0), its page empty.
+fn wide_frame(cx: anytype, tabs: anytype) void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    _ = tabs.begin(cx, fixture.at(0, 0, 1200, 100), .{ .flow = .down });
+    _ = cx.end();
+    _ = cx.end_frame();
+}
+
+/// Draws `tabs`, presses tab 1, drags it off the bar (a drag between widgets begins) and back
+/// over the bar, then calls `before` on the tabs and draws and observes the frame: the bar's
+/// marker, every tab, and the ghost of tab 1.
+fn wide_drag(cx: anytype, tabs: anytype, tally: anytype, comptime before: anytype) !void {
+    wide_frame(cx, tabs);
+    try tally.observe(cx);
+    const start = tab_center(cx, tabs, 1);
+    _ = fixture.send(cx, tabs, .{ .pointer_down = input.left_at(start) });
+    _ = fixture.send(cx, tabs, .{ .pointer_move = point(start.x, 90) });
+    try testing.expect(cx.dragging() != null);
+    _ = fixture.send(cx, tabs, .{ .pointer_move = point(start.x + 40, 16) });
+    try testing.expect(cx.drag_hovering(tabs.id));
+    before(tabs);
+    wide_frame(cx, tabs);
+    try tally.observe(cx);
+}
+
+/// Leaves the tabs as the drag left them.
+fn as_dragged(tabs: anytype) void {
+    assert(tabs.grab != null);
+}
+
+/// Selects tab 0 and puts the pointer on tab 2's close button, as the default skin's worst.
+fn worst_state(tabs: anytype) void {
+    assert(tabs.grab != null);
+    tabs.selected = 0;
+    tabs.hover_close = 2;
+}
+
+// Locks the composition of `TabsOf(S).appends_for` (section 5) with `fixture.Counted` (bar Box
+// 2, tab 3): 4 closable, movable tabs of "WWWWWWWW" in a 1200 px bar, tab 1 dragged off and
+// back over the bar, draw Box 2 + 5 x 3 = 17 (4 tabs, the ghost), Glyph 5 x 8 = 40, and areas 9
+// (the bar, 4 tabs, 4 close buttons), reached exactly.
+test "Tabs appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Counted = TabsOf(fixture.Counted);
+    var tabs = Counted.init_keyed(ui.id("tabs", 0), &wide_labels, &wide_keys, 0);
+    tabs.closable = true;
+    tabs.movable = true;
+    var tally: fixture.Tally(Counted.appends_for(wide_text)) = .{};
+    try wide_drag(cx, &tabs, &tally, as_dragged);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 17), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 40), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 9), cx.area_count);
+}
+
+// Locks `Tabs.appends_for` (section 5) with the default skin on the same frame, tab 0 selected
+// and tab 2's close button hovered: at most Box 17, Glyph 45, areas 9, and it draws Box 9 (the
+// bar's line and marker, 4 faces, the underline, the close band, the ghost's face), Glyph 44 (4
+// x 8 and a "x" each, the ghost's 8), and areas 9.
+test "Tabs appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var tabs = Tabs.init_keyed(ui.id("tabs", 0), &wide_labels, &wide_keys, 0);
+    tabs.closable = true;
+    tabs.movable = true;
+    var tally: fixture.Tally(Tabs.appends_for(wide_text)) = .{};
+    try wide_drag(cx, &tabs, &tally, worst_state);
+    try testing.expectEqual(@as(usize, 9), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 44), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 9), cx.area_count);
+}
+
+// Locks `widgets.Segmented`'s count (section 5): 3 segments of "WWWWWW" in a 600 x 32 bar,
+// focused, 0 selected and 1 hovered, at most Box 4, Glyph 18, areas 4, draw Box 3 (the track,
+// the selected capsule, the hovered band), Glyph 18, and areas 4.
+test "Segmented appends at most appends_for" {
+    const Segmented = TabsOf(skin.Segmented);
+    const labels = [_][]const u8{ "WWWWWW", "WWWWWW", "WWWWWW" };
+    const cx = fixture.wide_context();
+    var segmented = Segmented.init(ui.id("segments", 0), &labels, 0);
+    var tally: fixture.Tally(Segmented.appends_for(.{ .tabs = 3, .label_max = 6 })) = .{};
+    cx.event_begin(.{ .frame = 0 });
+    cx.set_focus(segmented.id);
+    cx.event_end();
+    segmented.hover = 1;
+    cx.begin_frame(1280, 720, 120);
+    segmented.bar(cx, fixture.at(0, 0, 600, 32));
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    try testing.expect(cx.focused(segmented.id));
+    try testing.expectEqual(@as(usize, 3), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(usize, 18), cx.draw.items(draw.Glyph).len);
+    try testing.expectEqual(@as(u32, 4), cx.area_count);
 }

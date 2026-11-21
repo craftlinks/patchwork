@@ -43,7 +43,17 @@
 //! A `Menu` opened at the pointer (`.at`) by a right press on a target id the app names:
 //! `handle(cx, event, target)`. Its actions are the menu's.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `MenuOf(S).appends_for(MenuText)` is what the open menu appends to a frame at most
+//! (`widgets/appends.zig`): one `menu_face` call, one `menu_row` call per item with a label of
+//! up to `label_max` bytes (the longest), the backdrop's area, and an area per row. The popup
+//! asks for no dim, so the backdrop appends no Box, and marking the backdrop for glass is not a
+//! per-frame pool. A cut popup draws fewer rows. A frame draws one popup
+//! (`popup.popup_depth_max == 1`, asserted below), so an app adds each popup owner's face and
+//! takes the `max` of their popups (`widgets.zig`, section 4); a step that adds submenus must
+//! revisit that rule. `ContextMenuOf(S).appends_for` is its menu's.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation: labels are app-owned; every loop is bounded by `menu_items_max`.
 //! - `handle` is the only mutator; `draw_overlay` reads the state.
 
@@ -54,6 +64,7 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Id = kit.Id;
 const Rect = kit.Rect;
@@ -83,6 +94,10 @@ pub const menu_text_options: text.Options = .{
 
 /// Every item enabled.
 pub const all_enabled: u32 = std.math.maxInt(u32);
+
+/// What a menu's items are at most, for `appends_for` (section 5): how many, and the longest
+/// label's bytes.
+pub const MenuText = struct { items: u32, label_max: u32 };
 
 /// The default menu: `MenuOf(skins.Default)`.
 pub const Menu = MenuOf(skin.Default);
@@ -122,6 +137,22 @@ pub fn MenuOf(comptime Skin: type) type {
         material: ?kit.Material = null,
 
         pub const Action = MenuAction;
+
+        /// What the open menu appends to a frame at most (section 5): the face, a row per
+        /// item, the backdrop's area and the rows'. A frame draws one popup.
+        pub fn appends_for(comptime menu_text: MenuText) Appends {
+            comptime {
+                assert(menu_text.items >= 1);
+                assert(menu_text.items <= menu_items_max);
+                assert(menu_text.label_max <= text.byte_cap);
+                const rows = Skin.menu_row_appends.with(menu_text.label_max).times(menu_text.items);
+                const out = Skin.menu_face_appends.with(0).plus(rows).plus(.{
+                    .areas = 1 + menu_text.items,
+                });
+                assert(out.areas == 1 + menu_text.items);
+                return out;
+            }
+        }
 
         /// A closed menu of `items`, all enabled.
         pub fn init(id: Id, items: []const []const u8) Self {
@@ -336,6 +367,16 @@ pub fn ContextMenuOf(comptime Skin: type) type {
 
         pub const Action = MenuAction;
 
+        /// What the open context menu appends to a frame at most: its menu's (section 5).
+        pub fn appends_for(comptime menu_text: MenuText) Appends {
+            comptime {
+                const out = MenuOf(Skin).appends_for(menu_text);
+                assert(out.areas == 1 + menu_text.items);
+                assert(out.draws.len >= 1);
+                return out;
+            }
+        }
+
         /// A closed context menu of `items`, all enabled.
         pub fn init(id: Id, items: []const []const u8) Self {
             const context: Self = .{ .menu = MenuOf(Skin).init(id, items) };
@@ -362,6 +403,36 @@ pub fn ContextMenuOf(comptime Skin: type) type {
             self.menu.draw_overlay(cx);
         }
     };
+}
+
+const quads = @import("../draw.zig");
+
+/// True when `a` and `b` name the same types in the same order with the same counts, points,
+/// and areas.
+fn same_appends(comptime a: Appends, comptime b: Appends) bool {
+    comptime {
+        assert(a.draws.len <= 16);
+        assert(b.draws.len <= 16);
+        if (a.draws.len != b.draws.len) return false;
+        for (a.draws, b.draws) |left, right| {
+            if (left.type != right.type or left.count != right.count) return false;
+        }
+        return a.points == b.points and a.areas == b.areas;
+    }
+}
+
+comptime {
+    // The popup rule of section 5 (sum the faces, take the max of the popups) holds only while
+    // a frame draws one popup; `widgets.zig`, section 4, states it for apps.
+    assert(popup.popup_depth_max == 1);
+    // The default skin's menu of 5 items of up to 7 bytes (section 5): the face Box 1 and Glass
+    // 1, rows 5 x (Box 1, Glyph 7), areas 1 + 5.
+    const five = Menu.appends_for(.{ .items = 5, .label_max = 7 });
+    assert(five.of(quads.Box) == 6);
+    assert(five.of(quads.Glass) == 1);
+    assert(five.of(quads.Glyph) == 35);
+    assert(five.areas == 6);
+    assert(same_appends(ContextMenu.appends_for(.{ .items = 5, .label_max = 7 }), five));
 }
 
 const testing = std.testing;
@@ -533,4 +604,67 @@ test "a context menu opens at a right press on its target" {
     _ = send(cx, &context, .{ .pointer_move = .{ .x = 900, .y = 100 } }, target);
     const press_far: input.Event = .{ .pointer_down = far };
     try testing.expectEqual(MenuAction.dismissed, send(cx, &context, press_far, target));
+}
+
+/// Five labels of seven inked bytes.
+const wide_items = [_][]const u8{ "WWWWWWW", "WWWWWWW", "WWWWWWW", "WWWWWWW", "WWWWWWW" };
+
+/// The items' shape for `appends_for`.
+const wide_text: MenuText = .{ .items = wide_items.len, .label_max = "WWWWWWW".len };
+
+/// One frame: the anchor area "file" at (20, 20, 80, 32), then `menu`'s overlay, observed.
+fn counted_frame(cx: anytype, menu: anytype, tally: anytype) !void {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    cx.area(ui.id("file", 0), .{ .x = 20, .y = 20, .width = 80, .height = 32 }, 0, ui.cx.plain);
+    ui.overlays(cx, menu);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+}
+
+/// Draws a frame, opens `menu` below the anchor, and draws and observes the next.
+fn counted_open(cx: anytype, menu: anytype, tally: anytype) !void {
+    try counted_frame(cx, menu, tally);
+    cx.event_begin(.{ .frame = 0 });
+    menu.open_at(cx, .{ .id = ui.id("file", 0) }, .below);
+    cx.event_end();
+    try counted_frame(cx, menu, tally);
+    assert(menu.open);
+}
+
+// Locks the composition of `MenuOf(S).appends_for` (section 5) with `fixture.Counted` (face
+// Box 2, row Box 3): 5 x "WWWWWWW" open below an anchor draw Box 2 + 15 = 17, Glyph 35, and
+// areas 6 (the backdrop, the rows), with the anchor's own area beside them, reached exactly.
+test "Menu appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const Counted = MenuOf(fixture.Counted);
+    var menu = Counted.init(ui.id("menu", 0), &wide_items);
+    var tally: fixture.Tally(Counted.appends_for(wide_text).plus(.{ .areas = 1 })) = .{};
+    try counted_open(cx, &menu, &tally);
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 17), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 35), cx.draw.items(quads.Glyph).len);
+}
+
+// Locks `Menu.appends_for` (section 5) with the default skin, row 0 highlighted: a solid frame
+// draws Box 2 (the face, the band), Glyph 35, areas 6 and the anchor's; a frosted one Glass 1,
+// Box 2 (the hairline, the band), Glyph 35, the same areas. Both are at most Box 6, Glass 1,
+// Glyph 35, areas 6.
+test "Menu appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var menu = Menu.init(ui.id("menu", 0), &wide_items);
+    var tally: fixture.Tally(Menu.appends_for(wide_text).plus(.{ .areas = 1 })) = .{};
+    try counted_open(cx, &menu, &tally);
+    menu.highlight = 0;
+    try counted_frame(cx, &menu, &tally);
+    try testing.expectEqual(@as(usize, 2), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 0), cx.draw.items(quads.Glass).len);
+    try testing.expectEqual(@as(usize, 35), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
+    menu.material = .frosted;
+    try counted_frame(cx, &menu, &tally);
+    try testing.expectEqual(@as(usize, 2), cx.draw.items(quads.Box).len);
+    try testing.expectEqual(@as(usize, 1), cx.draw.items(quads.Glass).len);
+    try testing.expectEqual(@as(usize, 35), cx.draw.items(quads.Glyph).len);
+    try testing.expectEqual(@as(u32, 7), cx.area_count);
 }

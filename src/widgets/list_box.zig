@@ -45,9 +45,20 @@
 //! the row; `ListBox` is `ListBoxOf(skins.Default)`: `colors.selection` under the selected row,
 //! `colors.track` under the hovered one.
 //!
-//! ## 5. TigerStyle Invariants
+//! ## 5. Counts
+//! `ListBoxOf(S).appends_for(rows)` is what one list appends to a frame at most with up to
+//! `rows` rows walked (`widgets/appends.zig`): a `list_row` call and an area per row, the
+//! view's area, and the thumb's Box and area, which the context draws (`end_view`) when the
+//! content scrolls. The rows' content is the app's. The rows a draw walks depend on the
+//! viewport's height at layout time, which no comptime parameter sees, so the app states its
+//! bound twice: `rows_for(view_h, row_h)` (`ceil(view_h / row_h) + 1`, partial rows at both
+//! ends included) for the count, and the field `visible_max` for the draw, which `begin`
+//! asserts. Its default, `list_rows_max`, holds for every list.
+//!
+//! ## 6. TigerStyle Invariants
 //! - No allocation; `handle` is O(visible rows), `next` O(1).
 //! - `selected` is below `count` whenever it is set (asserted at `begin`).
+//! - A draw walks at most `visible_max` rows (asserted at `begin`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -55,6 +66,8 @@ const input = @import("../input.zig");
 const ui = @import("../ui.zig");
 const kit = @import("kit.zig");
 const skin = @import("skin.zig");
+const draw = @import("../draw.zig");
+const Appends = @import("appends.zig").Appends;
 
 const Rect = kit.Rect;
 const Clip = kit.Clip;
@@ -97,6 +110,19 @@ pub fn scroll_for(scroll_y: f32, index: u32, row_h: f32, view_h: f32) f32 {
     return offset;
 }
 
+/// The most rows a viewport `view_h` high shows of rows `row_h` high, partial rows included:
+/// `ceil(view_h / row_h) + 1` (section 5).
+pub fn rows_for(comptime view_h: f32, comptime row_h: f32) u32 {
+    comptime {
+        assert(row_h > 0);
+        assert(view_h >= 0);
+        const rows: u32 = @intFromFloat(@ceil(view_h / row_h) + 1);
+        assert(rows >= 1);
+        assert(rows <= list_rows_max);
+        return rows;
+    }
+}
+
 /// The default list box: `ListBoxOf(skins.Default)`.
 pub const ListBox = ListBoxOf(skin.Default);
 
@@ -118,6 +144,9 @@ pub fn ListBoxOf(comptime Skin: type) type {
         open: bool,
         /// The current press was a double press (activated on its down).
         double: bool,
+        /// The most rows one draw walks; `appends_for` is a bound only up to it. `begin`
+        /// asserts it (section 5).
+        visible_max: u32 = list_rows_max,
 
         pub const Action = union(enum) {
             none,
@@ -126,6 +155,23 @@ pub fn ListBoxOf(comptime Skin: type) type {
             /// A double click or Enter activated this row.
             activated: u32,
         };
+
+        /// What one list appends to a frame at most with up to `rows` rows walked (section 5):
+        /// a band per row, the thumb's Box, the view's area, the thumb's, and a row's each. The
+        /// rows' content is the app's.
+        pub fn appends_for(comptime rows: u32) Appends {
+            comptime {
+                assert(rows >= 1);
+                assert(rows <= list_rows_max);
+                const bands = Skin.list_row_appends.with(0).times(rows);
+                const out = bands.plus(.{
+                    .draws = &.{.{ .type = draw.Box, .count = 1 }},
+                    .areas = rows + 2,
+                });
+                assert(out.areas == rows + 2);
+                return out;
+            }
+        }
 
         /// A list of `count` rows of `row_h`, scrolled to the top, nothing selected.
         pub fn init(id: Id, count: u32, row_h: f32) Self {
@@ -161,6 +207,7 @@ pub fn ListBoxOf(comptime Skin: type) type {
             const port = cx.begin_view_with(self.id, walk, layout, &self.view, list_flags);
             const list: ui.List = .{ .row_height = self.row_h, .count = self.count };
             self.range = list.visible(self.view.scroll_y, port.height);
+            assert(self.range.end - self.range.first <= self.visible_max);
             cx.skip(@as(f32, @floatFromInt(self.range.first)) * self.row_h);
             self.cursor = self.range.first;
             self.open = true;
@@ -288,10 +335,12 @@ pub fn ListBoxOf(comptime Skin: type) type {
 comptime {
     assert(row_salt > ui.view.thumb_salt);
     assert(row_salt + list_rows_max > row_salt);
+    // The default skin's list of 11 walked rows (section 5): 11 bands and the thumb, areas 13.
+    assert(ListBox.appends_for(11).of(draw.Box) == 12);
+    assert(ListBox.appends_for(11).areas == 13);
 }
 
 const testing = std.testing;
-const draw = @import("../draw.zig");
 const fixture = @import("fixture.zig");
 
 // Locks the scroll-into-view formula of section 3 in a 240 px view of 24 px rows: row 23 from
@@ -416,4 +465,66 @@ test "a double click activates and a list box routes" {
     _ = ui.route(cx, wheel, &holder);
     cx.event_end();
     try testing.expectEqual(@as(f32, 48), list.view.scroll_y);
+}
+
+// Locks `rows_for` (section 5): a 240 px view of 24 px rows shows 11 (10 and a part at each end
+// once scrolled by a fraction), 250 px shows 12, and a view one row high shows 2.
+test "rows_for counts the partial rows at both ends" {
+    try testing.expectEqual(@as(u32, 11), comptime rows_for(240, 24));
+    try testing.expectEqual(@as(u32, 12), comptime rows_for(250, 24));
+    try testing.expectEqual(@as(u32, 2), comptime rows_for(24, 24));
+    const list: ui.List = .{ .row_height = 24, .count = 100 };
+    try testing.expectEqual(ui.List.Range{ .first = 0, .end = 11 }, list.visible(12, 240));
+}
+
+/// Draws `list` in a 300 x 240 box at (0, 0) with no content and observes the frame; returns
+/// the rows walked.
+fn list_frame(cx: anytype, list: anytype, tally: anytype) !u32 {
+    assert(cx.phase != .draw);
+    cx.begin_frame(1280, 720, 120);
+    _ = list.begin(cx, fixture.at(0, 0, 300, 240));
+    var walked: u32 = 0;
+    while (list.next(cx)) |_| walked += 1;
+    list.end(cx);
+    _ = cx.end_frame();
+    try tally.observe(cx);
+    assert(walked <= list.visible_max);
+    return walked;
+}
+
+// Locks the composition of `ListBoxOf(S).appends_for` (section 5) with `fixture.Counted`
+// (Box 2 a row): 100 rows of 24 px in a 240 px view with `visible_max = 11`, scrolled by 12,
+// walk 11 rows: Box 22 + the thumb = 23, areas 11 + the view's + the thumb's = 13, reached
+// exactly; `begin`'s assert holds on both frames.
+test "ListBox appends exactly appends_for with a counted skin" {
+    const cx = fixture.wide_context();
+    const List = ListBoxOf(fixture.Counted);
+    var list = List.init(ui.id("list", 0), 100, 24);
+    list.visible_max = comptime rows_for(240, 24);
+    var tally: fixture.Tally(List.appends_for(rows_for(240, 24))) = .{};
+    try testing.expectEqual(@as(u32, 10), try list_frame(cx, &list, &tally));
+    list.view.scroll_y = 12;
+    try testing.expectEqual(@as(u32, 11), try list_frame(cx, &list, &tally));
+    try tally.expect_reached();
+    try testing.expectEqual(@as(usize, 23), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(u32, 13), cx.area_count);
+}
+
+// Locks `ListBox.appends_for` (section 5) with the default skin on the same frames, row 0
+// selected and the pointer moved over row 3 between them: at most Box 12 and areas 13, and it
+// draws Box 3 (the selected band, the hovered band, the thumb) and areas 13.
+test "ListBox appends at most appends_for" {
+    const cx = fixture.wide_context();
+    var list = ListBox.init(ui.id("list", 0), 100, 24);
+    list.visible_max = comptime rows_for(240, 24);
+    list.selected = 0;
+    var tally: fixture.Tally(ListBox.appends_for(rows_for(240, 24))) = .{};
+    _ = try list_frame(cx, &list, &tally);
+    const three = cx.find(list.row_id(3)).?;
+    const over: input.Point = .{ .x = three.rect[0] + 10, .y = three.rect[1] + 10 };
+    _ = fixture.send(cx, &list, .{ .pointer_move = over });
+    list.view.scroll_y = 12;
+    try testing.expectEqual(@as(u32, 11), try list_frame(cx, &list, &tally));
+    try testing.expectEqual(@as(usize, 3), cx.draw.items(draw.Box).len);
+    try testing.expectEqual(@as(u32, 13), cx.area_count);
 }

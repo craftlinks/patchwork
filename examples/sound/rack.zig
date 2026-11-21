@@ -1393,9 +1393,12 @@ comptime {
     assert(@backingInt(cable_layer) > @backingInt(quads.Layer.base));
     assert(@backingInt(cable_layer) < @backingInt(quads.Layer.tooltip));
     assert(tooltip_text_cap <= widgets.tooltip_text_cap);
-    // Areas: a ring and a hub per knob, the preset view and its thumb, the visible rows, one
-    // title per panel, the rename field, one per cable, and the envelope display.
-    assert(2 * knob_count + 2 + preset_rows_max + panel_count + 1 + cable_cap + 1 == area_cap);
+    // Areas: a ring and a hub per knob, the preset list's (its view, its thumb, the visible
+    // rows), one title per panel, the rename field, one per cable, and the envelope display.
+    const preset_areas = PresetList.appends_for(preset_rows_max).areas;
+    assert(preset_areas == 2 + preset_rows_max);
+    assert(2 * knob_count + preset_areas + panel_count + 1 + cable_cap + 1 == area_cap);
+    assert(area_cap == 104);
     // At most `preset_rows_max` rows overlap the tallest viewport, partial rows included.
     assert(preset_view_max_px / preset_row_px + 2 <= preset_rows_max);
     // The box covers the neighbouring cell's whole name column.

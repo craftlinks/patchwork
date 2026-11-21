@@ -999,8 +999,19 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   // .area_cap = need.areas,
   ```
 
-  Menus, lists, tabs, and the other containers grow with their items and publish no counts
-  yet.
+  The containers take what the app bounds: their items and the longest label
+  (`widgets.label_max_of(labels)`), as `MenuOf(S).appends_for(.{ .items, .label_max })` (a
+  `widgets.MenuText`), `DropdownOf`, `MenuBarOf` (a `widgets.MenuBarText`, `.of(titles,
+  items)`), `TabsOf` (a `widgets.TabText`, with `closable` and `movable`), `ColumnHeaderOf` (a
+  `widgets.ColumnText`), and `DockOf` (a `widgets.DockText`); their visible rows, as
+  `ListBoxOf(S).appends_for(rows)` and `TreeViewOf(S, n).appends_for(rows)`, with `rows` from
+  `widgets.list_rows_for(view_h, row_h)` and the list's `visible_max` set to the same bound,
+  which `begin` asserts. `WindowButtonsOf(S).appends`, `widgets.window_drag_appends`, and
+  `widgets.window_edges_appends` are constants; `Label` and `Paragraph` take their bytes. A
+  container counts every call of a skin function at its declared bound, so its count holds
+  for any skin. A frame draws one popup, so an app adds the popup owners' faces
+  (`DropdownOf(S).face_appends_for(label_bytes)`, `MenuBarOf(S).face_appends_for(...)`) and
+  the `max` of their popups.
 - **Colors** come from `cx.theme()` inside the skin and from the look's paints, so a skin
   follows the app's theme. Animator values arrive raw; apply `scheme.hover_lighten` yourself.
   A skin that should follow the scheme's corners and strokes reads `cx.theme().form`, as
@@ -1561,7 +1572,8 @@ rebuilds the default. Scenarios: `still`; `dock-centre` (log into the editor's s
 editor), `dock-edge` (files held over the dock's right edge, then released: a quarter on the
 right), `dock-close` (log's "×"), `dock-resize` (the files divider 80 px right), `dock-ghost`
 (files held over the editor's right zone: the overlay and the ghost), and `dock-save` (Save,
-close log, Load: the default again).
+close log, Load: the default again). Its pools' widget terms come from `Dock.appends_for`,
+`ListBox.appends_for`, and the others' counts.
 
 ### 11. Live-Coding Session (`examples/session/app.zig`)
 
