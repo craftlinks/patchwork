@@ -1451,7 +1451,7 @@ Chromium's are equal.
 A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, and a
 `widgets.Knob` with a 40 px ring, all 1,000 routed by one `ui.route` call and draggable at any
 zoom) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
-rung (2^(1/4)) about the pointer from 25% to 400%, dragging the background pans, pressing a
+rung (2^(1/6)) about the pointer from 25% to 400%, dragging the background pans, pressing a
 module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
 center, and `0` resets; `d` dashes every cable at 8 on, 4 off, and `f` makes the dashes flow at
 40 world pixels a second (step 65). Modules and cables are culled in world pixels, below 50% a module is
@@ -1881,7 +1881,7 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
   `ui.Drag.track_in(hit, origin, view.drawn)` keeps a grab offset in world pixels.
   `cx.begin_at(rect, layout)` places a container at a fixed rect outside its parent's flow
   (free placement).
-- **Zoom ladder.** 17 rungs `2^(k/4)` from 0.25 to 4. The wheel moves one rung about the
+- **Zoom ladder.** 25 rungs `2^(k/6)` from 0.25 to 4. The wheel moves one rung about the
   pointer; the offset is snapped to device pixels when drawn. Glyphs rasterize at the rung
   nearest the zoom (`text.Cache.zoom`), so the cache holds at most one size per rung, text is
   pixel-exact on every rung, and a full sweep fits the atlas without a reset.

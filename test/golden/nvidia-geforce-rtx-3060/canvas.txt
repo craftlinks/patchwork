@@ -8,4 +8,4 @@ flow         e518c5db66d81e35
 pan          bc23d444ad3a5b1f
 still        bc23d444ad3a5b1f
 zoom         bc23d444ad3a5b1f
-zoomed       cc954b9288b36f8d
+zoomed       4cb3427e9ad4c824

@@ -183,13 +183,17 @@ pub const App = struct {
         return @splat(step);
     }
 
+    /// Every rung in from zoom 1, every rung out to the bottom, and back up to zoom 1.
+    const sweep = steps(canvas.rung_count - 1 - canvas.rung_one, zoom_in) ++
+        steps(canvas.rung_count - 1, zoom_out) ++ steps(canvas.rung_one, zoom_in);
+
     pub const scenarios: []const patchwork.bench.Scenario = &.{
         .{ .name = "still", .setup = &.{.{ .wait = 5 }}, .cycle = &.{.{ .wait = 1 }}, .frames = 60 },
         .{
             .name = "zoom",
             .setup = &.{.{ .wait = 5 }},
-            .cycle = &(steps(8, zoom_in) ++ steps(16, zoom_out) ++ steps(8, zoom_in)),
-            .frames = 320,
+            .cycle = &sweep,
+            .frames = 480,
         },
         .{
             .name = "pan",
@@ -206,8 +210,8 @@ pub const App = struct {
         .{
             .name = "dashed-zoom",
             .setup = &.{ dash_key, wait },
-            .cycle = &(steps(8, zoom_in) ++ steps(16, zoom_out) ++ steps(8, zoom_in)),
-            .frames = 320,
+            .cycle = &sweep,
+            .frames = 480,
         },
         // 60 s of flow. Whether a frame's cost grows over a long run is measured offscreen on
         // the scenario's clock, `--render flow --frames 36000 --out -` (600 s) against 3,600:
@@ -603,8 +607,8 @@ test "a zoom sweep never resets the glyph atlas" {
     const cx = &fixture.context;
     const zoom = bench.find(App.scenarios, "zoom").?;
     const app = new_app();
-    const steps = try bench.replay_headless(App, app, cx, zoom, .{ 1280, 720 }, 5 + 64);
-    try std.testing.expectEqual(@as(u32, 5 + 64), steps);
+    const steps = try bench.replay_headless(App, app, cx, zoom, .{ 1280, 720 }, 5 + 96);
+    try std.testing.expectEqual(@as(u32, 5 + 96), steps);
     try std.testing.expectEqual(@as(u32, 0), cx.draw.text.epoch);
     try std.testing.expectEqual(@as(f32, 1), app.view.zoom);
 }
@@ -626,7 +630,7 @@ test "the scenarios replay headless" {
     _ = try bench.replay_headless(App, new_app(), cx, still, .{ 1280, 720 }, 10);
     const dashed_zoom = bench.find(App.scenarios, "dashed-zoom").?;
     const dashing = new_app();
-    _ = try bench.replay_headless(App, dashing, cx, dashed_zoom, .{ 1280, 720 }, 1 + 5 + 32);
+    _ = try bench.replay_headless(App, dashing, cx, dashed_zoom, .{ 1280, 720 }, 1 + 5 + 48);
     try std.testing.expect(dashing.dashed);
     try std.testing.expectEqual(@as(f32, 1), dashing.view.zoom);
     const flow = bench.find(App.scenarios, "flow").?;

@@ -17,13 +17,13 @@
 //! through `drawn`, the view the last frame drew with, which is what the user sees.
 //!
 //! ## 3. The Zoom Ladder
-//! `rungs[k] = 2^((k - 8) / 4)` for `k = 0 .. 16`, from 0.25 to 4, computed at compile time so
-//! both targets read the same 17 values. `rung_of(zoom)` is the nearest rung in log2, ties up:
-//! the count of the geometric midpoints `2^((2k - 15) / 8)` at or below `zoom`. Glyphs
+//! `rungs[k] = 2^((k - 12) / 6)` for `k = 0 .. 24`, from 0.25 to 4, computed at compile time so
+//! both targets read the same 25 values. `rung_of(zoom)` is the nearest rung in log2, ties up:
+//! the count of the geometric midpoints `2^((2k - 23) / 12)` at or below `zoom`. Glyphs
 //! rasterize at `glyph_zoom(zoom) = rungs[rung_of(zoom)]`, so the cache holds at most one size
 //! per rung and text is pixel-exact on every rung. The wheel moves one rung, so it never
 //! leaves the zoom between rungs; an app that animates `zoom` gets glyphs stretched by at most
-//! `2^(1/8)` (9%) either way.
+//! `2^(1/12)` (6%) either way.
 //!
 //! ## 4. Zooming About a Point
 //! `zoom_at(px, py, next)` keeps the world point under `(px, py)` in place: with
@@ -52,16 +52,26 @@ pub const Rect = draw.Rect;
 pub const View = draw.View;
 pub const Id = areas.Id;
 
-/// Rungs of the zoom ladder, 2^(1/4) apart.
-pub const rung_count: u32 = 17;
+/// Rungs per doubling of the zoom.
+pub const rungs_per_octave: u32 = 6;
+/// Doublings each way from zoom 1: the ladder runs from 2^-2 to 2^2.
+const octaves: u32 = 2;
+/// Rungs of the zoom ladder, 2^(1/6) apart.
+pub const rung_count: u32 = 2 * octaves * rungs_per_octave + 1;
 /// The index of zoom 1.
-pub const rung_one: u32 = 8;
+pub const rung_one: u32 = octaves * rungs_per_octave;
+
+comptime {
+    assert(rung_count == 25);
+    assert(rung_one == 12);
+    assert(rungs_per_octave * octaves == rung_one);
+}
 
 /// The zoom of each rung (section 3).
 pub const rungs: [rung_count]f32 = blk: {
     var out: [rung_count]f32 = undefined;
     for (0..rung_count) |index| {
-        const exponent = (@as(f64, @floatFromInt(index)) - rung_one) / 4;
+        const exponent = (@as(f64, @floatFromInt(index)) - rung_one) / rungs_per_octave;
         out[index] = @floatCast(@exp2(exponent));
     }
     break :blk out;
@@ -71,7 +81,8 @@ pub const rungs: [rung_count]f32 = blk: {
 const midpoints: [rung_count - 1]f32 = blk: {
     var out: [rung_count - 1]f32 = undefined;
     for (0..rung_count - 1) |index| {
-        const exponent = (2 * @as(f64, @floatFromInt(index)) + 1 - 2 * rung_one) / 8;
+        const doubled = 2 * @as(f64, @floatFromInt(index)) + 1 - 2 * rung_one;
+        const exponent = doubled / (2 * rungs_per_octave);
         out[index] = @floatCast(@exp2(exponent));
     }
     break :blk out;
@@ -220,22 +231,26 @@ const Redraws = struct {
     }
 };
 
-// Locks the ladder (section 3): 17 rungs from 0.25 to 4 with 1 at index 8, the nearest rung
+// Locks the ladder (section 3): 25 rungs from 0.25 to 4 with 1 at index 12, the nearest rung
 // in log2 at and between rungs, and the clamps beyond the range.
-test "the ladder has 17 rungs and zooms snap to the nearest" {
+test "the ladder has 25 rungs and zooms snap to the nearest" {
     try testing.expectEqual(@as(f32, 0.25), rungs[0]);
     try testing.expectEqual(@as(f32, 1), rungs[rung_one]);
-    try testing.expectEqual(@as(f32, 4), rungs[16]);
-    try testing.expectApproxEqAbs(@as(f32, 1.189207), rungs[9], 1e-6);
+    try testing.expectEqual(@as(f32, 4), rungs[24]);
+    try testing.expectApproxEqAbs(@as(f32, 1.122462), rungs[13], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2), rungs[18], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), rungs[6], 1e-6);
     for (rungs, 0..) |rung, index| {
         try testing.expectEqual(@as(u32, @intCast(index)), rung_of(rung));
     }
-    // The midpoint above 1 is 2^(1/8) = 1.0905: 1.09 stays at 1 and 1.091 goes up.
-    try testing.expectEqual(rung_one, rung_of(1.09));
-    try testing.expectEqual(rung_one + 1, rung_of(1.091));
+    // The midpoint above 1 is 2^(1/12) = 1.059463: 1.0594 stays at 1 and 1.0595 goes up.
+    try testing.expectEqual(rung_one, rung_of(1.0594));
+    try testing.expectEqual(rung_one + 1, rung_of(1.0595));
     try testing.expectEqual(@as(u32, 0), rung_of(0.01));
-    try testing.expectEqual(@as(u32, 16), rung_of(100));
-    try testing.expectEqual(rungs[9], glyph_zoom(1.15));
+    try testing.expectEqual(@as(u32, 24), rung_of(100));
+    // 1.15 lies between rungs[13] = 1.1225 and its upper midpoint 2^(3/12) = 1.1892.
+    try testing.expectEqual(rungs[13], glyph_zoom(1.15));
+    try testing.expectEqual(rungs[14], glyph_zoom(1.19));
 }
 
 // Locks zooming about a point (section 4): one rung in about (400, 300) from offset (16, 56) at
@@ -246,7 +261,7 @@ test "zooming keeps the point under the pointer" {
     const before = state.drawn.invert(400, 300);
     try testing.expectEqual([2]f32{ 384, 244 }, before);
     try testing.expectEqual(CanvasState.Action.zoomed, state.step_at(&redraws, 400, 300, 1));
-    try testing.expectEqual(rungs[9], state.zoom);
+    try testing.expectEqual(rungs[13], state.zoom);
     const view: View = .{ .x = state.x, .y = state.y, .zoom = state.zoom };
     const after = view.invert(400, 300);
     try testing.expectApproxEqAbs(before[0], after[0], 1e-3);
