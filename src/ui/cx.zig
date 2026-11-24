@@ -178,8 +178,10 @@
 //! - A focused id that the last draw did not record stays focused; `focus_rect` is its area's
 //!   rect from the last draw that recorded it (refreshed in `end_frame`, only while focused).
 //! - `window_focus(false)` clears the held keys and the modifiers.
-//! A browser key is `consumed` when a widget had focus or Tab moved it, unless it is a
-//! clipboard shortcut, so the page's own copy, cut, and paste events still fire.
+//! A browser key is `consumed` when a widget had focus, Tab moved it, or its event gave an area
+//! focus (`set_focus`, so a `/` that opens a palette never reaches the page's quick find),
+//! unless it is a clipboard shortcut, so the page's own copy, cut, and paste events still
+//! fire.
 //!
 //! ## 7a. File Drops
 //! A file drag does not move the pointer (the drag holds it), so it has its own target: the
@@ -665,6 +667,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         escaping: bool,
         /// True after a key press a widget or Tab took (section 7).
         key_consumed: bool,
+        /// The current key press is Ctrl or Meta with C, X, or V: never consumed (section 7).
+        key_clipboard: bool,
         /// Held keys as `Key.bit` flags, and the latest modifiers.
         keys_held: u64,
         mods: input.Mods,
@@ -777,6 +781,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             self.focus_rect = self.window;
             self.escaping = false;
             self.key_consumed = false;
+            self.key_clipboard = false;
             self.keys_held = 0;
             self.mods = .none;
             self.window_focused = true;
@@ -2237,6 +2242,7 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             const clipboard_key = press.key == .c or press.key == .x or press.key == .v;
             const shortcut = press.mods.shortcut() and clipboard_key;
             const routed = self.focus_prev != .none or self.focus != .none;
+            self.key_clipboard = shortcut;
             self.key_consumed = routed and !shortcut;
             if (shortcut) assert(!self.key_consumed);
         }
@@ -2312,6 +2318,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(self.phase == .event);
             assert(id != .none);
             self.focus = id;
+            // A key that opened something which took focus (a palette on "/") is consumed.
+            if (self.event_tag == .key_down and !self.key_clipboard) self.key_consumed = true;
             if (self.find(id)) |found| self.focus_rect = rect_of(found.rect);
             assert(self.focus == id);
         }
@@ -2974,6 +2982,31 @@ test "keys are consumed by focus but clipboard shortcuts never are" {
     send(context, press_key(.a, ctrl), &.{field}, &out);
     try testing.expect(context.consumed());
     try testing.expectEqual(Hit.none, out[0]);
+}
+
+// Locks the opening key: with nothing focused a "/" is not consumed, unless its event gives an
+// area focus (a palette opened by it), and a clipboard shortcut that gives focus still is not.
+test "a key whose event gives focus is consumed" {
+    const context = new_context();
+    const field = areas.id("field", 0);
+    draw_fields(context);
+    const slash = input.key_press(.other, .none, false, "/");
+    context.event_begin(.{ .key_down = slash });
+    context.event_end();
+    try testing.expect(!context.consumed());
+    context.event_begin(.{ .key_down = slash });
+    context.set_focus(field);
+    context.event_end();
+    try testing.expect(context.consumed());
+    context.event_begin(.{ .frame = 0 });
+    context.clear_focus();
+    context.event_end();
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    context.event_begin(.{ .key_down = input.key_press(.v, ctrl, false, "") });
+    context.set_focus(field);
+    context.event_end();
+    try testing.expect(!context.consumed());
 }
 
 // Locks held keys: presses set and releases clear their bits, and a window blur releases every

@@ -6,7 +6,8 @@
 //! A library widget is generic over a skin: `KnobOf(Skin)`, `ButtonOf(Skin)`, `SliderOf(Skin)`,
 //! `ToggleOf(Skin)`, `CheckboxOf(Skin)`, `MeterOf(Skin)`, `PanelOf(Skin)`, `TextFieldOf(Skin)`,
 //! `MenuOf(Skin)` (and `ContextMenuOf`), `DropdownOf(Skin)`, `TabsOf(Skin)`, `SplitterOf(Skin)`,
-//! `ListBoxOf(Skin)`, `NumberBoxOf(Skin)`, `TooltipOf(Skin)`, and the rest of the table below.
+//! `ListBoxOf(Skin)`, `NumberBoxOf(Skin)`, `TooltipOf(Skin)`, `PaletteOf(Skin)`, and the rest of
+//! the table below.
 //! The behaviour
 //! (fields, `init`, `handle`, `Action`) is written once in the widget's file. Its `draw` asks
 //! the turtle for the box, culls it, builds a look struct of plain values, and hands it to the
@@ -53,6 +54,9 @@
 //! MenuBarOf(S)    menu_title(cx, MenuTitleLook)        ?Shape   one title; its menus are
 //!                                                               MenuOf(S)
 //! TooltipOf(S)    tooltip(cx, TooltipLook)             void     on Layer.tooltip
+//! PaletteOf(S)    field / menu_face / palette_row(cx, PaletteRowLook) void
+//!                                                               its field is TextFieldOf(S);
+//!                                                               one row: band, label, detail
 //! every function  <function>_appends: SkinAppends               what one call appends (2b)
 //! ```
 //! `check` reads the table of each widget's functions (`functions_of`), in this order.
@@ -150,6 +154,7 @@ const disclosure_file = @import("disclosure.zig");
 const column_header_file = @import("column_header.zig");
 const window_chrome_file = @import("window_chrome.zig");
 const menu_bar_file = @import("menu_bar.zig");
+const palette_file = @import("palette.zig");
 
 const Rect = kit.Rect;
 const SkinAppends = appends.SkinAppends;
@@ -397,6 +402,18 @@ pub const TooltipLook = struct {
     fill: ?[4]f32 = null,
 };
 
+/// One palette row: its rect, its label and detail in `style`, whether its item is enabled,
+/// and whether it is the highlighted row.
+pub const PaletteRowLook = struct {
+    rect: Rect,
+    clip: Clip,
+    label: []const u8,
+    detail: []const u8,
+    style: text.Style,
+    enabled: bool,
+    highlighted: bool,
+};
+
 /// The widgets a skin may cover.
 pub const Kind = enum {
     button,
@@ -419,6 +436,7 @@ pub const Kind = enum {
     window_buttons,
     menu_bar,
     tooltip,
+    palette,
 };
 
 /// One skin function: its name, its look's type and name, and whether it returns the hit
@@ -509,6 +527,16 @@ fn functions_of(comptime widget: Kind) []const Function {
         },
         .tooltip => &.{
             .{ .name = "tooltip", .look = "TooltipLook", .Look = TooltipLook, .shape = false },
+        },
+        .palette => &.{
+            .{ .name = "field", .look = "FieldLook", .Look = FieldLook, .shape = false },
+            .{ .name = "menu_face", .look = "MenuFaceLook", .Look = MenuFaceLook, .shape = false },
+            .{
+                .name = "palette_row",
+                .look = "PaletteRowLook",
+                .Look = PaletteRowLook,
+                .shape = false,
+            },
         },
     };
 }
@@ -1272,6 +1300,42 @@ pub const Default = struct {
         return .{ .rect = look.rect, .radius = 0 };
     }
 
+    /// The highlight band.
+    pub const palette_row_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
+        .{ .type = quads.Box, .count = 1 },
+    } } };
+
+    /// The highlight band in `colors.selection` over the whole row, then the detail at the
+    /// right at `hint_alpha` and the label at the left in the room left, cut with an ellipsis,
+    /// both inside `palette_text_inset` and at half alpha when disabled.
+    pub fn palette_row(cx: anytype, look: PaletteRowLook) void {
+        assert(look.rect.width > 0);
+        assert(look.rect.height > 0);
+        assert(look.label.len <= text.byte_cap);
+        assert(look.detail.len <= text.byte_cap);
+        const scheme = cx.theme();
+        if (look.highlighted) {
+            const fill = scheme.colors.selection;
+            const radius = scheme.form.radius.band;
+            kit.face(cx, look.rect, look.clip, .{ .fill = fill, .radius = radius });
+        }
+        var style = look.style;
+        if (!look.enabled) style.color[3] *= 0.5;
+        const inner = ui.cx.inset(look.rect, .xy(palette_file.palette_text_inset, 0));
+        if (!(inner.width > 0)) return;
+        var room = inner;
+        if (look.detail.len > 0) {
+            var faint = style;
+            faint.color[3] *= field_file.hint_alpha;
+            const detail_w = @ceil(text.measure(faint, look.detail));
+            const options = palette_file.palette_detail_options;
+            kit.label(cx, faint, look.detail, inner, look.clip, options);
+            room.width = inner.width - detail_w - palette_file.palette_detail_gap;
+        }
+        if (!(room.width > 0)) return;
+        kit.label(cx, style, look.label, room, look.clip, menu_file.menu_text_options);
+    }
+
     /// The band.
     pub const list_row_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
         .{ .type = quads.Box, .count = 1 },
@@ -1645,7 +1709,7 @@ const Mixed = struct {
     }
 };
 
-// Locks the contract check (section 2): `Default` covers all 20 kinds; a skin covering the
+// Locks the contract check (section 2): `Default` covers all 21 kinds; a skin covering the
 // knob alone (and declaring it) passes for the knob and names the missing `button`, `tab_bar`,
 // and `tooltip`; a wrong return type and a wrong look each give their message; a slider skin
 // needs `slider_travel` too, and a number box skin `field` for its editor.
@@ -1687,7 +1751,7 @@ test "check names the skin and the first problem" {
         "widgets.skin.KnobOnly: missing `pub fn tooltip(cx, widgets.TooltipLook) void`",
         comptime check(KnobOnly, .tooltip).?,
     );
-    try testing.expectEqual(@as(usize, 20), @typeInfo(Kind).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 21), @typeInfo(Kind).@"enum".field_names.len);
     const FaceOnly = struct {
         pub fn number_face(cx: anytype, look: NumberLook) ?Shape {
             _ = cx;
@@ -2314,6 +2378,16 @@ test "Default's faces and popups reach their declarations" {
         .rect = reach_rect(0, 28),
         .clip = reach_clip,
         .label = reach_text,
+        .style = theme.dark.name,
+        .enabled = true,
+        .highlighted = true,
+    });
+    const palette_bound = comptime Default.palette_row_appends.with(2 * reach_bytes);
+    try reach(cx, palette_bound, Default.palette_row, PaletteRowLook{
+        .rect = reach_rect(0, 28),
+        .clip = reach_clip,
+        .label = reach_text,
+        .detail = reach_text,
         .style = theme.dark.name,
         .enabled = true,
         .highlighted = true,

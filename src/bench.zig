@@ -137,7 +137,7 @@ const png = @import("png.zig");
 pub const steps_max: u32 = 256;
 
 /// Most scenarios one app declares.
-pub const scenario_cap: u32 = 48;
+pub const scenario_cap: u32 = 64;
 
 /// Most frames one run measures; the host's sample storage.
 pub const sample_cap: u32 = 4096;
