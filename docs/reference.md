@@ -77,7 +77,7 @@ point pool, which exists only when a registered type reads points (`draw.Path`).
 
 Widgets (`patchwork.widgets`) are plain structs the app owns: `Panel`, `Label`, `Paragraph`, `Button`,
 `Toggle`, `Checkbox`, `Slider`, `Knob`, `Meter`, `TextField`, the popups (`Menu`, `ContextMenu`,
-`Dropdown`, `Tooltip`), the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
+`Dropdown`, `Palette`, `Tooltip`), the containers and value boxes (`Tabs`, `Segmented`, `Splitter`,
 `ListBox`, `NumberBox`), trees and tables (`TreeView`, `Disclosure`, `ColumnHeader`), and
 window chrome (`MenuBar`, `WindowButtons`, `window_drag`, `window_edges`); the code editor
 (`patchwork.editor.Editor`, see Code Editor below) follows the same contract. Each draws with `draw(cx, walk)` and,
@@ -158,6 +158,7 @@ patchwork/
 │   ├── widgets/column_header.zig # ColumnHeader: resizable, sortable columns and a row's spans
 │   ├── widgets/window_chrome.zig # WindowButtons, the drag area, and the resize edges
 │   ├── widgets/menu_bar.zig    # MenuBar: menus side by side; hover and Left / Right switch them
+│   ├── widgets/palette.zig     # Palette: a field over a filtered list in a popup
 │   ├── widgets/fixture.zig     # The widget tests' static context and drivers
 │   ├── editor.zig              # Code editor namespace: EditorOf, Editor, Style, Decoration
 │   ├── editor/language.zig     # The language contract (State, Class, palette, faces, scales, next)
@@ -863,6 +864,9 @@ the device scale, and only the glyph records change (see Text below).
 - **Clipboard.** `cx.copy(bytes)` hands up to 64 KiB to the host and `cx.request_paste()`
   asks for the clipboard, which arrives as one `paste` event for the focused widget.
 - **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
+- **Browser keys.** A browser key is consumed (`cx.consumed()`, so the page's default does not
+  run) when a widget had focus, Tab moved it, or the key's own event gave an area focus (a `/`
+  that opens a palette); clipboard shortcuts (Ctrl or Cmd with C, X, V) never are.
 - **Repeat.** Hosts repeat keys (`KeyPress.repeat`); the library never does.
 
 ## Theme
@@ -927,7 +931,8 @@ where it takes presses belong to a skin, a struct of draw functions passed at co
 `DropdownOf`, `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TreeViewOf` (its bands are
 the list box's `list_row`, its chevrons `tree_chevron`), `DisclosureOf`, `ColumnHeaderOf`,
 `WindowButtonsOf` (`window_button`), `MenuBarOf` (`menu_title`, and its menus' `menu_face`
-and `menu_row`), and `TooltipOf` (`tooltip`, handed a `widgets.TooltipLook`: the placed box,
+and `menu_row`), `PaletteOf` (`field`, `menu_face`, and `palette_row`), and
+`TooltipOf` (`tooltip`, handed a `widgets.TooltipLook`: the placed box,
 the clip, the text, and the app's fill or null) work the same way. A
 `TabsOf` skin may also declare `pub const tab_arrange: widgets.TabArrange = .even` (equal
 segments in an inset track); the library's second skin, `skins.Segmented`, does. There
@@ -1002,7 +1007,9 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   The containers take what the app bounds: their items and the longest label, a
   `widgets.Items` (`.{ .count, .label_max }`, or `widgets.Items.of(labels)`), as
   `MenuOf(S).appends_for(items)`, `DropdownOf`, `ColumnHeaderOf`, and `DockOf`; `MenuBarOf`
-  takes a `widgets.MenuBarText` (its titles and largest menu, `.of(titles, items)`) and
+  takes a `widgets.MenuBarText` (its titles and largest menu, `.of(titles, items)`),
+  `PaletteOf(S, config).appends_for(widgets.PaletteText)` (its field's text and the longest
+  label and detail, `.of(items, field)`), and
   `TabsOf` a `widgets.TabText` (its labels, `closable`, and `movable`); their visible rows, as
   `ListBoxOf(S).appends_for(rows)` and `TreeViewOf(S, n).appends_for(rows)`, with `rows` from
   `widgets.list_rows_for(view_h, row_h)` and the list's `visible_max` set to the same bound,
@@ -1060,7 +1067,12 @@ pub fn draw(app: *App, cx: *Context) void {
 - **Widgets.** `widgets.Menu` (up to 32 items, disabled items, Up/Down/Home/End/Enter/Escape,
   Tab dismisses), `widgets.ContextMenu` (a menu opened by a right press on a target id),
   `widgets.Dropdown` (a face and its menu, `Action.changed` only for a different item), and
-  `widgets.Tooltip` (the app says what is hovered as a `widgets.Tip`; it shows after
+  `widgets.Palette(.{ .capacity })` (a text field over a list filtered as you type: Up, Down,
+  Page Up, and Page Down move the highlight while the field keeps the caret, Enter or a click
+  chooses, Escape, Tab, or an outside press dismisses; `filter` is the built-in prefix-then-
+  substring match or `.app`, where the app calls `show(cx, rows)`; disabled rows are greyed and
+  skipped; `chosen` carries the item's index), `widgets.Tooltip` (the app says what is hovered
+  as a `widgets.Tip`; it shows after
   `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)`,
   `DropdownOf(Skin)`, and `TooltipOf(Skin)` are skinnable like the other widgets.
 - **Forgetting `ui.overlays`.** Opening a popup calls `cx.request_popup(id)`; in safe builds
@@ -1559,7 +1571,10 @@ typed before `typedef struct {`: the lines below turn to comment down to the nex
 `code-light` (both editors in their light palettes) for the code page; `tab-close` (app.zig
 closed), `tab-move` (main.zig dragged past ui.zig), `tab-drag` (app.zig dragged onto the right
 bar between README.md and build.zig), and `tab-ghost` (ui.zig held over that gap: its ghost
-and the insertion marker) for the tabs page.
+and the insertion marker) for the tabs page. Ctrl+K (Cmd+K) on any page, or File > Command
+palette…, opens a `widgets.Palette` of 21 commands (pages, themes, waves, About); `palette`
+(Ctrl+K, "a", Page Down, Down) and `palette-pointer` (File, Command palette…, the wheel to
+the end, Redo hovered and clicked: nothing, About… highlighted) show it.
 
 ### 10. Docking Workspace (`examples/workspace/app.zig`)
 

@@ -276,6 +276,18 @@ pub const Counted = struct {
         place(cx, look.style, look.label, look.rect, look.clip);
     }
 
+    pub const field_appends = counted(1);
+    pub fn field(cx: anytype, look: skin.FieldLook) void {
+        faces(cx, look.rect, look.clip, 1);
+    }
+
+    pub const palette_row_appends = counted(4);
+    pub fn palette_row(cx: anytype, look: skin.PaletteRowLook) void {
+        faces(cx, look.rect, look.clip, 4);
+        place(cx, look.style, look.label, look.rect, look.clip);
+        place(cx, look.style, look.detail, look.rect, look.clip);
+    }
+
     pub const dropdown_appends = counted(5);
     pub fn dropdown(cx: anytype, look: skin.DropdownLook) ?skin.Shape {
         faces(cx, look.rect, look.clip, 5);
@@ -375,7 +387,7 @@ comptime {
     // `Counted` covers every container kind (module guide, section 3).
     for ([_]skin.Kind{
         .menu, .dropdown,      .tabs,           .splitter, .list_box,
-        .tree, .column_header, .window_buttons, .menu_bar,
+        .tree, .column_header, .window_buttons, .menu_bar, .palette,
     }) |kind| {
         assert(skin.check(Counted, kind) == null);
     }
@@ -499,4 +511,18 @@ test "Counted's labelled functions append their declarations" {
         .sorted = null,
         .hovered = false,
     }, Counted.header_cell_appends, bytes);
+    try counted_reach(cx, Counted.palette_row, skin.PaletteRowLook{
+        .rect = rect,
+        .clip = clip,
+        .label = counted_label,
+        .detail = counted_label,
+        .style = theme.dark.name,
+        .enabled = true,
+        .highlighted = false,
+    }, Counted.palette_row_appends, 2 * bytes);
+    try counted_reach(cx, Counted.field, skin.FieldLook{
+        .rect = rect,
+        .clip = clip,
+        .focused = false,
+    }, Counted.field_appends, 0);
 }

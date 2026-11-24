@@ -65,6 +65,7 @@
 //! widgets/column_header.zig  ColumnHeader: resizable, sortable columns and a row's spans
 //! widgets/window_chrome.zig  WindowButtons, the drag area, and the resize edges
 //! widgets/menu_bar.zig    MenuBar: menus side by side; hover and Left / Right switch them
+//! widgets/palette.zig     Palette: a field over a filtered list in a popup
 //! widgets/fixture.zig     the tests' static context and drivers
 //! ```
 //! A widget file imports `kit.zig` and `skin.zig` (and `knob.zig` for the shared row
@@ -89,6 +90,8 @@
 //!   `Dropdown.appends_for(Items)`, `MenuBar.appends_for(MenuBarText)` (titles and the largest
 //!   menu), `Tabs.appends_for(TabText)` (labels, `closable`, `movable`; and `Segmented`'s),
 //!   `ColumnHeader.appends_for(Items)`, and `Dock.appends_for(Items)`;
+//! - a field and a list: `Palette(config).appends_for(PaletteText)` (the field's text, the
+//!   longest label and detail, and the empty line);
 //! - visible rows: `ListBox.appends_for(rows)` and `TreeView(n).appends_for(rows)`, with
 //!   `rows` from `list_rows_for(view_h, row_h)`; set the list's `visible_max` to the same
 //!   bound, which its `begin` asserts.
@@ -114,17 +117,18 @@
 //! Every widget but `Label` is generic over a skin, a struct of draw functions passed at
 //! compile time (`widgets/skin.zig`): `KnobOf(Skin)`, `ButtonOf`, `SliderOf`, `ToggleOf`,
 //! `CheckboxOf`, `MeterOf`, `PanelOf`, `TextFieldOf` (its face only), `MenuOf`, `DropdownOf`,
-//! `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TooltipOf`, and the later ones in
-//! `widgets/skin.zig`'s table. The plain names are the default skin, `Knob =
+//! `TabsOf`, `SplitterOf`, `ListBoxOf`, `NumberBoxOf`, `TooltipOf`, `PaletteOf`, and the later
+//! ones in `widgets/skin.zig`'s table. The plain names are the default skin, `Knob =
 //! KnobOf(skins.Default)`, and draw exactly what they drew before skins. `skins.Default` takes
 //! its corners and strokes from the scheme's form (`theme.zig`, section 8). A skin
 //! gets a look struct of values and returns the hit shape; a missing or mistyped function is
 //! a compile error naming the skin (`skins.check`). `ui.route` routes any of them.
 //!
 //! ## 6a. Popups
-//! `Menu`, `ContextMenu`, `Dropdown`, and `Tooltip` draw their popups in `draw_overlay(cx)`,
-//! which `ui.overlays(cx, app)` calls at the end of `App.draw`, at the root, on `Layer.popup`
-//! and `Layer.tooltip` (`ui/cx.zig`, section 3c). A menu's backdrop takes every press outside
+//! `Menu`, `ContextMenu`, `Dropdown`, `Palette`, and `Tooltip` draw their popups in
+//! `draw_overlay(cx)`, which `ui.overlays(cx, app)` calls at the end of `App.draw`, at the
+//! root, on `Layer.popup` and `Layer.tooltip` (`ui/cx.zig`, section 3c). A menu's backdrop
+//! takes every press outside
 //! it, so an outside press only dismisses. `bounds` (null for the window) is the rect a popup
 //! stays inside.
 //!
@@ -174,6 +178,7 @@ const disclosure = @import("widgets/disclosure.zig");
 const column_header = @import("widgets/column_header.zig");
 const window_chrome = @import("widgets/window_chrome.zig");
 const menu_bar = @import("widgets/menu_bar.zig");
+const palette = @import("widgets/palette.zig");
 
 pub const Rect = quads.Rect;
 pub const Inset = quads.Inset;
@@ -407,6 +412,25 @@ pub const MenuBarOf = menu_bar.MenuBarOf;
 pub const MenuChoice = menu_bar.MenuChoice;
 pub const MenuBarText = menu_bar.MenuBarText;
 pub const menubar_menus_max = menu_bar.menubar_menus_max;
+pub const menubar_menu_salt = menu_bar.menubar_menu_salt;
+
+pub const Palette = palette.Palette;
+pub const PaletteOf = palette.PaletteOf;
+pub const PaletteItem = palette.PaletteItem;
+pub const PaletteConfig = palette.PaletteConfig;
+pub const PaletteFilter = palette.PaletteFilter;
+pub const PaletteText = palette.PaletteText;
+pub const PaletteRowLook = skins.PaletteRowLook;
+pub const palette_width = palette.palette_width;
+pub const palette_row_h = palette.palette_row_h;
+pub const palette_rows_default = palette.palette_rows_default;
+pub const palette_empty = palette.palette_empty;
+pub const palette_field_salt = palette.palette_field_salt;
+pub const palette_list_salt = palette.palette_list_salt;
+pub const palette_row_salt = palette.palette_row_salt;
+pub const palette_items_max = palette.palette_items_max;
+pub const palette_filter = palette.filter_items;
+pub const palette_height_for = palette.height_for;
 
 pub const NumberBox = number_box.NumberBox;
 pub const NumberBoxOf = number_box.NumberBoxOf;
@@ -444,6 +468,7 @@ test {
     _ = column_header;
     _ = window_chrome;
     _ = menu_bar;
+    _ = palette;
 }
 
 /// Every public name of `widgets.zig` at step 29, before the split.

@@ -147,7 +147,8 @@
 //! The title bar (step 43) is the window's own: a `widgets.window_drag` area over the whole
 //! bar, recorded first so everything on it takes the pointer over it (a press moves the
 //! window, a double press maximizes or restores, a right press opens the window manager's
-//! menu); a `widgets.MenuBar` of File (New, Open, Save, Quit), Edit (Undo and Redo disabled,
+//! menu); a `widgets.MenuBar` of File (New, Open, Save, Command palette…, Quit), Edit (Undo and
+//! Redo disabled,
 //! Cut, Copy, Paste), and View (Light, Dark, Maximize); a Run button; the light toggle; the
 //! status; and `widgets.WindowButtons` flush right, which draw nothing while the window
 //! manager decorates the window (`config.decorations` is the default `server`; run with
@@ -174,9 +175,20 @@
 //! app.zig", "close app.zig", "move main.zig to 2", "drop app.zig on right 1", and "tabs
 //! reset".
 //!
+//! ## 2k. Palette
+//! The command palette (step 80) is a `widgets.Palette` over 21 items (`palette_items`): the ten
+//! pages, Light and Dark theme, the six waves, About…, and Undo and Redo (disabled). Ctrl+K
+//! (Cmd+K) on any page, while no other popup is open, or File > Command palette… opens it at
+//! (460, 104), centred under the tab bar, with the hint "Type a command". Choosing an item
+//! goes to its page, sets the theme (as View does) or the wave dropdown's value, or opens
+//! About. `palette_appends` is its worst frame, which the comptime block adds to every page's
+//! areas and, on basics, takes the larger of with a popup's boxes. The status line reports
+//! "palette a" (the text), "palette Go to data" (the choice), and "palette closed".
+//!
 //! ## 3. Events
 //! `event` hands every event first to the window chrome (`chrome_events`: the menu bar before
-//! anything its open menu's backdrop covers), then to each widget itself, because the status line needs each
+//! anything its open menu's backdrop covers), then to the palette (`palette_events`), then to
+//! each widget itself, because the status line needs each
 //! action (`ui.route` returns only how many acted), then to the view (it takes its id), then
 //! to the rows it drew last through `kit.clicked`, which also repaints a row on hover, then to
 //! the form group (`form_events`), the popups (`popup_events`) and to the tabs and the containers page (`container_events`; the
@@ -228,7 +240,10 @@
 //! 2a): `tabs` (click each tab in turn, ending on containers); `split` (drag the presets'
 //! divider 120 px left); `list` (click preset row 3, then Down 20 times: preset 0024 scrolled
 //! into view); `number` (drag the frequency up 40 px, double-click the gain, type "-6.5",
-//! Enter). Type (section 2b): `type` (the type page, still); `wrap` (the
+//! Enter). Palette (section 2k): `palette` (Ctrl+K, "a", Page Down, Down: 14 rows, Wave
+//! triangle highlighted, rows 2 to 9 shown); `palette-pointer` (File, Command palette…, the
+//! wheel to the end, a hover and a click on the disabled Redo, a hover on About…). Type
+//! (section 2b): `type` (the type page, still); `wrap` (the
 //! type divider dragged 240 px left: the wrapped text widens); `wrap-narrow` (dragged right to
 //! the wrapped pane's 200 px minimum: "antidisestablishmentarianism" breaks between letters);
 //! `wrap-scroll` (that, then the wheel over the wrapped text: scrolled to its end);
@@ -354,6 +369,42 @@ const file_items = [_][]const u8{ "New", "Open…", "Save", "Save as…", "About
 const file_disabled: u32 = 3;
 const file_about: u32 = 4;
 const context_items = [_][]const u8{ "Copy", "Paste", "Reset" };
+
+/// The command palette's items (section 2k): the ten pages (index = page), the two themes, the
+/// six waves (index - 12 = `wave_items` index), About, and two disabled edits.
+const palette_items = [_]widgets.PaletteItem{
+    .{ .label = "Go to basics", .detail = "page" },
+    .{ .label = "Go to popups", .detail = "page" },
+    .{ .label = "Go to containers", .detail = "page" },
+    .{ .label = "Go to type", .detail = "page" },
+    .{ .label = "Go to files", .detail = "page" },
+    .{ .label = "Go to surfaces", .detail = "page" },
+    .{ .label = "Go to glass", .detail = "page" },
+    .{ .label = "Go to data", .detail = "page" },
+    .{ .label = "Go to code", .detail = "page" },
+    .{ .label = "Go to tabs", .detail = "page" },
+    .{ .label = "Light theme", .detail = "view" },
+    .{ .label = "Dark theme", .detail = "view" },
+    .{ .label = "Wave sine", .detail = "wave" },
+    .{ .label = "Wave triangle", .detail = "wave" },
+    .{ .label = "Wave saw", .detail = "wave" },
+    .{ .label = "Wave square", .detail = "wave" },
+    .{ .label = "Wave noise", .detail = "wave" },
+    .{ .label = "Wave sample & hold", .detail = "wave" },
+    .{ .label = "About…", .detail = "help" },
+    .{ .label = "Undo", .detail = "edit", .enabled = false },
+    .{ .label = "Redo", .detail = "edit", .enabled = false },
+};
+const palette_theme_first: u32 = 10;
+const palette_wave_first: u32 = 12;
+const palette_about: u32 = 18;
+const palette_hint = "Type a command";
+const palette_id = ui.id("palette", 0);
+const CommandPalette = widgets.Palette(.{ .capacity = palette_items.len });
+/// What the open palette appends at most, beside the frame's other popups.
+const palette_appends = CommandPalette.appends_for(
+    widgets.PaletteText.of(&palette_items, .{ .limit = 32, .hint = palette_hint.len }),
+);
 
 /// The form group (section 2): two columns of `form_column_w` and the checkboxes, 16 apart.
 const form_column_w: f32 = 240;
@@ -551,14 +602,15 @@ const edges_id = ui.id("edges", 0);
 /// The menu bar (section 2h): File, Edit, and View; Edit's Undo and Redo are disabled.
 const bar_titles = [_][]const u8{ "File", "Edit", "View" };
 const bar_names = [_][]const u8{ "file", "edit", "view" };
-const bar_file_items = [_][]const u8{ "New", "Open", "Save", "Quit" };
+const bar_file_items = [_][]const u8{ "New", "Open", "Save", "Command palette…", "Quit" };
 const bar_edit_items = [_][]const u8{ "Undo", "Redo", "Cut", "Copy", "Paste" };
 const bar_view_items = [_][]const u8{ "Light", "Dark", "Maximize" };
 const bar_items = [_][]const []const u8{ &bar_file_items, &bar_edit_items, &bar_view_items };
 const bar_file: u32 = 0;
 const bar_edit: u32 = 1;
 const bar_view: u32 = 2;
-const bar_quit: u32 = 3;
+const bar_palette: u32 = 3;
+const bar_quit: u32 = 4;
 const bar_light: u32 = 0;
 const bar_dark: u32 = 1;
 const bar_maximize: u32 = 2;
@@ -647,6 +699,8 @@ pub const App = struct {
     context: widgets.ContextMenu,
     about: About,
     tooltip: widgets.Tooltip,
+    /// The command palette (section 2k), over any page.
+    palette: CommandPalette,
     /// The containers page (section 2a).
     split: widgets.Splitter,
     side: widgets.Splitter,
@@ -747,6 +801,13 @@ pub const App = struct {
         .{ .name = "tab-move", .setup = &tab_move_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "tab-drag", .setup = &tab_drag_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
         .{ .name = "tab-ghost", .setup = &tab_ghost_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{ .name = "palette", .setup = &palette_steps, .cycle = &.{.{ .wait = 1 }}, .frames = 30 },
+        .{
+            .name = "palette-pointer",
+            .setup = &palette_pointer_steps,
+            .cycle = &.{.{ .wait = 1 }},
+            .frames = 30,
+        },
     };
 
     /// The widgets at their starting values, styled from `config.theme`; the gallery creates
@@ -876,6 +937,9 @@ pub const App = struct {
         app.about = About.init();
         app.tooltip = widgets.Tooltip.init();
         app.tooltip.bounds = frame_rect;
+        app.palette = CommandPalette.init(palette_id, &palette_items, 32, config.theme.name);
+        app.palette.field.hint = palette_hint;
+        app.palette.bounds = frame_rect;
         app.drawn = .{ .first = 0, .end = 0 };
         app.selected = null;
         app.status = @splat(0);
@@ -889,6 +953,7 @@ pub const App = struct {
     /// Every widget, the view, then the rows drawn last (module guide, section 3).
     pub fn event(app: *App, cx: *Context, event_value: input.Event) void {
         app.chrome_events(cx, event_value);
+        app.palette_events(cx, event_value);
         switch (app.light.handle(cx, event_value)) {
             .toggled => |on| app.apply_theme(cx, on),
             .none => {},
@@ -975,6 +1040,7 @@ pub const App = struct {
         const items = bar_items[choice.menu];
         app.note(cx, &.{ bar_names[choice.menu], " ", items[choice.item] });
         if (choice.menu == bar_file and choice.item == bar_quit) cx.close();
+        if (choice.menu == bar_file and choice.item == bar_palette) app.open_palette(cx);
         if (choice.menu != bar_view) return;
         switch (choice.item) {
             bar_light, bar_dark => {
@@ -985,6 +1051,64 @@ pub const App = struct {
             },
             bar_maximize => cx.toggle_maximize(),
             else => unreachable,
+        }
+    }
+
+    /// The command palette (section 2k): its filtered, chosen, and dismissed actions on the
+    /// status line, then Ctrl+K (Cmd+K) opens it when it is closed and no other popup is.
+    fn palette_events(app: *App, cx: *Context, event_value: input.Event) void {
+        switch (app.palette.handle(cx, event_value)) {
+            .filtered => app.note(cx, &.{ "palette ", app.palette.field.bytes() }),
+            .chosen => |item| {
+                app.note(cx, &.{ "palette ", palette_items[item].label });
+                app.run_command(cx, item);
+            },
+            .dismissed => app.note(cx, &.{"palette closed"}),
+            .none => {},
+        }
+        if (app.palette.open) return;
+        const press = switch (event_value) {
+            .key_down => |press| press,
+            else => return,
+        };
+        if (press.key != .k or !press.mods.shortcut()) return;
+        if (!app.popup_open()) app.open_palette(cx);
+    }
+
+    /// True while any popup but the palette is open: two popups in a frame are refused.
+    fn popup_open(app: *const App) bool {
+        if (app.menubar.open != null) return true;
+        if (app.wave.menu.open or app.flip.menu.open) return true;
+        if (app.file_menu.open or app.context.menu.open) return true;
+        return app.about.open or app.glass.output.menu.open;
+    }
+
+    /// Opens the palette at the page's top, centred in the screen.
+    fn open_palette(app: *App, cx: *Context) void {
+        assert(!app.palette.open);
+        assert(!app.popup_open());
+        const at: [2]f32 = .{ (screen_w - widgets.palette_width) / 2, page_y };
+        app.palette.open_at(cx, .{ .point = at }, .at);
+    }
+
+    /// Runs palette item `item`: a page, a theme, a wave, or About.
+    fn run_command(app: *App, cx: *Context, item: u32) void {
+        assert(item < palette_items.len);
+        assert(palette_items[item].enabled);
+        if (item < page_labels.len) {
+            app.tabs.selected = item;
+            cx.redraw();
+        } else if (item < palette_wave_first) {
+            const on = item == palette_theme_first;
+            app.light.on = on;
+            kit.aim(cx, &app.light.thumb, if (on) 1 else 0);
+            app.apply_theme(cx, on);
+        } else if (item < palette_about) {
+            app.wave.selected = item - palette_wave_first;
+            cx.redraw();
+        } else {
+            assert(item == palette_about);
+            app.about.show(cx);
         }
     }
 
@@ -1260,6 +1384,7 @@ pub const App = struct {
         app.code.restyle(scheme);
         app.password.style = field_style(scheme);
         app.search.style = field_style(scheme);
+        app.palette.field.style = scheme.name;
         assert(app.sliders[0].track.radius == widgets.track_radius);
         assert(app.field.style.face == .mono);
     }
@@ -2265,6 +2390,49 @@ const about_steps = [_]bench.Step{
     .{ .wait = 12 },
 };
 
+/// The palette's list, a wheel target of the `palette-pointer` scenario.
+const palette_list: bench.Target = .{
+    .id = palette_id.derive(widgets.palette_list_salt),
+    .name = "palette list",
+    .index = 0,
+};
+
+/// Palette row `row`, a hover and click target.
+fn palette_row(row: u32) bench.Target {
+    const id = palette_id.derive(widgets.palette_row_salt + row);
+    return .{ .id = id, .name = "palette row", .index = row };
+}
+
+/// Row `item` of menu bar menu `menu`, a click target.
+fn bar_row(menu: u32, item: u32) bench.Target {
+    const menu_id = menubar_id.derive(widgets.menubar_menu_salt + menu);
+    return .{ .id = menu_id.derive(item), .name = "menubar row", .index = item };
+}
+
+const ctrl_mods: input.Mods = .{ .shift = false, .ctrl = true, .alt = false, .meta = false };
+
+/// `palette` (section 2k), keys only: Ctrl+K on the basics page, "a", Page Down, Down. It ends
+/// open with 14 rows, the ninth (Wave triangle) highlighted, rows 2 to 9 shown.
+const palette_steps = [_]bench.Step{
+    .{ .key = .{ .key = .k, .mods = ctrl_mods } },
+    .{ .key = .{ .key = .a, .text = "a" } },
+    .{ .key = .{ .key = .page_down } },
+    .{ .key = .{ .key = .down } },
+    .{ .wait = 2 },
+};
+
+/// `palette-pointer`, pointer only: File, "Command palette…", the wheel to the list's end,
+/// a hover and a click on disabled Redo (nothing), and a hover on About….
+const palette_pointer_steps = [_]bench.Step{
+    .{ .click = bar_title(bar_file) },
+    .{ .click = bar_row(bar_file, bar_palette) },
+    .{ .wheel = .{ .target = palette_list, .dx = 0, .dy = 400 } },
+    .{ .hover = .{ .target = palette_row(20), .x = 20, .y = 14 } },
+    .{ .click = palette_row(20) },
+    .{ .hover = .{ .target = palette_row(18), .x = 20, .y = 14 } },
+    .{ .wait = 2 },
+};
+
 comptime {
     // Every page starts under the title, the tab bar, and a gap: y 104, 584 px tall.
     assert(page_y == 104 and page_h == 584);
@@ -2299,13 +2467,17 @@ comptime {
     assert(split_min_a + split_min_b + widgets.splitter_px <= inner_w);
     assert(params_h + side_min_b + widgets.splitter_px <= page_h);
     assert(params.len == param_names.len and params.len == 6);
+    const palette_areas = palette_appends.areas;
+    const palette_boxes = palette_appends.of(quads.Box);
+    assert(palette_areas == 14 and palette_boxes == 14);
     // Faces, on the busiest page (basics): the title and its toggle (2), Run, a title's band,
     // and a window button's band (3), the tab bar's line,
     // four tabs, and the underline, 7 groups, 3 buttons, 3 per slider, 2 per toggle, 2 meter,
     // 3 for the focused field and 1 for each other field, the segments' track, selected, and
     // hovered segment, a box per checkbox and the mixed bar, 2 highlighted rows, the thumb; a
-    // popup's dim, face, and band; the tooltip.
-    assert(1 + 2 + 3 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 3 + checkbox_names.len + 1 + 2 + 1 + 3 + 1 <= box_cap);
+    // popup's dim, face, and band (or the palette's boxes); the tooltip.
+    const basics_boxes = 1 + 2 + 3 + 6 + 7 + 3 + 3 * 2 + 2 * 3 + 2 + 3 + 2 + 3 + checkbox_names.len;
+    assert(basics_boxes + 1 + 2 + 1 + @max(3, palette_boxes) + 1 <= box_cap);
     // The containers page: the title (3), the tabs (6), the list's panel, two bands, and thumb,
     // two dividers, the grid's panel, six faces (one an editing field: face, band, caret), and
     // the preset panel.
@@ -2327,9 +2499,12 @@ comptime {
     // view, thumb, and rows, two dividers, six number boxes).
     const title_areas = 1 + bar_titles.len + 1 + 1 + 3 + 8;
     const chrome = title_areas + 1 + page_labels.len;
-    assert(chrome + 3 + 2 + 4 + 3 + 3 + 1 + segment_labels.len + checkbox_names.len + 2 + rows_drawn_max + 8 <= area_cap);
-    assert(chrome + 4 + 1 + file_items.len <= area_cap);
-    assert(chrome + 2 + preset_rows_max + 2 + param_names.len <= area_cap);
+    // The command palette (section 2k) opens over any page, so its areas and boxes are added to
+    // each page's; on the popups page it is the one popup beside the File menu's.
+    const basics_areas = chrome + 3 + 2 + 4 + 3 + 3 + 1 + segment_labels.len + checkbox_names.len;
+    assert(basics_areas + 2 + rows_drawn_max + 8 + palette_areas <= area_cap);
+    assert(chrome + 4 + @max(1 + file_items.len, palette_areas) <= area_cap);
+    assert(chrome + 2 + preset_rows_max + 2 + param_names.len + palette_areas <= area_cap);
     assert(wave_items.len >= file_items.len and file_items.len >= context_items.len);
     // Paths: the window buttons' icons (at most four strokes, eleven points), and one chevron
     // per dropdown (popups) or one mark per checkbox (basics), three points each.
@@ -2345,7 +2520,7 @@ comptime {
     assert(data_page.tree_w + data_page.table_w + data_page.props_w + 2 * data_page.gap_px == inner_w);
     const tree_rows_max: u32 = 24;
     const data_areas = chrome + 2 * 2 + 2 * tree_rows_max + 3 + 2 + data_page.children_max + 3 + 1;
-    assert(data_areas <= area_cap);
+    assert(data_areas + palette_areas <= area_cap);
     assert(icon_paths + tree_rows_max + 3 + 1 <= path_cap);
     assert(icon_points + 3 * (tree_rows_max + 4) <= point_cap);
     // The form group: two field columns and the checkboxes' column fit its inner width; two
@@ -2369,24 +2544,24 @@ comptime {
     assert(type_band_px + set_px + 2 * gap_px + 2 * group_padding + face_lines.len * face_line_px <= page_h);
     assert(transport_names.len == transport_icons.len and tool_tips.len == tool_icons.len);
     // Areas: the chrome and the eight icon buttons.
-    assert(chrome + transport_icons.len + tool_icons.len <= area_cap);
+    assert(chrome + transport_icons.len + tool_icons.len + palette_areas <= area_cap);
     // The files page: the zone over the list, beside the waveform panel; the list shows at
     // most 14 rows. Boxes: the title (3), the tabs (7), the zone, the list's panel, a band,
     // and its thumb, the wave panel and its track. Areas: the zone, the list's view and
     // thumb, and its rows.
     assert(files_page.zone_h + gap_px + 2 * group_padding + files_page.row_px <= page_h - gap_px);
     assert(3 + 7 + 1 + 1 + 2 + 2 <= box_cap);
-    assert(chrome + 3 + 14 <= area_cap);
+    assert(chrome + 3 + 14 + palette_areas <= area_cap);
     // The code page (section 2i): its budgets assume the gallery's page, and its boxes and
     // areas sit beside the title's (3) and the tabs' (7).
     assert(code_page.page_w == inner_w and code_page.page_h == page_h);
     assert(3 + 7 + code_page.box_max <= box_cap);
-    assert(chrome + code_page.area_max <= area_cap);
+    assert(chrome + code_page.area_max + palette_areas <= area_cap);
     // The tabs page (section 2j): the title (3) and the tabs (7), two panels, two bar lines,
     // seven tab faces and two underlines, a close band, the marker, the ghost, and Reset;
     // areas: Reset, two bars, seven tabs, and seven close buttons.
     assert(3 + 7 + 2 + 2 + tabs_page.names.len + 2 + 1 + 1 + 1 + 1 <= box_cap);
-    assert(chrome + 1 + 2 + 2 * tabs_page.names.len <= area_cap);
+    assert(chrome + 1 + 2 + 2 * tabs_page.names.len + palette_areas <= area_cap);
     assert(2 * tabs_page.panel_w + tabs_page.gap_px == inner_w and tabs_page.page_w == inner_w);
     // Points: the waveform's columns with RMS, then the dropdowns' chevrons.
     assert(2 * (inner_w - files_page.zone_w - gap_px - 2 * group_padding) + 2 * 3 <= point_cap);
@@ -3612,4 +3787,100 @@ test "a long wav is cut at the sample cap and cancels only itself" {
     try std.testing.expect(page.received[0] < page.sizes[0]);
     try std.testing.expectEqual(files_page.Status.done, page.status[1]);
     try std.testing.expect(page.shown);
+}
+
+fn send(app: *App, event_value: input.Event) void {
+    ui.dispatch(App, app, &test_context, event_value);
+    _ = frame(app);
+}
+
+fn send_key(app: *App, key: input.Key, text_bytes: []const u8, mods: input.Mods) void {
+    send(app, .{ .key_down = input.key_press(key, mods, false, text_bytes) });
+}
+
+fn click_at_center(app: *App, id: ui.Id) void {
+    const rect = area_rect(id);
+    const point: input.Point = .{ .x = rect.x + 10, .y = rect.y + 10 };
+    send(app, .{ .pointer_move = point });
+    send(app, .{ .pointer_down = input.left_at(point) });
+    send(app, .{ .pointer_up = input.left_at(point) });
+}
+
+// Locks the `palette` scenario (section 2k): Ctrl+K opens the palette, "a" lists 14 rows, Page
+// Down and Down highlight row 9 (Wave triangle, item 13) with the list scrolled to 56, rows 2
+// to 9 drawn; Enter chooses it: the wave dropdown shows triangle and the palette is closed.
+test "the palette scenario filters and pages by keys" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "palette");
+    try std.testing.expect(app.palette.open);
+    try std.testing.expectEqual(@as(usize, 14), app.palette.rows().len);
+    try std.testing.expectEqual(@as(?u32, 9), app.palette.highlight);
+    try std.testing.expectEqual(@as(u32, 13), app.palette.rows()[9]);
+    try std.testing.expectEqual(@as(f32, 56), app.palette.view.scroll_y);
+    try std.testing.expectEqual(ui.List.Range{ .first = 2, .end = 10 }, app.palette.range);
+    try std.testing.expectEqualStrings("palette a", app.status_text());
+    try std.testing.expectEqual(app.palette.field.id, test_context.focus);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+    send_key(app, .enter, "", .none);
+    try std.testing.expect(!app.palette.open);
+    try std.testing.expectEqual(@as(u32, 1), app.wave.selected);
+    try std.testing.expectEqualStrings("palette Wave triangle", app.status_text());
+    try std.testing.expectEqual(ui.Id.none, test_context.focus);
+}
+
+// Locks the `palette-pointer` scenario (section 2k): the File menu's "Command palette…" opens
+// it, the wheel scrolls to 364 (rows 13 to 20), Redo (disabled) does nothing on hover or click,
+// About… is highlighted; a click on it opens the dialog and closes the palette.
+test "the palette-pointer scenario scrolls, skips disabled rows, and opens About" {
+    const app = new_app();
+    _ = frame(app);
+    try replay(app, "palette-pointer");
+    try std.testing.expect(app.palette.open);
+    try std.testing.expectEqual(@as(f32, 364), app.palette.view.scroll_y);
+    try std.testing.expectEqual(ui.List.Range{ .first = 13, .end = 21 }, app.palette.range);
+    try std.testing.expectEqual(@as(?u32, 18), app.palette.highlight);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    click_at_center(app, app.palette.row_id(18));
+    try std.testing.expect(app.about.open);
+    try std.testing.expect(!app.palette.open);
+    try std.testing.expectEqualStrings("palette About…", app.status_text());
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+}
+
+// Locks Ctrl+K (section 2k): it opens the palette on the start page and the key counts consumed;
+// Escape closes ("palette closed"); on the code page "da" lists Dark theme then Go to data,
+// Down and Enter go to the data page, and the frame with the palette open over the code page
+// overflows nothing; with the File menu open Ctrl+K opens nothing.
+test "Ctrl+K opens the palette on any page, and is consumed" {
+    const app = new_app();
+    _ = frame(app);
+    send_key(app, .k, "", ctrl_mods);
+    try std.testing.expect(app.palette.open);
+    try std.testing.expect(test_context.consumed());
+    send_key(app, .escape, "", .none);
+    try std.testing.expect(!app.palette.open);
+    try std.testing.expectEqualStrings("palette closed", app.status_text());
+    click_at_center(app, tabs_id.derive(page_code));
+    try std.testing.expectEqual(page_code, app.tabs.selected);
+    _ = frame(app);
+    send_key(app, .k, "", ctrl_mods);
+    send_key(app, .d, "d", .none);
+    send_key(app, .a, "a", .none);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 7 }, app.palette.rows());
+    try std.testing.expectEqual(@as(?u32, 0), app.palette.highlight);
+    try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
+    try std.testing.expectEqual(@as(u32, 0), test_context.area_overflow);
+    send_key(app, .down, "", .none);
+    send_key(app, .enter, "", .none);
+    try std.testing.expectEqual(page_data, app.tabs.selected);
+    try std.testing.expectEqualStrings("palette Go to data", app.status_text());
+    const menu = new_app();
+    _ = frame(menu);
+    click_at_center(menu, menu.menubar.title_id(bar_file));
+    try std.testing.expectEqual(@as(?u32, bar_file), menu.menubar.open);
+    send_key(menu, .k, "", ctrl_mods);
+    try std.testing.expect(!menu.palette.open);
+    try std.testing.expectEqual(@as(?u32, bar_file), menu.menubar.open);
 }
