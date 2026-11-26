@@ -46,6 +46,16 @@
 //! A consumer's `install` step gets the same layout under its own prefix, and its `run` step
 //! starts the installed executable, never the copy in the cache.
 //!
+//! ## 4a. Which Linker
+//! Zig 0.17 builds a Debug executable with its own x86-64 backend and linker, and a release one
+//! through LLVM and LLD. Zig's own pair rebuilds and runs fastest, but it writes an `undefined`
+//! static into the file with a third more room, and an executable whose static data ends past
+//! 2 GiB links without an error and crashes at start. LLD keeps such a static in BSS and refuses
+//! a link that cannot reach, naming the relocation. `AppOptions.lld` links the executable, the
+//! tests, and every `addTool` tool over the app through LLVM and LLD in every mode; without it the
+//! hosts refuse, at compile time, an App, context, and renderer past 1 GiB under Zig's own backend
+//! (`src/host/statics.zig`, section 4). `test/reach` holds both ends (section 5).
+//!
 //! ## 5. Steps
 //! - `run` installs, then runs the installed native executable (Wayland, libxkbcommon, and
 //!   wgpu-native).
@@ -107,6 +117,11 @@
 //!   test` builds its native executable, never installed or run, and runs `tools/statics.zig`
 //!   on it, which counts the App, the UI context, and the renderer among the executable's data
 //!   symbols and fails unless each is there once (step 82); `zig build statics` prints its line.
+//! - `test/reach` is an app whose App is 1600 MiB, always built in Debug (section 4a, step 85).
+//!   `zig build test` builds it with `lld`, installs it, and runs it with an option the host
+//!   refuses, which passes only if the executable starts. `test-contract` builds it without
+//!   `lld`, which must fail to compile naming the limit, and with 2048 MiB through LLD, which
+//!   must fail to link naming the relocation.
 //!
 //! ## 6. Fonts
 //! `add_font_module(patchwork_builder, ranges, fonts)` builds `tools/subset.zig` for the host,
@@ -230,6 +245,11 @@ pub const AppOptions = struct {
     web_files: []const WebFile = &.{},
     /// Folders the app's page fetches from, each served under its route.
     web_dirs: []const WebDir = &.{},
+    /// Links the native executable, the tests, and every `addTool` tool through LLVM and LLD in
+    /// every mode (section 4a). Without it a Debug build uses Zig's own backend and linker, which
+    /// rebuild and run faster but write the App into the file and refuse, at compile time, an
+    /// App, context, and renderer past 1 GiB together (`src/host/statics.zig`).
+    lld: bool = false,
 };
 
 /// The steps `addApp` creates. The caller attaches them to its own named steps.
@@ -263,6 +283,8 @@ pub const AppSteps = struct {
     app: *std.Build.Module,
     /// The directory holding `libwgpu_native.so`.
     wgpu_lib: std.Build.LazyPath,
+    /// `AppOptions.lld`, which `addTool` follows.
+    lld: bool,
 };
 
 /// Options for `addTool`.
@@ -314,6 +336,7 @@ pub fn addApp(
     const wasm_install = b.addInstallArtifact(wasm, .{});
 
     const tests = b.addTest(.{ .root_module = native_app });
+    if (options.lld) link_through_lld(tests);
     return .{
         .install = &install.step,
         .run = add_run(b, options, &install.step, "run", &.{}),
@@ -327,6 +350,7 @@ pub fn addApp(
         .library = native_library,
         .app = native_app,
         .wgpu_lib = wgpu_lib,
+        .lld = options.lld,
     };
 }
 
@@ -350,6 +374,7 @@ pub fn addTool(b: *std.Build, options: ToolOptions) *std.Build.Step.Compile {
     for (options.imports) |entry| root.addImport(entry.name, entry.module);
     const exe = b.addExecutable(.{ .name = options.name, .root_module = root });
     link_wgpu(exe, options.app.wgpu_lib);
+    if (options.app.lld) link_through_lld(exe);
     exe.step.dependOn(options.app.install);
     return exe;
 }
@@ -648,6 +673,7 @@ fn add_native(
     root.addImport("patchwork", modules.library);
     root.addImport("app", modules.app);
     const exe = b.addExecutable(.{ .name = options.name, .root_module = root });
+    if (options.lld) link_through_lld(exe);
     link_wgpu(exe, lib_path);
     exe.root_module.linkSystemLibrary("wayland-client", .{
         .needed = true,
@@ -658,6 +684,12 @@ fn add_native(
     });
     link_xkbcommon(exe.root_module);
     return exe;
+}
+
+/// Links a native artifact through LLVM and LLD in every mode (`AppOptions.lld`, section 4a).
+fn link_through_lld(compile: *std.Build.Step.Compile) void {
+    compile.use_llvm = true;
+    compile.use_lld = true;
 }
 
 /// Links `libwgpu_native.so` from `lib_path`, with RUNPATH `$ORIGIN/../lib` (section 4).
@@ -918,6 +950,7 @@ pub fn build(b: *std.Build) void {
     add_seams_step(b, vector, library, target, optimize);
     add_panic_steps(b, target, optimize, wgpu_lib_dir);
     add_statics_step(b, target, optimize, wgpu_lib_dir);
+    add_reach_steps(b, target, wgpu_lib_dir);
     add_consumer_step(b, optimize);
     add_sound_step(b, optimize);
 }
@@ -980,6 +1013,63 @@ fn add_panic_steps(
     add_example_steps(b, "-panic", "the panic test", panic);
     const test_step = b.top_level_steps.get("test").?;
     test_step.step.dependOn(panic.tests);
+}
+
+/// `test/reach` (step 85): an App of 1600 MiB, past what Zig's own Debug linker holds, always a
+/// Debug build. With `lld`, `zig build test` installs its executable and runs it with an option
+/// the host refuses, so it passes only if the executable starts and reaches `main`. Two
+/// `test-contract` cases: the same app built by Zig's own backend must fail to compile, naming
+/// the limit, and an App of 2048 MiB through LLD must fail to link, naming the relocation.
+fn add_reach_steps(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    wgpu_lib_dir: ?[]const u8,
+) void {
+    const reach = add_reach_app(b, "reach", reach_mib, true, target, wgpu_lib_dir);
+    const started = std.Build.Step.Run.create(b, "run reach");
+    started.addFileArg(b.graph.path(.install_bin, "reach"));
+    started.addArg("--reach");
+    started.step.dependOn(reach.install);
+    started.expectStdErrMatch("reach test: UnknownArgument");
+    started.expectExitCode(1);
+    const test_step = b.top_level_steps.get("test").?;
+    test_step.step.dependOn(&started.step);
+    const contract_step = b.top_level_steps.get("test-contract").?;
+    const own = add_reach_app(b, "reach-own", reach_mib, false, target, wgpu_lib_dir);
+    own.exe.expect_errors = .{ .contains = "static data, past the 1073741824 bytes Zig's own " ++
+        "linker holds: link through LLD (`AppOptions.lld`)" };
+    contract_step.step.dependOn(&own.exe.step);
+    const far = add_reach_app(b, "reach-far", 2048, true, target, wgpu_lib_dir);
+    // `contains` matches a line's end, and `/?/` stands for the object, function, and offset.
+    far.exe.expect_errors = .{ .contains = "error: ld.lld: /?/ is not in " ++
+        "[-2147483648, 2147483647]; references section '.bss'" };
+    contract_step.step.dependOn(&far.exe.step);
+}
+
+/// The App of `test/reach` in MiB: past Zig's own Debug linker (1536 crashed at start), under
+/// LLD's reach (2000 links and starts).
+const reach_mib: u32 = 1600;
+
+/// `test/reach/app.zig` with an App of `mib` MiB of ballast and 4 bytes.
+fn add_reach_app(
+    b: *std.Build,
+    name: []const u8,
+    mib: u32,
+    lld: bool,
+    target: std.Build.ResolvedTarget,
+    wgpu_lib_dir: ?[]const u8,
+) AppSteps {
+    const size = b.addOptions();
+    size.addOption(u32, "ballast_mib", mib);
+    return addApp(b, b, .{
+        .name = name,
+        .root_source_file = b.path("test/reach/app.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .wgpu_lib_dir = wgpu_lib_dir,
+        .imports = &.{.{ .name = "reach_size", .module = size.createModule() }},
+        .lld = lld,
+    });
 }
 
 /// `test/statics` and `tools/statics.zig` (step 82): the tool counts the App, the UI context, and
