@@ -272,7 +272,8 @@ pub const Frame = struct {
         assert(self.running);
     }
 
-    /// Ends the window loop by clearing `running`.
+    /// Ends the window loop by clearing `running`. The last transition: every other one
+    /// asserts `running`, so a host closes between frames, never inside one.
     pub fn close(self: *Frame) void {
         assert(self.running);
         self.running = false;

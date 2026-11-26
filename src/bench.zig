@@ -35,6 +35,10 @@
 //! second move resolves the target the first one's `drag_begin` left open; `release` moves to
 //! a point and releases there, ending a hold a frame later.
 //!
+//! A host ends a finished run between frames, never inside one: on the turn after the last
+//! measured frame, before its next step, `Replay.end_if_done` closes the host's `Frame`
+//! (test "a finished run closes the frame on the turn after its last present").
+//!
 //! ## 2b. File Drops
 //! `drop_hover` drags files over the target's centre and stays (the drag is not ended), so a
 //! drop zone's highlight shows in the dump. `drop` drags them there and drops: `replay_drop`
@@ -449,6 +453,18 @@ pub const Replay = struct {
         self.measured += 1;
         if (self.measured == scenario.frames) self.phase = .done;
         assert(self.measured <= scenario.frames);
+        return true;
+    }
+
+    /// Ends a finished run: closes `window` through `Frame.close` once every measured frame
+    /// was presented, and returns true. A host calls it between frames, before its next step,
+    /// never inside one, so the last frame's `mark_presented` sees a running frame.
+    pub fn end_if_done(self: *const Replay, window: *frame.Frame) bool {
+        assert(window.running);
+        if (self.phase != .done) return false;
+        assert(self.measured >= 1);
+        window.close();
+        assert(!window.running);
         return true;
     }
 };
@@ -1525,6 +1541,34 @@ test "replay runs setup once, cycles while measuring, and stops after frames" {
     try testing.expectEqual(Replay.Phase.done, replay.phase);
     try testing.expectEqual(@as(?Step, null), replay.next(s));
     try testing.expect(!replay.presented(s));
+}
+
+// Locks the end of a run (section 2): a host asks `end_if_done` at the start of each turn, so
+// all seven presents of `test_scenario` (the first frame, three setup steps, three measured) are
+// marked on a running frame, and the seventh turn closes it with no redraw owed.
+test "a finished run closes the frame on the turn after its last present" {
+    const s = &test_scenario;
+    var replay: Replay = .init();
+    var window: frame.Frame = .init();
+    window.mark_presented();
+    try testing.expect(!replay.presented(s));
+    var presents: u32 = 1;
+    var turns: u32 = 0;
+    while (turns < 16) : (turns += 1) {
+        if (replay.end_if_done(&window)) break;
+        try testing.expect(window.running);
+        _ = replay.next(s).?;
+        window.request_redraw();
+        window.mark_presented();
+        presents += 1;
+        _ = replay.presented(s);
+    }
+    try testing.expectEqual(@as(u32, 7), presents);
+    try testing.expectEqual(@as(u32, 6), turns);
+    try testing.expectEqual(@as(u32, 3), replay.measured);
+    try testing.expectEqual(Replay.Phase.done, replay.phase);
+    try testing.expect(!window.running);
+    try testing.expect(!window.redraw);
 }
 
 // Locks the key step's default: `.{ .key = .end }` with no `.text` validates, and its events are
