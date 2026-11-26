@@ -218,10 +218,11 @@
 //! that flips at the window's edge. The "flip" dropdown sits 40 px above the frame's bottom, so
 //! its list opens above it. The File menu holds New, Open…, Save, Save as… (disabled),
 //! About…, and Quit; About… opens a modal dialog centered in the frame over a dimmed backdrop,
-//! closed by its Close button or Escape. A right press on the panel opens the context menu
-//! (Copy, Paste, Reset) at the pointer. Hovering any knob, default or hardware, for
-//! `widgets.tooltip_delay_ms` shows "name value" beside its ring. An outside press only
-//! dismisses: the dropdown under it does not open.
+//! closed by its Close button or Escape, which withdraw its popup's request
+//! (`cx.withdraw_popup`), so a dialog shown and closed before a draw owes nothing. A right
+//! press on the panel opens the context menu (Copy, Paste, Reset) at the pointer. Hovering any
+//! knob, default or hardware, for `widgets.tooltip_delay_ms` shows "name value" beside its ring.
+//! An outside press only dismisses: the dropdown under it does not open.
 //!
 //! ## 4. Scenarios
 //! `still`; `interact` (click button 0, drag slider 0 by +80 px, click toggle 1, drag knob 1
@@ -1768,6 +1769,8 @@ const About = struct {
         const escape = event_value == .key_down and event_value.key_down.key == .escape;
         if (!clicked and !escape) return false;
         self.open = false;
+        // Opened and closed before a draw (Escape in the same frame), it owes that draw nothing.
+        cx.withdraw_popup(about_id);
         cx.redraw();
         return true;
     }
@@ -2666,6 +2669,28 @@ test "the chrome scenario maximizes, runs, and rests on close" {
     try std.testing.expect(app.maximized);
     try std.testing.expectEqualStrings("run", app.status_text());
     try std.testing.expectEqual(@as(f32, 1), app.window_buttons.hover[2].target);
+}
+
+// Locks the About dialog's withdrawal (section 3c, Patchwork step 83): shown and closed by
+// Escape before the next draw, it owes that draw nothing, so the draw ends cleanly in a safe
+// build.
+test "the About dialog opened and closed before a draw owes no popup" {
+    const app = new_app();
+    _ = frame(app);
+    const ctx = &test_context;
+    const key: input.Event = .{ .key_down = input.key_press(.a, .none, false, "a") };
+    ctx.event_begin(key);
+    app.about.show(ctx);
+    ctx.event_end();
+    try std.testing.expectEqual(about_id, ctx.popup_requested);
+    const escape: input.Event = .{ .key_down = input.key_press(.escape, .none, false, "") };
+    ctx.event_begin(escape);
+    try std.testing.expect(app.about.handle(ctx, escape));
+    ctx.event_end();
+    try std.testing.expectEqual(ui.Id.none, ctx.popup_requested);
+    _ = frame(app);
+    try std.testing.expect(!app.about.open);
+    try std.testing.expect(ctx.find(ctx.popup_backdrop(about_id)) == null);
 }
 
 // Locks the menu bar's choices (section 2h): Quit asks to close, Maximize to toggle, Dark sets

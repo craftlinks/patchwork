@@ -264,6 +264,26 @@ test "a dropdown changes only on a different item" {
     try testing.expectEqual(@as(u32, 0), cx.draw.overflow_count);
 }
 
+// Locks the withdrawn request (Patchwork step 83): a click that opens the list and Escape
+// before the next draw owe that draw nothing.
+test "a dropdown opened and closed before a draw owes no popup" {
+    const cx = fixture.context();
+    var dropdown = Dropdown.init(ui.id("wave", 0), &waves, 0);
+    dropdown_frame(cx, &dropdown);
+    const center: input.Point = .{ .x = 184, .y = 116 };
+    _ = fixture.send(cx, &dropdown, .{ .pointer_down = input.left_at(center) });
+    _ = fixture.send(cx, &dropdown, .{ .pointer_up = input.left_at(center) });
+    try testing.expect(dropdown.menu.open);
+    try testing.expectEqual(dropdown.menu.id, cx.popup_requested);
+    const escape = input.key_press(.escape, .none, false, "");
+    const closed = fixture.send(cx, &dropdown, .{ .key_down = escape });
+    try testing.expectEqual(Dropdown.Action.none, closed);
+    try testing.expect(!dropdown.menu.open);
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    dropdown_frame(cx, &dropdown);
+    try testing.expect(cx.find(cx.popup_backdrop(dropdown.menu.id)) == null);
+}
+
 // Locks the chevron: a "v" 12 px inside the right edge of a 168 x 32 face at (100, 100), 10
 // px wide and 5 high around the face's middle.
 test "the chevron sits inside the face's right edge" {

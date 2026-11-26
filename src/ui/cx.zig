@@ -65,7 +65,11 @@
 //! A widget that opens a popup calls `request_popup(id)`, which owes a draw. The owner's draw
 //! then meets the request with `begin_popup` (or `skip_popup` when its anchor was not drawn),
 //! and in safe builds `end_frame` panics naming the id when nothing met it: an app that forgot
-//! `ui.overlays` learns it on the first open, not by a menu that never shows.
+//! `ui.overlays` learns it on the first open, not by a menu that never shows. An owner that
+//! closes calls `withdraw_popup(id)`, so a popup opened and closed before the next draw (two
+//! keys in one frame: a key repeat, a paste, a script) owes nothing: closed, it has nothing to
+//! draw, and its `draw_overlay` returns before meeting anything. Withdrawing clears only the
+//! owner's own request, so a popup another owner opened in the same frame is still checked.
 //!
 //! ## 4. Alignment After the Fact
 //! At `end`, `turtle.main_shift` (main-axis alignment of the children) and then
@@ -966,7 +970,8 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
                 if (std.debug.runtime_safety and self.popup_met != self.popup_requested) {
                     std.debug.panic(
                         "popup {x} was requested but not drawn: call ui.overlays(cx, app) " ++
-                            "at the end of App.draw",
+                            "at the end of App.draw; a popup that closes before its draw " ++
+                            "calls cx.withdraw_popup(id)",
                         .{@backingInt(self.popup_requested)},
                     );
                 }
@@ -1386,6 +1391,16 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             assert(id != .none);
             self.popup_requested = id;
             self.redraw();
+        }
+
+        /// Withdraws popup `id`'s request: its owner closed it before the draw that would have
+        /// met it, so that draw owes it nothing (section 3c). A request for another id stays.
+        /// Every owner's `close` calls it; a no-op when `id` owes nothing. Not during a draw.
+        pub fn withdraw_popup(self: *Self, id: Id) void {
+            assert(self.phase != .draw);
+            assert(id != .none);
+            if (self.popup_requested == id) self.popup_requested = .none;
+            assert(self.popup_requested != id);
         }
 
         /// Notes that the owner of popup `id` reached it this frame but drew nothing, because
@@ -3611,6 +3626,38 @@ test "a popup request is met by the next draw" {
     context.event_end();
     context.begin_frame(400, 300, 120);
     context.skip_popup(menu);
+    _ = context.end_frame();
+    try testing.expectEqual(Id.none, context.popup_requested);
+}
+
+// Locks the withdrawal (section 3c): a request withdrawn before the draw is cleared, so a draw
+// that meets nothing ends cleanly; withdrawing another id, or an id that owes nothing, leaves
+// the request as it was; a popup opened after another was withdrawn is still owed its draw.
+test "a popup request withdrawn before the draw owes nothing" {
+    const context = new_context();
+    const menu = areas.id("menu", 0);
+    const other = areas.id("palette", 0);
+    popup_frame(context, false, 0);
+    context.event_begin(.{ .frame = 0 });
+    context.request_popup(menu);
+    context.withdraw_popup(other);
+    try testing.expectEqual(menu, context.popup_requested);
+    context.withdraw_popup(menu);
+    try testing.expectEqual(Id.none, context.popup_requested);
+    context.withdraw_popup(menu);
+    try testing.expectEqual(Id.none, context.popup_requested);
+    context.event_end();
+    context.begin_frame(400, 300, 120);
+    _ = context.end_frame();
+    try testing.expectEqual(Id.none, context.popup_requested);
+    context.event_begin(.{ .frame = 0 });
+    context.request_popup(menu);
+    context.withdraw_popup(menu);
+    context.request_popup(other);
+    context.event_end();
+    try testing.expectEqual(other, context.popup_requested);
+    context.begin_frame(400, 300, 120);
+    context.skip_popup(other);
     _ = context.end_frame();
     try testing.expectEqual(Id.none, context.popup_requested);
 }

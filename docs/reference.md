@@ -1084,7 +1084,10 @@ pub fn draw(app: *App, cx: *Context) void {
   `DropdownOf(Skin)`, and `TooltipOf(Skin)` are skinnable like the other widgets.
 - **Forgetting `ui.overlays`.** Opening a popup calls `cx.request_popup(id)`; in safe builds
   the next draw panics naming the id if no `draw_overlay` drew it, and `ui.overlays` on a target
-  with no overlay at all is a compile error.
+  with no overlay at all is a compile error. Closing calls `cx.withdraw_popup(id)`, so a popup
+  opened and closed before the next draw (`/` then Escape in one frame: a key repeat, a paste,
+  a script) owes nothing. The widgets do both; an app's own popup, like the gallery's About
+  dialog, calls `request_popup` when it shows and `withdraw_popup` when it closes.
 - **Idle.** An open menu at rest wakes nothing, and a tooltip's dwell animates only until it
   shows.
 
