@@ -130,7 +130,10 @@
 //! root, on `Layer.popup` and `Layer.tooltip` (`ui/cx.zig`, section 3c). A menu's backdrop
 //! takes every press outside
 //! it, so an outside press only dismisses. `bounds` (null for the window) is the rect a popup
-//! stays inside.
+//! stays inside. A popup owner requests its popup when it opens (`cx.request_popup`) and
+//! withdraws the request when it closes (`cx.withdraw_popup`), so one opened and closed before
+//! the next draw owes it nothing; `Menu.close` and `Palette.close` do both for every widget
+//! here, and an app's own popup (a dialog) does the same.
 //!
 //! ## 6b. Containers
 //! `Tabs`, `Splitter`, and `ListBox` keep the turtle's begin/end shape: the library owns the

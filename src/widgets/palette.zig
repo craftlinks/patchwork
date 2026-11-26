@@ -53,7 +53,9 @@
 //! next or previous enabled row, wrapping; from none, the first or last. Page Down and Page
 //! Up move over up to `config.rows` enabled rows, stopping at the last enabled row before the
 //! end. A key move scrolls the row into view. Tab moves focus before the palette sees it, so
-//! it arrives as `focus_lost` and dismisses. Closing clears focus and never restores it.
+//! it arrives as `focus_lost` and dismisses. Closing clears focus and never restores it, and
+//! withdraws the popup's request (`cx.withdraw_popup`), so a palette opened and closed before
+//! the next draw (`/` then Escape, or `/`, `f`, `i`, Enter, in one frame) owes it nothing.
 //!
 //! ## 5. Drawing and Geometry
 //! The popup is `width` wide and `height_for(rows)` high. It is placed once, at the height of
@@ -296,10 +298,13 @@ pub fn PaletteOf(comptime Skin: type, comptime config: PaletteConfig) type {
         }
 
         pub fn close(self: *Self, cx: anytype) void {
+            assert(self.id != .none);
             self.open = false;
             self.highlight = null;
             if (cx.focused(self.field.id)) cx.clear_focus();
+            cx.withdraw_popup(self.id);
             cx.redraw();
+            assert(!self.open);
         }
 
         pub fn filter_now(self: *Self, cx: anytype) void {
@@ -805,6 +810,35 @@ test "the key that opens the palette is not typed, and Tab dismisses" {
     try testing.expectEqual(P.Action.dismissed, press_key(cx, &p, .tab, ""));
     try testing.expect(!p.open);
     try testing.expect(cx.focused(ui.id("other", 0)));
+}
+
+// Locks the withdrawn request (Patchwork step 83): "/" that opens the palette and Escape before
+// the next draw owe that draw nothing; so do "/", "f", "i", and Enter, which choose row 0 of
+// the "fi" filter, item 4 ("Go to files").
+test "a palette opened and closed before a draw owes no popup" {
+    const cx = fixture.wide_context();
+    var p = P.init(ui.id("palette", 0), &test_items, 32, test_style);
+    frame_of(cx, &p);
+    const slash: input.Event = .{ .key_down = input.key_press(.other, .none, false, "/") };
+    cx.event_begin(slash);
+    p.open_at(cx, .{ .point = .{ 460, 104 } }, .at);
+    _ = p.handle(cx, slash);
+    cx.event_end();
+    try testing.expectEqual(p.id, cx.popup_requested);
+    try testing.expectEqual(P.Action.dismissed, press_key(cx, &p, .escape, ""));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    frame_of(cx, &p);
+    try testing.expect(cx.find(cx.popup_backdrop(p.id)) == null);
+    cx.event_begin(slash);
+    p.open_at(cx, .{ .point = .{ 460, 104 } }, .at);
+    _ = p.handle(cx, slash);
+    cx.event_end();
+    try testing.expectEqual(P.Action.filtered, press_key(cx, &p, .f, "f"));
+    try testing.expectEqual(P.Action.filtered, press_key(cx, &p, .i, "i"));
+    try testing.expectEqual(P.Action{ .chosen = 4 }, press_key(cx, &p, .enter, ""));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    frame_of(cx, &p);
+    try testing.expect(!p.open);
 }
 
 // Locks the app filter: a change returns filtered and leaves 21 rows; show lists items 19 and 4,

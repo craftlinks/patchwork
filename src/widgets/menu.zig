@@ -7,9 +7,10 @@
 //! item, the highlighted item, whether it is open, and what it hangs from: an `Anchor` (an id
 //! drawn this frame, or a point) and a `popup.Side`. `open_at(cx, anchor, side)` opens it with
 //! no highlight, gives it keyboard focus, and requests its popup (`cx.request_popup`), so a
-//! safe build that never draws it panics naming the id. `bounds` is the rect the popup stays
-//! inside (null for the window), which keeps placement deterministic in a window whose size the
-//! compositor picks.
+//! safe build that never draws it panics naming the id. `close` withdraws the request
+//! (`cx.withdraw_popup`), so a menu opened and closed before the next draw (Escape in the same
+//! frame) owes that draw nothing. `bounds` is the rect the popup stays inside (null for the
+//! window), which keeps placement deterministic in a window whose size the compositor picks.
 //!
 //! ## 2. Events
 //! `handle(cx, event) Action` reads nothing while closed. Open, it answers:
@@ -194,12 +195,14 @@ pub fn MenuOf(comptime Skin: type) type {
             assert(self.open);
         }
 
-        /// Closes the menu, gives up its focus, and owes a draw. Event phase.
+        /// Closes the menu, gives up its focus, withdraws its popup's request (a menu opened
+        /// and closed before a draw owes it nothing), and owes a draw. Event phase.
         pub fn close(self: *Self, cx: anytype) void {
             assert(self.id != .none);
             self.open = false;
             self.highlight = null;
             if (cx.focused(self.id)) cx.clear_focus();
+            cx.withdraw_popup(self.id);
             cx.redraw();
             assert(!self.open);
         }
@@ -575,6 +578,58 @@ test "a context menu opens at a right press on its target" {
     _ = send(cx, &context, .{ .pointer_move = .{ .x = 900, .y = 100 } }, target);
     const press_far: input.Event = .{ .pointer_down = far };
     try testing.expectEqual(MenuAction.dismissed, send(cx, &context, press_far, target));
+}
+
+// Locks the withdrawn request (section 1): a menu opened and closed before the next draw, by
+// Escape or by Enter on a row, owes that draw nothing, so the draw (which reaches the closed
+// menu and draws no popup) ends cleanly in a safe build (Patchwork step 83).
+test "a menu opened and closed before a draw owes no popup" {
+    const cx = fixture.context();
+    var menu = Menu.init(ui.id("menu", 0), &file_items);
+    menu_frame(cx, &menu, false);
+    cx.event_begin(.{ .frame = 0 });
+    menu.open_at(cx, .{ .id = ui.id("file", 0) }, .below);
+    cx.event_end();
+    try testing.expectEqual(menu.id, cx.popup_requested);
+    try testing.expectEqual(MenuAction.dismissed, send_key(cx, &menu, .escape));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    menu_frame(cx, &menu, false);
+    try testing.expect(cx.find(cx.popup_backdrop(menu.id)) == null);
+    cx.event_begin(.{ .frame = 0 });
+    menu.open_at(cx, .{ .id = ui.id("file", 0) }, .below);
+    cx.event_end();
+    _ = send_key(cx, &menu, .down);
+    try testing.expectEqual(MenuAction{ .chosen = 0 }, send_key(cx, &menu, .enter));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    menu_frame(cx, &menu, false);
+    try testing.expect(!menu.open);
+}
+
+// Locks the same for a context menu (section 4): a right press on the target and Escape before
+// the next draw owe it nothing.
+test "a context menu opened and closed before a draw owes no popup" {
+    const cx = fixture.context();
+    var context = ContextMenu.init(ui.id("context", 0), &file_items);
+    const target = ui.id("under", 0);
+    const point: input.Point = .{ .x = 410, .y = 405 };
+    var right = input.left_at(point);
+    right.button = .right;
+    const escape: input.Event = .{ .key_down = input.key_press(.escape, .none, false, "") };
+    menu_frame(cx, &context.menu, false);
+    const events = [_]input.Event{ .{ .pointer_move = point }, .{ .pointer_down = right }, escape };
+    var actions: [events.len]MenuAction = undefined;
+    for (events, &actions) |event, *action| {
+        cx.event_begin(event);
+        action.* = context.handle(cx, event, target);
+        cx.event_end();
+    }
+    try testing.expectEqual(MenuAction.dismissed, actions[2]);
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    cx.begin_frame(1280, 720, 120);
+    cx.area(target, .{ .x = 400, .y = 400, .width = 80, .height = 32 }, 0, ui.cx.plain);
+    ui.overlays(cx, &context);
+    _ = cx.end_frame();
+    try testing.expect(!context.menu.open);
 }
 
 /// Five labels of seven inked bytes.

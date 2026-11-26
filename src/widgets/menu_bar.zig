@@ -475,6 +475,30 @@ test "a menu bar chooses, closes on its title, and dismisses" {
     try testing.expectEqual(MenuBar.Action.closed, dismissed);
 }
 
+// Locks the withdrawn request (Patchwork step 83): a press on File and Escape before the next
+// draw owe it nothing; so do a press on File, Right to Edit, and Escape, where closing File
+// withdraws File's request and Escape then withdraws Edit's.
+test "a menu bar opened and closed before a draw owes no popup" {
+    const cx = fixture.context();
+    var bar = MenuBar.init(ui.id("bar", 0), &test_titles, &test_items);
+    draw_bar(cx, &bar);
+    const at_file = centre_of(cx, &bar, 0);
+    _ = fixture.send(cx, &bar, .{ .pointer_down = input.left_at(at_file) });
+    try testing.expectEqual(bar.menus[0].id, cx.popup_requested);
+    try testing.expectEqual(MenuBar.Action.closed, fixture.send(cx, &bar, key(.escape)));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    _ = fixture.send(cx, &bar, .{ .pointer_up = input.left_at(at_file) });
+    draw_bar(cx, &bar);
+    _ = fixture.send(cx, &bar, .{ .pointer_down = input.left_at(at_file) });
+    try testing.expectEqual(MenuBar.Action{ .opened = 1 }, fixture.send(cx, &bar, key(.right)));
+    try testing.expectEqual(bar.menus[1].id, cx.popup_requested);
+    try testing.expectEqual(MenuBar.Action.closed, fixture.send(cx, &bar, key(.escape)));
+    try testing.expectEqual(Id.none, cx.popup_requested);
+    _ = fixture.send(cx, &bar, .{ .pointer_up = input.left_at(at_file) });
+    draw_bar(cx, &bar);
+    try testing.expectEqual(@as(?u32, null), bar.open);
+}
+
 const wide_titles: [3][]const u8 = @splat(fixture.inked(4));
 const wide_menu: [3][]const u8 = @splat(fixture.inked(5));
 const wide_items = [_][]const []const u8{ &wide_menu, &wide_menu, &wide_menu };
