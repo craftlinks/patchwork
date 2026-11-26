@@ -103,6 +103,10 @@
 //!   (`python3 -I tools/browser_check.py panic still --headless` fails naming the panic). It
 //!   gets the `-panic` steps and `zig build` installs it; `test` runs its tests, and it is in no
 //!   `check` or `regress` list.
+//! - `test/statics` is an app whose App has a size of its own (1 MiB and 4 bytes). `zig build
+//!   test` builds its native executable, never installed or run, and runs `tools/statics.zig`
+//!   on it, which counts the App, the UI context, and the renderer among the executable's data
+//!   symbols and fails unless each is there once (step 82); `zig build statics` prints its line.
 //!
 //! ## 6. Fonts
 //! `add_font_module(patchwork_builder, ranges, fonts)` builds `tools/subset.zig` for the host,
@@ -913,6 +917,7 @@ pub fn build(b: *std.Build) void {
     add_compare_step(b, library);
     add_seams_step(b, vector, library, target, optimize);
     add_panic_steps(b, target, optimize, wgpu_lib_dir);
+    add_statics_step(b, target, optimize, wgpu_lib_dir);
     add_consumer_step(b, optimize);
     add_sound_step(b, optimize);
 }
@@ -975,6 +980,46 @@ fn add_panic_steps(
     add_example_steps(b, "-panic", "the panic test", panic);
     const test_step = b.top_level_steps.get("test").?;
     test_step.step.dependOn(panic.tests);
+}
+
+/// `test/statics` and `tools/statics.zig` (step 82): the tool counts the App, the UI context, and
+/// the renderer in the app's native executable and fails `test` unless each is held once. The
+/// executable is built, never installed or run. `zig build statics` prints the tool's line.
+fn add_statics_step(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    wgpu_lib_dir: ?[]const u8,
+) void {
+    const statics = addApp(b, b, .{
+        .name = "statics",
+        .root_source_file = b.path("test/statics/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .wgpu_lib_dir = wgpu_lib_dir,
+    });
+    // The count reads the symbol table (`tools/statics.zig`, section 1).
+    statics.exe.root_module.strip = false;
+    const root = b.createModule(.{
+        .root_source_file = b.path("tools/statics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root.addImport("patchwork", statics.library);
+    root.addImport("app", statics.app);
+    const tool = b.addExecutable(.{ .name = "statics-check", .root_module = root });
+    const checked = b.addRunArtifact(tool);
+    checked.addFileArg(statics.exe.getEmittedBin());
+    checked.expectStdErrMatch("held once");
+    checked.expectExitCode(0);
+    const test_step = b.top_level_steps.get("test").?;
+    test_step.step.dependOn(&checked.step);
+    test_step.step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = root })).step);
+    const shown = b.addRunArtifact(tool);
+    shown.addFileArg(statics.exe.getEmittedBin());
+    shown.stdio = .inherit;
+    const step = b.step("statics", "Count the App, context, and renderer in a native executable");
+    step.dependOn(&shown.step);
 }
 
 /// `test-consumer`: `test/consumer`, a package outside this build graph, through its own `zig

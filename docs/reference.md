@@ -205,6 +205,7 @@ patchwork/
 │   ├── web_exports.zig         # Wasm exports and zero-copy FFI bridge via @export
 │   ├── gpu_wgpu.zig            # Native replayer: id tables, execute, swapchain, headless target
 │   ├── offscreen.zig           # Offscreen(App): frames with no window, at any size and time
+│   ├── statics.zig             # Statics(App): the one app, context, and renderer both native hosts use
 │   ├── headless.zig            # `--regress` and `--render`: scenarios on Offscreen, goldens
 │   ├── wl_seat.zig             # Wayland seat, pointer, and keyboard bindings (version 8)
 │   ├── xkb.zig                 # libxkbcommon: keymap, modifiers, text, compose, repeat
@@ -295,6 +296,7 @@ patchwork/
 │   ├── browser_check.py        # A scenario replayed in Chromium against its headless frame;
 │   │                           # a panic in the page fails it at once, naming the panic
 │   ├── seams.zig               # `zig build seams`: counts a translucent stroke's seam faults on the GPU
+│   ├── statics.zig             # `zig build statics`: how many times an executable holds its App
 │   └── subset.zig              # The build's font subsetter (runs text/subset.zig on a face)
 ├── web/                        # Browser harness
 │   ├── index.html              # WebGPU canvas host page
@@ -313,6 +315,7 @@ patchwork/
     │                              # any `draw_overlay` fails, naming it
     ├── contract_args_mistyped.zig # Test verifying that an `args` of the wrong type fails
     ├── panic/app.zig           # A page that panics on its first frame, for the browser check
+    ├── statics/app.zig         # An App of a size of its own, for tools/statics.zig (part of test)
     └── consumer/               # A package outside this build (`zig build test-consumer`)
         ├── build.zig, build.zig.zon # `addApp` and `addTool` through a `.path` dependency
         ├── app.zig             # Imports both peers, declares `args` and a still scenario
@@ -428,6 +431,8 @@ zig build regress -Doptimize=ReleaseFast   # Every example's scenarios headless 
 zig build regress -Doptimize=ReleaseFast -- --bless   # Rewrite the goldens from this run
 zig build test-consumer   # test/consumer, a package outside this build: native, wasm, its tests
                           # and regress, its tool, and an argument (needs a GPU)
+zig build statics         # How many times test/statics's executable holds its App, context,
+                          # and renderer (each once; `zig build test` fails otherwise)
 ./zig-out/bin/gallery --render still --out frames     # A scenario's frames as PNGs
 python3 -I tools/browser_check.py gallery still   # One scenario in Chromium against headless
 python3 -I tools/browser_check.py gallery still --headless   # The same in headless Chromium
@@ -760,9 +765,11 @@ executable large. Zig's own Debug code generator and linker write it into the fi
 Debug's undefined pattern, and the linker leaves earlier copies behind as the data grows, so each
 such byte costs about 3.7 bytes of file. Builds through LLVM (ReleaseSafe, ReleaseFast,
 ReleaseSmall) keep it in BSS, where it costs nothing. The hosts keep the app, its UI context, and
-the renderer in such statics, and an executable holds two sets, the window host's and the one
-`Offscreen` uses for `--regress` and `--render`, so a slab that is a field of `App` is written
-twice: 128 MiB there gave a 981 MiB Debug executable. Only disk pays: a rebuild after an edit
+the renderer in such statics, one set that the window host and `Offscreen` (`--regress`,
+`--render`) share (`src/host/statics.zig`), so a slab that is a field of `App` is written once:
+128 MiB there gives a 510 MB Debug executable. All of an executable's static data must stay under
+the 2 GiB an x86-64 native link can reach (`R_X86_64_PC32`); with the one set, an App of 1.3 GB
+links. Only disk pays: a rebuild after an edit
 takes about as long either way. To keep an app's own slab out of the file, declare it at file
 scope and start it at zero, as `file_bytes` above does and as the headless host does for its
 `--render` frame: a zeroed static goes to BSS in every build.
@@ -2097,7 +2104,9 @@ try Off.frame(patchwork.host.offscreen.at_frame(n, 60));
 const pixels = try Off.read(.rgba, out);     // out.len == width_px * height_px * 4 (see Off.size_px())
 ```
 
-`Offscreen` has static storage, so there is one live instance per `App` type. `open` returns
+`Offscreen` has static storage, so there is one live instance per `App` type. Its app, UI context,
+and renderer are the ones the window host uses, held from `open` to `close`
+(`src/host/statics.zig`), so an executable holds them once. `open` returns
 `error.TooLarge` or `error.BadScale` for a size it cannot make. `frame` takes any
 `.{ .time_ms, .dt_ms }`, and time may go backwards: the shader clock follows it exactly, timer
 ticks fire only as time passes the next multiple of the period, and the app is never rewound, so

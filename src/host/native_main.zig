@@ -3,7 +3,8 @@
 //! The build compiles this file with two imports: `patchwork`, the library, and `app`, the
 //! application's root file. It contains no app code, so the same app source builds for
 //! native and browser. `linux_window.run` checks the app contract at compile time, then
-//! owns all storage on its own stack frame: window state, draw lists, queue, and the app.
+//! then keeps the window state on its own stack frame and the app, its context, and its
+//! renderer in the one static set both native hosts share (`host/statics.zig`).
 //! The command line selects the adapter, bench mode, the windowless shader check (`--check`,
 //! which returns before any Wayland connection), and the windowless scenario runs
 //! (`--regress` and `--render`, `host/headless.zig`, entered here before the window host);
