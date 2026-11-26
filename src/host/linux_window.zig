@@ -194,8 +194,9 @@
 //!
 //! ## 6. TigerStyle Invariants
 //! - `State` lives on the stack of `run`; the app, the draw context, and the renderer are
-//!   static in `Host(App)`, because their sizes follow the app (an editor holds hundreds of
-//!   KiB) and `App.config.draw`. The loop allocates nothing.
+//!   static, in the one set the offscreen host shares (`statics.zig`), because their sizes
+//!   follow the app (an editor holds hundreds of KiB) and `App.config.draw`. `run` holds the
+//!   set until it returns. The loop allocates nothing.
 //! - Every loop is bounded: input drain by `input.queue_cap`, `EINTR` retry by a fixed guard.
 //! - Wayland callbacks are leaf writers; all app and GPU work happens in the loop body.
 
@@ -209,6 +210,7 @@ const frame = @import("../frame.zig");
 const gpu = @import("../gpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
+const statics = @import("statics.zig");
 const font_data = @import("../text.zig").font_data;
 const ui = @import("../ui.zig");
 const wl_callback = @import("wl_callback.zig");
@@ -597,29 +599,32 @@ comptime {
 /// 7. Enters the blocking event loop (`Host(App).loop`).
 ///
 /// The window state lives on this stack frame. The app, the UI context (with the draw context
-/// inside it), and the renderer, whose pools and shadows are sized by `App.config`, are static
-/// (`Host(App)`), as on the web host, so a large app or configuration never grows the stack.
+/// inside it), and the renderer, whose pools and shadows are sized by `App.config`, are static,
+/// in the one set the offscreen host shares (`statics.zig`), as on the web host, so a large app or
+/// configuration never grows the stack and an executable holds them once.
 pub fn run(comptime App: type, options: bench.Options) !void {
     comptime app_contract.check(App);
     const AppHost = Host(App);
     if (options.bench) {
         if (!AppHost.bench_select(options)) return;
     }
+    AppHost.shared.claim(.window);
+    defer AppHost.shared.release(.window);
     var state = initial_state();
     AppHost.context.init();
-    app_contract.start(App, &AppHost.context);
+    app_contract.start(App, AppHost.context);
     AppHost.render.init();
     AppHost.render.cache = options.cache;
-    App.init(&AppHost.app_static, &AppHost.context.draw.textures);
+    App.init(AppHost.app_static, &AppHost.context.draw.textures);
     if (options.check) return AppHost.check(&state, options.adapter);
     // Before `args`, so a producer it starts can notify at once (section 5c).
     if (AppHost.has_producer) AppHost.wake_fd = try create_wake();
     defer if (AppHost.has_producer) {
         _ = std.os.linux.close(AppHost.wake_fd);
     };
-    if (AppHost.has_producer) App.wake(&AppHost.app_static).attach(AppHost.wake_fd);
+    if (AppHost.has_producer) App.wake(AppHost.app_static).attach(AppHost.wake_fd);
     if (comptime app_contract.has_args(App)) {
-        if (!options.bench) App.args(&AppHost.app_static, options.app_args);
+        if (!options.bench) App.args(AppHost.app_static, options.app_args);
     } else {
         assert(options.app_args.len == 0);
     }
@@ -632,7 +637,7 @@ pub fn run(comptime App: type, options: bench.Options) !void {
     try create_device(&state, .{ .adapter = options.adapter, .profile = options.bench });
     var host: AppHost = .{
         .state = &state,
-        .app = &AppHost.app_static,
+        .app = AppHost.app_static,
         .timer_fd = no_timer_fd,
         .timer_armed = false,
     };
@@ -823,12 +828,14 @@ fn Host(comptime App: type) type {
         timer_fd: i32,
         timer_armed: bool,
 
-        /// The app, its UI context (pools, areas, pointer state), and the renderer. Static so
-        /// app storage and the pools and shadows sized by `App.config` stay off the stack;
-        /// `run` initializes all three in place.
-        var app_static: App = undefined;
-        var context: Context = undefined;
-        var render: Renderer = undefined;
+        /// The app, its UI context (pools, areas, pointer state), and the renderer: the
+        /// process's one copy, shared with the offscreen host (`statics.zig`). Static so app
+        /// storage and the pools and shadows sized by `App.config` stay off the stack; `run`
+        /// initializes all three in place.
+        const shared = statics.Statics(App);
+        const app_static: *App = &shared.app;
+        const context: *Context = &shared.context;
+        const render: *Renderer = &shared.render;
 
         /// A producer on another thread (section 5c), and its descriptor.
         const has_producer = app_contract.has_producer(App);
@@ -931,8 +938,8 @@ fn Host(comptime App: type) type {
             const time_ms: u32 = @truncate(monotonic_ns() / std.time.ns_per_ms);
             const count = bench.step_events(step, rect, time_ms, &events);
             for (events[0..count]) |event| self.dispatch(event);
-            if (step == .drop) bench.replay_drop(App, self.app, &context, step.drop, rect.?);
-            bench.serve_window(App, self.app, &context);
+            if (step == .drop) bench.replay_drop(App, self.app, context, step.drop, rect.?);
+            bench.serve_window(App, self.app, context);
             state.frame.request_redraw();
             assert(state.frame.redraw);
         }
@@ -1333,7 +1340,7 @@ fn Host(comptime App: type) type {
         fn dispatch_chunks(self: *Self, chunks: []const input.Chunk) void {
             assert(chunks.len <= input.drop_files_max);
             for (chunks) |*chunk| {
-                ui.dispatch(App, self.app, &context, .{ .file = chunk });
+                ui.dispatch(App, self.app, context, .{ .file = chunk });
                 if (context.dirty) self.state.frame.request_redraw();
             }
         }
@@ -1355,7 +1362,7 @@ fn Host(comptime App: type) type {
         /// One dispatch, then the clipboard requests it made (section 5a).
         fn dispatch(self: *Self, event: input.Event) void {
             const state = self.state;
-            ui.dispatch(App, self.app, &context, event);
+            ui.dispatch(App, self.app, context, event);
             if (context.dirty) {
                 state.frame.request_redraw();
             }
@@ -1373,7 +1380,7 @@ fn Host(comptime App: type) type {
                 ui.dispatch(
                     App,
                     self.app,
-                    &context,
+                    context,
                     .{ .paste = state.clipboard.buffer[0..own.len] },
                 );
                 if (context.dirty) state.frame.request_redraw();
@@ -1398,7 +1405,7 @@ fn Host(comptime App: type) type {
             note_refresh(state);
             const dt_ms = state.clock.advance(state.frame_time_ms);
             if (render.animating) state.time.advance(dt_ms);
-            const animating = ui.animate(App, self.app, &context, dt_ms) or render.animating;
+            const animating = ui.animate(App, self.app, context, dt_ms) or render.animating;
             if (context.dirty) {
                 state.frame.request_redraw();
             }
@@ -1465,7 +1472,7 @@ fn Host(comptime App: type) type {
             bench_run.drew = ui.draw_frame(
                 App,
                 self.app,
-                &context,
+                context,
                 state.frame.width_logical,
                 state.frame.height_logical,
                 scale_120,
@@ -1573,7 +1580,7 @@ fn Host(comptime App: type) type {
         /// Calls `App.drain` once, and owes a redraw if it left the app dirty (section 5c).
         fn sync_producer(self: *Self) void {
             if (!has_producer) return;
-            App.drain(self.app, &context);
+            App.drain(self.app, context);
             producer_drains += 1;
             if (context.dirty) self.state.frame.request_redraw();
         }
@@ -1655,7 +1662,7 @@ fn Host(comptime App: type) type {
             // `sync_timer` disarms before every sleep, which discards unread expirations.
             assert(self.timer_armed);
             const now_ms = monotonic_ns() / 1_000_000;
-            App.timer(self.app, &context, now_ms);
+            App.timer(self.app, context, now_ms);
             if (context.dirty) {
                 if (state.frame.running) {
                     assert(state.frame.running);

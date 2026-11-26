@@ -18,8 +18,10 @@
 //! ```
 //! Drawing and reading are separate calls because a regress run draws a whole scenario and reads
 //! only its last frame. Nothing in the renderer or the app knows which client drives it. The
-//! storage is static, so there is one live instance per `App` type. Sizes follow the windowed
-//! host's rule (`frame.pixel_size`), and either side may be at most `bench.width_max`, the limit
+//! storage is static, so there is one live instance per `App` type, and its app, UI context, and
+//! renderer are the window host's too (`statics.zig`): `open` takes them and `close` gives them
+//! back, so a process never runs both hosts at once and an executable holds them once. Sizes
+//! follow the windowed host's rule (`frame.pixel_size`), and either side may be at most `bench.width_max`, the limit
 //! of a device with default limits. Frames are opaque: `read` gives alpha 255.
 //!
 //! ## 2. The Frame
@@ -40,7 +42,8 @@
 //! changed nothing leaves the target as it was.
 //!
 //! ## 3. Fresh State per Start
-//! The app, the UI context, the renderer, and the command buffer are static
+//! The app, the UI context, and the renderer (the set shared with the window host,
+//! `statics.zig`) and the command buffer are static
 //! (their sizes follow `App.config`), and every `start` initializes them in place as the windowed
 //! host's `run` does. The device is kept between starts and its tables are emptied with
 //! `gpu_wgpu.reset` before the setup stream is replayed again, which costs far less than a new
@@ -89,6 +92,7 @@ const frame_module = @import("../frame.zig");
 const gpu_wgpu = @import("gpu_wgpu.zig");
 const input = @import("../input.zig");
 const renderer = @import("../draw/renderer.zig");
+const statics = @import("statics.zig");
 const ui = @import("../ui.zig");
 
 /// A frame read back: `height` rows of `width` pixels in `layout`, top to bottom, over the
@@ -150,10 +154,13 @@ pub fn Offscreen(comptime App: type) type {
         const Renderer = renderer.Renderer(Context.DrawContext);
         const has_producer = app_contract.has_producer(App);
 
-        // Module guide, section 3: static, initialized in place per start.
-        var app_state: App = undefined;
-        var ui_context: Context = undefined;
-        var render: Renderer = undefined;
+        // Module guide, section 3: static, initialized in place per start. The app, the UI
+        // context, and the renderer are the process's one copy, shared with the window host
+        // (`statics.zig`).
+        const shared = statics.Statics(App);
+        const app_state: *App = &shared.app;
+        const ui_context: *Context = &shared.context;
+        const render: *Renderer = &shared.render;
         var buffer: commands.CommandBuffer = undefined;
         var device: gpu_wgpu.Gpu = undefined;
         var paste_buffer: [ui.cx.clipboard_cap]u8 = undefined;
@@ -184,6 +191,8 @@ pub fn Offscreen(comptime App: type) type {
             const width_px = frame_module.pixel_size(options.width, scale);
             const height_px = frame_module.pixel_size(options.height, scale);
             if (width_px > bench.width_max or height_px > bench.width_max) return error.TooLarge;
+            shared.claim(.offscreen);
+            errdefer shared.release(.offscreen);
             device = try gpu_wgpu.create_headless(options.adapter);
             errdefer gpu_wgpu.destroy(&device);
             try gpu_wgpu.headless_target_create(&device, width_px, height_px);
@@ -205,6 +214,7 @@ pub fn Offscreen(comptime App: type) type {
         pub fn close() void {
             assert(opened);
             gpu_wgpu.destroy(&device);
+            shared.release(.offscreen);
             opened = false;
             started = false;
             drawn = false;
@@ -217,10 +227,10 @@ pub fn Offscreen(comptime App: type) type {
             drawn = false;
             gpu_wgpu.reset(&device);
             ui_context.init();
-            app_contract.start(App, &ui_context);
+            app_contract.start(App, ui_context);
             render.init();
             render.cache = options.cache;
-            App.init(&app_state, &ui_context.draw.textures);
+            App.init(app_state, &ui_context.draw.textures);
             buffer.reset();
             render.setup(&buffer, &ui_context.draw);
             try gpu_wgpu.execute(&device, &buffer);
@@ -236,26 +246,26 @@ pub fn Offscreen(comptime App: type) type {
         /// The app, which the caller may change between frames.
         pub fn app() *App {
             assert(started);
-            return &app_state;
+            return app_state;
         }
 
         /// The UI context, which the caller may change between frames.
         pub fn context() *Context {
             assert(started);
-            return &ui_context;
+            return ui_context;
         }
 
         /// One dispatch with the windowed host's clipboard rule when the app owns the selection:
         /// a paste request pastes the app's own copy (`linux_window.zig`, 5a).
         pub fn dispatch(event: input.Event) void {
             assert(started);
-            ui.dispatch(App, &app_state, &ui_context, event);
+            ui.dispatch(App, app_state, ui_context, event);
             if (ui_context.take_copy()) owns_copy = true;
             if (!ui_context.take_paste_request()) return;
             if (!owns_copy) return;
             const own = ui_context.copied();
             @memcpy(paste_buffer[0..own.len], own);
-            ui.dispatch(App, &app_state, &ui_context, .{ .paste = paste_buffer[0..own.len] });
+            ui.dispatch(App, app_state, ui_context, .{ .paste = paste_buffer[0..own.len] });
         }
 
         /// A scenario step's events, stamped `time_ms`. `error.NoArea` when its target was not
@@ -271,9 +281,9 @@ pub fn Offscreen(comptime App: type) type {
             const count = bench.step_events(taken, rect, time_ms, &events);
             for (events[0..count]) |event| dispatch(event);
             if (taken == .drop) {
-                bench.replay_drop(App, &app_state, &ui_context, taken.drop, rect.?);
+                bench.replay_drop(App, app_state, ui_context, taken.drop, rect.?);
             }
-            bench.serve_window(App, &app_state, &ui_context);
+            bench.serve_window(App, app_state, ui_context);
         }
 
         /// One frame at the given time (module guide, section 2). With `.ticks = .each`,
@@ -282,7 +292,7 @@ pub fn Offscreen(comptime App: type) type {
         pub fn frame(at: At) !void {
             assert(started);
             assert(at.dt_ms >= 0);
-            _ = fire_ticks(App, &app_state, &ui_context, &clock, at) catch |err| {
+            _ = fire_ticks(App, app_state, ui_context, &clock, at) catch |err| {
                 std.log.err(
                     "offscreen frame at {d} ms owes {d} timer ticks of {d} ms, more than " ++
                         "bench.ticks_per_frame_max ({d}): draw it with .ticks = .collapse",
@@ -295,11 +305,11 @@ pub fn Offscreen(comptime App: type) type {
                 );
                 return err;
             };
-            _ = ui.animate(App, &app_state, &ui_context, at.dt_ms);
+            _ = ui.animate(App, app_state, ui_context, at.dt_ms);
             if (has_producer) produce();
             const logical_w = size.width_logical;
             const logical_h = size.height_logical;
-            _ = ui.draw_frame(App, &app_state, &ui_context, logical_w, logical_h, size.scale_120);
+            _ = ui.draw_frame(App, app_state, ui_context, logical_w, logical_h, size.scale_120);
             buffer.reset();
             const time: animator.Time = .{ .ms = at.time_ms };
             render.frame(&buffer, &ui_context.draw, size, time.seconds());
@@ -311,10 +321,10 @@ pub fn Offscreen(comptime App: type) type {
         fn produce() void {
             assert(has_producer);
             if (comptime app_contract.has_produce(App)) {
-                App.produce(&app_state, bench.producer_frames_at(producer_frames, fps));
+                App.produce(app_state, bench.producer_frames_at(producer_frames, fps));
             }
             producer_frames += 1;
-            App.drain(&app_state, &ui_context);
+            App.drain(app_state, ui_context);
         }
 
         /// Copies the target into `out`, whose length is the frame's in `layout`. Blocks until

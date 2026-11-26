@@ -92,6 +92,7 @@ test {
     _ = host.clipboard;
     _ = host.offscreen;
     _ = host.headless;
+    _ = @import("host/statics.zig");
     // These two hosts carry layout asserts and tests shared with the web shell and the wgpu
     // pipelines; referencing them here makes those checks part of `zig build test`.
     _ = host.web_exports;
