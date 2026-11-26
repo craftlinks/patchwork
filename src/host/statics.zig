@@ -29,14 +29,32 @@
 //! close, and open again. Claiming while the other holds it is a bug, caught by an assert: both
 //! would initialize the same app in place under each other.
 //!
-//! ## 4. TigerStyle Invariants
+//! ## 4. How Large
+//! Zig 0.17's own Debug backend and linker write these `undefined` statics into the file with a
+//! third more room, and an executable whose static data ends past 2 GiB links without an error and
+//! crashes (an absolute 32-bit address that cannot hold it). An App of 1500 MiB started, 1536 MiB
+//! crashed at start (step 85). So under any backend but LLVM the three together may be at most
+//! `own_linker_bytes_max`, 1 GiB, and a larger App fails to compile naming the fix. Through LLD
+//! (`AppOptions.lld`) they are BSS and LLD refuses a link that cannot reach, so there is no bound
+//! here. The app's own file-scope statics are not counted.
+//!
+//! ## 5. TigerStyle Invariants
 //! - Static allocation: the sizes follow `App` and `App.config`, as in each host before.
 //! - `claim` and `release` assert the holder, so a second host cannot start silently.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const app_contract = @import("../app.zig");
 const renderer = @import("../draw/renderer.zig");
+
+/// The most bytes the app, its context, and its renderer may be together when Zig's own backend and
+/// linker build the executable (module guide, section 4).
+pub const own_linker_bytes_max: u64 = 1 << 30;
+
+comptime {
+    assert(own_linker_bytes_max < 1 << 31);
+}
 
 /// The host that holds an App's statics (module guide, section 3).
 pub const Holder = enum(u8) { none, window, offscreen };
@@ -54,6 +72,18 @@ pub fn Statics(comptime App: type) type {
         pub var render: Renderer = undefined;
 
         var holder: Holder = .none;
+
+        comptime {
+            const bytes = @sizeOf(App) + @sizeOf(Context) + @sizeOf(Renderer);
+            if (builtin.zig_backend != .stage2_llvm and bytes > own_linker_bytes_max) {
+                @compileError(std.fmt.comptimePrint("the app, its context, and its renderer " ++
+                    "are {d} bytes of static data, past the {d} bytes Zig's own linker " ++
+                    "holds: link through LLD (`AppOptions.lld`)", .{
+                    bytes,
+                    own_linker_bytes_max,
+                }));
+            }
+        }
 
         /// Takes the statics for `by`. Asserts no host holds them.
         pub fn claim(by: Holder) void {

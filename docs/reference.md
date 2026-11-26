@@ -316,6 +316,7 @@ patchwork/
     ├── contract_args_mistyped.zig # Test verifying that an `args` of the wrong type fails
     ├── panic/app.zig           # A page that panics on its first frame, for the browser check
     ├── statics/app.zig         # An App of a size of its own, for tools/statics.zig (part of test)
+    ├── reach/app.zig           # An App of 1600 MiB: starts through LLD, refused without (step 85)
     └── consumer/               # A package outside this build (`zig build test-consumer`)
         ├── build.zig, build.zig.zon # `addApp` and `addTool` through a `.path` dependency
         ├── app.zig             # Imports both peers, declares `args` and a still scenario
@@ -421,8 +422,9 @@ zig build test-contract   # Verify compile errors for a missing `draw`, a ragged
                           # knob skin without `knob`, `ui.overlays` of a target
                           # with no `draw_overlay`, an editor language without
                           # `next`, `draw.covered_glyphs` without a `Box`, too few `faces`
-                          # in an editor language, `scales` without `faces`, and an
-                          # `args` of the wrong type
+                          # in an editor language, `scales` without `faces`, an
+                          # `args` of the wrong type, an App too large for Zig's own
+                          # linker, and an App past LLD's reach (test/reach)
 zig build check           # Compile every example's shaders and pipelines on a GPU with no
                           # window; fails naming the broken draw type (needs a GPU)
 zig build check -- --adapter low   # The same on the integrated GPU
@@ -550,9 +552,16 @@ Steps. `steps.install` puts `<name>` in the consumer's `<prefix>/bin` and
 directories together when shipping the native build.
 
 `AppSteps` also carries `exe` (the native executable), `library` and `app` (the native
-`patchwork` and app modules), and `wgpu_lib` (the directory holding `libwgpu_native.so`), for a
-`build.zig` that needs more than the steps. Regress works from a consumer's tree: `steps.regress`
-runs from its build root, and its goldens are its own `test/golden/<adapter>/<name>.txt`.
+`patchwork` and app modules), `wgpu_lib` (the directory holding `libwgpu_native.so`), and `lld`,
+for a `build.zig` that needs more than the steps. Regress works from a consumer's tree:
+`steps.regress` runs from its build root, and its goldens are its own
+`test/golden/<adapter>/<name>.txt`.
+
+`AppOptions.lld` links the native executable, the app's tests, and every `addTool` tool over the
+app through LLVM and LLD in every mode. Leave it off unless the App is large: a Debug build then
+uses Zig's own backend and linker, which rebuild and run faster. Without it the hosts refuse, at
+compile time, an App that Zig's own linker cannot hold, and the error names the option (see the
+static data under Arguments).
 
 ### 3. `src/app.zig`
 
@@ -763,16 +772,23 @@ pub fn args(app: *App, arguments: []const [:0]const u8) void {
 A file too long for the buffer comes back cut to it. A large static left `undefined` makes a Debug
 executable large. Zig's own Debug code generator and linker write it into the file, filled with
 Debug's undefined pattern, and the linker leaves earlier copies behind as the data grows, so each
-such byte costs about 3.7 bytes of file. Builds through LLVM (ReleaseSafe, ReleaseFast,
-ReleaseSmall) keep it in BSS, where it costs nothing. The hosts keep the app, its UI context, and
-the renderer in such statics, one set that the window host and `Offscreen` (`--regress`,
-`--render`) share (`src/host/statics.zig`), so a slab that is a field of `App` is written once:
-128 MiB there gives a 510 MB Debug executable. All of an executable's static data must stay under
-the 2 GiB an x86-64 native link can reach (`R_X86_64_PC32`); with the one set, an App of 1.3 GB
-links. Only disk pays: a rebuild after an edit
-takes about as long either way. To keep an app's own slab out of the file, declare it at file
-scope and start it at zero, as `file_bytes` above does and as the headless host does for its
-`--render` frame: a zeroed static goes to BSS in every build.
+such byte costs about 3.7 bytes of file. Builds through LLVM and LLD (ReleaseSafe, ReleaseFast,
+ReleaseSmall, and every build with `AppOptions.lld`) keep it in BSS, where it costs nothing. The
+hosts keep the app, its UI context, and the renderer in such statics, one set that the window host
+and `Offscreen` (`--regress`, `--render`) share (`src/host/statics.zig`), so a slab that is a
+field of `App` is written once: 128 MiB there gives a 510 MB Debug executable. Only disk pays: a
+rebuild after an edit takes about as long either way. To keep an app's own slab out of the file,
+declare it at file scope and start it at zero, as `file_bytes` above does and as the headless host
+does for its `--render` frame: a zeroed static goes to BSS in every build.
+
+An executable's static data must end below 2 GiB, the most its 32-bit addresses reach. LLD refuses
+a link past that, naming the relocation that cannot reach (`R_X86_64_PC32 out of range`). Zig's
+own linker does not refuse: past the reach it writes an executable that crashes, at start or at the
+first static it cannot address, and since it gives these statics a third more room it reaches less.
+So under Zig's own backend the hosts refuse, at compile time, an App, UI context, and renderer past
+1 GiB together (`own_linker_bytes_max` in `src/host/statics.zig`), naming `AppOptions.lld`; with
+it, an App of up to about 2 GB starts. Statics an app declares at file scope are not counted: an
+app with large ones of its own sets `lld` as well.
 
 ## Layout While Drawing
 
