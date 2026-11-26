@@ -1976,7 +1976,8 @@ zig build bench-<example> -Doptimize=ReleaseFast -- <scenario> [options]
 - **Report.** Min, p10, p50, p90, and max per metric, the mode, the adapter's name, and the
   window size; `--csv` writes every measured frame. Compare runs at the same window size: GPU
   time scales with it, and drivers change clock states under light load, so read the minimum
-  next to the median.
+  next to the median. A Debug or ReleaseSafe build runs the same replay and report, with every
+  assert checked; only ReleaseFast timings are worth comparing.
 - **Frames.** `--dump` copies the last measured frame from the swapchain and writes a PPM.
   Two runs of a step-driven scenario (`typing`) give identical dumps; a timer-driven one
   (`transport`) differs where the timer moved things, because how many ticks land during the

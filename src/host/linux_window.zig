@@ -62,7 +62,9 @@
 //!
 //! ## 4. Loop State Machine
 //! Each iteration runs, in order: `ack_if_needed`, `sync_input`, `sync_producer`, `bench_step`,
-//! `sync_clock`, `present_if_dirty`, `sync_timer`, `sync_title`, `wait_for_events`.
+//! `sync_clock`, `present_if_dirty`, `sync_timer`, `sync_title`, `wait_for_events`. A close
+//! (`sync_input`) or the end of a bench run (`bench_step`) stops the loop at once, so no later
+//! call meets a closed `Frame`.
 //! Callbacks only write `State`; all app calls happen in this order on the main thread. A bench
 //! frame's work runs in the order `host/offscreen.zig` states (section 2); this host adds the
 //! pacing and the presentation.
@@ -142,9 +144,12 @@
 //! owed), before `sync_clock`, so the forced frame is scheduled like real input. Around the
 //! existing seams it times `prepare_app`, `finalize` (run once early, since it is idempotent),
 //! `Renderer.frame`, and `gpu.submit`, reads the pass time from `gpu.native`, and counts shaded
-//! area per draw type. After the last measured frame the loop ends and `bench_finish` writes
-//! the frame dump and prints the report. Without `--bench` only two clock reads per present
-//! remain.
+//! area per draw type. On the loop's next turn after the last measured frame, `bench_step`
+//! ends the run through `Replay.end_if_done` (`Frame.close`), as an unknown target does, and
+//! the loop stops before `sync_clock`; `bench_finish` then writes the frame dump and prints
+//! the report. Nothing ends the run inside a frame, whose transitions (`mark_presented`,
+//! `request_redraw`) assert a running `Frame`, so every build mode runs the bench. Without
+//! `--bench` only two clock reads per present remain.
 //!
 //! ## 5c. A Producer
 //! An app that declares a producer (`app.zig`, section 4e) gets an `eventfd` in `Slot.wake`,
@@ -921,6 +926,8 @@ fn Host(comptime App: type) type {
         fn bench_step(self: *Self) void {
             if (!bench_run.active) return;
             const state = self.state;
+            // A finished run ends here, between frames, never inside one (section 5b).
+            if (bench_run.replay.end_if_done(&state.frame)) return;
             if (!bench_run.presented_any) return;
             if (state.frame.redraw) return;
             if (state.frame_callback != null) return;
@@ -929,7 +936,7 @@ fn Host(comptime App: type) type {
             if (bench.step_target(step)) |target| {
                 const found = context.find(target.id) orelse {
                     std.debug.print("bench: no area {s} {d}\n", .{ target.name, target.index });
-                    state.frame.running = false;
+                    state.frame.close();
                     return;
                 };
                 rect = found.rect;
@@ -965,8 +972,8 @@ fn Host(comptime App: type) type {
             render.present_next = true;
         }
 
-        /// Records a presented frame: a sample when it was measured, the CSV line, and the
-        /// end of the run after the last one.
+        /// Records a presented frame: a sample when it was measured, and its CSV line. The
+        /// run ends on the loop's next turn, in `bench_step` (section 5b).
         fn bench_presented(state: *State, timing: bench.Sample) void {
             assert(bench_run.active);
             bench_run.presented_any = true;
@@ -988,7 +995,6 @@ fn Host(comptime App: type) type {
             bench_samples[bench_run.count] = sample;
             bench_run.count += 1;
             if (bench_run.csv_fd >= 0) bench_write_csv(bench_run.count - 1, &sample);
-            if (bench_run.replay.phase == .done) state.frame.running = false;
             assert(bench_run.count == bench_run.replay.measured);
         }
 
@@ -1291,6 +1297,8 @@ fn Host(comptime App: type) type {
                 if (!state.frame.running) break;
                 self.sync_producer();
                 self.bench_step();
+                // A bench run that ended (section 5b) stops before the clock.
+                if (!state.frame.running) break;
                 self.sync_clock();
                 try self.present_if_dirty();
                 self.sync_timer();
@@ -1568,8 +1576,8 @@ fn Host(comptime App: type) type {
             if (fds[@backingInt(Slot.receive)].revents != 0) clipboard.pump_receive();
             if (fds[@backingInt(Slot.wake)].revents != 0) drain_wake(wake_fd);
             if (fds[@backingInt(Slot.drop_list)].revents != 0) clipboard.dnd.pump_list();
-            // A bench run that ended in a callback read above stops the loop. That wake is not
-            // a failure.
+            // A guard: nothing read above closes the frame (a close is served after a
+            // dispatch, and a bench run ends in `bench_step`, section 5b).
             if (!state.frame.running) {
                 assert(!state.frame.running);
                 return;
