@@ -803,6 +803,9 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   container's box. Only `flow` is required; the rest default to none, so a container opens
   in one statement: `cx.begin(walk, .{ .flow = .down, .spacing = 8, .padding = .all(12) })`.
   `Inset.all(v)`, `Inset.xy(x, y)`, and `Inset.sides(left, top, right, bottom)` build insets.
+  A `draw.Rect` answers the plain questions: `rect.contains(p)` (half-open, so neighbours do
+  not both claim an edge), `rect.intersects(other)` (strict: touching rects are apart),
+  `rect.center()`, and `draw.Rect.around(centre, radius)`, the square round a point.
 - **Walk** (on the child): `width`, `height`, and `margin` (none by default; `ui.sized(w, h)`
   is `.{ .width = w, .height = h }`). A `Size` is `fixed`, `fill` (on
   the main axis, what remains at placement, so a second fill gets 0), `share(n)` (one n-th of
@@ -848,7 +851,9 @@ Nesting is the call structure; the stack holds at most 32 open containers.
   (`ArcLook.shape`), or with none the scheme's (`Scheme.arc`, through `kit.arc`) or the default
   ring (`Arc.of`); `ArcLook.start`, a fraction of the sweep, moves the arc along the ring (a
   pan is an arc from 0.5), and `draw.arc_point(ring, shape, fraction, inset)` is the point a
-  value dot sits on; `ui` and `draw` use the constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
+  value dot sits on (`draw.arc_point_at(centre, radius, shape, fraction)` the same round a
+  centre at a radius, for an app that keeps its rings as a centre); `ui` and `draw` use the
+  constructors directly. One file per widget lives in `src/widgets/`; `widgets.zig`
   re-exports every name. Each widget is generic over a skin that draws it (`KnobOf(Skin)`;
   see Make a Skin below).
 - **Views and lists.** `cx.begin_view(id, walk, layout, *ViewState)` clips its children to
@@ -889,12 +894,17 @@ the device scale, and only the glyph records change (see Text below).
 - **Clipboard.** `cx.copy(bytes)` hands up to 64 KiB to the host and `cx.request_paste()`
   asks for the clipboard, which arrives as one `paste` event for the focused widget.
 - **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
+  `ui.cx.plain_with(cursor)` is the plain flags with a shape, for an area that only hovers
+  and presses (a grab handle, a link, a resize strip); `plain_with(.default)` is `plain`.
 - **Browser keys.** A browser key is consumed (`cx.consumed()`, so the page's default does not
   run) when a widget had focus, Tab moved it, the key's own event gave an area focus (a `/`
   that opens a palette), or the app called `cx.consume_key()` during the press (a key it acts
   on with nothing focused, such as Ctrl and + for its own zoom); clipboard shortcuts (Ctrl or
   Cmd with C, X, V) never are.
 - **Repeat.** Hosts repeat keys (`KeyPress.repeat`); the library never does.
+- **Typed keys.** `press.types("?")` is whether a key typed exactly those bytes: an app's bare
+  character keys (`?`, `=`, a space). It has no repeat or modifier policy of its own; a press
+  with Ctrl or Meta types nothing, so it never matches, and a shortcut is read by `press.key`.
 
 ## Theme
 
@@ -1014,7 +1024,10 @@ const HardKnob = widgets.KnobOf(Skin); // init, sized, handle, Action: those of 
   counts no areas; the widget records them. `KnobOf(S)` checks it after the function:
   "hardware.Skin: missing `pub const knob_appends: widgets.SkinAppends`", and a type named
   twice, a type that is not a draw type, or areas are refused by name. `with(bytes)` gives one
-  call's `widgets.Appends`; `plus`, `times`, `max`, and `of(T)` combine and read them.
+  call's `widgets.Appends`; `plus`, `times`, `max`, and `of(T)` combine and read them, and
+  `widgets.Appends.stroke(n)` is one stroke through `n` points (its chunks' `draw.Path`
+  instances and `n` points), so a chevron is `stroke(3)` and two five-point strokes
+  `stroke(5).times(2)`.
 - **A widget's counts.** `KnobOf(S).appends`, and the same on `ToggleOf`, `CheckboxOf`,
   `SliderOf`, `PanelOf`, `SplitterOf`, `DisclosureOf`, `TooltipOf`, and `NumberBoxOf`, is
   what one instance appends to a frame at most with skin `S`: the skin's declarations with the
@@ -1496,8 +1509,9 @@ zoom) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms 
 rung (2^(1/6)) about the pointer from 25% to 400%, dragging the background pans, pressing a
 module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
 center, and `0` resets; `d` dashes every cable at 8 on, 4 off, and `f` makes the dashes flow at
-40 world pixels a second (step 65). Modules and cables are culled in world pixels, below 50% a module is
-its face and header, and text below a 6-pixel on-screen em is not placed, so the zoomed-out
+40 world pixels a second (step 65). Modules and cables are culled in world pixels (a cable by
+`draw.path.bounds` round its control points), below 50% a module is its face and header, and
+text that is not `ui.canvas.legible` (below a 6-pixel on-screen em) is not placed, so the zoomed-out
 canvas (408 modules visible) places no glyphs. The status line shows the zoom, the offset,
 the visible modules and cables, and the glyph cache's epoch, which a full zoom sweep leaves
 at 0. Scenarios: `still`, `zoom` (every rung in and out), `pan` (arrow keys), `zoomed`
@@ -1936,6 +1950,10 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
 - **Paths.** `draw.path.cubic` flattens by the on-screen length (`view_zoom`). Widths and dash
   lengths are world pixels, so dashes scale with the zoom; a pattern that shimmers far out is
   the app's level of detail to drop.
+- **Legibility.** `ui.canvas.legible(size, zoom)` is whether text of `size` at `zoom` is at least
+  `ui.canvas.legible_px_min` (6) on screen. A canvas tests it before placing a label, so a
+  zoomed-out canvas places no glyphs; `kit.label` itself never skips, so each canvas chooses
+  what it drops.
 
 ## Data From Another Thread
 
@@ -2496,6 +2514,13 @@ if (placed) |p| cx.path_area(id, p, stroke.width, flags);             // hit wit
 
 - **Flattening.** A cubic gets `clamp(ceil(((chord + control polygon) / 2) / 6), 4, 64)`
   segments.
+- **Geometry.** `draw.path.cubic_point(control, t)` is the point at `t` on a cubic (the
+  Bernstein weights summed left to right), and `draw.path.sample_cubic(out, control)` fills
+  `out` (2 to 65 points) at `t = index / (out.len - 1)` with exact ends, for an app that keeps
+  a fixed count of points to stroke and hit-test. `draw.path.bounds(points, grow)` is the box
+  round any points grown by `grow` on every side, the cull box of a stroke `2 * grow` wide
+  (`cx.visible(draw.path.bounds(&control, width))`). Flattening keeps its own `t` steps,
+  which differ from `sample_cubic`'s in the last bit.
 - **Chunks.** Each `Path` instance (96 bytes) covers a chunk of at most 16 points of the point
   pool, and its fragment takes the minimum distance over the chunk's segments, so joints
   inside a chunk blend once. Chunks share their end point by index (no point is stored
@@ -2758,11 +2783,16 @@ const options: text.Options = .{ .align_x = .center, .align_y = .center, .ellips
 text.place(cx.drawing(), style, "0.50", rect, clip, options);  // during App.draw
 const runs = [_]text.Run{ .{ .style = style, .bytes = "x = " }, .{ .style = bold, .bytes = "2" } };
 text.place_runs(cx.drawing(), &runs, rect, clip, options);    // one baseline for mixed styles
+const box = text.bounds(style, "0.50", rect, options);        // the box place puts it in, pure
 ```
 
 `text.Options` has no defaults: `align_x`, `align_y`, and `ellipsis` are all required.
 `text.WrapOptions` defaults both alignments to `.start`. A `text.Run` is `.style`, a
-`text.Style`, and `.bytes`, its UTF-8.
+`text.Style`, and `.bytes`, its UTF-8. `text.bounds` is the box `place` puts a line in,
+before the device snap: from the pen's start for the extent (or the ellipsis cut's width), and
+from the top of the ascent for the ascent and descent. It comes from the same fit `place`
+uses, so a rule or a hit box placed by it meets the drawn text; with an ellipsis that does not
+fit even itself it is 0 wide.
 
 - **Letter spacing.** `Style.tracking` (default 0) is extra advance after every codepoint,
   spaces and the ellipsis included, in ems of `size`, in `[0, text.tracking_max]` (0.5):

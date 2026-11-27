@@ -33,6 +33,19 @@
 //! `x = rect.x + rect.width * i / (n - 1)` and
 //! `y = rect.y + rect.height * (1 - clamp((v - lo) / (hi - lo), 0, 1))`.
 //!
+//! ## 3a. Points on a Cubic
+//! `cubic_point(control, t)` is the Bernstein form with `u = 1 - t`:
+//! ```text
+//! p(t) = u*u*u * p0 + 3*u*u*t * p1 + 3*u*t*t * p2 + t*t*t * p3     summed left to right per axis
+//! ```
+//! `sample_cubic(out, control)` writes `out.len` points at `t = index / (out.len - 1)` with the
+//! ends exactly `p0` and `p3`, for an app that keeps a fixed count of points (a cable it also
+//! hit-tests, a label on the curve). `flatten_cubic_at` keeps its own loop on purpose: it steps
+//! `t = index * (1 / segments)`, which in `f32` is not `index / segments`, so moving it onto
+//! `sample_cubic` would move every path's points by a bit and every golden that draws one.
+//! `bounds(points, grow)` is the box round any points grown by `grow`, the cull box of a stroke
+//! `2 * grow` wide; the appenders take their own bounds from it with `grow` 0.
+//!
 //! ## 4. Chunks and Seams
 //! Chunks overlap by one index: a chunk ends at point `e` and the next starts at `e`, so no
 //! point is stored twice. `chunk_end` is greedy: at least `chunk_segments_min` segments, at
@@ -366,6 +379,42 @@ pub fn flatten_cubic_at(
     assert(out[0][0] == p0[0]);
     assert(out[segments][1] == p3[1]);
     return segments + 1;
+}
+
+/// The point at `t` (in `[0, 1]`) on the cubic `control` (section 3a): with `u = 1 - t`, the
+/// weights `u*u*u`, `3*u*u*t`, `3*u*t*t`, `t*t*t` times the control points, summed in that order
+/// per axis.
+pub fn cubic_point(control: [4]Point, t: f32) Point {
+    assert(t >= 0 and t <= 1);
+    const u = 1 - t;
+    const w0 = u * u * u;
+    const w1 = 3 * u * u * t;
+    const w2 = 3 * u * t * t;
+    const w3 = t * t * t;
+    const point: Point = .{
+        w0 * control[0][0] + w1 * control[1][0] + w2 * control[2][0] + w3 * control[3][0],
+        w0 * control[0][1] + w1 * control[1][1] + w2 * control[2][1] + w3 * control[3][1],
+    };
+    assert(point[0] == point[0]);
+    assert(point[1] == point[1]);
+    return point;
+}
+
+/// Fills `out` with `out.len` points of the cubic `control` at `t = index / (out.len - 1)`, the
+/// ends written exactly (section 3a). `out.len` is 2 to `cubic_points_max`.
+pub fn sample_cubic(out: []Point, control: [4]Point) void {
+    assert(out.len >= 2);
+    assert(out.len <= cubic_points_max);
+    const last: u32 = @intCast(out.len - 1);
+    const span: f32 = @floatFromInt(last);
+    out[0] = control[0];
+    var index: u32 = 1;
+    while (index < last) : (index += 1) {
+        out[index] = cubic_point(control, @as(f32, @floatFromInt(index)) / span);
+    }
+    out[last] = control[3];
+    assert(out[0][0] == control[0][0]);
+    assert(out[last][1] == control[3][1]);
 }
 
 /// Maps `samples` into `rect` with `range = .{ lo, hi }` (section 3); one point per sample.
@@ -714,27 +763,27 @@ fn segment_at(points: []const Point, index: u32, x: f32, y: f32) f32 {
 /// pool, or the batch list could not take all of it; nothing is kept then and the refusal is
 /// counted in `cx.overflow_count`.
 pub fn polyline(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?Placed {
-    const bounds = bounds_of(points);
-    const origin = grid_origin(.{ bounds.x, bounds.y });
+    const hull = bounds(points, 0);
+    const origin = grid_origin(.{ hull.x, hull.y });
     const first = append_from(cx, points, origin, stroke, clip) orelse {
         return null;
     };
-    return .{ .first = first, .count = @intCast(points.len), .bounds = gridded(bounds, origin) };
+    return .{ .first = first, .count = @intCast(points.len), .bounds = gridded(hull, origin) };
 }
 
-/// `bounds` grown to start at the gridded `origin` (section 5b): it holds what it held, and a
+/// `hull` grown to start at the gridded `origin` (section 5b): it holds what it held, and a
 /// path area measured from it hits where it did.
-fn gridded(bounds: Rect, origin: Point) Rect {
-    assert(origin[0] <= bounds.x);
-    assert(origin[1] <= bounds.y);
+fn gridded(hull: Rect, origin: Point) Rect {
+    assert(origin[0] <= hull.x);
+    assert(origin[1] <= hull.y);
     const out: Rect = .{
         .x = origin[0],
         .y = origin[1],
-        .width = bounds.width + (bounds.x - origin[0]),
-        .height = bounds.height + (bounds.y - origin[1]),
+        .width = hull.width + (hull.x - origin[0]),
+        .height = hull.height + (hull.y - origin[1]),
     };
-    assert(out.x + out.width >= bounds.x + bounds.width);
-    assert(out.y + out.height >= bounds.y + bounds.height);
+    assert(out.x + out.width >= hull.x + hull.width);
+    assert(out.y + out.height >= hull.y + hull.height);
     return out;
 }
 
@@ -855,8 +904,8 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
         cx.refuse();
         return null;
     }
-    const bounds = bounds_of(points);
-    const origin = grid_origin(.{ bounds.x, bounds.y });
+    const hull = bounds(points, 0);
+    const origin = grid_origin(.{ hull.x, hull.y });
     // The ring, its last point before it, and its second point after it (section 4).
     const stored = count + 3;
     const reserved = cx.reserve_points(stored) orelse return null;
@@ -891,7 +940,7 @@ pub fn polygon(cx: anytype, points: []const Point, stroke: Stroke, clip: Clip) ?
         if (stroke.dash != null) arc += arc_length(relative[1 + start .. 1 + end + 1]);
         start = end;
     }
-    return .{ .first = first, .count = count + 1, .bounds = gridded(bounds, origin) };
+    return .{ .first = first, .count = count + 1, .bounds = gridded(hull, origin) };
 }
 
 /// The last point of a closed ring's first chunk: `chunk_end`'s, unless the ring would then be
@@ -924,7 +973,7 @@ fn chunk_of(
     assert(start < end);
     assert(end < points.len);
     const dash = dash_fields(stroke.dash, arc);
-    const box = bounds_of(points[start .. end + 1]);
+    const box = bounds(points[start .. end + 1], 0);
     const pad = stroke.width * 0.5 + aa_pad;
     // The rect moves down to the grid and keeps its size, so the padding still holds the stroke
     // and `origin - rect.xy` is exact (section 5b).
@@ -1012,11 +1061,16 @@ fn arc_length(points: []const Point) f64 {
     return total;
 }
 
-/// The unpadded axis-aligned bounds of `points` (zero width or height for a straight line).
-fn bounds_of(points: []const Point) Rect {
+/// The axis-aligned bounds of `points`, grown by `grow` on every side: what a stroke `2 * grow`
+/// wide through them covers, for a cull test (section 5). `grow` 0 gives the bare bounds, zero
+/// wide or high for a straight line. In this order: `x = low - grow`,
+/// `width = high - low + 2 * grow`, so a hand-written hull loop moved onto it keeps its bits.
+pub fn bounds(points: []const Point, grow: f32) Rect {
     assert(points.len >= 1);
+    assert(grow >= 0);
     var low = points[0];
     var high = points[0];
+    assert(low[0] == low[0] and low[1] == low[1]);
     for (points[1..]) |point| {
         assert(point[0] == point[0]);
         assert(point[1] == point[1]);
@@ -1024,10 +1078,10 @@ fn bounds_of(points: []const Point) Rect {
         high = .{ @max(high[0], point[0]), @max(high[1], point[1]) };
     }
     const box: Rect = .{
-        .x = low[0],
-        .y = low[1],
-        .width = high[0] - low[0],
-        .height = high[1] - low[1],
+        .x = low[0] - grow,
+        .y = low[1] - grow,
+        .width = high[0] - low[0] + 2 * grow,
+        .height = high[1] - low[1] + 2 * grow,
     };
     assert(box.width >= 0);
     assert(box.height >= 0);
@@ -1164,6 +1218,77 @@ test "a cubic flattens to the clamped segment count with exact ends" {
     try testing.expectApproxEqAbs(@as(f32, 520), out[32][1], 0.001);
 }
 
+// Locks `bounds` (section 3a): (3, 4), (-1, 10), (7, 2) give (-1, 2, 8, 8) at grow 0 and
+// (-3.5, -0.5, 13, 13) at grow 2.5; one point (5, 5) at grow 1 gives (4, 4, 2, 2); and grow 0
+// gives the bits of the formula it replaced (low, then high - low) on assorted points.
+test "bounds is the box round the points grown on every side" {
+    const three = [_]Point{ .{ 3, 4 }, .{ -1, 10 }, .{ 7, 2 } };
+    try testing.expectEqual(Rect{ .x = -1, .y = 2, .width = 8, .height = 8 }, bounds(&three, 0));
+    try testing.expectEqual(
+        Rect{ .x = -3.5, .y = -0.5, .width = 13, .height = 13 },
+        bounds(&three, 2.5),
+    );
+    const one = [_]Point{.{ 5, 5 }};
+    try testing.expectEqual(Rect{ .x = 4, .y = 4, .width = 2, .height = 2 }, bounds(&one, 1));
+    const sets = [_][]const Point{
+        &three,
+        &.{ .{ 0.1, 0.7 }, .{ 13.3, -2.9 }, .{ 1e-3, 1e4 }, .{ -77.25, 3.0e-5 } },
+        &.{ .{ 1216.5, 380.125 }, .{ 1290.333, 391.75 }, .{ 1350.8, 377.4 } },
+    };
+    for (sets) |points| {
+        var low = points[0];
+        var high = points[0];
+        for (points[1..]) |point| {
+            low = .{ @min(low[0], point[0]), @min(low[1], point[1]) };
+            high = .{ @max(high[0], point[0]), @max(high[1], point[1]) };
+        }
+        const old: [4]f32 = .{ low[0], low[1], high[0] - low[0], high[1] - low[1] };
+        const got = bounds(points, 0).array();
+        try testing.expectEqual(@as([4]u32, @bitCast(old)), @as([4]u32, @bitCast(got)));
+    }
+}
+
+// Locks `cubic_point` and `sample_cubic` (section 3a): on (0, 0), (0, 30), (30, 30), (30, 0)
+// t = 0.25 gives (4.6875, 16.875), 0.5 gives (15, 22.5), 0.75 gives (25.3125, 16.875), exactly,
+// and five samples are those with the ends; 32 samples of the cable (100, 200), (280, 236),
+// (320, 236), (500, 200) equal, bit for bit, the loop an app wrote by hand before (Treadle's
+// `cable.trace`: the weights times the points, summed left to right, at index / 31).
+test "a cubic's points and samples" {
+    const arch = [4]Point{ .{ 0, 0 }, .{ 0, 30 }, .{ 30, 30 }, .{ 30, 0 } };
+    try testing.expectEqual(Point{ 4.6875, 16.875 }, cubic_point(arch, 0.25));
+    try testing.expectEqual(Point{ 15, 22.5 }, cubic_point(arch, 0.5));
+    try testing.expectEqual(Point{ 25.3125, 16.875 }, cubic_point(arch, 0.75));
+    try testing.expectEqual(Point{ 0, 0 }, cubic_point(arch, 0));
+    try testing.expectEqual(Point{ 30, 0 }, cubic_point(arch, 1));
+    var five: [5]Point = undefined;
+    sample_cubic(&five, arch);
+    try testing.expectEqual([5]Point{
+        .{ 0, 0 }, .{ 4.6875, 16.875 }, .{ 15, 22.5 }, .{ 25.3125, 16.875 }, .{ 30, 0 },
+    }, five);
+    const from: Point = .{ 100, 200 };
+    const p1: Point = .{ 280, 236 };
+    const p2: Point = .{ 320, 236 };
+    const to: Point = .{ 500, 200 };
+    var sampled: [32]Point = undefined;
+    sample_cubic(&sampled, .{ from, p1, p2, to });
+    for (sampled, 0..) |point, index| {
+        const t = @as(f32, @floatFromInt(index)) / @as(f32, 32 - 1);
+        const u = 1 - t;
+        const a = u * u * u;
+        const b = 3 * u * u * t;
+        const c = 3 * u * t * t;
+        const d = t * t * t;
+        const old: Point = .{
+            a * from[0] + b * p1[0] + c * p2[0] + d * to[0],
+            a * from[1] + b * p1[1] + c * p2[1] + d * to[1],
+        };
+        try testing.expectEqual(@as([2]u32, @bitCast(old)), @as([2]u32, @bitCast(point)));
+    }
+    var two: [2]Point = undefined;
+    sample_cubic(&two, arch);
+    try testing.expectEqual([2]Point{ .{ 0, 0 }, .{ 30, 0 } }, two);
+}
+
 // Locks the chunk rule: chunks share their end points, hold 5 to 16 points (the last may hold
 // fewer), and number at most `chunks_max`. Even a straight horizontal cable stops at 11
 // points, where its 6 px tall bounds pass `chunk_area_max`; a diagonal one splits at the
@@ -1294,7 +1419,7 @@ test "every chunk's oriented quad contains its stroke" {
 
 fn expect_quad_holds_stroke(points: []const Point, width: f32) !void {
     const quad = oriented_quad(points, width);
-    const box = bounds_of(points);
+    const box = bounds(points, 0);
     for ([_]f32{ 1, 0.5 }) |pixel_size| {
         const reach = width * 0.5 + 0.5 * pixel_size;
         var y = box.y - reach - 2;

@@ -331,12 +331,7 @@ pub fn SplitterOf(comptime Skin: type) type {
         }
 
         fn flags(self: *const Self) ui.Flags {
-            return .{
-                .wheel = false,
-                .focusable = false,
-                .tab = false,
-                .cursor = if (self.axis == .horizontal) .ew_resize else .ns_resize,
-            };
+            return ui.cx.plain_with(if (self.axis == .horizontal) .ew_resize else .ns_resize);
         }
     };
 }

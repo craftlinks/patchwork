@@ -104,7 +104,7 @@ pub const view_id = ui.id("glass_view", 0);
 pub const segment_id = ui.id("glass_segment", 0);
 pub const output_id = ui.id("glass_output", 0);
 pub const position_id = ui.id("glass_position", 0);
-const button_flags: ui.Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .pointer };
+const button_flags = ui.cx.plain_with(.pointer);
 
 /// The lens: a clear disc that bends the whole of itself and reads the lightly filtered level.
 const lens_material: theme.Material = .clear;

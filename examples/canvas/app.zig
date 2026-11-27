@@ -18,8 +18,8 @@
 //! ("osc 17"), an input port on the left, an output port on the right, and a `widgets.Knob`
 //! with a 40 px ring (`Knob.sized`), its name, and its value. Cables run from each module's output to the next module's input in its row, and
 //! from every third column to the module below. Below zoom 0.5 a module is its face and header
-//! only, and text is placed only when its on-screen em is at least `label_min_px` (level of
-//! detail; `ui/canvas.zig`, section 3).
+//! only, and text is placed only when its on-screen em is legible, at least
+//! `ui.canvas.legible_px_min` (level of detail; `ui/canvas.zig`, section 3a).
 //!
 //! ## 3. Input
 //! ```text
@@ -78,8 +78,6 @@ pub const knob_ring: f32 = 40;
 pub const knob_top: f32 = 8;
 /// The port row, from a module's top.
 pub const port_y: f32 = 64;
-/// Smallest on-screen em, in logical pixels, that is placed (section 2).
-pub const label_min_px: f32 = 6;
 /// Below this zoom a module is its face and header only (section 2).
 pub const detail_zoom: f32 = 0.5;
 /// Arrow-key pan, in logical pixels.
@@ -339,19 +337,18 @@ pub const App = struct {
             .up => _ = app.view.pan_by(cx, 0, pan_step),
             .down => _ = app.view.pan_by(cx, 0, -pan_step),
             else => {
-                const typed = press.typed();
-                if (std.mem.eql(u8, typed, "=") or std.mem.eql(u8, typed, "+")) {
+                if (press.types("=") or press.types("+")) {
                     _ = app.view.step_at(cx, mid_x, mid_y, 1);
-                } else if (std.mem.eql(u8, typed, "-")) {
+                } else if (press.types("-")) {
                     _ = app.view.step_at(cx, mid_x, mid_y, -1);
-                } else if (std.mem.eql(u8, typed, "0")) {
+                } else if (press.types("0")) {
                     app.view = .init(start_x, start_y, 1);
                     cx.redraw();
-                } else if (std.mem.eql(u8, typed, "d")) {
+                } else if (press.types("d")) {
                     app.dashed = !app.dashed;
                     app.flowing = app.flowing and app.dashed;
                     cx.redraw();
-                } else if (std.mem.eql(u8, typed, "f")) {
+                } else if (press.types("f")) {
                     app.flowing = !app.flowing;
                     app.dashed = app.dashed or app.flowing;
                     // The frame event takes it from here (section 3).
@@ -406,7 +403,7 @@ pub const App = struct {
             if (cx.visible(in_port)) |port_clip| append_box(cx, in_port, port_color, port_clip, port_size / 2, 0, null);
             if (cx.visible(out_port)) |port_clip| append_box(cx, out_port, port_color, port_clip, port_size / 2, 0, null);
             app.knobs[index].draw(cx, .{ .width = .fill, .height = .{ .fixed = widgets.knob_height }, .margin = .sides(0, knob_top, 0, 0) });
-            if (zoom * header_style.size >= label_min_px) {
+            if (canvas.legible(header_style.size, zoom)) {
                 var buffer: [16]u8 = undefined;
                 const name = std.fmt.bufPrint(&buffer, "osc {d}", .{index}) catch unreachable;
                 const label: Rect = .{ .x = header.x + 10, .y = header.y, .width = header.width - 20, .height = header.height };
@@ -438,28 +435,8 @@ pub const App = struct {
     /// A cable that hangs from `from`'s output to `to`'s input: each control point a third of
     /// the way along, both dropped by the sag, so it never folds back on itself.
     fn cable(app: *const App, cx: *Context, from: u32, to: u32, tint: usize) bool {
-        const a = app.origins[from];
-        const b = app.origins[to];
-        const start: Point = .{ a[0] + module_width, a[1] + port_y + port_size / 2 };
-        const end: Point = .{ b[0], b[1] + port_y + port_size / 2 };
-        const dx = end[0] - start[0];
-        const dy = end[1] - start[1];
-        const sag = cable_sag + 0.15 * @sqrt(dx * dx + dy * dy);
-        const control = [4]Point{
-            start,
-            .{ start[0] + dx / 3, start[1] + dy / 3 + sag },
-            .{ start[0] + 2 * dx / 3, start[1] + 2 * dy / 3 + sag },
-            end,
-        };
-        var low = control[0];
-        var high = control[0];
-        for (control[1..]) |point| {
-            low = .{ @min(low[0], point[0]), @min(low[1], point[1]) };
-            high = .{ @max(high[0], point[0]), @max(high[1], point[1]) };
-        }
-        const pad = cable_width;
-        const bounds: Rect = .{ .x = low[0] - pad, .y = low[1] - pad, .width = high[0] - low[0] + 2 * pad, .height = high[1] - low[1] + 2 * pad };
-        const clip = cx.visible(bounds) orelse return false;
+        const control = cable_control(app.origins[from], app.origins[to]);
+        const clip = cx.visible(quads.path.bounds(&control, cable_width)) orelse return false;
         const color = cable_colors[tint % cable_colors.len];
         var stroke: quads.path.Stroke = .{ .color = color, .width = cable_width, .hover = 0 };
         if (app.dashed) {
@@ -483,7 +460,23 @@ pub const App = struct {
 
 pub const Context = patchwork.app.Context(App);
 
-const grab_flags: ui.Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .grab };
+const grab_flags = ui.cx.plain_with(.grab);
+
+/// The control points of the cable from the module at origin `a`'s output to the one at `b`'s
+/// input (section 2).
+fn cable_control(a: Point, b: Point) [4]Point {
+    const start: Point = .{ a[0] + module_width, a[1] + port_y + port_size / 2 };
+    const end: Point = .{ b[0], b[1] + port_y + port_size / 2 };
+    const dx = end[0] - start[0];
+    const dy = end[1] - start[1];
+    const sag = cable_sag + 0.15 * @sqrt(dx * dx + dy * dy);
+    return .{
+        start,
+        .{ start[0] + dx / 3, start[1] + dy / 3 + sag },
+        .{ start[0] + 2 * dx / 3, start[1] + 2 * dy / 3 + sag },
+        end,
+    };
+}
 
 pub fn module_id(index: u32) ui.Id {
     return ui.id("module", index);
@@ -654,6 +647,31 @@ test "the scenarios replay headless" {
     const flowing = new_app();
     _ = try bench.replay_headless(App, flowing, cx, flow, .{ 1280, 720 }, 3);
     try std.testing.expect(flowing.flowing);
+}
+
+// Locks the cull box on `draw.path.bounds` (step 87): for the cable along each row and down each
+// column from module 0, at the home origins and with module 1 dragged up and left of module 0,
+// it gives the bits of the hull loop it replaced (low less the pad, high - low plus twice it).
+test "the cable cull box is the old hull loop's to the bit" {
+    const pairs = [_][2]Point{
+        .{ home_of(0), home_of(1) },
+        .{ home_of(0), home_of(columns) },
+        .{ home_of(0), .{ home_of(0)[0] - 333.3, home_of(0)[1] - 71.7 } },
+        .{ home_of(columns * rows - 2), home_of(columns * rows - 1) },
+    };
+    for (pairs) |pair| {
+        const control = cable_control(pair[0], pair[1]);
+        var low = control[0];
+        var high = control[0];
+        for (control[1..]) |point| {
+            low = .{ @min(low[0], point[0]), @min(low[1], point[1]) };
+            high = .{ @max(high[0], point[0]), @max(high[1], point[1]) };
+        }
+        const pad = cable_width;
+        const old: Rect = .{ .x = low[0] - pad, .y = low[1] - pad, .width = high[0] - low[0] + 2 * pad, .height = high[1] - low[1] + 2 * pad };
+        const got = quads.path.bounds(&control, cable_width);
+        try std.testing.expectEqual(@as([4]u32, @bitCast(old.array())), @as([4]u32, @bitCast(got.array())));
+    }
 }
 
 // Locks the dash keys (section 3): `d` dashes every cable at 8 / 4, `f` flows them, lowering the

@@ -853,8 +853,7 @@ pub const App = struct {
     fn draw_chrome(app: *const App, cx: *Context, index: u32, hash: Rect) void {
         const rect: Rect = .{ .x = 0, .y = hash.y - rule_room, .width = rule_end + 16, .height = header_h };
         const clip = cx.visible(rect) orelse return;
-        var grab = ui.cx.plain;
-        grab.cursor = .grab;
+        const grab = ui.cx.plain_with(.grab);
         const handle: Rect = .{ .x = hash.x - handle_slop, .y = hash.y, .width = hash.width + 2 * handle_slop, .height = hash.height };
         cx.area(hash_id(index), handle, 0, grab);
         look.hline(cx, code_x, rule_end, rect.y + rect.height - 3, clip, look.rule);

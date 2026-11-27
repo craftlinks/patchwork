@@ -22,6 +22,7 @@
 //! top      = rect.y + offset(align_y, rect.height - (ascent + descent))
 //! baseline = top + ascent
 //! offset(start, gap) = 0, offset(center, gap) = gap / 2, offset(end, gap) = gap
+//! bounds   = (pen_x, top, extent, ascent + descent)  before the device snap
 //! ```
 //! `t_last` is the tracking of the run holding the line's last codepoint (`Extent.hang`), so
 //! spaced text centres on its ink run. `measure` sums whole font units and converts once, then
@@ -31,7 +32,10 @@
 //! `ellipsis` and `extent > rect.width`, the line is cut before the first codepoint at which
 //! the kept pen (tracked) plus the ellipsis advance (in the style of the run being cut, its own
 //! gap hanging) would exceed `rect.width`, and U+2026 is appended; the cut width replaces
-//! `extent` in the alignment. If not even the ellipsis fits, nothing is drawn.
+//! `extent` in the alignment. If not even the ellipsis fits, nothing is drawn. `bounds` is the
+//! box `place` puts a line in, from the same fit (`fit_of`) that `place_runs` and `Glyphs.line`
+//! read, so it cannot drift from what is drawn: the pen's start, the extent or cut width, and
+//! the ascent and descent from `top`, unsnapped (glyphs then snap within a device pixel).
 //!
 //! ## 2b. Wrapping
 //! `Lines` walks runs and cuts them into lines no wider than `width` (at least 0), greedily.
@@ -530,27 +534,74 @@ pub fn place_runs(
     assert(runs.len <= text.run_cap);
     assert(clip.x1 > clip.x0);
     assert(clip.y1 > clip.y0);
-    const line = line_of(runs);
-    var cut: ?Cut = null;
-    // The last codepoint's tracking gap hangs: it is in neither the fit nor the alignment.
-    var width = line.width - line.hang;
-    if (options.ellipsis) {
-        if (width > rect.width) {
-            cut = cut_of(runs, rect.width);
-            width = cut.?.width;
-            if (!cut.?.fits) return;
-        }
-    }
+    const fit = fit_of(runs, rect, options);
+    if (!fit.shown) return;
     const scale = cx.text.device_scale();
     const pen: Pen = .{
-        .x = rect.x + offset(options.align_x, rect.width - width),
-        .baseline_px = @round(
-            (rect.y + offset(options.align_y, rect.height - line.ascent - line.descent) +
-                line.ascent) * scale,
-        ),
+        .x = fit.x,
+        .baseline_px = @round((fit.top + fit.ascent) * scale),
         .scale = scale,
     };
-    emit_runs(cx, runs, pen, clip, cut);
+    emit_runs(cx, runs, pen, clip, fit.cut);
+}
+
+/// The box `place` puts `utf8` in within `rect`, before the device snap: from the pen's start
+/// (`x`) for the line's extent or its cut width (`width`), from the top of its ascent (`y`) for
+/// its ascent and descent (`height`). Nothing is placed when not even the ellipsis fits: then
+/// `width` is 0 at where the pen would start. Pure; built on `place_runs`' own fit, so it
+/// cannot drift from what is drawn. See the module guide, section 2.
+pub fn bounds(style: text.Style, utf8: []const u8, rect: draw.Rect, options: text.Options) draw.Rect {
+    const runs = [1]text.Run{.{ .style = style, .bytes = utf8 }};
+    const fit = fit_of(&runs, rect, options);
+    const box: draw.Rect = .{ .x = fit.x, .y = fit.top, .width = fit.width, .height = fit.height };
+    assert(box.width >= 0);
+    assert(box.height > 0);
+    return box;
+}
+
+/// Where one line of `runs` sits in `rect` (module guide, section 2): what `place_runs`,
+/// `Glyphs.line`, and `bounds` all read, unsnapped.
+const Fit = struct {
+    /// The pen's start: `rect.x + offset(align_x, rect.width - width)`.
+    x: f32,
+    /// `rect.y + offset(align_y, rect.height - ascent - descent)`; the baseline is `top + ascent`.
+    top: f32,
+    /// The extent, or the cut's width with its ellipsis.
+    width: f32,
+    /// `ascent + descent`.
+    height: f32,
+    ascent: f32,
+    cut: ?Cut,
+    /// False when an ellipsis was asked for and not even it fits: nothing is drawn.
+    shown: bool,
+};
+
+fn fit_of(runs: []const text.Run, rect: draw.Rect, options: text.Options) Fit {
+    assert(runs.len >= 1);
+    assert(runs.len <= text.run_cap);
+    const line = line_of(runs);
+    var cut: ?Cut = null;
+    var shown = true;
+    // The last codepoint's tracking gap hangs: it is in neither the fit nor the alignment.
+    var width = line.width - line.hang;
+    if (options.ellipsis and width > rect.width) {
+        cut = cut_of(runs, rect.width);
+        width = cut.?.width;
+        shown = cut.?.fits;
+        if (!shown) cut = null;
+    }
+    const fit: Fit = .{
+        .x = rect.x + offset(options.align_x, rect.width - width),
+        .top = rect.y + offset(options.align_y, rect.height - line.ascent - line.descent),
+        .width = width,
+        .height = line.ascent + line.descent,
+        .ascent = line.ascent,
+        .cut = cut,
+        .shown = shown,
+    };
+    assert(fit.width >= 0);
+    assert(fit.shown or fit.width == 0);
+    return fit;
 }
 
 const Extent = struct {
@@ -740,22 +791,16 @@ pub const Glyphs = struct {
     pub fn line(runs: []const text.Run, rect: draw.Rect, options: text.Options) Glyphs {
         assert(runs.len >= 1);
         assert(runs.len <= text.run_cap);
-        const extent = line_of(runs);
+        const fit = fit_of(runs, rect, options);
         var self = Glyphs.empty(runs);
-        var width = extent.width - extent.hang;
-        if (options.ellipsis and width > rect.width) {
-            const cut = cut_of(runs, rect.width);
-            if (!cut.fits) {
-                self.done = true;
-                return self;
-            }
-            self.cut = cut;
-            width = cut.width;
+        if (!fit.shown) {
+            self.done = true;
+            return self;
         }
+        self.cut = fit.cut;
         self.active = true;
-        self.pen_x = rect.x + offset(options.align_x, rect.width - width);
-        self.baseline = rect.y +
-            offset(options.align_y, rect.height - extent.ascent - extent.descent) + extent.ascent;
+        self.pen_x = fit.x;
+        self.baseline = fit.top + fit.ascent;
         return self;
     }
 
@@ -1218,6 +1263,70 @@ test "ellipsis cuts the line so it fits the rect" {
     const empty = test_context(120);
     place(empty, sans_16, long, narrow, window, options);
     try testing.expectEqual(@as(usize, 0), empty.items(types.Glyph).len);
+}
+
+// Locks `bounds` (section 2) on sans 14 "osc 17" in (10, 20, 200, 24): at start, center, and
+// end its x is 10, 10 + gap / 2, and 10 + gap for the gap 200 - extent, its width the extent
+// (the measure less the hanging gap, also at tracking 0.1), its y and height the line's ascent
+// and descent centred in 24; with an ellipsis in 40 px it is the cut's width; in a rect of
+// width 0 with an ellipsis nothing is placed and its width is 0; empty text has width 0. The
+// glyphs `place` appends lie within it, widened by one device pixel.
+test "bounds is the box place puts the line in" {
+    const sans_14: text.Style = .{ .face = .sans, .size = 14, .color = .{ 1, 1, 1, 1 } };
+    var tracked = sans_14;
+    tracked.tracking = 0.1;
+    const label = "osc 17";
+    const rect: draw.Rect = .{ .x = 10, .y = 20, .width = 200, .height = 24 };
+    const line = line_of(&.{.{ .style = sans_14, .bytes = label }});
+    const top = 20 + (24 - line.ascent - line.descent) * 0.5;
+    for ([_]text.Style{ sans_14, tracked }) |style| {
+        const extent = measure(style, label) - text.tracking_px(style);
+        const gap = 200 - extent;
+        const aligns = [_]struct { a: text.Align, x: f32 }{
+            .{ .a = .start, .x = 10 },
+            .{ .a = .center, .x = 10 + gap * 0.5 },
+            .{ .a = .end, .x = 10 + gap },
+        };
+        for (aligns) |case| {
+            const options: text.Options = .{ .align_x = case.a, .align_y = .center, .ellipsis = false };
+            const box = bounds(style, label, rect, options);
+            try testing.expectEqual(draw.Rect{
+                .x = case.x,
+                .y = top,
+                .width = extent,
+                .height = line.ascent + line.descent,
+            }, box);
+            const cx = test_context(120);
+            place(cx, style, label, rect, window, options);
+            const glyphs = cx.items(types.Glyph);
+            try testing.expectEqual(@as(usize, 5), glyphs.len);
+            for (glyphs) |glyph| try expect_within(glyph.rect, box, 1);
+        }
+    }
+    const cutting: text.Options = .{ .align_x = .start, .align_y = .center, .ellipsis = true };
+    const short: draw.Rect = .{ .x = 10, .y = 20, .width = 40, .height = 24 };
+    const runs = [1]text.Run{.{ .style = sans_14, .bytes = label }};
+    const cut = cut_of(&runs, 40);
+    try testing.expect(cut.fits);
+    const cut_box = bounds(sans_14, label, short, cutting);
+    try testing.expectEqual(cut.width, cut_box.width);
+    try testing.expect(cut_box.width <= 40);
+    const cx = test_context(120);
+    place(cx, sans_14, label, short, window, cutting);
+    for (cx.items(types.Glyph)) |glyph| try expect_within(glyph.rect, cut_box, 1);
+    const closed: draw.Rect = .{ .x = 10, .y = 20, .width = 0, .height = 24 };
+    try testing.expectEqual(@as(f32, 0), bounds(sans_14, label, closed, cutting).width);
+    const none = bounds(sans_14, "", rect, cutting);
+    try testing.expectEqual(@as(f32, 0), none.width);
+    try testing.expectEqual(@as(f32, 10), none.x);
+}
+
+/// Fails unless `quad` lies within `box` grown by `slack` on every side.
+fn expect_within(quad: [4]f32, box: draw.Rect, slack: f32) !void {
+    try testing.expect(quad[0] >= box.x - slack);
+    try testing.expect(quad[1] >= box.y - slack);
+    try testing.expect(quad[0] + quad[2] <= box.x + box.width + slack);
+    try testing.expect(quad[1] + quad[3] <= box.y + box.height + slack);
 }
 
 // Locks device snapping at scale 1.5: every quad edge lands on a device pixel edge, and each

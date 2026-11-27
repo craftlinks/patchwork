@@ -31,6 +31,13 @@
 //! `[4]f32` an instance's `rect` and `clip` fields hold; `Inset.all`, `xy`, and `sides` build
 //! insets.
 //!
+//! `Rect` also answers the plain geometry questions apps would otherwise write by hand:
+//! `contains(p)` is half-open (`x <= p[0] < x + width`, so a rect's right and bottom edges
+//! belong to its neighbour), `intersects(other)` is strict (rects that only touch are apart),
+//! `center()` is `(x + width * 0.5, y + height * 0.5)`, and `Rect.around(centre, radius)` is
+//! the square of side `2 * radius` round a point. Each is one expression in a fixed order, so
+//! an app that moves onto it keeps its bits.
+//!
 //! ## 3. Y-Down Orthographic Projection
 //! Coordinate spaces:
 //! - **UI logical pixels:** origin at the top-left of the window, `+X` right in `[0, w]`,
@@ -153,6 +160,39 @@ pub const Rect = struct {
         assert(values[3] == self.height);
         return values;
     }
+
+    /// Whether `p` is inside, half-open: `x <= p[0] < x + width`, and likewise in y. An empty
+    /// rect contains nothing.
+    pub fn contains(self: Rect, p: Point) bool {
+        assert(self.width >= 0);
+        assert(self.height >= 0);
+        return p[0] >= self.x and p[0] < self.x + self.width and
+            p[1] >= self.y and p[1] < self.y + self.height;
+    }
+
+    /// Whether the two overlap in an area, strictly: rects that only touch are apart.
+    /// Symmetric.
+    pub fn intersects(self: Rect, other: Rect) bool {
+        assert(self.width >= 0 and self.height >= 0);
+        assert(other.width >= 0 and other.height >= 0);
+        return self.x < other.x + other.width and other.x < self.x + self.width and
+            self.y < other.y + other.height and other.y < self.y + self.height;
+    }
+
+    /// The square of side `2 * radius` centred on `centre`: a dot's or a port's rect.
+    pub fn around(centre: Point, radius: f32) Rect {
+        assert(radius >= 0);
+        assert(centre[0] == centre[0] and centre[1] == centre[1]);
+        const side = 2 * radius;
+        return .{ .x = centre[0] - radius, .y = centre[1] - radius, .width = side, .height = side };
+    }
+
+    /// The centre, `(x + width * 0.5, y + height * 0.5)`.
+    pub fn center(self: Rect) Point {
+        assert(self.width >= 0);
+        assert(self.height >= 0);
+        return .{ self.x + self.width * 0.5, self.y + self.height * 0.5 };
+    }
 };
 
 /// Independent insets in UI logical pixels: container padding and child margins.
@@ -235,6 +275,7 @@ pub const shadow_alpha = types.shadow_alpha;
 pub const sdf_segment = types.sdf_segment;
 pub const sdf_arc = types.sdf_arc;
 pub const arc_point = types.arc_point;
+pub const arc_point_at = types.arc_point_at;
 pub const contains_box = types.contains_box;
 /// Null when a type satisfies the draw type convention, else a message naming it.
 pub const check_type = registry.check;
@@ -737,6 +778,39 @@ test "rect and clip arrays and inset constructors" {
         Inset{ .left = 1, .top = 2, .right = 3, .bottom = 4 },
         Inset.sides(1, 2, 3, 4),
     );
+}
+
+// Locks `Rect`'s geometry (section 2) on r = (10, 20, 30, 40): `contains` is half-open, so
+// (10, 20) and (39.5, 59.5) are in and (40, 20), (9.99, 30), and (20, 60) out; `intersects`
+// against (0, 0, 10, 10) is strict and symmetric: (10, 0, 10, 10) and (0, 10, 10, 10) only
+// touch, (9, 9, 10, 10) and (-5, -5, 5.5, 5.5) overlap; `center(r)` is (25, 40), and
+// `around((25, 40), 5)` is (20, 35, 10, 10).
+test "rect contains half-open, intersects strictly, and has a centre" {
+    const r: Rect = .{ .x = 10, .y = 20, .width = 30, .height = 40 };
+    try std.testing.expect(r.contains(.{ 10, 20 }));
+    try std.testing.expect(r.contains(.{ 39.5, 59.5 }));
+    try std.testing.expect(!r.contains(.{ 40, 20 }));
+    try std.testing.expect(!r.contains(.{ 9.99, 30 }));
+    try std.testing.expect(!r.contains(.{ 20, 60 }));
+    const empty: Rect = .{ .x = 10, .y = 20, .width = 0, .height = 40 };
+    try std.testing.expect(!empty.contains(.{ 10, 20 }));
+    const base: Rect = .{ .x = 0, .y = 0, .width = 10, .height = 10 };
+    const cases = [_]struct { other: Rect, overlaps: bool }{
+        .{ .other = .{ .x = 10, .y = 0, .width = 10, .height = 10 }, .overlaps = false },
+        .{ .other = .{ .x = 9, .y = 9, .width = 10, .height = 10 }, .overlaps = true },
+        .{ .other = .{ .x = 0, .y = 10, .width = 10, .height = 10 }, .overlaps = false },
+        .{ .other = .{ .x = -5, .y = -5, .width = 5.5, .height = 5.5 }, .overlaps = true },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.overlaps, base.intersects(case.other));
+        try std.testing.expectEqual(case.overlaps, case.other.intersects(base));
+    }
+    try std.testing.expectEqual(Point{ 25, 40 }, r.center());
+    try std.testing.expectEqual(
+        Rect{ .x = 20, .y = 35, .width = 10, .height = 10 },
+        Rect.around(.{ 25, 40 }, 5),
+    );
+    try std.testing.expectEqual(Rect{ .x = 3, .y = 4, .width = 0, .height = 0 }, Rect.around(.{ 3, 4 }, 0));
 }
 
 /// One projection under test for `frag_position`: its matrix, its pass size slot, the pass's

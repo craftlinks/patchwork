@@ -49,7 +49,7 @@ const seam = [4]f32{ 0.72, 0.72, 0.72, 1 };
 const held_fill = [4]f32{ 0.30, 0.62, 0.90, 1 };
 const letter = [4]f32{ 0.55, 0.55, 0.55, 1 };
 
-const flags: ui.Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .pointer };
+const flags = ui.cx.plain_with(.pointer);
 
 /// True when `note` is a black key.
 pub fn is_black(note: u8) bool {

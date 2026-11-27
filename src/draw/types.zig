@@ -57,7 +57,8 @@
 //! record is byte-identical to it (test "constructors match the literals byte for byte").
 //! `Arc.of` turns the look's fractions into radians on its shape (`ArcLook.shape`, else the
 //! default ring) and brings the start into `[-pi, pi]`, which the shader's one-turn wrap needs;
-//! `arc_point` is the point a fraction along a shape, for a value dot. They append
+//! `arc_point` is the point a fraction along a shape on the ring inscribed in a square, for a
+//! value dot, and `arc_point_at` the same round a centre at a radius. They append
 //! nothing: `widgets.kit` appends, and `ui` and `draw` append them with their own skip. Glyphs,
 //! images, and paths have appenders instead (`text.place`, `draw.path`).
 //!
@@ -798,23 +799,31 @@ fn wrap_tau(angle: f32) f32 {
     return value;
 }
 
+/// The point `fraction` (in `[0, 1]`) of the way along `shape` on the circle of `radius` round
+/// `centre`: `centre + radius * (cos, sin)` of `shape.angle(fraction)`, the centre added first.
+pub fn arc_point_at(centre: Point, radius: f32, shape: theme.ArcShape, fraction: f32) Point {
+    assert(radius >= 0);
+    assert(fraction >= 0 and fraction <= 1);
+    const angle = shape.angle(fraction);
+    const point: Point = .{
+        centre[0] + radius * @cos(angle),
+        centre[1] + radius * @sin(angle),
+    };
+    assert(point[0] == point[0]);
+    assert(point[1] == point[1]);
+    return point;
+}
+
 /// The point `fraction` (in `[0, 1]`) of the way along `shape` on the ring inscribed in the
-/// square `ring`, `inset` inside its edge (a value dot's centre).
+/// square `ring`, `inset` inside its edge (a value dot's centre): `arc_point_at` round the
+/// square's centre at `ring.width * 0.5 - inset`.
 pub fn arc_point(ring: Rect, shape: theme.ArcShape, fraction: f32, inset: f32) Point {
     assert(ring.width == ring.height);
     assert(inset >= 0);
     assert(inset <= ring.width * 0.5);
     // This order of operations is the one apps used before the library had it, so their dots
-    // keep their exact positions.
-    const angle = shape.angle(fraction);
-    const radius = ring.width * 0.5 - inset;
-    const point: Point = .{
-        ring.x + ring.width * 0.5 + radius * @cos(angle),
-        ring.y + ring.height * 0.5 + radius * @sin(angle),
-    };
-    assert(point[0] == point[0]);
-    assert(point[1] == point[1]);
-    return point;
+    // keep their exact positions: the centre, then the radius times the cosine or sine.
+    return arc_point_at(ring.center(), ring.width * 0.5 - inset, shape, fraction);
 }
 
 /// Wraps `angle`, in `[-tau, 2 tau]` (a shape's start plus at most one sweep), into `[-pi, pi]`.
@@ -1054,6 +1063,35 @@ test "arc_point follows the shape" {
         try std.testing.expectApproxEqAbs(case.x, point[0], 1e-3);
         try std.testing.expectApproxEqAbs(case.y, point[1], 1e-3);
     }
+}
+
+// Locks `arc_point` on `arc_point_at` (step 87): over two rings ((0, 0, 100, 100) inset 0 and
+// (13.5, 7.25, 41, 41) inset 3.5), three fractions (0, 0.37, 1), and two shapes (the default
+// and `symmetric(pi / 3)`) it gives the bits of the formula it had before; round centre
+// (100, 80) at radius 20, `symmetric(pi / 3)`'s 0.5 is (100, 60), straight up.
+test "arc_point_at is arc_point round a centre to the bit" {
+    const rings = [_]struct { rect: Rect, inset: f32 }{
+        .{ .rect = .{ .x = 0, .y = 0, .width = 100, .height = 100 }, .inset = 0 },
+        .{ .rect = .{ .x = 13.5, .y = 7.25, .width = 41, .height = 41 }, .inset = 3.5 },
+    };
+    const shapes = [_]theme.ArcShape{ .{}, theme.ArcShape.symmetric(std.math.pi / 3.0) };
+    for (rings) |ring| {
+        for (shapes) |shape| {
+            for ([_]f32{ 0, 0.37, 1 }) |fraction| {
+                const angle = shape.angle(fraction);
+                const radius = ring.rect.width * 0.5 - ring.inset;
+                const old: Point = .{
+                    ring.rect.x + ring.rect.width * 0.5 + radius * @cos(angle),
+                    ring.rect.y + ring.rect.height * 0.5 + radius * @sin(angle),
+                };
+                const got = arc_point(ring.rect, shape, fraction, ring.inset);
+                try std.testing.expectEqual(@as([2]u32, @bitCast(old)), @as([2]u32, @bitCast(got)));
+            }
+        }
+    }
+    const up = arc_point_at(.{ 100, 80 }, 20, shapes[1], 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), up[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 60), up[1], 1e-4);
 }
 
 // Locks that a sharp box includes its edges and a rounded box rejects the pixel just inside

@@ -17,6 +17,7 @@
 //! plus(other)  both in one frame: counts added by type
 //! times(n)     n of these in one frame
 //! max(other)   the larger of each count: a frame draws one or the other
+//! stroke(n)    one stroke through n points: its chunks' draw.Path instances and n points
 //! ```
 //! `plus` and `max` keep `self`'s types in order and then add the types only `other` names, so
 //! results are deterministic. `times(0)` keeps the type list with zero counts, and a count of
@@ -96,6 +97,17 @@ pub const Appends = struct {
                 .points = self.points * n,
                 .areas = self.areas * n,
             };
+        }
+    }
+
+    /// What one stroke through `count` points appends (`kit.stroke`, `draw.path.polyline`): its
+    /// chunks' `draw.Path` instances, at most `draw.path.chunks_max(count)`, and `count` points.
+    pub fn stroke(comptime count: u32) Appends {
+        comptime {
+            assert(count >= 2);
+            assert(count <= draw.point_cap_max);
+            const draws = [_]Count{.{ .type = draw.Path, .count = draw.path.chunks_max(count) }};
+            return .{ .draws = &draws, .points = count };
         }
     }
 
@@ -247,6 +259,24 @@ test "of reads a named type and 0 for an absent one" {
     try testing.expectEqual(@as(u32, 24), comptime face.of(draw.Glyph));
     try testing.expectEqual(@as(u32, 0), comptime face.of(draw.Arc));
     try testing.expectEqual(@as(u32, 0), comptime (Appends{}).of(draw.Box));
+}
+
+// Locks `stroke` (section 2): 2 and 3 points are one `draw.Path` chunk; two strokes of 5 are 2
+// and 10 points; 32 points (31 segments) are at most 8 chunks, `ceil(31 / 4)`, and 32 points;
+// nothing else is named.
+test "stroke counts a polyline's chunks and points" {
+    const cases = [_]struct { appends: Appends, paths: u32, points: u32 }{
+        .{ .appends = comptime Appends.stroke(2), .paths = 1, .points = 2 },
+        .{ .appends = comptime Appends.stroke(3), .paths = 1, .points = 3 },
+        .{ .appends = comptime Appends.stroke(5).times(2), .paths = 2, .points = 10 },
+        .{ .appends = comptime Appends.stroke(32), .paths = 8, .points = 32 },
+    };
+    inline for (cases) |case| {
+        try testing.expectEqual(@as(usize, 1), case.appends.draws.len);
+        try testing.expectEqual(case.paths, comptime case.appends.of(draw.Path));
+        try testing.expectEqual(case.points, case.appends.points);
+        try testing.expectEqual(@as(u32, 0), case.appends.areas);
+    }
 }
 
 // Locks `plus` (section 2): Box 1 plus {Box 2, Arc 1, points 3, area 1} is Box 3 then Arc 1,

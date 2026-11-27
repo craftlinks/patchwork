@@ -165,7 +165,7 @@ pub fn DropdownOf(comptime Skin: type) type {
             if (hit == .up and hit.up.inside) self.open(cx);
             if (event == .key_down and cx.focused(self.id)) {
                 const press = event.key_down;
-                const space = press.key == .other and std.mem.eql(u8, press.typed(), " ");
+                const space = press.key == .other and press.types(" ");
                 if (press.key == .enter or press.key == .down or space) self.open(cx);
             }
             return .none;

@@ -158,9 +158,22 @@ const palette_file = @import("palette.zig");
 
 const Rect = kit.Rect;
 const SkinAppends = appends.SkinAppends;
+const Appends = appends.Appends;
 const Clip = kit.Clip;
 const Inset = kit.Inset;
 const Paint = kit.Paint;
+
+/// `count` boxes, for a declaration that adds strokes to them (`Appends.stroke`).
+fn box_appends(comptime count: u32) Appends {
+    comptime {
+        assert(count >= 1);
+        const draws = [_]appends.Count{.{ .type = quads.Box, .count = count }};
+        return .{ .draws = &draws };
+    }
+}
+
+/// One glyph: a stroke's fallback ("+", "−", a window icon) where the app has no `draw.Path`.
+const one_glyph: Appends = .{ .draws = &.{.{ .type = quads.Glyph, .count = 1 }} };
 
 /// The hit area a skin returns: where the behaviour records its id, rounded by `radius`.
 pub const Shape = struct { rect: Rect, radius: f32 };
@@ -668,7 +681,7 @@ fn chevron_in(cx: anytype, rect: Rect, clip: Clip, turn: f32, lit: bool) void {
     const scheme = cx.theme();
     const colors = &scheme.colors;
     const color = if (lit) mix(colors.text, colors.lighten, scheme.hover_lighten) else colors.text;
-    const centre: [2]f32 = .{ rect.x + rect.width * 0.5, rect.y + rect.height * 0.5 };
+    const centre = rect.center();
     if (kit.chevron(cx, centre, chevron_half, turn, clip, color)) return;
     const sign = if (turn >= 0.5) "\u{2212}" else "+";
     var style = scheme.name;
@@ -696,8 +709,9 @@ const window_icon_stroke: f32 = 1;
 fn window_icon(cx: anytype, rect: Rect, clip: Clip, kind: WindowButtonKind, color: [4]f32) void {
     assert(rect.width > 0);
     assert(color[3] >= 0);
-    const x = @floor(rect.x + rect.width * 0.5) + 0.5;
-    const y = @floor(rect.y + rect.height * 0.5) + 0.5;
+    const middle = rect.center();
+    const x = @floor(middle[0]) + 0.5;
+    const y = @floor(middle[1]) + 0.5;
     const h = window_icon_half - 0.5;
     const w = window_icon_stroke;
     const drawn = switch (kind) {
@@ -901,10 +915,9 @@ pub const Default = struct {
     }
 
     /// The box, then the mixed bar, the mark (3 points), or the mark's square fallback.
-    pub const checkbox_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Box, .count = 2 },
-        .{ .type = quads.Path, .count = 1 },
-    }, .points = 3 } };
+    pub const checkbox_appends: SkinAppends = .{
+        .fixed = box_appends(2).plus(Appends.stroke(3)),
+    };
 
     /// The box in `colors.track` moving toward `colors.focus` with the check (all the way when
     /// mixed), lightened by hover, its border `colors.focus` while focused, the fill once
@@ -1104,10 +1117,9 @@ pub const Default = struct {
     }
 
     /// The face and the chevron (3 points).
-    pub const dropdown_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Box, .count = 1 },
-        .{ .type = quads.Path, .count = 1 },
-    }, .points = 3 } };
+    pub const dropdown_appends: SkinAppends = .{
+        .fixed = box_appends(1).plus(Appends.stroke(3)),
+    };
 
     /// A button-like face in `colors.track` with a `colors.control` border (`colors.focus`
     /// while the list is open), lightened by hover, or outlined in that border's colour; the
@@ -1356,10 +1368,9 @@ pub const Default = struct {
     }
 
     /// The chevron (3 points), or its "+" / "−" fallback.
-    pub const tree_chevron_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Path, .count = 1 },
-        .{ .type = quads.Glyph, .count = 1 },
-    }, .points = 3 } };
+    pub const tree_chevron_appends: SkinAppends = .{
+        .fixed = Appends.stroke(3).plus(one_glyph),
+    };
 
     /// A chevron centred in the cell in `colors.text` (lightened toward `colors.lighten` while
     /// hovered), turned by `turn` (`kit.chevron`); without `draw.Path`, "+" closed or "−" open
@@ -1371,11 +1382,9 @@ pub const Default = struct {
     }
 
     /// The header, and the chevron (3 points) or its glyph fallback.
-    pub const disclosure_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Box, .count = 1 },
-        .{ .type = quads.Path, .count = 1 },
-        .{ .type = quads.Glyph, .count = 1 },
-    }, .points = 3 } };
+    pub const disclosure_appends: SkinAppends = .{
+        .fixed = box_appends(1).plus(Appends.stroke(3)).plus(one_glyph),
+    };
 
     /// The header in `colors.track` (lightened by hover) with a one-pixel `colors.focus` border
     /// while focused, the chevron in its left cell turned by `turn`, and the label in the
@@ -1445,11 +1454,9 @@ pub const Default = struct {
     }
 
     /// The band, and restore's two strokes (10 points) or a glyph fallback.
-    pub const window_button_appends: SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Box, .count = 1 },
-        .{ .type = quads.Path, .count = 2 },
-        .{ .type = quads.Glyph, .count = 1 },
-    }, .points = 10 } };
+    pub const window_button_appends: SkinAppends = .{
+        .fixed = box_appends(1).plus(Appends.stroke(5).times(2)).plus(one_glyph),
+    };
 
     /// A band inset `window_band_inset` while hovered or pressed (`colors.track`, or `close_red`
     /// for close) at the hover value's alpha, darkened by the press, then the icon
@@ -2474,6 +2481,34 @@ test "Default's bars and rows reach their declarations" {
         });
         try reach_end(cx, &tally);
         try tally.expect_reached();
+    }
+}
+
+// Locks the declarations built on `Appends.stroke` (step 87): the checkbox, dropdown, tree
+// chevron, disclosure, and window button each equal the literal they replaced, type by type in
+// order, with the same points and areas (Box 2, Path 1, points 3; Box 1, Path 1, points 3;
+// Path 1, Glyph 1, points 3; Box 1, Path 1, Glyph 1, points 3; Box 1, Path 2, Glyph 1, points 10).
+test "the stroke declarations equal their old literals" {
+    const B = quads.Box;
+    const P = quads.Path;
+    const G = quads.Glyph;
+    const cases = .{
+        .{ Default.checkbox_appends.fixed, Appends{ .draws = &.{ .{ .type = B, .count = 2 }, .{ .type = P, .count = 1 } }, .points = 3 } },
+        .{ Default.dropdown_appends.fixed, Appends{ .draws = &.{ .{ .type = B, .count = 1 }, .{ .type = P, .count = 1 } }, .points = 3 } },
+        .{ Default.tree_chevron_appends.fixed, Appends{ .draws = &.{ .{ .type = P, .count = 1 }, .{ .type = G, .count = 1 } }, .points = 3 } },
+        .{ Default.disclosure_appends.fixed, Appends{ .draws = &.{ .{ .type = B, .count = 1 }, .{ .type = P, .count = 1 }, .{ .type = G, .count = 1 } }, .points = 3 } },
+        .{ Default.window_button_appends.fixed, Appends{ .draws = &.{ .{ .type = B, .count = 1 }, .{ .type = P, .count = 2 }, .{ .type = G, .count = 1 } }, .points = 10 } },
+    };
+    inline for (cases) |case| {
+        const got: Appends = case[0];
+        const want: Appends = case[1];
+        try testing.expectEqual(want.draws.len, got.draws.len);
+        inline for (want.draws, 0..) |entry, index| {
+            try testing.expect(got.draws[index].type == entry.type);
+            try testing.expectEqual(entry.count, got.draws[index].count);
+        }
+        try testing.expectEqual(want.points, got.points);
+        try testing.expectEqual(want.areas, got.areas);
     }
 }
 
