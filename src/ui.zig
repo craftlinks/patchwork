@@ -25,9 +25,10 @@
 //! ui/areas.zig    Id, Area, the resolve scan, the duplicate-id stamps
 //! ui/cx.zig       Context: draw context + turtle stack + areas + pointer, hover, capture
 //! ui/view.zig     ViewState, scrollbar geometry, List
-//! ui/canvas.zig   CanvasState, the zoom ladder, wheel and drag
+//! ui/canvas.zig   CanvasState, the zoom ladder, wheel and drag, and its actions
 //! ui/gestures.zig tap, drag, long-press, pinch, and two-finger recognizers per target
-//! ui/drag.zig     Drag: one area's press, drag, and release as the place of the point it moves
+//! ui/drag.zig     Drag: one area's press, drag, and release as the place of the point it moves;
+//!                 Scrub: a knob's vertical grip, a value moved by pointer travel
 //! ui/edit.zig     the single-line editing core: bounded UTF-8 buffer, caret, selection, words,
 //!                 and paste sanitizing for one line and the code editor's multi-line text
 //! ```
@@ -108,6 +109,7 @@ pub const title_max = cx.title_max;
 pub const Decorations = input.Decorations;
 pub const Hit = cx.Hit;
 pub const Drag = drag.Drag;
+pub const Scrub = drag.Scrub;
 pub const Dragging = cx.Dragging;
 pub const DragOver = cx.DragOver;
 pub const DragEnd = cx.DragEnd;

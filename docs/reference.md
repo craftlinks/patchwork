@@ -1111,7 +1111,8 @@ pub fn draw(app: *App, cx: *Context) void {
   Page Up, and Page Down move the highlight while the field keeps the caret, Enter or a click
   chooses, Escape, Tab, or an outside press dismisses; `filter` is the built-in prefix-then-
   substring match or `.app`, where the app calls `show(cx, rows)`; disabled rows are greyed and
-  skipped; `chosen` carries the item's index), `widgets.Tooltip` (the app says what is hovered
+  skipped; `chosen` carries the item's index; `hovered_row(cx)` is the row under the pointer,
+  an index into `rows()`, or null), `widgets.Tooltip` (the app says what is hovered
   as a `widgets.Tip`; it shows after
   `tooltip_delay_ms`, hides on a press, and records no area). `MenuOf(Skin)`,
   `DropdownOf(Skin)`, and `TooltipOf(Skin)` are skinnable like the other widgets.
@@ -1373,7 +1374,8 @@ between knobs, beside a scrolling list of 1,000 presets and a status line. It de
   (before step 26 a 30 Hz timer woke it forever).
 
 Knob interaction: a knob draws a track arc and, unless its value is at the minimum, a value
-arc. Dragging vertically adjusts the value in proportion to `-dy` (up increases). Wheel over
+arc. Dragging vertically adjusts the value in proportion to `-dy` (up increases), through the
+knob's `ui.Scrub` (see Drag). Wheel over
 a visible knob ring nudges it the same way instead of scrolling. `Meter.set_value` returns
 false when the value is unchanged, and drawing only reads `value`. The scale factors are
 `widgets` constants checked by "knob drag is relative and clamped".
@@ -1508,7 +1510,8 @@ A 1,000-module grid (40 by 25, each a face, a header with its title, two ports, 
 zoom) with about 1,300 hanging cables, in a 1248 by 592 canvas. The wheel zooms one
 rung (2^(1/6)) about the pointer from 25% to 400%, dragging the background pans, pressing a
 module selects it, and dragging its header moves it; arrows pan, `=` and `-` zoom about the
-center, and `0` resets; `d` dashes every cable at 8 on, 4 off, and `f` makes the dashes flow at
+center (`CanvasState.step_center`), `0` resets (`reset`), and `n` selects the next module and
+pans by the least that shows it whole (`reveal`); `d` dashes every cable at 8 on, 4 off, and `f` makes the dashes flow at
 40 world pixels a second (step 65). Modules and cables are culled in world pixels (a cable by
 `draw.path.bounds` round its control points), below 50% a module is its face and header, and
 text that is not `ui.canvas.legible` (below a 6-pixel on-screen em) is not placed, so the zoomed-out
@@ -1822,6 +1825,20 @@ as `released`, and the last `dragged` place stays. `track` works in window pixel
 the offset in world pixels. `Drag` redraws nothing and ignores hover: the holder has the same
 `Hit` and does both from it. To forget a drag (the thing it moved is gone), write `.{}`.
 
+`ui.Scrub` is the other grip: a knob's, which moves a value by pointer travel rather than a
+point under the pointer. A press keeps the pointer's y, and each drag sample moves the value by
+its own pixels, `-(y - drag_y) / span_px` of the range (up increases it). It is relative, as
+`widgets.Knob` is: past an end the value clamps, and the way back responds at once.
+
+```zig
+var scrub: ui.Scrub = .{};
+if (scrub.track(cx.hit(id, event), value, 120)) |next| value = next;   // clamped to [0, 1]
+// scrub.delta(hit, span_px) is the unclamped fraction, for a value in its own units
+```
+
+`widgets.Knob` keeps one (`Knob.scrub`) and the live example's knobs share one. The wheel
+stays each widget's; a grip that is absolute from its press is not a scrub.
+
 ## Drags Between Widgets
 
 A widget that holds a press may turn it into a drag that another widget receives: a tab
@@ -1941,7 +1958,14 @@ A canvas draws content in world pixels through a view, `screen = (x, y) + zoom *
   `cx.begin_at(rect, layout)` places a container at a fixed rect outside its parent's flow
   (free placement).
 - **Zoom ladder.** 25 rungs `2^(k/6)` from 0.25 to 4. The wheel moves one rung about the
-  pointer; the offset is snapped to device pixels when drawn. Glyphs rasterize at the rung
+  pointer; the offset is snapped to device pixels when drawn.
+- **Actions.** An app's own keys and commands move the view with the moves the wheel makes:
+  `view.wheel(cx, turn)` is `handle`'s wheel arm (for a wheel the app takes itself),
+  `view.step_center(cx, steps)` steps about the viewport's centre (a zoom key),
+  `view.reset(cx, x, y, zoom)` sets the offset and zoom and keeps the rest (a "home" key), and
+  `view.reveal(cx, world_rect, margin)` pans by the least that shows a world rect whole with
+  `margin` screen pixels to spare, per axis, never zooming (a "go to" or a "next" key).
+  `step_center` and `reveal` do nothing before the first draw, while the viewport is empty. Glyphs rasterize at the rung
   nearest the zoom (`text.Cache.zoom`), so the cache holds at most one size per rung, text is
   pixel-exact on every rung, and a full sweep fits the atlas without a reset.
 - **Pixel cache.** A viewed batch maps its bounds through the view and folds the view into

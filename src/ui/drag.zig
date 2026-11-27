@@ -27,6 +27,25 @@
 //! `Drag` neither redraws nor reacts to hover: the holder holds the same `Hit`, so it asks for
 //! a redraw or lights a hover look from it. What moves, and where it stops, stay the holder's.
 //!
+//! ## 1a. Scrub
+//! A `Scrub` is the vertical grip of a knob: a value moved by pointer travel, not a point put
+//! under the pointer. It keeps the y of the press and then of each drag sample, and each sample
+//! moves the value by its own pixels:
+//! ```text
+//! hit     state      delta(hit, span_px)              state after
+//! down    any        null                             drag_y = y
+//! drag    held       -(y - drag_y) / span_px          drag_y = y
+//! drag    not held   null                             unchanged
+//! up      any        null                             drag_y = null
+//! other   any        null                             unchanged
+//! track(hit, value, span_px) = clamp(value + delta, 0, 1), null when it equals value
+//! ```
+//! It is relative, as `widgets.Knob` is documented: a drag past an end clamps, and the way
+//! back responds at once rather than after the overshoot. `track` is the knob's own expression,
+//! so a knob on it keeps its bits; `delta` serves a value that is not in `[0, 1]` (the live
+//! example's literals). The wheel stays each widget's. A grip that is absolute from the press
+//! (a tempo dragged from where it was) is not a `Scrub`.
+//!
 //! ## 2. Spaces
 //! `track` works in logical window pixels, the space `Hit` reports. `track_in` takes a
 //! `draw.View` (a canvas's `CanvasState.drawn`), maps the pointer through `view.invert`, and
@@ -35,7 +54,7 @@
 //!
 //! ## 3. TigerStyle Invariants
 //! - No allocation, no loop; every call is a straight-line switch over all of `Hit`'s tags, so
-//!   a new tag is a compile error here.
+//!   a new tag is a compile error here. The same holds for `Scrub`.
 //! - `origin` is finite on every call and `view.zoom` positive; the mapped pointer, the offset,
 //!   and the place are finite (asserted, so they compile out in ReleaseFast).
 
@@ -106,6 +125,58 @@ pub const Drag = struct {
     }
 };
 
+/// A vertical scrub grip (module guide, section 1a): a press keeps the pointer's y, and each
+/// drag sample moves a value by its own pixels, `-(y - drag_y) / span_px` of the range, up
+/// increasing it. Relative, as `widgets.Knob` is: a drag past an end responds at once on the way
+/// back. The holder keeps one per grip; it draws nothing and holds no id.
+pub const Scrub = struct {
+    /// The pointer's y at the last press or drag sample, from a `down` to the next `up`.
+    drag_y: ?f32 = null,
+
+    /// True from a press to its release.
+    pub fn held(self: *const Scrub) bool {
+        if (self.drag_y) |y| assert(y == y);
+        return self.drag_y != null;
+    }
+
+    /// What `hit` moves the value by, in fractions of the range, `-dy / span_px` for a drag
+    /// sample `dy` pixels below the last; null for anything else. A `down` grabs, an `up` lets
+    /// go.
+    pub fn delta(self: *Scrub, hit: Hit, span_px: f32) ?f32 {
+        assert(span_px > 0);
+        switch (hit) {
+            .down => |press| {
+                assert(press.y == press.y);
+                self.drag_y = press.y;
+                return null;
+            },
+            .drag => |press| {
+                const from = self.drag_y orelse return null;
+                const dy = press.y - from;
+                self.drag_y = press.y;
+                const moved = -dy / span_px;
+                assert(moved == moved);
+                return moved;
+            },
+            .up => {
+                self.drag_y = null;
+                return null;
+            },
+            .none, .hover_in, .hover_out, .wheel, .secondary => return null,
+        }
+    }
+
+    /// `value` (in `[0, 1]`) moved by `hit`'s `delta`, clamped to `[0, 1]`, in the knob's
+    /// expression; null when it does not change.
+    pub fn track(self: *Scrub, hit: Hit, value: f32, span_px: f32) ?f32 {
+        assert(value >= 0 and value <= 1);
+        const moved = self.delta(hit, span_px) orelse return null;
+        const next = std.math.clamp(value + moved, 0, 1);
+        if (next == value) return null;
+        return next;
+    }
+};
+
 /// True when both coordinates are finite (neither NaN nor infinite).
 fn finite(point: [2]f32) bool {
     return std.math.isFinite(point[0]) and std.math.isFinite(point[1]);
@@ -114,6 +185,7 @@ fn finite(point: [2]f32) bool {
 comptime {
     assert(@sizeOf(Drag) <= 16);
     assert(@typeInfo(Drag.Action).@"union".field_names.len == 4);
+    assert(@sizeOf(Scrub) <= 8);
 }
 
 const testing = std.testing;
@@ -260,4 +332,57 @@ test "track equals track_in at the identity, exactly" {
     try testing.expectEqual([2]f32{ 5, 0 }, large.grab.?);
     const far = large.track(drag_at(-8388600, 8388610), .{ -8388608, 8388608 });
     try testing.expectEqual(Drag.Action{ .dragged = .{ -8388605, 8388610 } }, far);
+}
+
+// Locks `Scrub` (section 1a) over a 120 px span: value 0.25, a press at y 36, a drag to 6 gives
+// 0.5, on to 126 gives 0 (clamped), on to 4000 null (no change); the up lets go; then from 0, a
+// press at 36 and a drag to 26 gives 10 / 120: relative, the overshoot forgotten.
+test "a scrub moves a value by each sample's pixels" {
+    var scrub: Scrub = .{};
+    try testing.expect(!scrub.held());
+    var value: f32 = 0.25;
+    try testing.expectEqual(@as(?f32, null), scrub.track(down_at(150, 36), value, 120));
+    try testing.expect(scrub.held());
+    value = scrub.track(drag_at(150, 6), value, 120).?;
+    try testing.expectEqual(@as(f32, 0.5), value);
+    value = scrub.track(drag_at(150, 126), value, 120).?;
+    try testing.expectEqual(@as(f32, 0), value);
+    try testing.expectEqual(@as(?f32, null), scrub.track(drag_at(150, 4000), value, 120));
+    try testing.expectEqual(@as(?f32, null), scrub.track(up_at(150, 4000, false), value, 120));
+    try testing.expect(!scrub.held());
+    try testing.expectEqual(@as(?f32, null), scrub.track(drag_at(150, 26), value, 120));
+    _ = scrub.track(down_at(150, 36), value, 120);
+    try testing.expectEqual(@as(?f32, 10.0 / 120.0), scrub.track(drag_at(150, 26), value, 120));
+}
+
+// Locks `track` against the knob's own rule (`widgets/knob.zig`, section 2), bit for bit over a
+// sequence of samples: `clamp(value + -dy / span, 0, 1)` with the last sample's y; and `delta`
+// on its own: -(y - drag_y) / span unclamped, null for the wheel, hover, and secondary hits.
+test "scrub track is the knob's nudge to the bit" {
+    var scrub: Scrub = .{};
+    var value: f32 = 0.6180339;
+    var old: f32 = value;
+    var last: f32 = 211.5;
+    _ = scrub.delta(down_at(150, last), 120);
+    for ([_]f32{ 210.25, 197.75, 260.5, 259.0, 101.125, 333.3, 1.5, 17.25 }) |y| {
+        const dy = y - last;
+        last = y;
+        const next = std.math.clamp(old + -dy / 120, 0, 1);
+        const got = scrub.track(drag_at(150, y), value, 120);
+        if (next == old) {
+            try testing.expectEqual(@as(?f32, null), got);
+        } else {
+            try testing.expectEqual(@as(u32, @bitCast(next)), @as(u32, @bitCast(got.?)));
+            value = got.?;
+        }
+        old = next;
+    }
+    var free: Scrub = .{};
+    _ = free.delta(down_at(150, 100), 120);
+    try testing.expectEqual(@as(?f32, -2), free.delta(drag_at(150, 340), 120));
+    const turn: Hit = .{ .wheel = .{ .x = 150, .y = 100, .dx = 0, .dy = 3 } };
+    try testing.expectEqual(@as(?f32, null), free.delta(turn, 120));
+    try testing.expectEqual(@as(?f32, null), free.delta(.hover_in, 120));
+    try testing.expectEqual(@as(?f32, null), free.delta(.{ .secondary = press_at(150, 9) }, 120));
+    try testing.expect(free.held());
 }
