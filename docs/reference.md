@@ -107,7 +107,9 @@ widget; the app routes every event to every widget it owns.
 | `window_state` | `WindowState{maximized, fullscreen, activated, tiled sides, decorations, capabilities}` |
 
 `Key` names arrows, Home, End, Page Up and Down, Backspace, Delete, Enter, Tab, Escape, `a`
-to `z`, `0` to `9`, and F1 to F12 after the user's layout; anything else is `other`. `Mods` is
+to `z`, `0` to `9`, F1 to F12, and `-`, `=`, `+` (the keypad's `+`, `-`, `=` too) after the
+user's layout; anything else is `other`. `+` is its own key (`plus`): Shift and = on a US
+layout names it, so an app that wants either reads `equal` and `plus`. `Mods` is
 shift, ctrl, alt, and meta (Command on a Mac); shortcuts use ctrl or meta. Text is dropped
 under ctrl or meta and for control characters. Click counting is the library's: presses of
 one button at most 400 ms and 4 logical pixels apart count up (`Press.clicks`).
@@ -888,8 +890,10 @@ the device scale, and only the glyph records change (see Text below).
   asks for the clipboard, which arrives as one `paste` event for the focused widget.
 - **Cursor.** `cx.cursor()` is the hot area's shape, `grabbing` while a `grab` area is held.
 - **Browser keys.** A browser key is consumed (`cx.consumed()`, so the page's default does not
-  run) when a widget had focus, Tab moved it, or the key's own event gave an area focus (a `/`
-  that opens a palette); clipboard shortcuts (Ctrl or Cmd with C, X, V) never are.
+  run) when a widget had focus, Tab moved it, the key's own event gave an area focus (a `/`
+  that opens a palette), or the app called `cx.consume_key()` during the press (a key it acts
+  on with nothing focused, such as Ctrl and + for its own zoom); clipboard shortcuts (Ctrl or
+  Cmd with C, X, V) never are.
 - **Repeat.** Hosts repeat keys (`KeyPress.repeat`); the library never does.
 
 ## Theme
@@ -3014,14 +3018,14 @@ In the browser host (`src/host/web_exports.zig` and `web/shell.js`):
 - Touch: the canvas has `touch-action: none` and every finger takes pointer capture; events with
   `pointerType` `"touch"` call `wasm.touch_down`, `touch_move`, and `touch_up` with the DOM
   `pointerId` and `touch_cancel` on `pointercancel`, while pens stay on the mouse path (see Touch).
-- Keyboard and clipboard: the canvas is focusable (`tabindex="0"`); `keydown` and `keyup`
-  pass `event.key` as UTF-8 through the Wasm input buffer, and Zig names the key, so
-  `shell.js` maps no keys. `preventDefault` runs only when Zig reports the key consumed
-  (focus or Tab), never for Ctrl or Meta with C, X, or V, so the page's `copy`, `cut`, and
+- Keyboard and clipboard: the canvas is focusable (`tabindex="0"`); `keydown` and `keyup` pass
+  `event.key` as UTF-8 through the Wasm input buffer, and Zig names the key, so `shell.js` maps
+  no keys. `preventDefault` runs only when Zig reports the key consumed (focus, Tab, or
+  `cx.consume_key`), never for Ctrl or Meta with C, X, or V, so the page's `copy`, `cut`, and
   `paste` events fire and use `clipboardData` synchronously. Canvas focus and blur are
-  `window_focus`, the context menu is suppressed, all buttons are forwarded, and after each
-  call `shell.js` sets `canvas.style.cursor` from `cursor()` and the CSS names Wasm exports.
-  IME composition is not supported.
+  `window_focus`, the context menu is suppressed, all buttons are forwarded, and after each call
+  `shell.js` sets `canvas.style.cursor` from `cursor()` and the CSS names Wasm exports. IME
+  composition is not supported.
 - File drops: `dragenter`, `dragover`, `dragleave`, and `drop` on the canvas, read with
   `File.slice` (see File Drops).
 - `present_frame()` records a frame into a static `CommandBuffer` and calls `submit_js` once.

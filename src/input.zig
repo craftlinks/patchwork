@@ -48,10 +48,13 @@
 //!
 //! ## 3. Keys and Text
 //! `Key` names the keys widgets act on: arrows, Home, End, Page Up and Down, Backspace,
-//! Delete, Enter, Tab, Escape, `a` to `z`, `0` to `9`, and F1 to F12; every other key is
-//! `other`. The name follows the layout (the xkb keysym natively, `KeyboardEvent.key` in the
-//! browser), so Ctrl+Z follows the user's layout. `key_of_keysym` and `key_of_dom` map both
-//! sources, so all key naming lives here and is tested.
+//! Delete, Enter, Tab, Escape, `a` to `z`, `0` to `9`, F1 to F12, and `-`, `=`, and `+` (the
+//! keypad's included); every other key is `other`. The name follows the layout (the xkb keysym
+//! at the current level natively, `KeyboardEvent.key` in the browser), so Ctrl+Z follows the
+//! user's layout. `+` is its own key: Shift and = on a layout that puts `+` there names `plus`,
+//! as the layout's level names every key; an app that wants both reads `equal` and `plus`.
+//! `key_of_keysym` and `key_of_dom` map both sources, so all key naming lives here and is
+//! tested.
 //!
 //! A `key_down` carries the text the key typed (`KeyPress.text`, at most 4 bytes): one event,
 //! one dispatch per keystroke and per repeat. Text is dropped when Ctrl or Meta is held
@@ -323,17 +326,23 @@ pub const Key = enum(u8) {
     f10,
     f11,
     f12,
+    /// `-`, and the keypad's `-` (section 3).
+    minus,
+    /// `=`, and the keypad's `=`.
+    equal,
+    /// `+`, and the keypad's `+`; Shift and = on a layout that puts `+` there (US, AZERTY).
+    plus,
 
     /// The bit of this key in a held-key set; `other` has none.
-    pub fn bit(self: Key) u64 {
+    pub fn bit(self: Key) u128 {
         if (self == .other) return 0;
-        const index: u6 = @intCast(@backingInt(self));
+        const index: u7 = @intCast(@backingInt(self));
         assert(index < key_count);
-        return @as(u64, 1) << index;
+        return @as(u128, 1) << index;
     }
 };
 
-/// Values of `Key`, `other` included; a held-key set fits a `u64`.
+/// Values of `Key`, `other` included; a held-key set fits a `u128`.
 pub const key_count: u32 = @typeInfo(Key).@"enum".field_names.len;
 
 /// A key press or release. `text` holds `len` bytes of whole UTF-8 codepoints the press
@@ -785,8 +794,8 @@ fn printable_text(utf8: []const u8) bool {
     return true;
 }
 
-/// The key an xkb keysym names (`xkbcommon-keysyms.h`); letters of either case and the keypad
-/// navigation keys included. Anything else is `other`.
+/// The key an xkb keysym names (`xkbcommon-keysyms.h`); letters of either case, the keypad
+/// navigation keys, and the keypad's +, -, and = included. Anything else is `other`.
 pub fn key_of_keysym(keysym: u32) Key {
     if (keysym >= 'a' and keysym <= 'z') return letter(@intCast(keysym - 'a'));
     if (keysym >= 'A' and keysym <= 'Z') return letter(@intCast(keysym - 'A'));
@@ -806,19 +815,28 @@ pub fn key_of_keysym(keysym: u32) Key {
         0xFF0D, 0xFF8D => .enter,
         0xFF09, 0xFE20 => .tab,
         0xFF1B => .escape,
+        0x2D, 0xFFAD => .minus,
+        0x3D, 0xFFBD => .equal,
+        0x2B, 0xFFAB => .plus,
         else => .other,
     };
 }
 
-/// The key a `KeyboardEvent.key` value names. A single ASCII letter of either case or digit
-/// names that key; named keys use the DOM spellings. Anything else is `other`.
+/// The key a `KeyboardEvent.key` value names. A single ASCII letter of either case, digit, `-`,
+/// `=`, or `+` names that key (the keypad's give the same values); named keys use the DOM
+/// spellings. Anything else is `other`.
 pub fn key_of_dom(name: []const u8) Key {
     if (name.len == 1) {
         const byte = name[0];
         if (byte >= 'a' and byte <= 'z') return letter(byte - 'a');
         if (byte >= 'A' and byte <= 'Z') return letter(byte - 'A');
         if (byte >= '0' and byte <= '9') return digit(byte - '0');
-        return .other;
+        return switch (byte) {
+            '-' => .minus,
+            '=' => .equal,
+            '+' => .plus,
+            else => .other,
+        };
     }
     if (name.len >= 2 and name.len <= 3 and name[0] == 'F') {
         const number = std.fmt.parseInt(u8, name[1..], 10) catch return .other;
@@ -944,8 +962,8 @@ pub const Repeat = struct {
 
 comptime {
     assert(queue_cap == 64);
-    assert(key_count == 62);
-    assert(key_count <= 64);
+    assert(key_count == 65);
+    assert(key_count <= 128);
     assert(@sizeOf(Pointer) <= 16);
     assert(@sizeOf(Point) == 8);
     assert(@sizeOf(Button) == 20);
@@ -1106,8 +1124,65 @@ test "keysyms and DOM names map to the same keys" {
     try testing.expectEqual(Key.escape, key_of_dom("Escape"));
     try testing.expectEqual(Key.other, key_of_dom("\u{e4}"));
     try testing.expectEqual(Key.other, key_of_dom("Dead"));
-    try testing.expectEqual(@as(u64, 0), Key.other.bit());
-    try testing.expectEqual(@as(u64, 1) << 61, Key.f12.bit());
+    try testing.expectEqual(@as(u128, 0), Key.other.bit());
+    try testing.expectEqual(@as(u128, 1) << 61, Key.f12.bit());
+}
+
+// Locks the punctuation keys (section 3): keysyms 0x2D, 0x3D, 0x2B and the keypad's 0xFFAD,
+// 0xFFBD, 0xFFAB name minus, equal, plus, as the DOM's "-", "=", "+" do; underscore, agrave,
+// KP_0, KP_Multiply, "_", "\u{e0}", and a `code` spelling stay `other`; the new keys take the
+// values 62 to 64 and bits 62 to 64, and the old ones keep theirs (f12 is 61).
+test "minus, equal, and plus are named on both hosts, the keypad's too" {
+    try testing.expectEqual(Key.minus, key_of_keysym(0x2D));
+    try testing.expectEqual(Key.minus, key_of_keysym(0xFFAD));
+    try testing.expectEqual(Key.equal, key_of_keysym(0x3D));
+    try testing.expectEqual(Key.equal, key_of_keysym(0xFFBD));
+    try testing.expectEqual(Key.plus, key_of_keysym(0x2B));
+    try testing.expectEqual(Key.plus, key_of_keysym(0xFFAB));
+    try testing.expectEqual(Key.other, key_of_keysym(0x5F));
+    try testing.expectEqual(Key.other, key_of_keysym(0xE0));
+    try testing.expectEqual(Key.other, key_of_keysym(0xFFB0));
+    try testing.expectEqual(Key.other, key_of_keysym(0xFFAA));
+    try testing.expectEqual(Key.minus, key_of_dom("-"));
+    try testing.expectEqual(Key.equal, key_of_dom("="));
+    try testing.expectEqual(Key.plus, key_of_dom("+"));
+    try testing.expectEqual(Key.other, key_of_dom("_"));
+    try testing.expectEqual(Key.other, key_of_dom("\u{e0}"));
+    try testing.expectEqual(Key.other, key_of_dom("Minus"));
+    try testing.expectEqual(@as(u32, 65), key_count);
+    try testing.expectEqual(@as(u8, 61), @backingInt(Key.f12));
+    try testing.expectEqual(@as(u8, 64), @backingInt(Key.plus));
+    try testing.expectEqual(@as(u128, 1) << 62, Key.minus.bit());
+    try testing.expectEqual(@as(u128, 1) << 63, Key.equal.bit());
+    try testing.expectEqual(@as(u128, 1) << 64, Key.plus.bit());
+    try testing.expectEqual(@as(u128, 1) << 61, Key.f12.bit());
+}
+
+// Locks that a shortcut keeps the key's name and types nothing (section 3): Ctrl and = is
+// `equal` with no text, Ctrl, Shift and + is `plus` with shift and no text, Meta and - and
+// Ctrl, Alt and = type nothing, while a bare "-" and Shift and "+" type themselves.
+test "a shortcut with minus, equal, or plus keeps its name and types nothing" {
+    var ctrl = Mods.none;
+    ctrl.ctrl = true;
+    var ctrl_shift = ctrl;
+    ctrl_shift.shift = true;
+    var ctrl_alt = ctrl;
+    ctrl_alt.alt = true;
+    var meta = Mods.none;
+    meta.meta = true;
+    var shift = Mods.none;
+    shift.shift = true;
+    const equal = key_press(.equal, ctrl, false, "=");
+    try testing.expectEqual(Key.equal, equal.key);
+    try testing.expectEqual(@as(u8, 0), equal.len);
+    const plus = key_press(.plus, ctrl_shift, false, "+");
+    try testing.expectEqual(Key.plus, plus.key);
+    try testing.expectEqual(@as(u8, 0), plus.len);
+    try testing.expect(plus.mods.shift);
+    try testing.expectEqual(@as(u8, 0), key_press(.minus, meta, false, "-").len);
+    try testing.expectEqual(@as(u8, 0), key_press(.equal, ctrl_alt, false, "=").len);
+    try testing.expectEqualStrings("+", key_press(.plus, shift, false, "+").typed());
+    try testing.expectEqualStrings("-", key_press(.minus, .none, false, "-").typed());
 }
 
 // Locks the text filter: printable text rides on the press, while Ctrl or Meta, a C0 control,

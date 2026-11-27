@@ -59,7 +59,7 @@ zig build serve-audio         # the meters and scope in the browser; Space plays
 | `data`, `wave`, `fx` | Data textures; waveforms and spectra; offscreen effects |
 | `audio` | Audio meters, scope, and XY trace of Thrum's test tone (in `examples/sound`) |
 | `wake` | A producer on another thread into the UI, and its own web module in the browser |
-| `canvas` | Pan and zoom canvas; `d` dashes the cables, `f` makes them flow |
+| `canvas` | Pan and zoom canvas; `=` and `-` zoom (with Ctrl too, kept from the page's zoom), `d` dashes the cables, `f` makes them flow |
 | `gallery`, `workspace` | Widget gallery; docking workspace |
 | `skins` | Four looks over one set of widgets, switched live |
 

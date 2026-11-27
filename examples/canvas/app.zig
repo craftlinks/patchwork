@@ -29,6 +29,8 @@
 //! arrows                  pan by pan_step                       = and -              a rung about
 //! 0                       back to the start view                                     the center
 //! d                       dashes every cable at 8 / 4             f                  flows them
+//! ctrl = + - 0            the same zoom keys, taken from the page (`cx.consume_key`), so a
+//!                         browser does not zoom the page as well
 //! ```
 //! Flow lowers the cables' dash offset by `flow_speed` world pixels a second on the `frame`
 //! event, wrapped to the period, and asks for the next frame (`draw/path.zig`, section 4b): every
@@ -316,6 +318,21 @@ pub const App = struct {
     fn key(app: *App, cx: *Context, press: input.KeyPress) void {
         const mid_x = canvas_rect.x + canvas_rect.width / 2;
         const mid_y = canvas_rect.y + canvas_rect.height / 2;
+        // With Ctrl or Command the zoom keys type nothing, so they are read by name, and the app
+        // takes them so a browser does not zoom the page as well (section 3).
+        if (press.mods.shortcut() and !press.mods.alt) {
+            switch (press.key) {
+                .equal, .plus => _ = app.view.step_at(cx, mid_x, mid_y, 1),
+                .minus => _ = app.view.step_at(cx, mid_x, mid_y, -1),
+                .d0 => {
+                    app.view = .init(start_x, start_y, 1);
+                    cx.redraw();
+                },
+                else => return,
+            }
+            cx.consume_key();
+            return;
+        }
         switch (press.key) {
             .left => _ = app.view.pan_by(cx, pan_step, 0),
             .right => _ = app.view.pan_by(cx, -pan_step, 0),
@@ -662,6 +679,62 @@ test "d dashes the cables and f flows them" {
     try std.testing.expect(!ui.animate(App, app, cx, 16));
     send(app, .{ .key_down = input.key_press(.other, .none, false, "d") });
     try std.testing.expect(!app.dashed);
+}
+
+/// The view's offset and zoom.
+fn view_of(app: *const App) [3]f32 {
+    assert(app.view.zoom > 0);
+    assert(app.view.zoom <= canvas.zoom_max);
+    return .{ app.view.x, app.view.y, app.view.zoom };
+}
+
+/// Sends a press of `key` with `mods` typing `utf8` as a host does, and returns whether the
+/// key was kept from the page.
+fn press_consumed(app: *App, key: input.Key, mods: input.Mods, utf8: []const u8) bool {
+    assert(utf8.len <= input.key_text_cap);
+    send(app, .{ .key_down = input.key_press(key, mods, false, utf8) });
+    assert(fixture.context.phase == .idle);
+    return fixture.context.consumed();
+}
+
+// Locks the shortcut zoom keys (section 3): Ctrl and = lands on the view bare "=" gives (zoom
+// rungs[13], 2^(1/6)), Ctrl and - twice on bare "-" twice's (rungs[11]), and each is consumed
+// while the bare keys are not; Ctrl, Shift and + is rungs[12] (1), Meta and + rungs[13], Ctrl
+// and 0 the start view; Ctrl, Alt and = and Ctrl and R change nothing and are not consumed.
+test "Ctrl and = + - 0 zoom as the bare keys do and are consumed" {
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    var ctrl_shift = ctrl;
+    ctrl_shift.shift = true;
+    var ctrl_alt = ctrl;
+    ctrl_alt.alt = true;
+    var meta = input.Mods.none;
+    meta.meta = true;
+    var app = new_app();
+    _ = frame_at(app);
+    try std.testing.expect(!press_consumed(app, .equal, .none, "="));
+    try std.testing.expectEqual(canvas.rungs[canvas.rung_one + 1], app.view.zoom);
+    const bare_in = view_of(app);
+    try std.testing.expect(!press_consumed(app, .minus, .none, "-"));
+    try std.testing.expect(!press_consumed(app, .minus, .none, "-"));
+    try std.testing.expectEqual(canvas.rungs[canvas.rung_one - 1], app.view.zoom);
+    const bare_out = view_of(app);
+    app = new_app();
+    _ = frame_at(app);
+    try std.testing.expect(press_consumed(app, .equal, ctrl, "="));
+    try std.testing.expectEqual(bare_in, view_of(app));
+    try std.testing.expect(press_consumed(app, .minus, ctrl, "-"));
+    try std.testing.expect(press_consumed(app, .minus, ctrl, "-"));
+    try std.testing.expectEqual(bare_out, view_of(app));
+    try std.testing.expect(press_consumed(app, .plus, ctrl_shift, "+"));
+    try std.testing.expectEqual(@as(f32, 1), app.view.zoom);
+    try std.testing.expect(press_consumed(app, .plus, meta, "+"));
+    try std.testing.expectEqual(canvas.rungs[canvas.rung_one + 1], app.view.zoom);
+    try std.testing.expect(press_consumed(app, .d0, ctrl, "0"));
+    try std.testing.expectEqual([3]f32{ start_x, start_y, 1 }, view_of(app));
+    try std.testing.expect(!press_consumed(app, .equal, ctrl_alt, "="));
+    try std.testing.expect(!press_consumed(app, .r, ctrl, "r"));
+    try std.testing.expectEqual([3]f32{ start_x, start_y, 1 }, view_of(app));
 }
 
 comptime {
