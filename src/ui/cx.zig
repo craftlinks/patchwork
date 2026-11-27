@@ -182,10 +182,11 @@
 //! - A focused id that the last draw did not record stays focused; `focus_rect` is its area's
 //!   rect from the last draw that recorded it (refreshed in `end_frame`, only while focused).
 //! - `window_focus(false)` clears the held keys and the modifiers.
-//! A browser key is `consumed` when a widget had focus, Tab moved it, or its event gave an area
-//! focus (`set_focus`, so a `/` that opens a palette never reaches the page's quick find),
-//! unless it is a clipboard shortcut, so the page's own copy, cut, and paste events still
-//! fire.
+//! A browser key is `consumed` when a widget had focus, Tab moved it, its event gave an area
+//! focus (`set_focus`, so a `/` that opens a palette never reaches the page's quick find), or
+//! the app said the key was its own (`consume_key`, for a key it acts on with nothing focused,
+//! such as Ctrl and + for its own zoom), unless it is a clipboard shortcut, so the page's own
+//! copy, cut, and paste events still fire.
 //!
 //! ## 7a. File Drops
 //! A file drag does not move the pointer (the drag holds it), so it has its own target: the
@@ -669,12 +670,12 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
         focus_rect: Rect,
         /// True during an Escape press; `event_end` then clears focus.
         escaping: bool,
-        /// True after a key press a widget or Tab took (section 7).
+        /// True after a key press a widget, Tab, or the app took (section 7).
         key_consumed: bool,
         /// The current key press is Ctrl or Meta with C, X, or V: never consumed (section 7).
         key_clipboard: bool,
         /// Held keys as `Key.bit` flags, and the latest modifiers.
-        keys_held: u64,
+        keys_held: u128,
         mods: input.Mods,
         window_focused: bool,
         /// `copy` output: `clipboard[0..copy_len]`. The flags are for the host (section 8).
@@ -2360,7 +2361,19 @@ pub fn Context(comptime Draw: type, comptime area_cap: u32) type {
             return self.keys_held & key.bit() != 0;
         }
 
-        /// True when the last key press went to a widget or moved focus (section 7).
+        /// The key press being dispatched is the app's: a browser keeps it from the page, so its
+        /// default (a zoom on Ctrl and +) does not run. A clipboard shortcut (Ctrl or Meta with C,
+        /// X, or V) stays unconsumed, so the page's copy, cut, and paste events still fire.
+        /// Natively it changes nothing. Event phase, during a `key_down` (section 7).
+        pub fn consume_key(self: *Self) void {
+            assert(self.phase == .event);
+            assert(self.event_tag == .key_down);
+            if (!self.key_clipboard) self.key_consumed = true;
+            assert(self.key_consumed or self.key_clipboard);
+        }
+
+        /// True when the last key press went to a widget, moved focus, or was consumed by the app
+        /// (section 7).
         pub fn consumed(self: *const Self) bool {
             assert(self.phase == .idle);
             assert(self.event_tag == .key_down);
@@ -3024,6 +3037,56 @@ test "a key whose event gives focus is consumed" {
     try testing.expect(!context.consumed());
 }
 
+// Locks the app's verdict (section 7): with nothing focused Ctrl and = is not consumed until the
+// app calls `consume_key`, the next press starts unconsumed again, Ctrl with C, X, or V stays
+// unconsumed through the call while Ctrl and A does not, the call keeps a focused press
+// consumed, and `plus`, bit 64 of the u128 held set, is held, released, and cleared by a blur.
+test "an app's consume_key keeps a key from the page, never a clipboard shortcut" {
+    const context = new_context();
+    var ctrl = input.Mods.none;
+    ctrl.ctrl = true;
+    const equal = input.key_press(.equal, ctrl, false, "");
+    context.event_begin(.{ .key_down = equal });
+    context.event_end();
+    try testing.expect(!context.consumed());
+    context.event_begin(.{ .key_down = equal });
+    context.consume_key();
+    context.event_end();
+    try testing.expect(context.consumed());
+    context.event_begin(.{ .key_down = input.key_press(.minus, ctrl, false, "") });
+    context.event_end();
+    try testing.expect(!context.consumed());
+    for ([_]input.Key{ .c, .x, .v }) |key| {
+        context.event_begin(.{ .key_down = input.key_press(key, ctrl, false, "") });
+        context.consume_key();
+        context.event_end();
+        try testing.expect(!context.consumed());
+    }
+    context.event_begin(.{ .key_down = input.key_press(.a, ctrl, false, "") });
+    context.consume_key();
+    context.event_end();
+    try testing.expect(context.consumed());
+    var out: [1]Hit = undefined;
+    const field = areas.id("field", 0);
+    draw_fields(context);
+    send(context, press_key(.tab, .none), &.{field}, &out);
+    try testing.expect(context.consumed());
+    context.event_begin(.{ .key_down = input.key_press(.a, .none, false, "a") });
+    context.consume_key();
+    context.event_end();
+    try testing.expect(context.consumed());
+    var shift = input.Mods.none;
+    shift.shift = true;
+    send(context, press_key(.plus, shift), &.{field}, &out);
+    try testing.expect(context.held(.plus));
+    try testing.expectEqual(@as(u128, 1) << 64, context.keys_held & input.Key.plus.bit());
+    send(context, .{ .key_up = input.key_press(.plus, shift, false, "") }, &.{field}, &out);
+    try testing.expect(!context.held(.plus));
+    send(context, press_key(.plus, shift), &.{field}, &out);
+    send(context, .{ .window_focus = false }, &.{field}, &out);
+    try testing.expectEqual(@as(u128, 0), context.keys_held);
+}
+
 // Locks held keys: presses set and releases clear their bits, and a window blur releases every
 // held key and the modifiers.
 test "a window blur releases held keys and modifiers" {
@@ -3043,7 +3106,7 @@ test "a window blur releases held keys and modifiers" {
     try testing.expect(!context.held(.left));
     try testing.expect(!context.mods.shift);
     try testing.expect(!context.window_focused);
-    try testing.expectEqual(@as(u64, 0), context.keys_held);
+    try testing.expectEqual(@as(u128, 0), context.keys_held);
 }
 
 // Locks the other buttons: a right press on the hot area is `secondary` without a capture, a

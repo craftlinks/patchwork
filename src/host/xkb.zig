@@ -297,6 +297,45 @@ const key_apostrophe: u32 = 40;
 const key_e: u32 = 18;
 const key_left_shift: u32 = 42;
 const key_backspace: u32 = 14;
+const key_6: u32 = 7;
+const key_0: u32 = 11;
+const key_minus: u32 = 12;
+const key_equal: u32 = 13;
+const key_right_brace: u32 = 27;
+const key_left_ctrl: u32 = 29;
+const key_slash: u32 = 53;
+const key_kp_minus: u32 = 74;
+const key_kp_plus: u32 = 78;
+
+/// Compiles the keymap of `layout` from names into `keyboard`, or skips the test when this
+/// system has no such layout.
+fn use_layout(keyboard: *Keyboard, layout: [*:0]const u8) !void {
+    const context = keyboard.context orelse return error.SkipZigTest;
+    const names: RuleNames = .{
+        .rules = null,
+        .model = null,
+        .layout = layout,
+        .variant = null,
+        .options = null,
+    };
+    const keymap = xkb_keymap_new_from_names(context, &names, 0) orelse return error.SkipZigTest;
+    try testing.expect(keyboard.use_keymap(keymap));
+    assert(keyboard.state != null);
+}
+
+/// Holds (`down`) or lets go of the modifier on the evdev `code`.
+fn hold(keyboard: *Keyboard, code: u32, down: bool) void {
+    assert(keyboard.state != null);
+    assert(code < 256);
+    _ = xkb_state_update_key(keyboard.state.?, code + keycode_offset, @intFromBool(down));
+}
+
+/// Presses the evdev `code` and checks the key it names and, unless null, the text it types.
+fn expect_press(keyboard: *Keyboard, code: u32, key: input.Key, text: ?[]const u8) !void {
+    var typed: Typed = undefined;
+    try testing.expectEqual(key, keyboard.press(code, false, &typed));
+    if (text) |expected| try testing.expectEqualStrings(expected, typed.text());
+}
 
 // Locks the native translation without a display: a German keymap compiled from names types
 // "ä" on the AC11 key and "A"-row keys through `press`, names Backspace, and repeats letters
@@ -341,4 +380,49 @@ test "a German keymap types umlauts and composes dead keys" {
     try testing.expectEqual(@as(u32, 0), typed.len);
     _ = keyboard.press(key_e, false, &typed);
     try testing.expectEqualStrings("\u{ea}", typed.text());
+}
+
+// Locks the punctuation keys by layout and level (input.zig, section 3). US: = is `equal`
+// typing "=", Shift and = is `plus` typing "+", - is `minus`, Shift and - is `other` typing
+// "_", the keypad's + and - are `plus` and `minus`, and Ctrl keeps each name (Ctrl and = is
+// `equal`, with Shift `plus`). French: AE06 is `minus`, = `equal`, Shift and = `plus`, the 0 key
+// `other` typing "à" and with Shift `d0` typing "0". German: AD12 is `plus` typing "+", AB10
+// `minus`, the 0 key `d0` and with Shift `equal` typing "=".
+test "US, French, and German keymaps name minus, equal, and plus by level" {
+    var keyboard: Keyboard = undefined;
+    keyboard.init();
+    keyboard.compose = null;
+    try use_layout(&keyboard, "us");
+    try expect_press(&keyboard, key_equal, .equal, "=");
+    try expect_press(&keyboard, key_minus, .minus, "-");
+    try expect_press(&keyboard, key_kp_plus, .plus, null);
+    try expect_press(&keyboard, key_kp_minus, .minus, null);
+    hold(&keyboard, key_left_shift, true);
+    try expect_press(&keyboard, key_equal, .plus, "+");
+    try expect_press(&keyboard, key_minus, .other, "_");
+    hold(&keyboard, key_left_shift, false);
+    hold(&keyboard, key_left_ctrl, true);
+    try expect_press(&keyboard, key_equal, .equal, null);
+    try testing.expect(keyboard.mods().ctrl);
+    hold(&keyboard, key_left_shift, true);
+    try expect_press(&keyboard, key_equal, .plus, null);
+    try testing.expect(keyboard.mods().shift);
+    try testing.expect(keyboard.mods().ctrl);
+    hold(&keyboard, key_left_shift, false);
+    hold(&keyboard, key_left_ctrl, false);
+    try use_layout(&keyboard, "fr");
+    try expect_press(&keyboard, key_6, .minus, "-");
+    try expect_press(&keyboard, key_equal, .equal, "=");
+    try expect_press(&keyboard, key_0, .other, "\u{e0}");
+    hold(&keyboard, key_left_shift, true);
+    try expect_press(&keyboard, key_equal, .plus, "+");
+    try expect_press(&keyboard, key_0, .d0, "0");
+    hold(&keyboard, key_left_shift, false);
+    try use_layout(&keyboard, "de");
+    try expect_press(&keyboard, key_right_brace, .plus, "+");
+    try expect_press(&keyboard, key_slash, .minus, "-");
+    try expect_press(&keyboard, key_0, .d0, "0");
+    hold(&keyboard, key_left_shift, true);
+    try expect_press(&keyboard, key_0, .equal, "=");
+    hold(&keyboard, key_left_shift, false);
 }

@@ -94,9 +94,10 @@
 //!   `TextEncoder.encodeInto`). `input.key_of_dom` names the key, and a value that is one
 //!   codepoint is the typed text (`input.key_press` filters it). `mods` is the `input.Mods`
 //!   byte: shift 1, ctrl 2, alt 4, meta 8. `key_down` returns bit 0 = a frame is owed and
-//!   bit 1 = consumed (`cx.consumed`): `shell.js` calls `preventDefault` only then, so Tab
-//!   leaves a canvas with nothing focusable and Ctrl+C, X, and V reach the page's clipboard
-//!   events. The browser repeats keys itself (`event.repeat`); Zig never repeats.
+//!   bit 1 = consumed (`cx.consumed`: focus, Tab, `set_focus`, or `cx.consume_key`):
+//!   `shell.js` calls `preventDefault` only then, so Tab leaves a canvas with nothing
+//!   focusable and Ctrl+C, X, and V reach the page's clipboard events. The browser repeats
+//!   keys itself (`event.repeat`); Zig never repeats.
 //! - Copy and cut: a focused field handles Ctrl+C or Ctrl+X in `key_down` and calls
 //!   `cx.copy`; the page's `copy` or `cut` event that follows asks `copy_take()`, which returns
 //!   the length of that pending copy (0 for none) at `copy_ptr()`. `key_down` drops a stale
