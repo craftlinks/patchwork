@@ -43,7 +43,10 @@
 //! everything else           the field: caret, selection, drag; a change refilters, filtered
 //! ```
 //! Row ids are by row, not item, so a refilter under a resting pointer moves no hot id and no
-//! synthetic hover pulls the highlight off the first row.
+//! synthetic hover pulls the highlight off the first row. `hovered_row(cx)` is the row under the
+//! pointer among the last draw's rows (`range`), the hovered id read back, null when closed or
+//! over none: an app that shows the item's detail beside it, or wants the row's area, reads it
+//! rather than the highlight, which keys move too.
 //!
 //! ## 4. Keys
 //! Keys count only while the field is focused, and the event that gave it focus is ignored,
@@ -283,6 +286,21 @@ pub fn PaletteOf(comptime Skin: type, comptime config: PaletteConfig) type {
 
         pub fn rows(self: *const Self) []const u32 {
             return self.shown[0..self.count];
+        }
+
+        /// The row under the pointer among the last draw's rows, its index into `rows()`; null
+        /// when closed or over none (section 3). O(`config.rows`).
+        pub fn hovered_row(self: *const Self, cx: anytype) ?u32 {
+            assert(self.range.first <= self.range.end);
+            if (!self.open) return null;
+            const hovered = cx.hovered();
+            if (hovered == .none) return null;
+            var row = self.range.first;
+            while (row < @min(self.range.end, self.count)) : (row += 1) {
+                if (self.row_id(row) == hovered) return row;
+            }
+            assert(row - self.range.first <= config.rows + 1);
+            return null;
         }
 
         pub fn open_at(self: *Self, cx: anytype, anchor: popup.Anchor, side: popup.Side) void {

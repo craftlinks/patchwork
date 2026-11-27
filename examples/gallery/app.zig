@@ -3857,7 +3857,8 @@ test "the palette scenario filters and pages by keys" {
 
 // Locks the `palette-pointer` scenario (section 2k): the File menu's "Command palette…" opens
 // it, the wheel scrolls to 364 (rows 13 to 20), Redo (disabled) does nothing on hover or click,
-// About… is highlighted; a click on it opens the dialog and closes the palette.
+// About… is highlighted and is the hovered row (`hovered_row` 18); a click on it opens the
+// dialog and closes the palette, which then hovers no row.
 test "the palette-pointer scenario scrolls, skips disabled rows, and opens About" {
     const app = new_app();
     _ = frame(app);
@@ -3866,10 +3867,12 @@ test "the palette-pointer scenario scrolls, skips disabled rows, and opens About
     try std.testing.expectEqual(@as(f32, 364), app.palette.view.scroll_y);
     try std.testing.expectEqual(ui.List.Range{ .first = 13, .end = 21 }, app.palette.range);
     try std.testing.expectEqual(@as(?u32, 18), app.palette.highlight);
+    try std.testing.expectEqual(@as(?u32, 18), app.palette.hovered_row(&test_context));
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
     click_at_center(app, app.palette.row_id(18));
     try std.testing.expect(app.about.open);
     try std.testing.expect(!app.palette.open);
+    try std.testing.expectEqual(@as(?u32, null), app.palette.hovered_row(&test_context));
     try std.testing.expectEqualStrings("palette About…", app.status_text());
     try std.testing.expectEqual(@as(u32, 0), test_context.draw.overflow_count);
 }

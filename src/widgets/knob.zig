@@ -21,9 +21,12 @@
 //! light it. Drag and wheel are relative:
 //! ```text
 //! value' = clamp(value - delta / drag_span_px, 0, 1)
-//! delta  = y - drag_y      for drags (up increases the value)
+//! delta  = y - drag_y      for drags (up increases the value): `ui.Scrub`
 //! delta  = wheel.dy        for the wheel
 //! ```
+//! The drag is the knob's `scrub` (`ui/drag.zig`, section 1a), whose `delta` is `-dy /
+//! drag_span_px` and whose `track` is `nudge`'s clamp: each sample moves by its own pixels, so
+//! after the value hits an end the way back responds at once.
 //! A right press resets the value to `default`, its value at `init`. Test "knob drag is
 //! relative and clamped".
 //!
@@ -130,7 +133,8 @@ pub fn KnobOf(comptime Skin: type) type {
         default: f32,
         accent: kit.Paint,
         hover: animator.Animator,
-        drag_y: f32,
+        /// The drag's grip (`ui.Scrub`): held from a press to its release.
+        scrub: ui.Scrub,
         /// The ring's side in logical pixels (section 1); `sized` sets another.
         ring: f32 = ring_size,
 
@@ -165,7 +169,7 @@ pub fn KnobOf(comptime Skin: type) type {
                 .default = value,
                 .accent = accent,
                 .hover = animator.Animator.init(kit.hover_rate_per_ms),
-                .drag_y = 0,
+                .scrub = .{},
             };
             knob.set_value(value);
             assert(knob.value == value);
@@ -192,16 +196,19 @@ pub fn KnobOf(comptime Skin: type) type {
             kit.respond(cx, hit, &self.hover, null);
             switch (hit) {
                 .none, .hover_in, .hover_out => return .none,
-                .down => |press| {
-                    self.drag_y = press.y;
+                .down => {
+                    _ = self.scrub.delta(hit, drag_span_px);
+                    assert(self.scrub.held());
                     return .none;
                 },
-                .drag => |press| {
-                    const dy = press.y - self.drag_y;
-                    self.drag_y = press.y;
-                    return self.nudge(cx, -dy / drag_span_px);
+                .drag => {
+                    const delta = self.scrub.delta(hit, drag_span_px) orelse return .none;
+                    return self.nudge(cx, delta);
                 },
-                .up => return .released,
+                .up => {
+                    _ = self.scrub.delta(hit, drag_span_px);
+                    return .released;
+                },
                 .wheel => |wheel| {
                     kit.aim(cx, &self.hover, 1);
                     return self.nudge(cx, -wheel.dy / drag_span_px);

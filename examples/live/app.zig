@@ -280,7 +280,8 @@ const Grip = struct {
     binding: u8,
     /// The knob's continuous position in its range, `[0, 1]`.
     position: f32,
-    drag_y: f32,
+    /// The knob drag's grip, shared by every knob (one gesture at a time).
+    scrub: ui.Scrub,
     wrote: bool,
     /// The literal when the gesture began, shown struck through until release.
     original: [literal_cap]u8,
@@ -293,7 +294,7 @@ const Grip = struct {
         .id = .none,
         .binding = 0,
         .position = 0,
-        .drag_y = 0,
+        .scrub = .{},
         .wrote = false,
         .original = @splat(0),
         .original_len = 0,
@@ -663,7 +664,7 @@ pub const App = struct {
 
     fn knob_event(app: *App, cx: *Context, id: ui.Id, index: u8, event_value: input.Event) void {
         const held = app.grip.kind != .none and app.grip.id == id;
-        switch (knob.interpret(cx, id, event_value, &app.grip.drag_y)) {
+        switch (knob.interpret(cx, id, event_value, &app.grip.scrub)) {
             .none, .hover => {},
             .grabbed => app.grab(cx, id, index, .drag),
             .turned => |delta| if (held and app.grip.kind == .drag) app.turn(cx, delta),
@@ -701,7 +702,7 @@ pub const App = struct {
         grip.id = id;
         grip.binding = index;
         grip.position = app.fraction(index);
-        grip.drag_y = app.grip.drag_y;
+        grip.scrub = app.grip.scrub;
         @memcpy(grip.original[0..original.len], original);
         grip.original_len = @intCast(original.len);
         app.grip = grip;
@@ -721,9 +722,9 @@ pub const App = struct {
         assert(app.grip.kind != .none);
         app.editor.gesture_end();
         const wrote = app.grip.wrote;
-        const drag_y = app.grip.drag_y;
+        const scrub = app.grip.scrub;
         app.grip = Grip.idle;
-        app.grip.drag_y = drag_y;
+        app.grip.scrub = scrub;
         if (wrote) app.reparse();
         cx.redraw();
     }

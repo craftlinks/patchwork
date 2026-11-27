@@ -12,8 +12,8 @@
 //! ## 2. Events
 //! ```text
 //! hover_in, hover_out   hover (the app redraws: curves brighten for a hovered knob)
-//! down                  grabbed; `drag_y` remembers the press
-//! drag                  turned by -(y - drag_y) / drag_span_px of the range
+//! down                  grabbed; the `ui.Scrub` remembers the press
+//! drag                  turned by the scrub's delta, -(y - drag_y) / drag_span_px of the range
 //! up                    released (also a capture lost to pointer_leave)
 //! wheel                 wheel by -dy / drag_span_px of the range
 //! right press           reset
@@ -57,28 +57,29 @@ pub const Action = union(enum) {
     reset,
 };
 
-/// What one event means for the knob `id` (section 2). `drag_y` is the gesture's last y.
-pub fn interpret(cx: anytype, id: ui.Id, event: patchwork.input.Event, drag_y: *f32) Action {
+/// What one event means for the knob `id` (section 2). `scrub` is the gesture's grip.
+pub fn interpret(cx: anytype, id: ui.Id, event: patchwork.input.Event, scrub: *ui.Scrub) Action {
     assert(id != .none);
-    assert(drag_y.* == drag_y.*);
-    switch (cx.hit(id, event)) {
+    const hit = cx.hit(id, event);
+    switch (hit) {
         .none => return .none,
         .hover_in, .hover_out => {
             cx.redraw();
             return .hover;
         },
-        .down => |press| {
-            drag_y.* = press.y;
+        .down => {
+            _ = scrub.delta(hit, drag_span_px);
+            assert(scrub.held());
             cx.redraw();
             return .grabbed;
         },
-        .drag => |press| {
-            const dy = press.y - drag_y.*;
-            drag_y.* = press.y;
-            if (dy == 0) return .none;
-            return .{ .turned = -dy / drag_span_px };
+        .drag => {
+            const delta = scrub.delta(hit, drag_span_px) orelse return .none;
+            if (delta == 0) return .none;
+            return .{ .turned = delta };
         },
         .up => {
+            _ = scrub.delta(hit, drag_span_px);
             cx.redraw();
             return .released;
         },

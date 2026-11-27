@@ -28,10 +28,15 @@
 //! drag or wheel a knob    turns it (`widgets.Knob`, routed with `ui.route`, at any zoom)
 //! arrows                  pan by pan_step                       = and -              a rung about
 //! 0                       back to the start view                                     the center
+//! n                       selects the next module and pans by the least that shows it whole,
+//!                         reveal_margin to spare (`CanvasState.reveal`)
 //! d                       dashes every cable at 8 / 4             f                  flows them
 //! ctrl = + - 0            the same zoom keys, taken from the page (`cx.consume_key`), so a
 //!                         browser does not zoom the page as well
 //! ```
+//! The keys drive the view through `CanvasState`'s actions (`ui/canvas.zig`, section 5a): `=`,
+//! `+`, and `-` are `step_center`, `0` is `reset`, and `n` is `reveal`, so a key zooms exactly as
+//! the wheel about the canvas's centre does.
 //! Flow lowers the cables' dash offset by `flow_speed` world pixels a second on the `frame`
 //! event, wrapped to the period, and asks for the next frame (`draw/path.zig`, section 4b): every
 //! frame redraws the app and rewrites the dashed cables' records, and no point. Dashes stay at
@@ -80,6 +85,8 @@ pub const knob_top: f32 = 8;
 pub const port_y: f32 = 64;
 /// Below this zoom a module is its face and header only (section 2).
 pub const detail_zoom: f32 = 0.5;
+/// What `n` keeps between the module it reveals and the canvas's edge, in screen pixels.
+pub const reveal_margin: f32 = 32;
 /// Arrow-key pan, in logical pixels.
 pub const pan_step: f32 = 64;
 /// Every `drop_every` columns a cable runs to the module below.
@@ -306,6 +313,16 @@ pub const App = struct {
         cx.keep_animating();
     }
 
+    /// Selects the module after the selected one (the first when none is, wrapping after the
+    /// last) and pans by the least that shows it whole (section 3).
+    fn select_next(app: *App, cx: *Context) void {
+        const next: u32 = if (app.selected) |index| (index + 1) % module_count else 0;
+        app.select(cx, next);
+        const origin = app.origins[next];
+        const rect: Rect = .{ .x = origin[0], .y = origin[1], .width = module_width, .height = module_height };
+        _ = app.view.reveal(cx, rect, reveal_margin);
+    }
+
     fn select(app: *App, cx: *Context, index: u32) void {
         assert(index < module_count);
         if (app.selected != null and app.selected.? == index) return;
@@ -314,18 +331,13 @@ pub const App = struct {
     }
 
     fn key(app: *App, cx: *Context, press: input.KeyPress) void {
-        const mid_x = canvas_rect.x + canvas_rect.width / 2;
-        const mid_y = canvas_rect.y + canvas_rect.height / 2;
         // With Ctrl or Command the zoom keys type nothing, so they are read by name, and the app
         // takes them so a browser does not zoom the page as well (section 3).
         if (press.mods.shortcut() and !press.mods.alt) {
             switch (press.key) {
-                .equal, .plus => _ = app.view.step_at(cx, mid_x, mid_y, 1),
-                .minus => _ = app.view.step_at(cx, mid_x, mid_y, -1),
-                .d0 => {
-                    app.view = .init(start_x, start_y, 1);
-                    cx.redraw();
-                },
+                .equal, .plus => _ = app.view.step_center(cx, 1),
+                .minus => _ = app.view.step_center(cx, -1),
+                .d0 => app.view.reset(cx, start_x, start_y, 1),
                 else => return,
             }
             cx.consume_key();
@@ -338,12 +350,13 @@ pub const App = struct {
             .down => _ = app.view.pan_by(cx, 0, -pan_step),
             else => {
                 if (press.types("=") or press.types("+")) {
-                    _ = app.view.step_at(cx, mid_x, mid_y, 1);
+                    _ = app.view.step_center(cx, 1);
                 } else if (press.types("-")) {
-                    _ = app.view.step_at(cx, mid_x, mid_y, -1);
+                    _ = app.view.step_center(cx, -1);
                 } else if (press.types("0")) {
-                    app.view = .init(start_x, start_y, 1);
-                    cx.redraw();
+                    app.view.reset(cx, start_x, start_y, 1);
+                } else if (press.types("n")) {
+                    app.select_next(cx);
                 } else if (press.types("d")) {
                     app.dashed = !app.dashed;
                     app.flowing = app.flowing and app.dashed;
@@ -753,6 +766,34 @@ test "Ctrl and = + - 0 zoom as the bare keys do and are consumed" {
     try std.testing.expect(!press_consumed(app, .equal, ctrl_alt, "="));
     try std.testing.expect(!press_consumed(app, .r, ctrl, "r"));
     try std.testing.expectEqual([3]f32{ start_x, start_y, 1 }, view_of(app));
+}
+
+// Locks `n` (section 3, `CanvasState.reveal`): from the start view (16, 56) the first press
+// selects module 0, at screen (32, 72), inside the 32 px margin of the canvas at (16, 56), and pans
+// by (16, 16) to (32, 72); modules 1 to 4 show whole and nothing moves; module 5 (world x 1056,
+// screen 1088 to 1264) pans by -32 to x 0; the zoom never changes; after the last module it wraps
+// to module 0. Bare `0` is `reset`: the start view, the drawn view kept.
+test "n selects the next module and reveals it" {
+    const app = new_app();
+    _ = frame_at(app);
+    send(app, .{ .key_down = input.key_press(.n, .none, false, "n") });
+    try std.testing.expectEqual(@as(?u32, 0), app.selected);
+    try std.testing.expectEqual([3]f32{ 32, 72, 1 }, view_of(app));
+    for (1..5) |index| {
+        send(app, .{ .key_down = input.key_press(.n, .none, false, "n") });
+        try std.testing.expectEqual(@as(?u32, @intCast(index)), app.selected);
+        try std.testing.expectEqual([3]f32{ 32, 72, 1 }, view_of(app));
+    }
+    send(app, .{ .key_down = input.key_press(.n, .none, false, "n") });
+    try std.testing.expectEqual(@as(?u32, 5), app.selected);
+    try std.testing.expectEqual([3]f32{ 0, 72, 1 }, view_of(app));
+    app.selected = module_count - 1;
+    send(app, .{ .key_down = input.key_press(.n, .none, false, "n") });
+    try std.testing.expectEqual(@as(?u32, 0), app.selected);
+    const drawn = app.view.drawn;
+    send(app, .{ .key_down = input.key_press(.d0, .none, false, "0") });
+    try std.testing.expectEqual([3]f32{ start_x, start_y, 1 }, view_of(app));
+    try std.testing.expectEqual(drawn, app.view.drawn);
 }
 
 comptime {
