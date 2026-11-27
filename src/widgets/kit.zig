@@ -353,7 +353,7 @@ pub fn is_space(press: input.KeyPress) bool {
     assert(press.len <= input.key_text_cap);
     if (press.key != .other) return false;
     if (press.mods.shortcut() or press.mods.alt) return false;
-    return std.mem.eql(u8, press.typed(), " ");
+    return press.types(" ");
 }
 
 /// The bevel of a glass face of `radius`: the radius, between 6 and 16 logical pixels.

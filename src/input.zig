@@ -60,7 +60,10 @@
 //! one dispatch per keystroke and per repeat. Text is dropped when Ctrl or Meta is held
 //! (`text_allowed`) and for C0 controls and DEL (`printable`), so Enter, Tab, and Backspace
 //! carry none. A compose result longer than 4 bytes is split by `next_chunk` into follow-up
-//! `key_down` events of key `other`, each holding whole codepoints.
+//! `key_down` events of key `other`, each holding whole codepoints. `KeyPress.types(utf8)` is
+//! whether a press typed exactly those bytes, for an app's bare character keys (`?`, `=`, a
+//! space); it adds no policy of its own, so a repeat matches as its press did and a Ctrl press,
+//! which types nothing, never does.
 //!
 //! ## 4. Clicks
 //! Click counting lives in the library so a double click behaves the same on both targets;
@@ -358,6 +361,15 @@ pub const KeyPress = struct {
     pub fn typed(self: *const KeyPress) []const u8 {
         assert(self.len <= key_text_cap);
         return self.text[0..self.len];
+    }
+
+    /// Whether the key typed exactly `utf8` (section 3). No repeat or modifier policy: a repeat
+    /// types what its press did, and a press with Ctrl or Meta types nothing, so it never
+    /// matches.
+    pub fn types(self: *const KeyPress, utf8: []const u8) bool {
+        assert(utf8.len >= 1);
+        assert(utf8.len <= key_text_cap);
+        return std.mem.eql(u8, self.typed(), utf8);
     }
 };
 
@@ -982,6 +994,23 @@ const testing = std.testing;
 
 fn button_at(x: f32, y: f32, time_ms: u32, which: MouseButton) Button {
     return .{ .x = x, .y = y, .time_ms = time_ms, .button = which, .mods = .none };
+}
+
+// Locks `KeyPress.types` (section 3): "?" matches "?" and not "/", on a repeat too; Ctrl and ?
+// types nothing, so it never matches; "ab" does not match "a"; the = key matches "=".
+test "a key press types exactly its bytes" {
+    const question = key_press(.other, .{ .shift = true, .ctrl = false, .alt = false, .meta = false }, false, "?");
+    try std.testing.expect(question.types("?"));
+    try std.testing.expect(!question.types("/"));
+    const repeat = key_press(.other, Mods.none, true, "?");
+    try std.testing.expect(repeat.types("?"));
+    const ctrl = key_press(.other, .{ .shift = false, .ctrl = true, .alt = false, .meta = false }, false, "?");
+    try std.testing.expect(!ctrl.types("?"));
+    const two = key_press(.other, Mods.none, false, "ab");
+    try std.testing.expect(!two.types("a"));
+    try std.testing.expect(two.types("ab"));
+    const equal = key_press(.equal, Mods.none, false, "=");
+    try std.testing.expect(equal.types("="));
 }
 
 // Locks the 24.8 conversion used by `wl_pointer.enter` and `motion`.

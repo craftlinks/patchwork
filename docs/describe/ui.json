@@ -47,7 +47,13 @@
 {"name":"ui.edit.Range","doc":"A byte range `start .. end` of the text.","file":"src/ui/edit.zig","kind":"struct","size":8,"fields":[{"name":"start","type":"u32"},{"name":"end","type":"u32"}]}],
 "constants":[
 {"name":"ui.title_max","doc":"Bytes of the title `set_title` keeps (module guide, section 5a).","file":"src/ui/cx.zig","type":"u32","value":"255"},
-{"name":"ui.zero_inset","file":"src/ui/turtle.zig","type":"draw.Inset","value":".{.left=0,.top=0,.right=0,.bottom=0}"}],
+{"name":"ui.zero_inset","file":"src/ui/turtle.zig","type":"draw.Inset","value":".{.left=0,.top=0,.right=0,.bottom=0}"},
+{"name":"ui.canvas.rungs_per_octave","doc":"Rungs per doubling of the zoom.","file":"src/ui/canvas.zig","type":"u32","value":"6"},
+{"name":"ui.canvas.rung_count","doc":"Rungs of the zoom ladder, 2^(1/6) apart.","file":"src/ui/canvas.zig","type":"u32","value":"25"},
+{"name":"ui.canvas.rung_one","doc":"The index of zoom 1.","file":"src/ui/canvas.zig","type":"u32","value":"12"},
+{"name":"ui.canvas.zoom_min","file":"src/ui/canvas.zig","type":"f32","value":"0.25"},
+{"name":"ui.canvas.zoom_max","file":"src/ui/canvas.zig","type":"f32","value":"4"},
+{"name":"ui.canvas.legible_px_min","doc":"The smallest on-screen em, in logical px, that `legible` passes (section 3a).","file":"src/ui/canvas.zig","type":"f32","value":"6"}],
 "functions":[
 {"name":"ui.Context","doc":"The UI context over the draw context type `Draw`.","file":"src/ui/cx.zig","params":[{"name":"Draw","type":"type","comptime":true},{"name":"area_cap","type":"u32","comptime":true}],"returns":"type"},
 {"name":"ui.id","doc":"The id of item `index` of the kind `name`.","file":"src/ui/areas.zig","params":[{"name":"name","type":"[]const u8","comptime":true},{"name":"index","type":"u32"}],"returns":"ui.Id"},
@@ -143,4 +149,7 @@
 {"name":"ui.Context(...).set_title","doc":"Sets the window's title: the toplevel's natively, `document.title` in a browser, kept and not shown where there is no window.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"},{"name":"text_new","type":"[]const u8"}],"returns":"void"},
 {"name":"ui.Context(...).title","doc":"The title last set, cleaned; empty until the first `set_title`.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*const app.Context(App)"}],"returns":"[:0]const u8"},
 {"name":"ui.Context(...).title_serial","doc":"Host side: a count that changes exactly when the title does; 0 until the first change.","file":"src/ui/cx.zig","params":[{"name":"self","type":"*const app.Context(App)"}],"returns":"u32"},
-{"name":"ui.Context(...).take_window_request","doc":"Host side: the request the last dispatches left, once (section 5a).","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"?ui.WindowRequest"}]}
+{"name":"ui.Context(...).take_window_request","doc":"Host side: the request the last dispatches left, once (section 5a).","file":"src/ui/cx.zig","params":[{"name":"self","type":"*app.Context(App)"}],"returns":"?ui.WindowRequest"},
+{"name":"ui.canvas.rung_of","doc":"The rung nearest `zoom` in log2, ties up (section 3).","file":"src/ui/canvas.zig","params":[{"name":"zoom","type":"f32"}],"returns":"u32"},
+{"name":"ui.canvas.glyph_zoom","doc":"The zoom glyphs rasterize at for a view at `zoom` (section 3).","file":"src/ui/canvas.zig","params":[{"name":"zoom","type":"f32"}],"returns":"f32"},
+{"name":"ui.canvas.legible","doc":"Whether text of `size` logical px drawn at `zoom` is at least `legible_px_min` on screen: `size * zoom >= legible_px_min` (section 3a).","file":"src/ui/canvas.zig","params":[{"name":"size","type":"f32"},{"name":"zoom","type":"f32"}],"returns":"bool"}]}

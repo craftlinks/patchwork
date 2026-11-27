@@ -212,7 +212,7 @@ const row_start: u32 = 0;
 pub const pill_id = ui.id("surface_pill", 0);
 pub const row_id = ui.id("surface_row", 0);
 pub const card_id = ui.id("surface_card", 0);
-const button_flags: ui.Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .pointer };
+const button_flags = ui.cx.plain_with(.pointer);
 
 /// What a click on the page did.
 pub const Report = union(enum) {

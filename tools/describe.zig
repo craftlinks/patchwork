@@ -132,6 +132,7 @@ comptime {
 const namespaces = [_]Namespace{
     .{ .path = "draw", .T = draw, .cx = .draw },
     .{ .path = "draw.Context()", .T = DrawContext, .cx = .draw },
+    .{ .path = "draw.Rect", .T = draw.Rect, .cx = .none },
     .{ .path = "draw.Box", .T = draw.Box, .cx = .none },
     .{ .path = "draw.Arc", .T = draw.Arc, .cx = .none },
     .{ .path = "draw.Surface", .T = draw.Surface, .cx = .none },
@@ -151,6 +152,7 @@ const namespaces = [_]Namespace{
     .{ .path = "theme.ArcShape", .T = patchwork.theme.ArcShape, .cx = .none },
     .{ .path = "ui", .T = ui, .cx = .ui },
     .{ .path = "ui.Context()", .T = UiContext, .cx = .ui },
+    .{ .path = "ui.canvas", .T = ui.canvas, .cx = .none },
     .{ .path = "widgets.kit", .T = widgets.kit, .cx = .ui },
     .{ .path = "app", .T = patchwork.app, .cx = .none },
     .{ .path = "png", .T = patchwork.png, .cx = .none },
@@ -2437,12 +2439,12 @@ fn test_setup() void {
 }
 
 // Locks that the list of namespaces is checked at comptime (a missing one is a compile error,
-// `check_namespace`) and holds the 31 namespaces, with `draw.path` expecting the draw context.
+// `check_namespace`) and holds the 33 namespaces, with `draw.path` expecting the draw context.
 test "every namespace in the list exists" {
-    comptime assert(namespaces.len == 31);
+    comptime assert(namespaces.len == 33);
     comptime check_namespace(namespaces[0]);
-    try testing.expectEqual(Cx.draw, namespaces[7].cx);
-    try testing.expectEqualStrings("draw.path", namespaces[7].path);
+    try testing.expectEqual(Cx.draw, namespaces[8].cx);
+    try testing.expectEqualStrings("draw.path", namespaces[8].path);
 }
 
 // Locks the root's namespaces: the real root has none in neither list; a stand-in root with

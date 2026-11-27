@@ -238,7 +238,9 @@
 //! ## 8. Cursor and Clipboard
 //! The hot area's `Flags.cursor` is resolved with the hot area; `cursor()` reports it, the
 //! captured area's cursor while a press is held (a held `grab` reads `grabbing`), and
-//! `default` outside the window. `copy(bytes)` stores up to `clipboard_cap` bytes (cut on a
+//! `default` outside the window. `plain_with(cursor)` is `plain` with a pointer shape, for an
+//! area that only hovers and presses with its own cursor (a grab handle, a link, a resize
+//! edge); `plain_with(.default)` is `plain`. `copy(bytes)` stores up to `clipboard_cap` bytes (cut on a
 //! codepoint boundary) in `clipboard` and flags the host; `request_paste` asks the host for
 //! the clipboard text, which arrives as a `paste` event routed to the focused widget.
 //!
@@ -532,6 +534,16 @@ const DragEnding = enum(u8) {
 
 /// No hover, press, or wheel interest beyond the default.
 pub const plain: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .default };
+
+/// `plain` with the pointer shape `cursor` over the area: a grab handle, a link, a resize edge.
+/// `plain_with(.default)` is `plain`.
+pub fn plain_with(cursor: Cursor) Flags {
+    var flags = plain;
+    flags.cursor = cursor;
+    assert(flags.cursor == cursor);
+    assert(!flags.wheel and !flags.focusable);
+    return flags;
+}
 /// A press by a contact other than the primary one treats the area as absent: for a widget of
 /// several ids that shares press state (module guide, section 5b).
 pub const primary_flag: Flags = .{
@@ -2678,6 +2690,15 @@ fn send(context: *TestContext, event: input.Event, ids: []const Id, out: []Hit) 
     context.event_begin(event);
     for (ids, out) |key, *result| result.* = context.hit(key, event);
     context.event_end();
+}
+
+// Locks `plain_with` (section 8): `.default` equals `plain`, and `.grab` equals the literal the
+// canvas example wrote by hand before (no wheel, focus, or tab, the grab cursor), bit for bit.
+test "plain_with is plain with a cursor" {
+    try testing.expectEqual(plain, plain_with(.default));
+    const grab: Flags = .{ .wheel = false, .focusable = false, .tab = false, .cursor = .grab };
+    try testing.expectEqual(@as(u16, @bitCast(grab)), @as(u16, @bitCast(plain_with(.grab))));
+    try testing.expectEqual(Cursor.pointer, plain_with(.pointer).cursor);
 }
 
 // Locks the post-hoc alignment: a fit row in a centered column measures its children, and

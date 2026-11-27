@@ -25,6 +25,13 @@
 //! leaves the zoom between rungs; an app that animates `zoom` gets glyphs stretched by at most
 //! `2^(1/12)` (6%) either way.
 //!
+//! ## 3a. Legibility
+//! A zoomed-out canvas has text too small to read, and placing it costs glyphs and atlas room
+//! for nothing. `legible(size, zoom)` is whether text of `size` logical px at `zoom` is at least
+//! `legible_px_min` (6) on screen, `size * zoom >= legible_px_min`; an app tests it before
+//! placing a label (level of detail). It is a test, not a policy of `kit.label`: each canvas
+//! chooses what it drops, and a label outside a canvas never skips.
+//!
 //! ## 4. Zooming About a Point
 //! `zoom_at(px, py, next)` keeps the world point under `(px, py)` in place: with
 //! `r = next / zoom`, `x' = px - (px - x) * r` and likewise `y`. Test "zooming keeps the point
@@ -105,6 +112,17 @@ pub fn rung_of(zoom: f32) u32 {
 /// The zoom glyphs rasterize at for a view at `zoom` (section 3).
 pub fn glyph_zoom(zoom: f32) f32 {
     return rungs[rung_of(zoom)];
+}
+
+/// The smallest on-screen em, in logical px, that `legible` passes (section 3a).
+pub const legible_px_min: f32 = 6;
+
+/// Whether text of `size` logical px drawn at `zoom` is at least `legible_px_min` on screen:
+/// `size * zoom >= legible_px_min` (section 3a).
+pub fn legible(size: f32, zoom: f32) bool {
+    assert(size > 0);
+    assert(zoom > 0);
+    return size * zoom >= legible_px_min;
 }
 
 /// What one canvas keeps between frames. The app owns it; `begin_canvas` writes `viewport`
@@ -251,6 +269,16 @@ test "the ladder has 25 rungs and zooms snap to the nearest" {
     // 1.15 lies between rungs[13] = 1.1225 and its upper midpoint 2^(3/12) = 1.1892.
     try testing.expectEqual(rungs[13], glyph_zoom(1.15));
     try testing.expectEqual(rungs[14], glyph_zoom(1.19));
+}
+
+// Locks `legible` (section 3a): 14 px at zoom 1 passes; 12 px at 0.5 is exactly 6 and passes,
+// at 0.4 (4.8) fails; 13 px passes at rung 6 (zoom 0.5, 6.5) and fails at rung 5 (0.445, 5.79).
+test "legible passes text of at least six on-screen pixels" {
+    try testing.expect(legible(14, 1));
+    try testing.expect(legible(12, 0.5));
+    try testing.expect(!legible(12, 0.4));
+    try testing.expect(legible(13, rungs[6]));
+    try testing.expect(!legible(13, rungs[5]));
 }
 
 // Locks zooming about a point (section 4): one rung in about (400, 300) from offset (16, 56) at

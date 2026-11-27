@@ -126,7 +126,7 @@ pub fn fill(cx: anytype, rect: Rect, clip: Clip, color: [4]f32) void {
 /// A disc of `radius` at `centre` on `over_layer`.
 pub fn dot(cx: anytype, centre: Point, radius: f32, clip: Clip, color: [4]f32) void {
     assert(radius > 0);
-    const rect: Rect = .{ .x = centre[0] - radius, .y = centre[1] - radius, .width = 2 * radius, .height = 2 * radius };
+    const rect = Rect.around(centre, radius);
     const previous = cx.drawing().layer(over_layer);
     kit.face(cx, rect, clip, .{ .fill = color, .radius = radius });
     _ = cx.drawing().layer(previous);
@@ -135,7 +135,7 @@ pub fn dot(cx: anytype, centre: Point, radius: f32, clip: Clip, color: [4]f32) v
 /// A ring of `radius` at `centre` on `over_layer`: a node on a curve.
 pub fn node(cx: anytype, centre: Point, radius: f32, clip: Clip, color: [4]f32) void {
     assert(radius > 1);
-    const rect: Rect = .{ .x = centre[0] - radius, .y = centre[1] - radius, .width = 2 * radius, .height = 2 * radius };
+    const rect = Rect.around(centre, radius);
     const previous = cx.drawing().layer(over_layer);
     kit.face(cx, rect, clip, .{ .fill = background, .border_color = color, .border_width = 1.5, .radius = radius });
     _ = cx.drawing().layer(previous);

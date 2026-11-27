@@ -186,6 +186,10 @@ pub const place = layout.place;
 /// Lays out `runs` as one line sharing a baseline. See `text/layout.zig`.
 pub const place_runs = layout.place_runs;
 
+/// The box `place` puts `utf8` in, unsnapped: its pen start, extent, ascent, and descent.
+/// Pure. See `text/layout.zig`, section 2.
+pub const bounds = layout.bounds;
+
 /// The line pitch of `style` in whole logical pixels: ascent, descent, and line gap, rounded
 /// up. Pure. See `text/layout.zig`, section 2b.
 pub const line_height = layout.line_height;

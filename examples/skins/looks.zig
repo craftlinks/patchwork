@@ -480,10 +480,10 @@ pub const Skin = struct {
 
     /// The focus face, the chevron (3 points, nothing without `draw.Path`), and the rule; the
     /// label's two parts are per byte.
-    pub const disclosure_appends: widgets.SkinAppends = .{ .fixed = .{ .draws = &.{
-        .{ .type = quads.Box, .count = 2 },
-        .{ .type = quads.Path, .count = 1 },
-    }, .points = 3 } };
+    pub const disclosure_appends: widgets.SkinAppends = .{
+        .fixed = (widgets.Appends{ .draws = &.{.{ .type = quads.Box, .count = 2 }} })
+            .plus(widgets.Appends.stroke(3)),
+    };
 
     pub fn disclosure(cx: anytype, look: widgets.DisclosureLook) ?widgets.Shape {
         assert(look.turn >= 0 and look.turn <= 1);
@@ -516,7 +516,8 @@ pub const Skin = struct {
             kit.label(cx, scheme.name, parts.right, label, look.clip, end);
             rule_end -= @ceil(label_extent(scheme.name, parts.right) + rule_gap);
         }
-        const rule_x = @ceil(label.x + label_extent(heading, parts.left) + rule_gap);
+        const heading_box = text.bounds(heading, parts.left, label, start);
+        const rule_x = @ceil(heading_box.x + heading_box.width + rule_gap);
         const rule: Rect = .{
             .x = rule_x,
             .y = @floor(look.rect.y + look.rect.height * 0.5),
@@ -871,6 +872,23 @@ test "headers and cards split their labels" {
     try std.testing.expectEqualStrings("the first oscillator", card.note);
     try std.testing.expectEqualStrings("", card_lines("A\nB").?.note);
     try std.testing.expectEqual(@as(?CardLines, null), card_lines("osc~"));
+}
+
+// Locks the disclosure's rule on `text.bounds` (step 87): for every look's heading, the box's
+// right edge is, bit for bit, the label's x plus `label_extent`, which the rule read before, for
+// a title, an empty title, and a label rect of width 0.
+test "the rule starts where the heading's box ends" {
+    for (all) |one| {
+        const heading = one.scheme.heading;
+        for ([_]f32{ 180, 0 }) |width| {
+            const label: Rect = .{ .x = 31.5, .y = 211, .width = width, .height = 28 };
+            for ([_][]const u8{ "RACK CONTROL", "" }) |title| {
+                const box = text.bounds(heading, title, label, start);
+                const old = label.x + label_extent(heading, title);
+                try std.testing.expectEqual(@as(u32, @bitCast(old)), @as(u32, @bitCast(box.x + box.width)));
+            }
+        }
+    }
 }
 
 // Locks the text over a meter's fill: Paper's and Codex's grey fills take the background, HUD's

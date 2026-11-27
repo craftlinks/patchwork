@@ -92,8 +92,7 @@ pub fn pad_rect(index: u32) Rect {
 
 /// The centre of pad `index`: where a scenario's finger lands.
 pub fn pad_centre(index: u32) [2]f32 {
-    const rect = pad_rect(index);
-    return .{ rect.x + rect.width * 0.5, rect.y + rect.height * 0.5 };
+    return pad_rect(index).center();
 }
 
 /// The x of a slider's value `value` along its travel, for a scenario's finger.
@@ -374,14 +373,9 @@ pub const App = struct {
         const scheme = cx.theme();
         kit.face(cx, box_rect, clip, .{ .fill = box_fill, .radius = 12 });
         const side = square_side * app.scale;
-        const centre_x = box_rect.x + box_rect.width * 0.5 + app.offset[0];
-        const centre_y = box_rect.y + box_rect.height * 0.5 + app.offset[1];
-        const square: Rect = .{
-            .x = centre_x - side * 0.5,
-            .y = centre_y - side * 0.5,
-            .width = side,
-            .height = side,
-        };
+        const middle = box_rect.center();
+        const centre: [2]f32 = .{ middle[0] + app.offset[0], middle[1] + app.offset[1] };
+        const square = Rect.around(centre, side * 0.5);
         const inside = quads.Clip{
             .x0 = box_rect.x,
             .y0 = box_rect.y,

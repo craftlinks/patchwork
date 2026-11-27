@@ -187,32 +187,12 @@ pub fn cubic_of(cable: Cable) [4]Point {
     };
 }
 
-/// The point at `t` of a cubic.
-pub fn cubic_at(control: [4]Point, t: f32) Point {
-    assert(t >= 0 and t <= 1);
-    const u = 1 - t;
-    const weights = [4]f32{ u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t };
-    var out: Point = .{ 0, 0 };
-    for (control, weights) |point, weight| {
-        out[0] += point[0] * weight;
-        out[1] += point[1] * weight;
-    }
-    assert(out[0] == out[0]);
-    return out;
-}
-
 /// The six ports, `port_side` squares in `colors.value`.
 pub fn draw_ports(cx: anytype, clip: Clip) void {
     const color = cx.theme().colors.value;
     assert(color[3] >= 0);
     for (ports) |centre| {
-        const square: Rect = .{
-            .x = centre[0] - port_side / 2,
-            .y = centre[1] - port_side / 2,
-            .width = port_side,
-            .height = port_side,
-        };
-        kit.face(cx, square, clip, .{ .fill = color });
+        kit.face(cx, Rect.around(centre, port_side / 2), clip, .{ .fill = color });
     }
 }
 
@@ -249,7 +229,7 @@ pub fn draw_pills(cx: anytype, look: *const looks.Look, clip: Clip) void {
     for (cables, look.cables) |cable, color| {
         const value = cable.pill orelse continue;
         style.color = color;
-        const rect = pill_rect(cubic_at(cubic_of(cable), pill_t), text.measure(style, value));
+        const rect = pill_rect(quads.path.cubic_point(cubic_of(cable), pill_t), text.measure(style, value));
         kit.face(cx, rect, clip, .{
             .fill = scheme.colors.background,
             .border_color = color,
@@ -323,11 +303,32 @@ test "ports sit on the boxes' edges" {
     try std.testing.expectEqual(Point{ 952, 308 }, ports[3]);
     try std.testing.expectEqual(Point{ 728, 520 }, ports[4]);
     try std.testing.expectEqual(Point{ 856, 520 }, ports[5]);
-    const middle = cubic_at(cubic_of(cables[0]), 0.5);
+    const middle = quads.path.cubic_point(cubic_of(cables[0]), 0.5);
     try std.testing.expectEqual(Point{ 824, 222 }, middle);
-    const at = cubic_at(cubic_of(cables[0]), pill_t);
+    const at = quads.path.cubic_point(cubic_of(cables[0]), pill_t);
     try std.testing.expectApproxEqAbs(@as(f32, 751.296), at[0], 1e-3);
     try std.testing.expectApproxEqAbs(@as(f32, 209.216), at[1], 1e-3);
     const pill = pill_rect(at, 23.2);
     try std.testing.expectEqual(Rect{ .x = 733, .y = 201, .width = 36, .height = 16 }, pill);
+}
+
+// Locks the move onto `draw.path.cubic_point` (step 87): at the pill's t and at 0.5, for every
+// cubic cable, it gives the bits of the example's own `cubic_at` it replaced (zero plus the
+// points times the weights, in order).
+test "the pill's point is the old cubic_at's to the bit" {
+    for (cables) |cable| {
+        if (cable.kind != .cubic) continue;
+        const control = cubic_of(cable);
+        for ([_]f32{ pill_t, 0.5 }) |t| {
+            const u = 1 - t;
+            const weights = [4]f32{ u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t };
+            var old: Point = .{ 0, 0 };
+            for (control, weights) |point, weight| {
+                old[0] += point[0] * weight;
+                old[1] += point[1] * weight;
+            }
+            const got = quads.path.cubic_point(control, t);
+            try std.testing.expectEqual(@as([2]u32, @bitCast(old)), @as([2]u32, @bitCast(got)));
+        }
+    }
 }
